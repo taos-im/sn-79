@@ -1,12 +1,12 @@
 #!/bin/sh
 ENDPOINT=wss://entrypoint-finney.opentensor.ai:443
 WALLET_PATH=~/.bittensor/wallets/
-WALLET_NAME=taos
+WALLET_NAME=huc_q
 HOTKEY_NAME=miner
 NETUID=79
-AXON_PORT=8091
+AXON_PORT=31313
 AGENT_PATH=~/.taos/agents
-AGENT_NAME=SimpleRegressorAgent
+AGENT_NAME=MyNewAgent
 AGENT_PARAMS="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
 LOG_LEVEL=info
 while getopts e:p:w:h:u:a:g:n:m:l: flag
@@ -37,8 +37,8 @@ echo "AGENT_PARAMS: $AGENT_PARAMS"
 git pull
 pip install -e .
 cd taos/im/neurons
-pm2 delete miner
-pm2 start --name=miner "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
+# pm2 delete sn79-1
+pm2 start --name=sn79-1 "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
 pm2 save
 pm2 startup
-pm2 logs miner
+pm2 logs sn79-1

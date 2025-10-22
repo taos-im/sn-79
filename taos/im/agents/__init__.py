@@ -385,8 +385,8 @@ class FinanceSimulationAgent(SimulationAgent):
             update_text += f"{event}" + "\n"
             update_text += '-' * 50 + "\n"
             self.onEnd(event)
-        bt.logging.debug("." + debug_text)
-        bt.logging.info("." + update_text)
+        # bt.logging.debug("." + debug_text)
+        # bt.logging.info("." + update_text)
 
     # Handler functions for various simulation events, to be overridden in agent implementations.
     def onStart(self, event : SimulationStartEvent) -> None:
@@ -537,7 +537,7 @@ class FinanceSimulationAgent(SimulationAgent):
         else:
             update_text += 'NO INSTRUCTIONS TO SUBMIT' + "\n"
         update_text += '-' * 50
-        bt.logging.info(".\n" + update_text)
+        # bt.logging.info(".\n" + update_text)
 
 from taos.im.utils.history import history, batch_history
 class StateHistoryManager:
