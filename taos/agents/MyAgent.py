@@ -105,7 +105,6 @@ class MyAgent(FinanceSimulationAgent):
                 continue
             best_bid = book.bids[0].p
             best_ask = book.asks[0].p
-            mid = (best_bid + best_ask) / 2
             spread = best_ask - best_bid
             spread = round(spread, 2)
 
