@@ -41,7 +41,11 @@ struct convert<taosim::accounting::AccountRegistry>
             else if (key == "accounts") {
                 auto acctsFromCkpt = val.as<taosim::accounting::AccountRegistry::Accounts>();
                 for (auto&& [agentId, acct] : acctsFromCkpt) {
-                    v.accounts().at(agentId) = std::move(acct);
+                    // insert_or_assign, not .at(): the checkpoint may hold accounts for
+                    // agentIds absent from the freshly-constructed registry (deregistered
+                    // agents, runtime-added external/miner UIDs). .at() would throw on the
+                    // first such account and abort the whole restore, resetting the exchange.
+                    v.accounts().insert_or_assign(agentId, std::move(acct));
                 }
             }
             else if (key == "agentIdToBaseName") {

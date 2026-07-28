@@ -255,7 +255,7 @@ class ReportingService:
         ], carry_forward=False)
         self.registry_books.register(self.prometheus_books)
         self.prometheus_miners = Gauge('miners', 'Gauge summaries for miner metrics.', [
-            'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id',
+            'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id', 'hotkey', 'coldkey',
             'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
             'inventory_value', 'inventory_value_change', 'pnl', 'pnl_change', 'total_realized_pnl',
             'total_daily_volume', 'min_daily_volume', 'average_daily_volume',
@@ -266,6 +266,7 @@ class ReportingService:
             'unnormalized_score', 'score',
             'miner_gauge_name'
         ], registry=self.registry_miner)
+        self.prometheus_miner_identity = Gauge('miner_identity', 'Per-miner identity (hotkey/coldkey) for historical attribution; value always 1.0, re-series on re-registration.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey'], registry=self.registry_miner)
         self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid', 'sim_id'], registry=self.registry_validator)
         self.prometheus_gentrx_gauges = Gauge('gentrx_gauges', 'GenTRX distributed-training validator metrics.', ['wallet', 'netuid', 'sim_id', 'gentrx_gauge_name'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_scores = Gauge('gentrx_miner_scores', 'Per-miner GenTRX EMA score (validator-smoothed).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
@@ -301,6 +302,7 @@ class ReportingService:
             self.prometheus_miner_trades.clear()
             self.prometheus_books.clear()
             self.prometheus_miners.clear()
+            self.prometheus_miner_identity.clear()
             self.prometheus_info.clear()
             # Cached children now point at removed series — drop the cache so the
             # next cycle re-resolves fresh handles.
@@ -1187,6 +1189,10 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 len(validator_data['pnl_factors'][agentId])
             ) if validator_data['pnl_factors'][agentId] else 0.0
             kappa_values = validator_data['kappa_values'][agentId] if agentId in validator_data['kappa_values'] else None
+            # EMA'd trading standing (0.5.5): reported as kappa_score/combined_score so the
+            # dashboard shows the smoothed standing that drives reward, not the raw per-window
+            # value. Falls back to the raw kappa_values when the EMA is off or not yet seeded.
+            _ema_std = (validator_data.get('trading_score_ema') or {}).get(agentId)
 
             miner_metrics[agentId] = {
                 'total_base_balance': total_base_balance,
@@ -1219,7 +1225,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'activity_weighted_normalized_median': kappa_values.get('activity_weighted_normalized_median') if kappa_values else None,
                 'kappa_score': kappa_values.get('score') if kappa_values else None,
                 'pnl_score': kappa_values.get('pnl_score') if kappa_values else None,
-                'combined_score': kappa_values.get('final_score') if kappa_values else None,
+                'combined_score': _ema_std if _ema_std is not None else (kappa_values.get('final_score') if kappa_values else None),
                 'unnormalized_score': validator_data['unnormalized_scores'].get(agentId, 0.0),
                 'score': scores[agentId].item() if agentId < len(scores) else 0.0,
                 'gentrx_score': float(validator_data.get('gentrx_scores', {}).get(agentId, 0.0)),
@@ -1613,6 +1619,7 @@ async def report(self: ReportingService) -> None:
 
         bt.logging.debug("Collecting miner metrics...")
         self.prometheus_miners.clear()
+        self.prometheus_miner_identity.clear()
         start = time.time()
         for agentId in miner_metrics:
             m = miner_metrics[agentId]
@@ -1695,6 +1702,8 @@ async def report(self: ReportingService) -> None:
                 netuid=netuid,
                 sim_id=simid,
                 agent_id=agentId,
+                hotkey=(self.metagraph.hotkeys[agentId] if len(getattr(self.metagraph, 'hotkeys', [])) > agentId else ""),
+                coldkey=(self.metagraph.coldkeys[agentId] if len(getattr(self.metagraph, 'coldkeys', [])) > agentId else ""),
                 timestamp=self.simulation_timestamp,
                 timestamp_str=duration_from_timestamp(self.simulation_timestamp),
                 placement=m['placement'],
@@ -1726,6 +1735,16 @@ async def report(self: ReportingService) -> None:
                 unnormalized_score=m['unnormalized_score'],
                 score=m['score'],
                 miner_gauge_name='miners'
+            )
+            _set_if_changed_metric(
+                self.prometheus_miner_identity,
+                1.0,
+                wallet=wallet_addr,
+                netuid=netuid,
+                sim_id=simid,
+                agent_id=agentId,
+                hotkey=(self.metagraph.hotkeys[agentId] if len(getattr(self.metagraph, 'hotkeys', [])) > agentId else ""),
+                coldkey=(self.metagraph.coldkeys[agentId] if len(getattr(self.metagraph, 'coldkeys', [])) > agentId else ""),
             )
         bt.logging.debug(f"Miner metrics collected ({time.time()-start:.4f}s).")
         

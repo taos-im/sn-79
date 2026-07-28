@@ -601,6 +601,9 @@ def _light_fields():
         "gentrx_scores": [0.0] * _UIDS,
         "unnormalized_scores": {u: 0.0 for u in range(_UIDS)},
         "deregistered_uids": [],
+        "trading_score_ema": {u: 0.1 * (u + 1) for u in range(_UIDS)},
+        "trading_score_ema_ts": 3 * _S,
+        "trading_score_ema_n": {u: u + 1 for u in range(_UIDS)},
         "miner_stats": {1: {"requests": 3, "timeouts": 0, "failures": 0,
                             "rejections": 0, "call_time": [0.5]}},
     }
@@ -643,13 +646,15 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "step", "simulation_timestamp", "hotkeys", "scores", "gentrx_scores",
         "activity_factors", "pnl_factors", "inventory_history", "kappa_values",
         "realized_pnl_history", "open_positions", "unnormalized_scores",
-        "deregistered_uids", "trade_volumes", "roundtrip_volumes",
+        "deregistered_uids", "trading_score_ema", "trading_score_ema_ts",
+        "trading_score_ema_n", "trade_volumes", "roundtrip_volumes",
         "volume_sums", "maker_volume_sums", "taker_volume_sums",
         "self_volume_sums", "roundtrip_volume_sums", "miner_stats",
     ]
 
     for key in ("step", "simulation_timestamp", "hotkeys", "scores",
-                "gentrx_scores", "deregistered_uids"):
+                "gentrx_scores", "deregistered_uids",
+                "trading_score_ema", "trading_score_ema_ts", "trading_score_ema_n"):
         assert saved[key] == _mp_norm(light[key])
     assert saved["unnormalized_scores"] == _mp_norm(light["unnormalized_scores"])
     assert saved["miner_stats"] == _mp_norm(light["miner_stats"])

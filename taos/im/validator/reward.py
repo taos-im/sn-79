@@ -1028,6 +1028,7 @@ def build_scoring_config(self: 'Validator') -> Dict:
             },
             'max_inactive_books_ratio': self.config.scoring.max_inactive_books,
             'interval': self.config.scoring.interval,
+            'score_ema_halflife': getattr(self.config.scoring, 'score_ema_halflife', 0) or 0,
         },
         'rewarding': {
             'seed': self.config.rewarding.seed,
@@ -1059,6 +1060,65 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
         'grace_period': self.simulation.grace_period,
         'book_count': self.simulation.book_count,
     }
+
+
+
+def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: int,
+                           ema: Dict, ema_n: Dict, last_ts):
+    """Age-annealed track-record EMA on the trading score, applied BEFORE floor+Pareto.
+
+    Counters the trader's-option exploit of one-sided window scoring (a max-variance
+    strategy collecting on up-windows and flooring at 0 on down-windows) the way real
+    allocators do: multi-period track records / deferred compensation. alpha derives from
+    the sim-time gap (cadence-independent half-life); the age-annealed floor
+    alpha_eff = max(alpha_dt, 1/(k+1)) makes a young miner's standing track its live
+    performance inside the immunity window (k=1 puts >=50% weight on the new window),
+    converging to the half-life EMA as a track record accumulates — with every window
+    counting from the start, so there is no immunity pass-through to farm.
+
+    Mutates `ema`/`ema_n` in place (per-UID value and application count); returns
+    (smoothed_scores, new_last_ts). Deregistered UIDs are reset so a new occupant of the
+    slot starts a fresh track record. Shared by main (get_rewards) and the scoring
+    shadow/cutover child (shadow_score) so both sides stay in exact parity.
+    """
+    # Deregistered/vacant slots (uid in deregs until re-registration — engines/exchange.py
+    # appends on dereg, removes on re-register) are excluded from the EMA entirely: cleared here
+    # AND skipped in the update below, so the slot stays empty (no value, k=0) through its
+    # vacancy. Otherwise a vacant slot would keep accruing k on neutral scores, and a miner
+    # later registering at the reused slot would inherit a large k -> a tiny annealing alpha ->
+    # under-scored through its immunity window (newcomer protection defeated). With this, the
+    # re-registered miner's first scored round seeds at k=0 = full protection.
+    dereg = set(deregs or [])
+    for uid in dereg:
+        ema.pop(uid, None)
+        ema_n.pop(uid, None)
+    # Simulation-boundary handling. Scores are NOT reset on a new sim run (by design —
+    # scoring is continuous across runs): the assessment window spans the boundary until the
+    # new run exceeds the lookback, then narrows to the new run (see shift_simulation_histories,
+    # which rebases old-run history timestamps into the negative region). The EMA state persists
+    # the same way. But simulation_timestamp itself RESETS to ~0 at the seam (on_start:
+    # new_simulation_timestamp = 0), so a naive `ts > last_ts` guard would freeze the EMA for a
+    # whole sim-day and the time-based alpha (ts-last_ts) would go negative. Detect the seam
+    # (ts < last_ts) and treat it as a normal continuous step: drop the time term (alpha_dt=0 →
+    # each UID updates at its annealing weight 1/(k+1), so established miners barely move and a
+    # young miner stays responsive), keep the persisted values, and rebase the clock. This keeps
+    # scoring continuous across the boundary rather than skipping the seam round.
+    seam = last_ts is not None and ts < last_ts
+    if last_ts is None or ts > last_ts or seam:
+        if seam or last_ts is None:
+            alpha_dt = 0.0 if seam else 1.0
+        else:
+            alpha_dt = 1.0 - 0.5 ** ((ts - last_ts) / halflife)
+        for uid in all_uids:
+            if uid in dereg:
+                continue
+            cur = scores[uid]
+            k = ema_n.get(uid, 0)
+            alpha = max(alpha_dt, 1.0 / (k + 1.0))
+            ema[uid] = alpha * cur + (1.0 - alpha) * ema.get(uid, cur)
+            ema_n[uid] = k + 1
+        last_ts = ts
+    return {uid: ema.get(uid, scores[uid]) for uid in all_uids}, last_ts
 
 
 def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.FloatTensor, torch.FloatTensor, Dict]:
@@ -1127,6 +1187,50 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     _prof_t0 = time.perf_counter()
     trading_uid_scores, gentrx_uid_scores = score_uids(validator_data)
     _prof_score = time.perf_counter()
+
+    # Track-record EMA on the trading score, BEFORE the floor+Pareto allocation. Window
+    # scoring with a one-sided payoff (score floors at 0, never negative) is a trader's
+    # option: a max-variance strategy collects on its up-windows and pays nothing back on
+    # its down-windows. Real allocators counter this convex-payoff moral hazard with
+    # multi-period track records / deferred compensation; this EMA is exactly that — one
+    # hot window converts into standing only gradually, and later bad windows forfeit
+    # unearned standing before it is monetized. Placement matters (measured): memory
+    # AFTER Pareto only re-times payouts; memory BEFORE the floor+Pareto convexity
+    # changes rankings. Alpha derives from the sim-time gap so the half-life is
+    # cadence-independent; new/dereg UIDs seed neutrally at their first score (the 3h
+    # window + min_lookback already gate fresh UIDs).
+    # Track-record EMA (see apply_track_record_ema). Parity contract with the scoring
+    # shadow/cutover child: the SAME pre-round EMA state must produce the same outputs on
+    # both sides, so verify uses the pinned (tee-time) state on copies, and the pre-round
+    # snapshot is stashed for the shadow-compare tee (on_main_scored).
+    _ema_hl = validator_data['config']['scoring'].get('score_ema_halflife', 0)
+    if _ema_hl and _ema_hl > 0:
+        _ts = validator_data['simulation_timestamp']
+        if _pin and 'trading_ema' in _pin:
+            # verify path: compute with EXACTLY the child's inputs, on copies (self state
+            # must not double-advance)
+            _ema = dict(_pin['trading_ema'] or {})
+            _ema_n = dict(_pin['trading_ema_n'] or {})
+            _last = _pin.get('trading_ema_ts')
+            self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
+            trading_uid_scores, _ = apply_track_record_ema(
+                trading_uid_scores, all_uids, validator_data['deregistered_uids'],
+                _ts, _ema_hl, _ema, _ema_n, _last)
+        else:
+            _ema = getattr(self, '_trading_score_ema', None)
+            if _ema is None:
+                _ema = {}
+                self._trading_score_ema = _ema
+            _ema_n = getattr(self, '_trading_score_ema_n', None)
+            if _ema_n is None:
+                _ema_n = {}
+                self._trading_score_ema_n = _ema_n
+            _last = getattr(self, '_trading_score_ema_ts', None)
+            self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
+            trading_uid_scores, _new_last = apply_track_record_ema(
+                trading_uid_scores, all_uids, validator_data['deregistered_uids'],
+                _ts, _ema_hl, _ema, _ema_n, _last)
+            self._trading_score_ema_ts = _new_last
 
     # Trading rewards run through Pareto sort-multiply. Optional soft floor (off by
     # default) tapers below-median scores toward zero before the Pareto step so a

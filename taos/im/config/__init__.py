@@ -103,6 +103,22 @@ def add_im_validator_args(cls, parser):
     )
     
     parser.add_argument(
+        "--scoring.score_ema_halflife",
+        type=int,
+        help="Half-life in simulation nanoseconds of the per-UID track-record EMA applied to the "
+             "trading score BEFORE the reward floor + Pareto allocation. Counters the convex-payoff "
+             "(trader's option) exploit of one-sided window scoring: one hot window converts into "
+             "standing only gradually, and later bad windows forfeit unearned standing — the market "
+             "analogue of multi-period track records / deferred compensation. Expressed as sim-time "
+             "so it is independent of the scoring cadence; 0 disables. Default equals "
+             "scoring.kappa.lookback (the 3h assessment window): the standing's memory horizon "
+             "matches the evidence horizon it is built on. Distinct from "
+             "neuron.moving_average_alpha, which smooths the POST-Pareto weight signal at the "
+             "scoring-cycle scale and does not affect rankings.",
+        default=10_800_000_000_000,
+    )
+
+    parser.add_argument(
         "--scoring.max_instructions_per_book",
         type=int,
         help="Maximum number of instructions that can be submitted by miners for each book in a single response.",
@@ -393,10 +409,13 @@ def add_im_validator_args(cls, parser):
         "--rewarding.pareto.shape",
         type=float,
         help="Shape parameter for Pareto distribution used in allocating rewards. Lower "
-             "= steeper payout curve concentrated on top performers. Default 1.0 "
-             "concentrates rewards to blunt bulk-registration farms (a fleet of "
-             "merely-adequate UIDs earns little); 1.42 was the flatter legacy curve.",
-        default=1.0,
+             "= steeper payout curve concentrated on top performers. 1.0 concentrated ~51% of "
+             "reward on the top-5 UIDs, over-amplifying whichever strategy tops Kappa (currently "
+             "directional-luck/farm winners in the up-market); 1.42 (the pre-0.5.4 curve) halves "
+             "that to ~33% and restores honest mid-tier reward, at ~0 cost to genuine-earner share, "
+             "with the soft floor kept on to still blunt bulk-registration farms. Re-sharpen once "
+             "the drift + inventory-risk fixes make the top genuinely skilled.",
+        default=1.42,
     )
 
     parser.add_argument(

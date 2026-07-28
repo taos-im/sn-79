@@ -60,11 +60,19 @@ fi
 python -m pip install -U pyopenssl cryptography
 
 echo "Installing taos"
+# GenTRX distributed-training deps (torch stack + polars/pyarrow) are an OPT-IN
+# extra. A plain miner runs basic trading on core deps; set INSTALL_GENTRX=1 to
+# also install the [gentrx] extra for training/inference agents.
+_TAOS_EXTRAS=""
+if [ "${INSTALL_GENTRX:-0}" = "1" ]; then
+    _TAOS_EXTRAS="[gentrx]"
+    echo "Including GenTRX training extra ([gentrx])"
+fi
 # Use the committed lockfile when present for a reproducible dependency set.
 if [ -f constraints.txt ]; then
-    python -m pip install -e . -c constraints.txt
+    python -m pip install -e ".${_TAOS_EXTRAS}" -c constraints.txt
 else
-    python -m pip install -e .
+    python -m pip install -e ".${_TAOS_EXTRAS}"
 fi
 mkdir -p ~/.taos
 cp -r agents ~/.taos/agents

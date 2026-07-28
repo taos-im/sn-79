@@ -185,4 +185,15 @@ if ! g++ -dumpversion | grep -q "14"; then
 else
 	"$CMAKE_BIN" -DCMAKE_BUILD_TYPE=Release ..
 fi
-"$CMAKE_BIN" --build . -j "$(nproc)"
+# Cap build parallelism by AVAILABLE RAM with headroom so building the simulator's
+# heavy-template TUs (~2.5 GB each) on a box already running the stacks can't OOM.
+# Reserve 6 GB for concurrent services and hard-cap at 12; -j$(nproc) on a 32-core
+# box is a ~48-64 GB spike that takes down the whole host.
+MEM_MB=$(free -m | awk '/^Mem:/{print $7}')
+BUILD_JOBS=$(( (MEM_MB - 6144) / 2560 ))
+BUILD_JOBS=$(( BUILD_JOBS < 1 ? 1 : BUILD_JOBS ))
+NPROC=$(nproc)
+BUILD_JOBS=$(( BUILD_JOBS < NPROC ? BUILD_JOBS : NPROC ))
+BUILD_JOBS=$(( BUILD_JOBS < 12 ? BUILD_JOBS : 12 ))
+echo "Build parallelism: -j $BUILD_JOBS  (${MEM_MB}MB avail, $(nproc) cores)"
+"$CMAKE_BIN" --build . -j "$BUILD_JOBS"

@@ -58,7 +58,8 @@ Inference params:
     gtx_quantity          (float): Order size in base units. Default: 1.0
 
 Training params:
-    gtx_training_enabled  (bool):  Enable assignment-driven training. Default: true
+    gtx_training_enabled  (bool):  Enable assignment-driven training (opt-in; needs
+                                   the [gentrx] extra). Default: false
     gtx_train_steps       (int):   Optional fixed-step cap per window. Default
                                    0 = one pass over the assigned pages.
     gtx_round_budget_s    (float): Wall-clock training budget per round, in
@@ -103,9 +104,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import polars as pl
-import pyarrow as pa
-import pyarrow.parquet as pq
 import bittensor as bt
 
 from fastapi import Request
@@ -114,20 +112,43 @@ from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.instructions import OrderDirection
 from taos.im.protocol.events import SimulationEndEvent
 
+# Light GenTRX helpers (no heavy deps) — safe on a core install; default_output_dir
+# is used in initialize() (the basic, non-training path).
 from GenTRX.src.bt_log import gtx_log
-from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
 from GenTRX.src.util.paths import default_output_dir
-from GenTRX.src.util.schema import (
-    BID,
-    ASK,
-    CANCEL,
-    EXEC_BUY,
-    EXEC_SELL,
-    LOB_DEPTH,
-    DEFAULT_PRICE_DECIMALS,
-    DEFAULT_VOLUME_DECIMALS,
-    order_stream_schema,
-)
+
+# GenTRX distributed-training deps are the OPT-IN [gentrx] extra (polars, pyarrow;
+# GenTRX.src.util.schema imports pyarrow). GenTRXAgent and basic trading import on
+# core deps alone — only opt-in training/inference (gtx_training_enabled /
+# gtx_n_trajectories>0) touch these, and every such path is gated on
+# training_enabled/inference_enabled. Bind to None when absent so the module still
+# imports; initialize() raises a clear "install .[gentrx]" error if the agent is
+# actually configured for training/inference without them.
+try:
+    import polars as pl
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
+    from GenTRX.src.util.schema import (
+        BID,
+        ASK,
+        CANCEL,
+        EXEC_BUY,
+        EXEC_SELL,
+        LOB_DEPTH,
+        DEFAULT_PRICE_DECIMALS,
+        DEFAULT_VOLUME_DECIMALS,
+        order_stream_schema,
+    )
+    _GENTRX_DEPS_AVAILABLE = True
+    _GENTRX_IMPORT_ERROR = None
+except ImportError as _exc:
+    pl = pa = pq = None
+    MatchingEngine = LobSnapshot = order_stream_schema = None
+    BID = ASK = CANCEL = EXEC_BUY = EXEC_SELL = LOB_DEPTH = None
+    DEFAULT_PRICE_DECIMALS = DEFAULT_VOLUME_DECIMALS = None
+    _GENTRX_DEPS_AVAILABLE = False
+    _GENTRX_IMPORT_ERROR = _exc
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +361,20 @@ class GenTRXAgent(FinanceAgent):
         _is_cuda = g.device.startswith("cuda")
 
         # ---- Training config ----
-        g.training_enabled = _cfg_bool(self.config, "gtx_training_enabled", True)
+        # OPT-IN: GenTRX distributed training is off unless explicitly enabled, so a
+        # plain miner runs basic trading on core deps without the [gentrx] extra.
+        g.training_enabled = _cfg_bool(self.config, "gtx_training_enabled", False)
+
+        # Training/inference need the opt-in [gentrx] extra (polars, pyarrow). If the
+        # agent is configured for either but the deps are absent, fail fast with a
+        # clear message instead of a cryptic NoneType error deep in a collection path.
+        if (g.training_enabled or g.inference_enabled) and not _GENTRX_DEPS_AVAILABLE:
+            raise RuntimeError(
+                "GenTRX training/inference is enabled (gtx_training_enabled / "
+                "gtx_n_trajectories>0) but the optional [gentrx] extra is not installed. "
+                "Install it with `pip install -e '.[gentrx]'`, or run basic trading only "
+                "with gtx_training_enabled=false."
+            ) from _GENTRX_IMPORT_ERROR
         # When set, the agent forwards each /gentrx/assignment payload to a
         # standalone miner_training_server instead of training inline.
         g.training_url = getattr(self.config, "gtx_training_url", "") or ""
