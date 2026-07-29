@@ -440,6 +440,16 @@ void ALGOTraderAgent::configure(const pugi::xml_node& node)
     m_topLevel = std::vector<TopLevel>(m_bookCount, TopLevel{});
 
     m_deviationProbCoef = node.attribute("wakeDeviationCoef").as_double(1.0);
+    // Limits-to-arbitrage response. reversionPower>1 makes the probabilistic reversion CONVEX
+    // in the fractional deviation from fundamental: near-zero in the normal trading range (price
+    // floats freely, short-horizon direction stays a ~random walk — essential so the subnet
+    // rewards genuine prediction, not a trivial fade-to-fundamental play), ramping to full only
+    // at large, persistent mispricings which it then bounds. Smooth (no kink → no predictable
+    // support/resistance level to trade against). reversionDeadband gates only the IMMEDIATE
+    // (aggressive) execution path so it never fires on small deviations. Defaults (power=1,
+    // band=0) = legacy linear behaviour.
+    m_reversionDeadband = node.attribute("reversionDeadband").as_double(0.0);
+    m_reversionPower = node.attribute("reversionPower").as_double(1.0);
     m_timeActivationCoef = node.attribute("wakeupTimeCoef").as_double(86'400'000'000'000.0);
 }
 
@@ -535,8 +545,13 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
     const double lastPrice = util::decimal2double(m_lastPrice.at(bookId));
     auto& state = m_state.at(bookId);
     const auto& balances =  simulation()->account(name()).at(bookId);
-    
-    if (fundamental >= lastPrice) {
+
+    // Immediate reversion also respects the no-trade band (see wakeupProb).
+    if (lastPrice > 0.0
+        && std::abs(fundamental - lastPrice) / lastPrice <= m_reversionDeadband) {
+        // inside the band: no immediate action; fall through to the periodic L2 request below
+    }
+    else if (fundamental >= lastPrice) {
          if (state.status != ALGOTraderStatus::EXECUTING  && state.volumeStats.askVolume() >= m_immediateBase) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::BUY;
@@ -711,7 +726,7 @@ double ALGOTraderAgent::wakeupProb(ALGOTraderState& state, double fundDist)
     double fullCostEst = m_depth*slope > volumeEstimate ? 1.0 : 1+ std::max(0.01, (2*m_depth*slope - volumeEstimate)/volumeEstimate);
     double probCost = std::min(1.0,1/(1+std::exp(2*((slope - volume*0.2)/slope))) * fullCostEst);
     double probTime = (state.statusChangeTime == 0) ? 1.0 : std::min(1.0, (simulation()->currentTimestamp()- state.statusChangeTime)/m_timeActivationCoef); 
-    double probDist = std::min(1.0,fundDist * m_deviationProbCoef); 
+    double probDist = std::min(1.0, std::pow(fundDist * m_deviationProbCoef, m_reversionPower)); 
 
     double probability = probVolatility * probCost * probTime * probDist;
     return std::min(1.0,std::max(probability,0.0));

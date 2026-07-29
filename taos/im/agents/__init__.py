@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: MIT
 from dataclasses import dataclass
 import os
+import json
 import msgpack
 import traceback
 import time
 import csv
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import cast
 import bittensor as bt
-from threading import Thread
+from threading import Thread, Lock
 from abc import ABC, abstractmethod
 from taos.common.agents import SimulationAgent
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, FinanceEventNotification
@@ -408,9 +411,124 @@ class FinanceSimulationAgent(SimulationAgent):
         else:
             config.lazy_load = bool(config.lazy_load)
         super().__init__(uid, config, log_dir)
+        self._live_config_start()
+
+    # ── Live config (Tier 2) ───────────────────────────────────────────────────
+    # Opt-in remote param reload with no restart. Enabled when the agent param
+    # `live_config_poll_s` is > 0 AND the scheduler injects TAOS_LIVE_CONFIG_URL
+    # (+ optional TAOS_LIVE_CONFIG_TOKEN) into the container. Because Hangar agents
+    # expose no inbound port, the agent PULLS: a daemon thread polls the endpoint
+    # off the hot path; the next handle() applies any change to self.config and
+    # calls on_config_reload(changed). See runbooks/planning/hangar-live-config.md.
+
+    @staticmethod
+    def _coerce_live_value(v):
+        # Match ParseKwargs: numeric strings become floats, everything else stays.
+        if not isinstance(v, str):
+            return v
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+
+    @staticmethod
+    def _parse_kv_csv(s: str) -> dict:
+        out = {}
+        for pair in str(s or "").split(","):
+            if "=" in pair:
+                k, _, v = pair.partition("=")
+                k = k.strip()
+                if k:
+                    out[k] = FinanceSimulationAgent._coerce_live_value(v.strip())
+        return out
+
+    def _parse_live_config_body(self, body: str) -> dict:
+        body = (body or "").strip()
+        if not body:
+            return {}
+        if body[0] in "{[":
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                src = data.get("agent_params", data)
+                if isinstance(src, str):
+                    return self._parse_kv_csv(src)
+                if isinstance(src, dict):
+                    return {str(k): self._coerce_live_value(v) for k, v in src.items()}
+        return self._parse_kv_csv(body)
+
+    def _live_config_start(self) -> None:
+        poll_s = int(getattr(self.config, "live_config_poll_s", 0) or 0)
+        url = os.environ.get("TAOS_LIVE_CONFIG_URL", "").strip()
+        if poll_s <= 0 or not url:
+            return
+        self._live_cfg_lock = Lock()
+        self._live_cfg_pending = None
+        self._live_cfg_etag = None
+        Thread(target=self._live_config_loop, args=(url, poll_s), daemon=True, name="taos-live-config").start()
+        bt.logging.info(f"live-config: polling {url} every {poll_s}s")
+
+    def _live_config_loop(self, url: str, poll_s: int) -> None:
+        token = os.environ.get("TAOS_LIVE_CONFIG_TOKEN", "").strip()
+        while True:
+            time.sleep(poll_s)
+            try:
+                req = urllib.request.Request(url)
+                if token:
+                    req.add_header("Authorization", f"Bearer {token}")
+                if self._live_cfg_etag:
+                    req.add_header("If-None-Match", self._live_cfg_etag)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        etag = r.headers.get("ETag")
+                        body = r.read().decode("utf-8", "replace")
+                except urllib.error.HTTPError as e:
+                    if e.code == 304:
+                        continue
+                    raise
+                params = self._parse_live_config_body(body)
+                with self._live_cfg_lock:
+                    self._live_cfg_pending = params
+                    self._live_cfg_etag = etag
+            except Exception as e:
+                bt.logging.debug(f"live-config: poll failed: {e}")
+
+    def _apply_pending_live_config(self) -> None:
+        # Cheap fast-path: the attribute only exists once the poller is running.
+        if getattr(self, "_live_cfg_pending", None) is None:
+            return
+        with self._live_cfg_lock:
+            pending = self._live_cfg_pending
+            self._live_cfg_pending = None
+        if not pending:
+            return
+        changed = {}
+        for k, v in pending.items():
+            if getattr(self.config, k, None) != v:
+                setattr(self.config, k, v)
+                changed[k] = v
+        if changed:
+            bt.logging.info(f"live-config: applied {sorted(changed.keys())}")
+            try:
+                self.on_config_reload(changed)
+            except Exception as e:
+                bt.logging.warning(f"live-config: on_config_reload raised: {e}")
+
+    def on_config_reload(self, changed: dict) -> None:
+        """Hook: a live strategy-param change was applied to self.config.
+
+        `changed` maps each changed param name to its new (coerced) value. The
+        config attributes are already updated; override this to re-derive cached
+        state computed in __init__ (e.g. ranges, intervals). Runs on the handle
+        thread before the tick's response is produced. Default: no-op.
+        """
+        return None
 
     def handle(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
-        return super().handle(state)    
+        self._apply_pending_live_config()
+        return super().handle(state)
 
     def process(self, notification: FinanceEventNotification) -> FinanceEventNotification:
         """
@@ -968,6 +1086,7 @@ class FinanceAgent(FinanceSimulationAgent):
         itself, not from a shared instance attribute that concurrent requests
         could overwrite.
         """
+        self._apply_pending_live_config()
         exchange_mode = isinstance(state, ExchangeStateUpdate)
         if exchange_mode:
             header = (

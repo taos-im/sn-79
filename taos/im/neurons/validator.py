@@ -29,6 +29,7 @@ if __name__ != "__mp_main__":
     import sys
     import platform
     import time
+    from datetime import datetime
     import argparse
     import torch
     import traceback
@@ -1356,6 +1357,12 @@ if __name__ != "__mp_main__":
                 self.gentrx_scores[uid] = 0.0
             if hasattr(self, '_gentrx_ema') and self._gentrx_ema:
                 self._gentrx_ema.pop(uid, None)
+            # New occupant of the slot starts its track record fresh (seeds at its own
+            # first score in get_rewards), not with the departed miner's standing.
+            if hasattr(self, '_trading_score_ema') and self._trading_score_ema:
+                self._trading_score_ema.pop(uid, None)
+            if hasattr(self, '_trading_score_ema_n') and self._trading_score_ema_n:
+                self._trading_score_ema_n.pop(uid, None)
             if getattr(self, '_gentrx', None) is not None:
                 self._gentrx._scores.pop(uid, None)
 
@@ -1935,6 +1942,10 @@ if __name__ != "__mp_main__":
                 'pnl_factors': self.pnl_factors,
                 'kappa_values': self.kappa_values,
                 'unnormalized_scores': self.unnormalized_scores,
+                # Track-record EMA standing (post-smoothing trading score that actually drives
+                # reward). Reported in place of raw kappa_score/combined_score so the dashboard
+                # shows the smoothed standing, not the pre-EMA per-window value.
+                'trading_score_ema': dict(getattr(self, '_trading_score_ema', {}) or {}),
                 'scores': {i: score.item() for i, score in enumerate(self.scores)},
                 'gentrx_scores': {i: score.item() for i, score in enumerate(self.gentrx_scores)},
                 'gentrx_enabled': self._gentrx is not None,
@@ -2252,6 +2263,9 @@ if __name__ != "__mp_main__":
                                 _deregs = _eager['deregistered_uids']
                                 _gtx_scores = _eager['gentrx_scores']
                                 _gtx_ema = _eager['gentrx_ema']
+                                _t_ema = _eager.get('trading_ema', {})
+                                _t_ema_n = _eager.get('trading_ema_n', {})
+                                _t_ema_ts = _eager.get('trading_ema_ts')
                             else:
                                 _sim_ts = self.simulation_timestamp
                                 _deregs = list(self.deregistered_uids)
@@ -2260,12 +2274,17 @@ if __name__ != "__mp_main__":
                                     if hasattr(self, '_gentrx') and self._gentrx is not None else {}
                                 )
                                 _gtx_ema = getattr(self, '_gentrx_ema', {})
+                                _t_ema = dict(getattr(self, '_trading_score_ema', {}) or {})
+                                _t_ema_n = dict(getattr(self, '_trading_score_ema_n', {}) or {})
+                                _t_ema_ts = getattr(self, '_trading_score_ema_ts', None)
                             adopted = await loop.run_in_executor(
                                 None,
                                 lambda: _shadow.request_scores(
                                     timestamp, _sim_ts, _deregs, _gtx_scores, _gtx_ema,
                                     timeout=float(os.environ.get("SCORING_PROC_TIMEOUT", "45")),
                                     eager=_eager is not None,
+                                    trading_ema=_t_ema, trading_ema_n=_t_ema_n,
+                                    trading_ema_ts=_t_ema_ts,
                                 ),
                             )
                             if adopted is not None and len(adopted['trading']) != self.effective_max_uids:
@@ -2293,6 +2312,9 @@ if __name__ != "__mp_main__":
                                 'deregistered_uids': _deregs,
                                 'gentrx_scores': _gtx_scores,
                                 'gentrx_ema': _gtx_ema,
+                                'trading_ema': _t_ema,
+                                'trading_ema_n': _t_ema_n,
+                                'trading_ema_ts': _t_ema_ts,
                             } if _verify else None
                             trading_rewards, gentrx_rewards, updated_data, all_uids = await loop.run_in_executor(
                                 self.reward_executor,
@@ -2322,6 +2344,12 @@ if __name__ != "__mp_main__":
                             updated_data = adopted['factors']
                             all_uids = list(range(len(adopted['trading'])))
                             self._gentrx_ema = adopted['gentrx_ema']
+                            if 'trading_ema' in adopted:
+                                self._trading_score_ema = {int(k): float(v) for k, v in
+                                                           (adopted['trading_ema'] or {}).items()}
+                                self._trading_score_ema_n = {int(k): int(v) for k, v in
+                                                             (adopted.get('trading_ema_n') or {}).items()}
+                                self._trading_score_ema_ts = adopted.get('trading_ema_ts')
 
                         bt.logging.info(
                             f"Reward calculation completed ({time.time()-calc_start:.4f}s"
@@ -2332,11 +2360,14 @@ if __name__ != "__mp_main__":
                             # Shadow-only mode: release the child's held boundary
                             # with the exact inputs this reward used + record
                             # main's trading scores for the [SHADOW-SCORES] compare.
+                            _pre = getattr(self, '_trading_score_ema_pre', None) or ({}, {}, None)
                             _shadow.on_main_scored(
                                 timestamp,
                                 updated_data['sim_ts_used'],
                                 updated_data['deregs_used'],
                                 [float(x) for x in trading_rewards.tolist()],
+                                trading_ema=_pre[0], trading_ema_n=_pre[1],
+                                trading_ema_ts=_pre[2],
                             )
 
                         self.kappa_values = updated_data['kappa_values']
@@ -2611,6 +2642,7 @@ if __name__ != "__mp_main__":
                 "accounts":            state.accounts or {},
                 "pools":               _sim_pools,
                 "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
+                "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
                 "reconciliation":      {"fills": _sim_fills, "rejections": _sim_rejects},
                 "notices":             {str(k): list(v) for k, v in (state.notices or {}).items()},
                 "agent_open_orders":   _sim_open_orders,
@@ -2745,7 +2777,25 @@ if __name__ != "__mp_main__":
             self.step += 1
 
             # Log received state data
-            bt.logging.info(f"STATE UPDATE RECEIVED | VALIDATOR STEP : {self.step} | TIME : {duration_from_timestamp(state.timestamp)} (T={state.timestamp})")
+            # exchange/observe mode: state.timestamp is the engine BLOCK clock
+            # (block x BLOCK_TIME_NS), not a real-world time. Report the engine's
+            # batch-processing time instead: the chain state fetched for this batch
+            # is stamped with a unix-SECONDS timestamp (chain_state['timestamp']),
+            # which is the exchange engine's real-world batch clock. Format
+            # dd/mm/yyyy HH:MM:SS.nnnnnnnnn (seconds source -> .000000000 nanos).
+            # Simulation mode keeps the sim-elapsed duration format unchanged.
+            if self.engine.mode == 'exchange':
+                _cs = getattr(self.engine, '_last_chain_state', None) or {}
+                _batch_ts = _cs.get('timestamp')
+                if _batch_ts:
+                    _t_disp = datetime.fromtimestamp(_batch_ts).strftime('%d/%m/%Y %H:%M:%S') + '.000000000'
+                else:
+                    # no chain state yet (pre-first-batch); fall back to wall clock
+                    _now = datetime.now()
+                    _t_disp = _now.strftime('%d/%m/%Y %H:%M:%S') + f".{_now.microsecond * 1000:09d}"
+            else:
+                _t_disp = duration_from_timestamp(state.timestamp)
+            bt.logging.info(f"STATE UPDATE RECEIVED | VALIDATOR STEP : {self.step} | TIME : {_t_disp} (T={state.timestamp})")
             if self.config.logging.debug or self.config.logging.trace:
                 debug_text = ''
                 for bookId, book in state.books.items():
@@ -2968,6 +3018,7 @@ if __name__ != "__mp_main__":
                     "metagraph":           _meta,
                     "validator_uid":       self.uid,
                     "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
+                "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
                     "sltp_triggers":       _live_triggers,
                     "exchange_constraints": _exch_constraints,
                 }, url=_ingest_url))
@@ -3145,6 +3196,7 @@ if __name__ != "__mp_main__":
                             "metagraph":           _sm,
                             "validator_uid":       self.uid,
                             "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
+                "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
                         }, url=getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')))
                 except Exception as _exc:
                     bt.logging.warning(f"MVTRX startup push failed: {_exc}")
@@ -3222,6 +3274,9 @@ if __name__ != "__mp_main__":
                                         (self._gentrx.get_scores()
                                          if hasattr(self, '_gentrx') and self._gentrx is not None else {}),
                                         getattr(self, '_gentrx_ema', {}),
+                                        trading_ema=dict(getattr(self, '_trading_score_ema', {}) or {}),
+                                        trading_ema_n=dict(getattr(self, '_trading_score_ema_n', {}) or {}),
+                                        trading_ema_ts=getattr(self, '_trading_score_ema_ts', None),
                                     )
                             response = await self.handle_state(normalized_state, receive_start)
                     except Exception as ex:

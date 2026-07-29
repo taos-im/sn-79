@@ -146,37 +146,21 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
             realized_means = realized_returns.mean(axis=1)
             realized_downside = np.maximum(tau - realized_returns, 0.0)
             realized_lpm3 = np.power(realized_downside, 3).mean(axis=1)
-            realized_upside = np.maximum(realized_returns - tau, 0.0)
-            realized_upm3 = np.power(realized_upside, 3).mean(axis=1)
-            
+
             # Data-driven regularization to prevent division by near-zero
             typical_scale = np.abs(realized_means) + np.std(realized_returns, axis=1)
             regularization = np.power(typical_scale * 0.1, 3)
-            
-            # Adaptive epsilon based on mean direction
-            # If mean is positive (winning), be generous with epsilon (ignore tiny losses)
-            # If mean is negative (losing), be strict with epsilon (don't ignore real losses)
-            epsilon_per_book = np.where(
-                realized_means > tau,
-                1e-2,
-                1e-6
+
+            # Monotonic Kappa-3: single downside-penalized formula for every sufficient book.
+            # A clean (zero-downside) record has LPM3->0 -> denominator is the regularization
+            # floor -> high (clamp-bounded) score; any losing round-trip raises LPM3 and lowers
+            # kappa. No separate upside-dispersion branch, so a clean win record can no longer be
+            # out-scored by an otherwise-identical record containing a loss (the previous
+            # non-monotonic inversion). Loss-bearing books are unchanged vs the old standard path.
+            kappa_ratios_realized[sufficient_mask] = (
+                (realized_means[sufficient_mask] - tau)
+                / np.cbrt(realized_lpm3[sufficient_mask] + regularization[sufficient_mask])
             )
-            
-            # Standard formula (meaningful downside) with regularization
-            valid_mask = sufficient_mask & (realized_lpm3 > epsilon_per_book)
-            kappa_ratios_realized[valid_mask] = (
-                (realized_means[valid_mask] - tau) / np.cbrt(realized_lpm3[valid_mask] + regularization[valid_mask])
-            )
-            
-            # Perfect formula (negligible downside AND positive mean) with regularization
-            perfect_mask = sufficient_mask & (realized_lpm3 <= epsilon_per_book) & (realized_means > tau)
-            kappa_ratios_realized[perfect_mask] = (
-                (realized_means[perfect_mask] - tau) / np.cbrt(realized_upm3[perfect_mask] + regularization[perfect_mask])
-            )
-            
-            # Zero score (no meaningful downside but negative mean)
-            zero_mask = sufficient_mask & (realized_lpm3 <= epsilon_per_book) & (realized_means <= tau)
-            kappa_ratios_realized[zero_mask] = 0.0
         
         kappa_values = {
             'books': {
@@ -214,26 +198,15 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
             realized_total_mean = total_realized_normalized.mean()
             realized_total_downside = np.maximum(tau - total_realized_normalized, 0.0)
             realized_total_lpm3 = np.power(realized_total_downside, 3).mean()
-            realized_total_upside = np.maximum(total_realized_normalized - tau, 0.0)
-            realized_total_upm3 = np.power(realized_total_upside, 3).mean()
-            
+
             # Regularization for portfolio
             total_typical_scale = abs(realized_total_mean) + np.std(total_realized_normalized)
             total_regularization = (total_typical_scale * 0.1) ** 3
-            
-            # Adaptive epsilon for portfolio
-            epsilon_portfolio = 1e-2 if realized_total_mean > tau else 1e-6
-            
-            if realized_total_lpm3 > epsilon_portfolio:
-                kappa_values['total'] = count_multiplier * float(
-                    (realized_total_mean - tau) / np.cbrt(realized_total_lpm3 + total_regularization)
-                )
-            elif realized_total_mean > tau:
-                kappa_values['total'] = count_multiplier * float(
-                    (realized_total_mean - tau) / np.cbrt(realized_total_upm3 + total_regularization)
-                )
-            else:
-                kappa_values['total'] = count_multiplier * 0.0
+
+            # Monotonic Kappa-3 (see per-book note): single downside-penalized formula.
+            kappa_values['total'] = count_multiplier * float(
+                (realized_total_mean - tau) / np.cbrt(realized_total_lpm3 + total_regularization)
+            )
         else:
             kappa_values['total'] = None
         

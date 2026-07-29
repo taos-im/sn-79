@@ -63,6 +63,9 @@ def build_validator_state(
         "gentrx_scores": [score.item() for score in self.gentrx_scores],
         "activity_factors": self.activity_factors,
         "pnl_factors": self.pnl_factors,
+        "trading_score_ema": dict(getattr(self, '_trading_score_ema', {}) or {}),
+        "trading_score_ema_ts": getattr(self, '_trading_score_ema_ts', None),
+        "trading_score_ema_n": dict(getattr(self, '_trading_score_ema_n', {}) or {}),
         "inventory_history": inventory_snapshot,
         "kappa_values": self.kappa_values,
         "realized_pnl_history": realized_pnl_snapshot,
@@ -111,6 +114,9 @@ def build_save_light_fields(self: Validator) -> dict:
         "gentrx_scores": [score.item() for score in self.gentrx_scores],
         "unnormalized_scores": dict(self.unnormalized_scores),
         "deregistered_uids": list(self.deregistered_uids),
+        "trading_score_ema": dict(getattr(self, '_trading_score_ema', {}) or {}),
+        "trading_score_ema_ts": getattr(self, '_trading_score_ema_ts', None),
+        "trading_score_ema_n": dict(getattr(self, '_trading_score_ema_n', {}) or {}),
         "miner_stats": snapshot_miner_stats(self),
     }
 
@@ -1293,6 +1299,12 @@ def _load_validator_state(self):
             num_gentrx_to_copy = min(len(loaded_gentrx_scores), self.effective_max_uids)
             if num_gentrx_to_copy:
                 self.gentrx_scores[:num_gentrx_to_copy] = torch.tensor(loaded_gentrx_scores[:num_gentrx_to_copy])
+
+            _ema = validator_state.get("trading_score_ema", {}) or {}
+            self._trading_score_ema = {int(u): float(v) for u, v in _ema.items()}
+            self._trading_score_ema_ts = validator_state.get("trading_score_ema_ts", None)
+            _ema_n = validator_state.get("trading_score_ema_n", {}) or {}
+            self._trading_score_ema_n = {int(u): int(v) for u, v in _ema_n.items()}
 
             loaded_activity = validator_state.get("activity_factors", {})
             if loaded_activity and isinstance(list(loaded_activity.values())[0], float):

@@ -36,7 +36,14 @@ struct convert<taosim::matching::FeePolicyWrapper>
             for (const auto& [k, val] : o.via.map) {
                 auto key = k.as<std::string>();
 
-                auto feePolicy = v.agentBaseNameFeePolicies().at(key).get();
+                // find(), not .at(): a checkpoint fee-policy key absent from the current
+                // config (policies changed between runs) is skipped, not treated as fatal
+                // (which would abort the whole restore and reset the exchange).
+                auto it = v.agentBaseNameFeePolicies().find(key);
+                if (it == v.agentBaseNameFeePolicies().end()) {
+                    continue;
+                }
+                auto feePolicy = it->second.get();
 
                 if (auto fp = dynamic_cast<taosim::matching::DynamicFeePolicy*>(feePolicy)) {
                     val.convert(*fp);

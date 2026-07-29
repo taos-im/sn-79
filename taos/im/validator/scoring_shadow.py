@@ -213,7 +213,8 @@ class ShadowState:
 
 
 def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
-                 gentrx_scores=None, gentrx_ema=None) -> dict:
+                 gentrx_scores=None, gentrx_ema=None,
+                 trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> dict:
     """Run the SAME scoring main runs (score_uids + Pareto distribute) on the
     shadow's structures. Mutates kappa/activity/pnl factors in place exactly as
     main's reward does, keeping the shadow in lockstep.
@@ -225,7 +226,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     Returns {'trading', 'gentrx', 'factors', 'gentrx_ema'} — everything main
     adopts in cutover mode.
     """
-    from taos.im.validator.reward import distribute_rewards, score_uids
+    from taos.im.validator.reward import (apply_reward_floor, apply_track_record_ema,
+                                          distribute_rewards, score_uids)
 
     shadow.deregistered_uids = list(deregs)
     all_uids = list(range(shadow.effective_max_uids))
@@ -247,9 +249,23 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         'gentrx_ema': _ema,
     }
     trading_scores, gentrx_scores_out = score_uids(validator_data)
-    distributed = distribute_rewards(
+    # Track-record EMA: same pre-round state main ships (parity contract with
+    # reward.get_rewards); the child stays stateless — the state round-trips.
+    _tema = dict(trading_ema or {})
+    _tema_n = dict(trading_ema_n or {})
+    _tema_ts = trading_ema_ts
+    _hl = (shadow.scoring_config.get('scoring', {}) or {}).get('score_ema_halflife', 0)
+    if _hl and _hl > 0:
+        trading_scores, _tema_ts = apply_track_record_ema(
+            trading_scores, all_uids, shadow.deregistered_uids,
+            sim_ts, _hl, _tema, _tema_n, _tema_ts)
+    # Identical allocation pipeline to main's get_rewards: soft floor THEN Pareto.
+    # (The floor was missing here — a pre-existing divergence whenever
+    # rewarding.floor.enabled is on; a no-op when it is off.)
+    floored = apply_reward_floor(
         [trading_scores[uid] for uid in all_uids], shadow.scoring_config
     )
+    distributed = distribute_rewards(floored, shadow.scoring_config)
     return {
         'trading': [float(x) for x in distributed.tolist()],
         'gentrx': [float(gentrx_scores_out[uid]) for uid in all_uids],
@@ -259,6 +275,9 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
             'pnl_factors': shadow.pnl_factors,
         },
         'gentrx_ema': validator_data.get('gentrx_ema', {}),
+        'trading_ema': _tema,
+        'trading_ema_n': _tema_n,
+        'trading_ema_ts': _tema_ts,
     }
 
 
@@ -290,6 +309,9 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
         "open_positions": snapshot_open_positions(shadow),
         "unnormalized_scores": light["unnormalized_scores"],
         "deregistered_uids": light["deregistered_uids"],
+        "trading_score_ema": light.get("trading_score_ema", {}),
+        "trading_score_ema_ts": light.get("trading_score_ema_ts"),
+        "trading_score_ema_n": light.get("trading_score_ema_n", {}),
         "trade_volumes": snapshot_trade_volumes(shadow),
         "roundtrip_volumes": snapshot_roundtrip_volumes(shadow),
         "volume_sums": vols["volume_sums"],
@@ -432,10 +454,12 @@ def _shadow_child_main(sock, cores, parity_ns):
                 except Exception:
                     pass
 
-        def _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema):
+        def _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
+                            t_ema=None, t_ema_n=None, t_ema_ts=None):
             t0 = time.time()
             try:
-                result = shadow_score(shadow, sim_ts, deregs, gtx_scores, gtx_ema)
+                result = shadow_score(shadow, sim_ts, deregs, gtx_scores, gtx_ema,
+                                      t_ema, t_ema_n, t_ema_ts)
                 _send_frame(sock, ("scores", (s_ts, result, time.time() - t0)))
             except Exception as e:
                 import traceback
@@ -568,11 +592,15 @@ def _shadow_child_main(sock, cores, parity_ns):
                 else:
                     pending_save = (expect_ts, path, light, time.monotonic() + 60.0)
             elif kind == "score_inputs":
-                s_ts, sim_ts, deregs, gtx_scores, gtx_ema = payload
+                s_ts, sim_ts, deregs, gtx_scores, gtx_ema = payload[:5]
+                t_ema = payload[5] if len(payload) > 5 else None
+                t_ema_n = payload[6] if len(payload) > 6 else None
+                t_ema_ts = payload[7] if len(payload) > 7 else None
                 if shadow is not None and awaiting_score_at is not None and awaiting_score_at[0] == s_ts:
                     # inputs arrived after the boundary was applied — score now
                     awaiting_score_at = None
-                    _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema)
+                    _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
+                                    t_ema, t_ema_n, t_ema_ts)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -580,20 +608,25 @@ def _shadow_child_main(sock, cores, parity_ns):
                         else:
                             side_buffer.append((ts, raw))
                 else:
-                    pending_score_inputs[s_ts] = (sim_ts, deregs, gtx_scores, gtx_ema)
+                    pending_score_inputs[s_ts] = (sim_ts, deregs, gtx_scores, gtx_ema,
+                                                  t_ema, t_ema_n, t_ema_ts)
                     while len(pending_score_inputs) > 4:
                         pending_score_inputs.pop(next(iter(pending_score_inputs)))
             elif kind == "score_at":
                 s_ts, sim_ts, deregs = payload[0], payload[1], payload[2]
                 gentrx_scores = payload[3] if len(payload) > 3 else None
                 gentrx_ema = payload[4] if len(payload) > 4 else None
+                t_ema = payload[5] if len(payload) > 5 else None
+                t_ema_n = payload[6] if len(payload) > 6 else None
+                t_ema_ts = payload[7] if len(payload) > 7 else None
                 if shadow is None or awaiting_score_at is None or awaiting_score_at[0] != s_ts:
                     print(f"[SHADOW] unexpected score_at ts={s_ts} (awaiting={awaiting_score_at}) — ignored", flush=True)
                     if shadow is not None:
                         _send_frame(sock, ("scores_err", (s_ts, "not at boundary")))
                 else:
                     awaiting_score_at = None
-                    _score_and_send(s_ts, sim_ts, deregs, gentrx_scores, gentrx_ema)
+                    _score_and_send(s_ts, sim_ts, deregs, gentrx_scores, gentrx_ema,
+                                    t_ema, t_ema_n, t_ema_ts)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -727,7 +760,8 @@ class ScoringShadow:
         self._executor.submit(_send)
 
     def tee_score_inputs(self, timestamp: int, sim_ts: int, deregs: list,
-                         gentrx_scores=None, gentrx_ema=None) -> None:
+                         gentrx_scores=None, gentrx_ema=None,
+                         trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> None:
         """Eager scoring: ship the boundary round's scoring inputs at TEE time,
         so the child computes during the seconds main's _reward spends queued
         behind _reward_lock — request_scores then collects a (usually) finished
@@ -740,6 +774,9 @@ class ScoringShadow:
             'deregistered_uids': list(deregs),
             'gentrx_scores': dict(gentrx_scores or {}),
             'gentrx_ema': dict(gentrx_ema or {}),
+            'trading_ema': dict(trading_ema or {}),
+            'trading_ema_n': dict(trading_ema_n or {}),
+            'trading_ema_ts': trading_ema_ts,
         }
         self._stash(self._eager_inputs, timestamp, pin, 4)
 
@@ -748,7 +785,8 @@ class ScoringShadow:
                 _send_frame(self._sock, (
                     "score_inputs",
                     (timestamp, sim_ts, pin['deregistered_uids'],
-                     pin['gentrx_scores'], pin['gentrx_ema']),
+                     pin['gentrx_scores'], pin['gentrx_ema'],
+                     pin['trading_ema'], pin['trading_ema_n'], pin['trading_ema_ts']),
                 ))
             except Exception:
                 pass
@@ -762,7 +800,8 @@ class ScoringShadow:
 
     def request_scores(self, timestamp: int, sim_ts: int, deregs: list,
                        gentrx_scores=None, gentrx_ema=None, timeout: float = 45.0,
-                       eager: bool = False):
+                       eager: bool = False,
+                       trading_ema=None, trading_ema_n=None, trading_ema_ts=None):
         """Cutover mode: collect this boundary's full scoring result, blocking
         until it arrives (call via run_in_executor — the wait is GIL-free).
         eager=True means the inputs were already shipped at tee time (the child
@@ -793,7 +832,8 @@ class ScoringShadow:
                     _send_frame(self._sock, (
                         "score_at",
                         (timestamp, sim_ts, list(deregs),
-                         dict(gentrx_scores or {}), dict(gentrx_ema or {})),
+                         dict(gentrx_scores or {}), dict(gentrx_ema or {}),
+                         dict(trading_ema or {}), dict(trading_ema_n or {}), trading_ema_ts),
                     ))
                 except Exception:
                     pass
@@ -958,7 +998,8 @@ class ScoringShadow:
         else:
             self._stash(self._ring, timestamp, digest, 16)
 
-    def on_main_scored(self, timestamp: int, sim_ts_used: int, deregs_used: list, trading_scores: list) -> None:
+    def on_main_scored(self, timestamp: int, sim_ts_used: int, deregs_used: list, trading_scores: list,
+                       trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> None:
         """Called after main's get_rewards completes on a scoring round: record
         main's trading scores for comparison and release the child (which is
         holding applies at this boundary) with the exact live inputs main used."""
@@ -972,7 +1013,10 @@ class ScoringShadow:
 
         def _send():
             try:
-                _send_frame(self._sock, ("score_at", (timestamp, sim_ts_used, list(deregs_used))))
+                _send_frame(self._sock, ("score_at", (timestamp, sim_ts_used, list(deregs_used),
+                                                      None, None,
+                                                      dict(trading_ema or {}), dict(trading_ema_n or {}),
+                                                      trading_ema_ts)))
             except Exception:
                 pass
 

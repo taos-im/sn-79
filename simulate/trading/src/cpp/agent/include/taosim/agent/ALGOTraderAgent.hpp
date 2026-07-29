@@ -203,6 +203,8 @@ private:
     std::normal_distribution<double> m_departureThreshold;
     VolatilityBounds m_volatilityBounds;
     double m_deviationProbCoef;
+    double m_reversionDeadband{};
+    double m_reversionPower{1.0};
     double m_timeActivationCoef;
     Timestamp m_period;
     size_t m_depth;
