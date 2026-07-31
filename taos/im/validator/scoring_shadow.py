@@ -256,9 +256,11 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     _tema_ts = trading_ema_ts
     _hl = (shadow.scoring_config.get('scoring', {}) or {}).get('score_ema_halflife', 0)
     if _hl and _hl > 0:
+        # Parity with main: fresh miners still in min_lookback (no valid Kappa) keep k=0.
+        _scorable = {uid for uid in all_uids if (shadow.kappa_values.get(uid) or {}).get('scorable')}
         trading_scores, _tema_ts = apply_track_record_ema(
             trading_scores, all_uids, shadow.deregistered_uids,
-            sim_ts, _hl, _tema, _tema_n, _tema_ts)
+            sim_ts, _hl, _tema, _tema_n, _tema_ts, _scorable)
     # Identical allocation pipeline to main's get_rewards: soft floor THEN Pareto.
     # (The floor was missing here — a pre-existing divergence whenever
     # rewarding.floor.enabled is on; a no-op when it is off.)
