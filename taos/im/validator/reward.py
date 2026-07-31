@@ -472,6 +472,12 @@ def calculate_kappa_score(
     uid_kappa['penalty'] = abs(outlier_penalty)
     uid_kappa['score'] = kappa_score
     uid_kappa['num_scored_books'] = len(data)
+    # Scorable = the miner has a valid Kappa on at least one book this round. Empty
+    # books_with_scores means every book is still inside its min_lookback window (raw
+    # Kappa None) — not yet scorable, distinct from a scored-but-poor miner whose valid
+    # book Kappas normalize to ~0. Consumed by apply_track_record_ema to keep a fresh
+    # UID's annealing counter at 0 through warmup.
+    uid_kappa['scorable'] = len(books_with_scores) > 0
     
     return kappa_score
 
@@ -1064,7 +1070,7 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
 
 
 def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: int,
-                           ema: Dict, ema_n: Dict, last_ts):
+                           ema: Dict, ema_n: Dict, last_ts, scorable=None):
     """Age-annealed track-record EMA on the trading score, applied BEFORE floor+Pareto.
 
     Counters the trader's-option exploit of one-sided window scoring (a max-variance
@@ -1111,6 +1117,18 @@ def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: in
             alpha_dt = 1.0 - 0.5 ** ((ts - last_ts) / halflife)
         for uid in all_uids:
             if uid in dereg:
+                continue
+            # Newcomer warmup: a UID still inside its min_lookback window (no valid Kappa
+            # on any book yet => scorable False) that has NEVER been scored (ema_n 0) is
+            # skipped so its annealing counter k stays 0. Otherwise the ~1000 zero-score
+            # warmup rounds burn the 1/(k+1) newcomer protection before the first real
+            # score, and the standing then crawls up from 0 across the whole immunity
+            # window (kappa is reached fast but the overall score is not). The guard is
+            # ema_n 0, not merely scorable: once a UID has been scored, it always updates,
+            # so an established miner going silent still decays toward 0 (the trader's-
+            # option protection the EMA exists for is preserved). scorable None => no skip
+            # (back-compat for callers that do not pass the set).
+            if scorable is not None and uid not in scorable and ema_n.get(uid, 0) == 0:
                 continue
             cur = scores[uid]
             k = ema_n.get(uid, 0)
@@ -1206,6 +1224,11 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     _ema_hl = validator_data['config']['scoring'].get('score_ema_halflife', 0)
     if _ema_hl and _ema_hl > 0:
         _ts = validator_data['simulation_timestamp']
+        # UIDs with a valid Kappa this round; the rest (fresh miners still in min_lookback)
+        # keep k=0 in apply_track_record_ema until their first real score.
+        _scorable = {
+            uid for uid in all_uids if (validator_data['kappa_values'].get(uid) or {}).get('scorable')
+        }
         if _pin and 'trading_ema' in _pin:
             # verify path: compute with EXACTLY the child's inputs, on copies (self state
             # must not double-advance)
@@ -1215,7 +1238,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
             self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
             trading_uid_scores, _ = apply_track_record_ema(
                 trading_uid_scores, all_uids, validator_data['deregistered_uids'],
-                _ts, _ema_hl, _ema, _ema_n, _last)
+                _ts, _ema_hl, _ema, _ema_n, _last, _scorable)
         else:
             _ema = getattr(self, '_trading_score_ema', None)
             if _ema is None:
@@ -1229,7 +1252,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
             self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
             trading_uid_scores, _new_last = apply_track_record_ema(
                 trading_uid_scores, all_uids, validator_data['deregistered_uids'],
-                _ts, _ema_hl, _ema, _ema_n, _last)
+                _ts, _ema_hl, _ema, _ema_n, _last, _scorable)
             self._trading_score_ema_ts = _new_last
 
     # Trading rewards run through Pareto sort-multiply. Optional soft floor (off by
