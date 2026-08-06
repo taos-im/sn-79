@@ -55,7 +55,7 @@ Each book object contains `bids` and `asks` arrays representing the top 21 level
 ```python
 # Topmost LevelInfo objects
 best_bid_level = book.bids[0]
-best_ask_level = book.bids[0]
+best_ask_level = book.asks[0]
 # Best bid price and volume
 bid = best_bid_level.price
 bid_vol = best_bid_level.quantity
@@ -78,6 +78,18 @@ It may also be useful for certain strategies to obtain the trade price history o
 ```python
 trade_price_history = {event.timestamp : event.price for event in book.events if event.type == 't'}
 ```
+
+Each book object also exposes an `MTR` property giving the current **maker-taker ratio** for that book: the fraction of recent volume that was maker-side, in `[0, 1]` (typically around `0.5`).  It is computed by the exchange's dynamic fee policy and published with every book state, so agents can read it directly rather than reconstructing it from fills:
+
+```python
+for book_id, book in state.books.items():
+    mtr = book.MTR
+    if mtr is None:
+        continue
+    # e.g. provide more / tighter liquidity on books where making is scarce (low MTR)
+```
+
+Note that `MTR` is populated only under the **dynamic fee policy** used in simulation mode.  Under a tiered or zero-fee policy (including the zero-fee exchange) it does not apply and reports `0`, so treat a `0` or `None` as "no dynamic-fee signal for this book" rather than a genuine ratio.  This is the **book-wide** ratio across all participants; to track your own maker/taker split on a book, accumulate it from your own trade notices (see [Notices](#notices)): a trade where `Ma` equals your UID was maker-side for you, otherwise taker-side.
 
 #### Notices
 
@@ -574,15 +586,21 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
 
       **Type:** `int`
 
+    - `MTR`
+
+      The current maker-taker ratio for this order book (fraction of recent volume that was maker-side, in `[0, 1]`, typically around `0.5`).  Populated by the exchange's dynamic fee policy, so it carries a value under the dynamic fee policy used in simulation and reports `0` under a tiered or zero-fee policy (including the zero-fee exchange).  Accessed via the `book.MTR` property (the underlying serialized field key is `r`).
+
+      **Type:** `float | None`
+
     - `bids`
 
-      A list of bid price levels (`LevelInfo`) in descending order.
+      A list of bid price levels (`LevelInfo`) in descending price order (best/highest bid at index 0).
 
       **Type:** `list[LevelInfo]`
 
     - `asks`
 
-      A list of ask price levels (`LevelInfo`) in descending order.
+      A list of ask price levels (`LevelInfo`) in ascending price order (best/lowest ask at index 0).
 
       **Type:** `list[LevelInfo]`
 
@@ -645,6 +663,11 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
 
             **Type:** `float` 
 
+          - **`leverage`**
+            The leverage applied to the order.  The effective order size is `(1+leverage)` times the base quantity, with the borrowed portion supplied by the exchange; `0.0` means unleveraged.
+
+            **Type:** `float`
+
         ---
 
     ---
@@ -690,6 +713,11 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
           The price at which the order was placed.
 
           **Type:** `float` 
+
+        - **`leverage`**
+          The leverage applied to the order.  The effective order size is `(1+leverage)` times the base quantity, with the borrowed portion supplied by the exchange; `0.0` means unleveraged.
+
+          **Type:** `float`
 
       ---
   
