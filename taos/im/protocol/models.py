@@ -1516,8 +1516,11 @@ class Book(BaseModel):
         """
         Get the current maker-taker ratio for the order book.
 
+        Populated only under the dynamic fee policy (simulation); a tiered or
+        zero-fee policy (including the zero-fee exchange) reports 0.
+
         Returns:
-            int: The book's unique identifier.
+            float: The book's maker-taker ratio in [0, 1], or None if unset.
         """
         return self.r
 
@@ -1654,7 +1657,7 @@ class Book(BaseModel):
                 for event in json['e']
             ]
 
-        return cls.model_construct(id=id, bids=bids, asks=asks, events=events)
+        return cls.model_construct(id=id, bids=bids, asks=asks, events=events, r=json.get("r"))
     
     @classmethod
     def from_ypy(cls, json: YpyObject, depth : int = 21) -> 'Book':

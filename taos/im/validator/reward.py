@@ -1118,19 +1118,24 @@ def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: in
         for uid in all_uids:
             if uid in dereg:
                 continue
-            # Newcomer warmup: a UID still inside its min_lookback window (no valid Kappa
-            # on any book yet => scorable False) that has NEVER been scored (ema_n 0) is
-            # skipped so its annealing counter k stays 0. Otherwise the ~1000 zero-score
-            # warmup rounds burn the 1/(k+1) newcomer protection before the first real
-            # score, and the standing then crawls up from 0 across the whole immunity
-            # window (kappa is reached fast but the overall score is not). The guard is
-            # ema_n 0, not merely scorable: once a UID has been scored, it always updates,
-            # so an established miner going silent still decays toward 0 (the trader's-
-            # option protection the EMA exists for is preserved). scorable None => no skip
-            # (back-compat for callers that do not pass the set).
-            if scorable is not None and uid not in scorable and ema_n.get(uid, 0) == 0:
-                continue
             cur = scores[uid]
+            # Newcomer warmup: skip the annealing-counter advance while a UID's incoming
+            # score is still 0 AND it has never been scored (ema_n 0). This subsumes BOTH
+            # warmup cases: a UID inside its min_lookback window (no valid Kappa yet =>
+            # score 0) AND a scorable-but-poor newcomer whose early Kappa normalizes to 0.
+            # In either case advancing k would burn the 1/(k+1) newcomer protection before
+            # the first REAL (nonzero) score, leaving the standing to crawl up from 0 across
+            # the whole immunity window while the live Kappa is already high => an
+            # excellent-but-young miner floored below median and culled. Seeding instead at
+            # the first nonzero score (k=0 => alpha 1 => standing = live score) gives a
+            # genuine newcomer its real standing immediately. The guard is ema_n 0: once a
+            # UID has been scored it always updates, so an established miner going silent
+            # still decays toward 0 (trader's-option protection preserved). Not gameable — a
+            # skipped round earns nothing, and the seed requires a genuine nonzero Kappa
+            # that decays away unless sustained. (The `scorable` arg is retained for
+            # signature/caller stability; the score-based guard supersedes it.)
+            if cur == 0 and ema_n.get(uid, 0) == 0:
+                continue
             k = ema_n.get(uid, 0)
             alpha = max(alpha_dt, 1.0 / (k + 1.0))
             ema[uid] = alpha * cur + (1.0 - alpha) * ema.get(uid, cur)
