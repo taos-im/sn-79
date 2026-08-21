@@ -692,8 +692,13 @@ def shift_simulation_histories(
     self.realized_pnl_history = defaultdict(lambda: defaultdict(dict))
     for uid, timestamps_data in shifted_pnl_history.items():
         for ts, books in timestamps_data.items():
-            for book_id, pnl in books.items():
-                self.realized_pnl_history[uid][ts][book_id] = pnl
+            # Preserve EVERY timestamp, including empty (zero-PnL / breakeven) book-dicts. The prior
+            # nested `for book_id, pnl in books.items()` never created the ts key when books was {},
+            # silently dropping breakeven-round timestamps. Those timestamps count toward the kappa
+            # assessment span in-sim, so dropping them at the crossover could collapse a miner's span
+            # below min_lookback -> kappa None -> score 0 (established miners then get their EMA
+            # dragged down). Keep the crossover a pure time-rebase of the exact in-sim history.
+            self.realized_pnl_history[uid][ts] = dict(books)
     bootstrap_pnl_totals(self)
     _log(f"Shifted realized P&L history: {len(shifted_pnl_history)} UIDs with data")
 
