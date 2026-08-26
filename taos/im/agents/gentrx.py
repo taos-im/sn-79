@@ -2199,7 +2199,7 @@ def _cfg_bool(config: Any, key: str, default: bool) -> bool:
         return default
     if isinstance(val, bool):
         return val
-    if isinstance(val, int):
+    if isinstance(val, (int, float)):
         return bool(val)
     s = str(val).strip().lower()
     if s in ("true", "1", "yes"):
