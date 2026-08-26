@@ -1,5 +1,9 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+"""
+The core intelligent market simulation protocol classes are defined here.
+These are the classes which inherit from bittensor.synapse, and are the objects which are transmitted between validator and miner via dendrite query calls.
+"""
 import time
 import traceback
 import bittensor as bt
@@ -13,11 +17,6 @@ from taos.im.protocol.models import Book, Account, Balance, Order
 from taos.im.protocol.response import FinanceAgentResponse
 from taos.im.protocol.gentrx import GenTRXAssignment
 from taos.im.utils.compress import compress, decompress
-
-"""
-The core intelligent market simulation protocol classes are defined here.
-These are the classes which inherit from bittensor.synapse, and are the objects which are transmitted between validator and miner via dendrite query calls.
-"""
 
 FinanceNotice = Annotated[
     Union[SimulationStartEvent | LimitOrderPlacementEvent | MarketOrderPlacementEvent | OrderCancellationsEvent | ClosePositionsEvent | TradeEvent | ResetAgentsEvent | SimulationEndEvent],
@@ -117,13 +116,36 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
                 for book_id, balances in enumerate(account['holdings']):
                     if agentId not in accounts:
                         accounts[agentId] = {}
+                    # ALL TWELVE FIELDS, MATCHING Account.from_json.
+                    #
+                    # This constructor passed SEVEN of the model's twelve fields, so base_loan,
+                    # quote_loan, base_collateral, quote_collateral and traded_volume all fell back to
+                    # their defaults on every state update a miner received. from_json (the other
+                    # reconstruction path in this file, used by the well-tested simulation flow) passes
+                    # all twelve, which is why the same data is correct there and wrong here.
+                    #
+                    # Found 2026-08-08 chasing traded_volume: the validator holds the real number
+                    # (measured 1383.308 for uid 171 book 5) and the miner received None. None rather
+                    # than 0.0 was the tell -- a working assignment of an empty volume sends 0.0, so
+                    # None meant the object was constructed without the field. Four earlier fixes
+                    # addressed hops that COMPUTE the value; the value was never being CARRIED.
+                    #
+                    # The engine serialises baseLoan/quoteLoan/baseCollateral/quoteCollateral in each
+                    # holdings entry (accounting Balances::jsonSerialize), so these are real values,
+                    # not invented defaults. A miner carrying a margin loan previously saw zero.
                     accounts[agentId][book_id] = Account(
                         agent_id=account['agentId'],book_id=book_id,
+                        base_loan=balances.get('baseLoan', 0.0),
+                        quote_loan=balances.get('quoteLoan', 0.0),
+                        base_collateral=balances.get('baseCollateral', 0.0),
+                        quote_collateral=balances.get('quoteCollateral', 0.0),
+                        traded_volume=account.get('v', account.get('traded_volume')),
                         base_balance=Balance.from_json(currency='BASE', json=balances['base']),
                         quote_balance=Balance.from_json(currency='QUOTE', json=balances['quote']),
                         orders=[Order.from_json(order) for order in account['orders'][book_id]] if account['orders'] and account['orders'][book_id] else [],
                         loans={int(id) : Loan.from_json(loan) for id, loan in account['loans'][book_id].items()} if account['loans'] and account['loans'][book_id] else {},
-                        fees=Fees.from_json(account['fees'][str(book_id)]) if account['fees'] else None
+                        fees=Fees.from_json(account['fees'][str(book_id)]) if account['fees'] else None,
+                        delegate_stakes=balances.get('ds', {}) or {}
                     )
         bt.logging.debug(f"Accounts populated ({time.time()-start:.4f}s).")
         start = time.time()
@@ -238,6 +260,14 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
         Method to compress large synapse fields for transmission over the network.
 
         Note this method DOES NOT modify the synapse in place, so that the original synapse data can be referenced after sending without requiring decompression.
+
+        Args:
+            level: Compression level; -1 uses the engine default.
+            engine: Compression engine override.
+            compressed_books: Pre-compressed books to reuse when the caller has them.
+
+        Returns:
+            A compressed copy of the synapse; the original is not modified.
         """
         try:
             if engine:
@@ -272,6 +302,15 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
         
     @classmethod
     def parse_dict(cls, data, normalize=False):
+        """Build an update from a decoded wire dict without re-validation.
+
+        Args:
+            data (dict): The decoded payload.
+            normalize (bool): When True, normalise wire keys before construction.
+
+        Returns:
+            MarketSimulationStateUpdate: The constructed update.
+        """
         ret = MarketSimulationStateUpdate(timestamp=data['timestamp'])
         if normalize:
             def normalize_int_keys(d):
@@ -337,7 +376,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
                 bt.logging.trace(f"Prepared accounts [Lazy] ({time.time() - sstart:.4f}s)")
 
             sstart = time.time()
-            self.notices = decompressed['notices']
+            self.notices = parse_notices(decompressed['notices'])
             bt.logging.trace(f"Populated notices ({time.time() - sstart:.4f}s)")
 
             sstart = time.time()

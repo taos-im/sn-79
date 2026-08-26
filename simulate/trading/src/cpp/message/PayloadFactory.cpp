@@ -63,6 +63,12 @@ MessagePayload::Ptr PayloadFactory::createFromJsonMessage(const rapidjson::Value
     else if (type == "RESPONSE_RETRIEVE_L1") {
         return RetrieveL1ResponsePayload::fromJson(payloadJson);
     }
+    else if (type == "RETRIEVE_L1_EXT") {
+        return RetrieveL1ExtPayload::fromJson(payloadJson);
+    }
+    else if (type == "RESPONSE_RETRIEVE_L1_EXT") {
+        return RetrieveL1ExtResponsePayload::fromJson(payloadJson);
+    }
     else if (type == "RETRIEVE_BOOK") {
         return RetrieveL2Payload::fromJson(payloadJson);
     }
@@ -77,6 +83,9 @@ MessagePayload::Ptr PayloadFactory::createFromJsonMessage(const rapidjson::Value
     }
     else if (type == "SUBSCRIBE_EVENT_ORDER_TRADE") {
         return SubscribeEventTradeByOrderPayload::fromJson(payloadJson);
+    }
+    else if (type == "SUBSCRIBE_EVENT_TRADE_OWN") {
+        return MessagePayload::create<EmptyPayload>();
     }
     else if (type == "RESET_AGENT") {
         return ResetAgentsPayload::fromJson(payloadJson);
@@ -170,6 +179,12 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
     else if (type == "RESPONSE_RETRIEVE_L1") {
         return makePayload.operator()<RetrieveL1ResponsePayload>();
     }
+    else if (type == "RETRIEVE_L1_EXT") {
+        return makePayload.operator()<RetrieveL1ExtPayload>();
+    }
+    else if (type == "RESPONSE_RETRIEVE_L1_EXT") {
+        return makePayload.operator()<RetrieveL1ExtResponsePayload>();
+    }
     else if (type == "RETRIEVE_L2") {
         return makePayload.operator()<RetrieveL2Payload>();
     }
@@ -190,6 +205,9 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
     }
     else if (type == "SUBSCRIBE_EVENT_ORDER_TRADE") {
         return makePayload.operator()<SubscribeEventTradeByOrderPayload>();
+    }
+    else if (type == "SUBSCRIBE_EVENT_TRADE_OWN") {
+        return MessagePayload::create<EmptyPayload>();
     }
     else if (type == "RESET_AGENT") {
         return makePayload.operator()<ResetAgentsPayload>();

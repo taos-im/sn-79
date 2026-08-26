@@ -286,7 +286,7 @@ class DevAgent(GenTRXAgent):
         Returns:
             Response object containing all trading instructions for this update.
         """
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         start = time.time()
         
         # Process each book independently

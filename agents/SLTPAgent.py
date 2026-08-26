@@ -37,6 +37,7 @@ class SLTPAgent(GenTRXAgent):
     """
 
     def initialize(self):
+        """Set up the example: pick its book and sizing, and reset its order tracking."""
         super().initialize()
         # Order sizing.
         self.quantity = float(self.config.quantity)
@@ -87,7 +88,12 @@ class SLTPAgent(GenTRXAgent):
         )
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        response = FinanceAgentResponse(agent_id=self.uid)
+        """Place one SL/TP-carrying limit order per cycle and hold while it works.
+
+        Returns:
+            FinanceAgentResponse: The response with at most one new order queued.
+        """
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         for book_id, book in state.books.items():
             if not book.bids or not book.asks:
                 continue
@@ -113,6 +119,7 @@ class SLTPAgent(GenTRXAgent):
     # ------------------------------------------------------------------
 
     def onOrderAccepted(self, event) -> None:
+        """Record the accepted order id so the cycle waits on its outcome."""
         label = self.parent_client_ids.get(event.clientOrderId)
         if label is not None:
             bt.logging.info(
@@ -121,6 +128,7 @@ class SLTPAgent(GenTRXAgent):
             )
 
     def onOrderRejected(self, event) -> None:
+        """Clear the pending order so the next cycle can try again."""
         label = self.parent_client_ids.get(event.clientOrderId)
         if label is not None:
             bt.logging.warning(
@@ -129,6 +137,12 @@ class SLTPAgent(GenTRXAgent):
             )
 
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
+        """Track fills against the working order and note when SL/TP closes the position.
+
+        Args:
+            event (TradeEvent): The fill event.
+            validator (str): Validator this event came from.
+        """
         label = self.parent_client_ids.get(event.clientOrderId)
         if label is None:
             return

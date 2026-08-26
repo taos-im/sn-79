@@ -4,8 +4,6 @@
 # This file intentionally has NO [build-system] table: setup.py remains the
 # build driver (`pip install -e .` keeps using the legacy setuptools path).
 #
-# The mvtrx/ submodules carry their own pyproject.toml (line-length 120,
-# py3.12) and are excluded here. ExeTRX / exchange / GenTRX/serve are not part
 # of the public release and are excluded too.
 
 [tool.black]
@@ -13,11 +11,8 @@ line-length = 120
 target-version = ["py310"]
 extend-exclude = '''
 /(
-    mvtrx
   | simulate/trading/build
   | simulate/trading/vcpkg
-  | agents/exchange
-  | GenTRX/serve
 )/
 '''
 
@@ -25,39 +20,14 @@ extend-exclude = '''
 target-version = "py310"
 line-length = 120
 # Mirror apply_testnet.sh: exclude everything not in the public sn-79 surface
-# (exchange-mode engine, chain reconciliation, ExeTRX, MVTRX push, exchange
 # protocol/config, and the exchange/dev-only example agents).
 extend-exclude = [
-    "mvtrx",
     "simulate/trading/build",
     "simulate/trading/vcpkg",
-    "GenTRX/serve",
-    "ExeTRX",
-    "external",
-    "bench",
     "simulate/trading/run/prof",
     # dev-only root scripts (not shipped by apply_testnet.sh)
-    "ising_movie.py",
-    "pcloud_size.py",
-    "shift.py",
-    "time_check.py",
-    "upload.py",
-    "xtract.py",
-    "reuse_annot.py",
-    "agents/exchange",
     "agents/ActiveAgent.py",
     "agents/SimpleAgent.py",
-    "agents/proxy/mvtrx_push.py",
-    "taos/im/agents/exchange",
-    "taos/im/validator/chain",
-    "taos/im/validator/engines/exchange.py",
-    "taos/im/validator/engines/exchange_ipc.py",
-    "taos/im/validator/engines/exetrx.py",
-    "taos/im/validator/exetrx.py",
-    "taos/im/validator/mvtrx_push.py",
-    "taos/im/protocol/exchange",
-    "taos/im/protocol/exchange_config.py",
-    "taos/im/config/exchange.py",
 ]
 
 [tool.ruff.lint]
@@ -114,7 +84,6 @@ ignore = [
 # service sockets on 0.0.0.0; XML/pickle inputs are trusted local config/checkpoints.
 "taos/im/neurons/validator.py" = ["S603", "S104"]
 "taos/im/neurons/miner.py" = ["S606"]
-"taos/im/neurons/benchmark.py" = ["S606"]
 "taos/im/validator/update.py" = ["S603", "S607"]
 "taos/im/validator/engines/simulation.py" = ["S603", "S104", "S314", "S108"]
 "taos/im/validator/query.py" = ["S104", "S301"]
@@ -137,28 +106,11 @@ namespace_packages = true
 warn_unused_ignores = true
 # Mirror apply_testnet.sh public-surface carve-out (see [tool.ruff].extend-exclude).
 exclude = [
-    '^mvtrx/',
     '^simulate/trading/build/',
     '^simulate/trading/vcpkg/',
-    '^GenTRX/serve/',
-    '^ExeTRX/',
-    '^external/',
-    '^bench/',
     '^simulate/trading/run/prof/',
-    '^(ising_movie|pcloud_size|shift|time_check|upload|xtract|reuse_annot)\.py$',
-    '^agents/exchange/',
     '^agents/ActiveAgent\.py$',
     '^agents/SimpleAgent\.py$',
-    '^agents/proxy/mvtrx_push\.py$',
-    '^taos/im/agents/exchange/',
-    '^taos/im/validator/chain/',
-    '^taos/im/validator/engines/exchange\.py$',
-    '^taos/im/validator/engines/exchange_ipc\.py$',
-    '^taos/im/validator/engines/exetrx\.py$',
-    '^taos/im/validator/exetrx\.py$',
-    '^taos/im/validator/mvtrx_push\.py$',
-    '^taos/im/protocol/exchange/',
-    '^taos/im/protocol/exchange_config\.py$',
     '^taos/im/config/exchange\.py$',
 ]
 
@@ -167,4 +119,4 @@ exclude = [
 # whitelist lives in vulture_whitelist.py. Min confidence trims framework noise.
 min_confidence = 80
 paths = ["taos", "agents", "GenTRX/src", "vulture_whitelist.py"]
-exclude = ["mvtrx/", "agents/exchange/", "GenTRX/serve/"]
+exclude = []

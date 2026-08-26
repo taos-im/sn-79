@@ -5,6 +5,7 @@
 #pragma once
 
 #include <taosim/checkpoint/SimulatorState.hpp>
+#include <taosim/xml/helpers.hpp>
 #include <taosim/checkpoint/serialization/accounting/AccountRegistry.hpp>
 #include <taosim/checkpoint/serialization/agent/ALGOTraderAgent.hpp>
 #include <taosim/checkpoint/serialization/agent/FuturesTraderAgent.hpp>
@@ -37,7 +38,7 @@ void packConfig(auto& o, const SimulatorState& v)
 
     pugi::xml_document doc;
     pugi::xml_parse_result result = doc.load_string(reprSimu->configSv().data());
-    pugi::xml_node node = doc.child("Simulation");
+    pugi::xml_node node = xml::rootNode(doc);
 
     if (pugi::xml_attribute attr = node.attribute("id")) {
         attr.set_value(reprSimu->id().data());
@@ -108,7 +109,10 @@ void packExchange(auto& o, const Simulation& simulation)
 {
     const auto exch = simulation.exchange();
 
-    o.pack_map(12);
+    // MUST match the number of key/value pairs packed below: an under-count makes
+    // the trailing entries bleed into the PARENT block map, displacing its
+    // messageQueue key — every checkpoint written that way fails to restore.
+    o.pack_map(14);
 
     o.pack("accounts");
     o.pack(exch->accounts());
@@ -142,6 +146,12 @@ void packExchange(auto& o, const Simulation& simulation)
 
     o.pack("localTradeByOrderSubs");
     o.pack(exch->localTradeByOrderSubs());
+
+    o.pack("localOwnTradeSubs");
+    o.pack(exch->localOwnTradeSubs());
+
+    o.pack("bookTradeStats");
+    o.pack(exch->bookTradeStats());
 
     o.pack("sltpContainer");
     o.pack(exch->sltpContainer());

@@ -1,0 +1,26 @@
+<!--
+    Both floors raised clear of each other so each can be shown to reject on its own.
+
+    Where the alpha floor equals the volume-grid quantum (minOrderSize 0.0001 at volumeDecimals 4, as
+    the other two fixtures here use) no representable positive volume is below it, so the alpha check can
+    never fire and its independence from the quote floor cannot be shown. This fixture lifts it clear,
+    using the PRODUCTION pair from run/config/exchange_0.xml, 0.25 alpha against 0.002 TAO, so it also
+    asserts the real deployed combination.
+-->
+<Simulation start="0" duration="11" mode="test">
+    <Agents>
+        <MultiBookExchangeAgent name="EXCHANGE" priceDecimals="4" volumeDecimals="4" baseDecimals="8" quoteDecimals="10"
+            remoteAgentCount="2" maxLeverage="4" maxLoan="5000" maintenanceMargin="0.1"
+            initialPrice="300.0" minOrderSize="0.25" minQuoteOrderSize="0.002">
+            <FeePolicy type="tiered" historySlots="30" slotPeriod="864">
+                <Tier volumeRequired="0" makerFee="0.0" takerFee="0.0"/>
+            </FeePolicy>
+            <Books instanceCount="1" algorithm="PriceTime" maxDepth="21"/>
+            <Balances>
+                <Base total="1001.0" maxLeverage="5" maxLoan="10000"/>
+                <Quote total="50001.0" maxLeverage="5" maxLoan="10000"/>
+            </Balances>
+        </MultiBookExchangeAgent>
+        <DistributedProxyAgent/>
+    </Agents>
+</Simulation>

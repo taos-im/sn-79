@@ -74,6 +74,12 @@ void packMessagePayload(auto& o, MessagePayload::Ptr payload)
     else if (auto pld = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(payload)) {
         o.pack(*pld);
     }
+    else if (auto pld = std::dynamic_pointer_cast<RetrieveL1ExtPayload>(payload)) {
+        o.pack(*pld);
+    }
+    else if (auto pld = std::dynamic_pointer_cast<RetrieveL1ExtResponsePayload>(payload)) {
+        o.pack(*pld);
+    }
     else if (auto pld = std::dynamic_pointer_cast<SubscribeEventTradeByOrderPayload>(payload)) {
         o.pack(*pld);
     }

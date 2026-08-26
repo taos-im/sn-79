@@ -12,9 +12,69 @@ import bittensor as bt
 from taos.im.protocol.models import TradeInfo
 from taos.im.protocol.events import TradeEvent
 from taos.im.protocol import MarketSimulationStateUpdate
+from taos.im.validator.debeta import (
+    accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
+    prune_hist_2level, prune_hist_1level, shift_hist_2level, shift_hist_1level,
+)
+
+# De-beta making: half-window (in trades) for the non-lagging centered mid used for spread capture.
+CAPTURE_W = 15
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
+
+
+_missing_fee_notices = 0
+
+
+def missing_fee_count() -> int:
+    """How many notices arrived without a fee field. Diagnostic, not control flow."""
+    return _missing_fee_notices
+
+
+def reset_missing_fee_count() -> None:
+    """Reset the missing-fee warning counter (used between runs and in tests)."""
+    global _missing_fee_notices
+    _missing_fee_notices = 0
+
+
+class MissingNoticeField(Exception):
+    """A notice arrived without a field its producer is required to populate.
+
+    Never substituted with a default. A fee is an input to realized PnL, and in simulation fees are
+    real, so quietly reading an absent Tf as 0.0 would UNDERSTATE cost and corrupt PnL for every
+    affected trade. A wrong number that looks fine is worse than a missing update, because nothing
+    downstream can tell it apart from a correct one.
+    """
+
+
+def notice_fee(trade: dict, is_maker: bool) -> float:
+    """The fee this agent paid on a trade notice. Raises rather than inventing one.
+
+    `fee = trade['Mf'] if is_maker else trade['Tf']` raised KeyError 28 times live between 09:21 and
+    11:35 on 2026-08-04, because the hand-built ET notice in engines/exchange.py omitted both fee
+    fields while the canonical to_notice_dict() emits them. That exception propagated out of
+    _process_uid_notices, so _process_uid_trade_volumes aborted for the whole uid and its trade
+    volumes, realized PnL and roundtrip volume were left unupdated for the block.
+
+    The fix is that producers always populate these fields (all three ET builders now do, pinned by
+    tests/test_notice_contract_across_layers.py), so an absence here is a producer bug and is reported
+    as one. What changed is only the blast radius: the caller skips THAT NOTICE rather than losing the
+    uid's entire update, and says so loudly.
+    """
+    global _missing_fee_notices
+    key = "Mf" if is_maker else "Tf"
+    if key not in trade:
+        _missing_fee_notices += 1
+        raise MissingNoticeField(
+            f"notice has no '{key}': every ET builder is required to populate it, so this is a "
+            f"producer defect. notice={ {k: trade.get(k) for k in ('y', 'b', 'i', 'q', 'p', 's')} }"
+        )
+    try:
+        return float(trade[key])
+    except (TypeError, ValueError) as exc:
+        _missing_fee_notices += 1
+        raise MissingNoticeField(f"notice '{key}' is not a number: {trade[key]!r}") from exc
 
 
 def _apply_pnl_delta(self: Validator, uid: int, book_id: int, delta: float) -> None:
@@ -178,6 +238,19 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
                 volume_deltas[uid_item] = {}
 
             for trade in trades:
+                # Check the required fields up front so one malformed notice costs that notice and
+                # nothing more. Previously a missing 'Tf' raised out of this whole function, so the
+                # uid lost its trade volumes, realized PnL and roundtrip volume for the block, and the
+                # same absence separately broke metrics publishing in report.py, where the notice is
+                # rebuilt with TradeEvent.model_construct and a missing key becomes a missing
+                # ATTRIBUTE. Reported as the producer defect it is, never defaulted: a fabricated zero
+                # fee would understate cost and corrupt PnL wherever fees are real.
+                try:
+                    notice_fee(trade, trade.get('Ma') == uid_item)
+                except MissingNoticeField as exc:
+                    bt.logging.error(f"PD: skipping malformed trade notice for UID {uid_item}: {exc}")
+                    continue
+
                 is_maker = trade['Ma'] == uid_item
                 is_taker = trade['Ta'] == uid_item
                 book_id = trade['b']
@@ -213,12 +286,29 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
 
                 uids_to_round.add(uid_item)
 
+                # A SELF-TRADE IS POSITION-NEUTRAL, so it must not enter FIFO at all.
+                #
+                # The volume split above already routes Ma == Ta to the 'self' bucket, but the FIFO
+                # block below it was unconditional. With Ma == Ta both is_maker and is_taker are true,
+                # so `is_buy` evaluates True for EITHER value of s, and the notice books a directional
+                # leg — fabricating realized PnL and roundtrip volume from a trade in which the miner
+                # was both sides and its position did not move. Both feed scoring.
+                #
+                # No such notice can arrive today: the sim instruction model omits STP.NO_STP from its
+                # Literal so a sim self-match is always cancelled, and in exchange mode
+                # resolve_trade_roles refuses to name the same uid on both sides. This is defence
+                # against that invariant changing, not a fix for a live path. It is cheap and it is
+                # the correct accounting either way. Raised by code review 2026-08-07, which noted the
+                # NO_STP justification in query.py leans on a protection that covers volume only.
+                if trade['Ma'] is not None and trade['Ma'] == trade['Ta']:
+                    continue
+
                 # FIFO Matching: Calculate realized P&L and round-trip volume
                 quantity = trade['q']
                 price = trade['p']
                 side = trade['s']
                 is_buy = (is_taker and side == 0) or (is_maker and side == 1)
-                fee = trade['Mf'] if is_maker else trade['Tf']
+                fee = notice_fee(trade, is_maker)
                 volume_deltas[uid_item][book_id]['fee'] += fee
 
                 realized_pnl, roundtrip_volume = match_trade_fifo(
@@ -415,8 +505,67 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         bt.logging.info(f"Pruning at step {self.step} (timestamp {timestamp})")
     volume_prune_threshold = timestamp - self.config.scoring.activity.trade_volume_assessment_period
 
+    # De-beta (P8) making + drift-strip skill inputs: accumulated over the ordered per-book fill
+    # stream, carried across publish batches. Gated so there is near-zero overhead when disabled.
+    _debeta_on = bool(getattr(getattr(self.config.scoring, 'debeta', None), 'enabled', False))
+    if _debeta_on:
+        # Running SUMS (what the score reads).
+        for _name in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum'):
+            if not hasattr(self, _name):
+                setattr(self, _name, defaultdict(lambda: defaultdict(float)))
+        if not hasattr(self, 'debeta_inv'):
+            self.debeta_inv = defaultdict(lambda: defaultdict(float))  # STATE (carried, re-based at boundary)
+        for _name in ('debeta_invn', 'debeta_pfirst', 'debeta_plast', 'debeta_drift'):
+            if not hasattr(self, _name):
+                setattr(self, _name, {})  # invn/drift running (per book); pfirst/plast STATE
+        if not hasattr(self, 'debeta_mark_state'):
+            self.debeta_mark_state = {}  # STATE (M1 rolling settlement-mark window; re-based at boundary, not persisted)
+        _debeta_cfg = getattr(self.config.scoring, 'debeta', None)
+        _mark_mode = str(getattr(_debeta_cfg, 'mark_mode', 'last') or 'last')
+        _mark_window = int(getattr(_debeta_cfg, 'mark_window', 0) or 0)
+        if not hasattr(self, 'debeta_cp'):
+            self.debeta_cp = {}  # {maker_uid: {taker_uid: vol}} for P11 (running sum)
+        # Timestamped HISTORIES ({...:{sampled_ts: incr}}) so every sum can be live-pruned + shifted at a
+        # sim boundary exactly like trade_volumes. Invariant: running == sum(history within window).
+        for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist',
+                      'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist'):
+            if not hasattr(self, _name):
+                setattr(self, _name, {})
+
+    # De-beta fill SOURCE: sim reads the book 't' events; exchange reads the ET settled-fill notices
+    # (correct aggressor=taker role; AMM/pool fills reach de-beta only here), deduped by trade id and
+    # built once. Stays under the _debeta_on gate, so the OFF and sim paths are byte-identical.
+    _debeta_exchange = _debeta_on and getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
+    _et_batches = {}
+    if _debeta_exchange:
+        if not hasattr(self, '_debeta_seen_tids'):
+            self._debeta_seen_tids = {}  # {trade_id: ts} carried + windowed-pruned; redelivery dedupe
+        _et_batches = et_book_batches(notices, self._debeta_seen_tids, sampled_timestamp)
+
     for bookId, book in books.items():
         trades = [event for event in book.get('e', []) if event['y'] == 't']
+        if _debeta_on:
+            # sim: the book 't' events; exchange: the ET batch for this book (same accumulators). Never
+            # both, so a fill is not double-counted between the parallel 't' copy and the ET notice.
+            de_trades = _et_batches.get(bookId, []) if _debeta_exchange else trades
+            if de_trades:
+                accumulate_book_capture(
+                    self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, CAPTURE_W,
+                    buy_hist=self.debeta_capbuy_hist, sell_hist=self.debeta_capsell_hist,
+                    ts=sampled_timestamp,
+                )
+                accumulate_book_mtm(
+                    self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
+                    self.debeta_pfirst, self.debeta_plast, bookId, de_trades,
+                    mtm_hist=self.debeta_mtm_hist, invsum_hist=self.debeta_invsum_hist,
+                    invn_hist=self.debeta_invn_hist, drift=self.debeta_drift,
+                    drift_hist=self.debeta_drift_hist, ts=sampled_timestamp,
+                    mark_state=self.debeta_mark_state, mark_mode=_mark_mode,
+                    mark_window=_mark_window,
+                )
+                accumulate_counterparties(
+                    self.debeta_cp, bookId, de_trades, cp_hist=self.debeta_cp_hist, ts=sampled_timestamp
+                )  # P11
         if trades:
             if bookId not in self.recent_trades:
                 self.recent_trades[bookId] = []
@@ -435,6 +584,22 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 for t in trades
             ])
             del recent_trades_book[:-25]
+
+    # De-beta live prune (mirror the volume-history prune above): making inputs to the volume-assessment
+    # window, skill inputs to the kappa lookback. Subtracts pruned mass from the running sums so
+    # running == sum(history within window). Retention is thereby bounded identically to kappa/volume.
+    if _debeta_on and should_prune:
+        _skill_prune_threshold = timestamp - self.config.scoring.kappa.lookback
+        prune_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, volume_prune_threshold)
+        prune_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, volume_prune_threshold)
+        prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, volume_prune_threshold)
+        prune_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, _skill_prune_threshold)
+        prune_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, _skill_prune_threshold)
+        prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _skill_prune_threshold)
+        prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _skill_prune_threshold)
+        if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the skill window
+            self._debeta_seen_tids = {k: v for k, v in self._debeta_seen_tids.items()
+                                      if v >= _skill_prune_threshold}
 
     volume_deltas = {}
     realized_pnl_updates = {}
@@ -602,6 +767,17 @@ def shift_simulation_histories(
     scoring service run the SAME transition (the shadow receives a
     ("sim_start", (old_ts, new_ts)) frame and calls this on its own container).
     Deterministic in (structures, old_ts, new_ts, knobs) — no wall clock.
+
+    NOTE: simulation-restart only. It is NEVER invoked in exchange mode: the
+    exchange engine inherits the no-op base on_start and a live chain has no sim
+    restarts, so the shadow's "sim_start" frame never fires there either. Its
+    range(book_count) loops are 0-based-correct in simulation (where book_ids ==
+    [0..book_count-1]) and are intentionally NOT converted to the exchange's
+    root-excluded [1..128] set.
+
+    Args:
+        old_ts: The previous simulation's time base.
+        new_ts: The new simulation's time base.
     """
     _log = log or (lambda m: None)
     new_threshold = new_ts - lookback
@@ -734,6 +910,26 @@ def shift_simulation_histories(
                 self.roundtrip_volume_sums[uid][bookId], volume_decimals
             )
 
+    # De-beta transition (only present when enabled): shift+prune the additive histories onto the new
+    # clock so the assessment window spans the boundary continuously (identical to the volume/kappa
+    # histories), then re-base the reconstructed-inventory + last-price STATE so the boundary price jump
+    # (openB-closeA) never enters the dp/drift accumulator. Making histories -> volume-assessment window;
+    # skill histories -> kappa lookback. Shared verbatim with the shadow. See SCORING_PATH_ARCHITECTURE.md §7.
+    if getattr(self, 'debeta_capbuy_hist', None) is not None:
+        _log("Shifting de-beta histories...")
+        shift_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, old_ts, new_ts, new_volume_threshold)
+        shift_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, old_ts, new_ts, new_volume_threshold)
+        shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_volume_threshold)
+        shift_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, old_ts, new_ts, new_threshold)
+        shift_hist_1level(self.debeta_invn_hist, self.debeta_invn, old_ts, new_ts, new_threshold)
+        shift_hist_1level(self.debeta_drift_hist, self.debeta_drift, old_ts, new_ts, new_threshold)
+        # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
+        self.debeta_inv = defaultdict(lambda: defaultdict(float))
+        self.debeta_pfirst = {}
+        self.debeta_plast = {}
+        self.debeta_mark_state = {}
+
     _log("Clearing open positions...")
     self.open_positions = defaultdict(lambda: defaultdict(lambda: {
         'longs': deque(), 'shorts': deque()
@@ -758,6 +954,10 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     service run the SAME zeroing (the shadow receives a ("resets", uids) frame).
     Main-only bookkeeping (miner_stats, deregistered_uids, publish flags,
     unnormalized_scores) stays in apply_resets.
+
+    Args:
+        uid: The uid whose structures are zeroed.
+        book_ids: The books to zero across.
     """
     self.kappa_values[uid] = {
         'books': {bookId: None for bookId in book_ids},
@@ -768,6 +968,10 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
         'activity_weighted_normalized_median': 0.0,
         'penalty': 0.0, 'score': 0.0,
     }
+    # Evict the kappa fingerprint-cache entry for the reused slot so a stale (old-occupant) entry can
+    # never be served after the reset (belt-and-suspenders alongside the dereg-first guard in kappa_3).
+    if hasattr(self, 'kappa_cache'):
+        self.kappa_cache.pop(uid, None)
     self.activity_factors[uid] = {bookId: 0.0 for bookId in book_ids}
     self.pnl_factors[uid] = {bookId: 1.0 for bookId in book_ids}
     self.inventory_history[uid] = {}
@@ -783,6 +987,25 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     self.roundtrip_volumes[uid] = defaultdict(lambda: defaultdict(float))
     for book_id in book_ids:
         self.roundtrip_volume_sums[uid][book_id] = 0.0
+    # De-beta (P8/E5/P11): a reused UID must NOT inherit the deregistered miner's making/skill/
+    # counterparty accumulation. Clear this UID from every de-beta accumulator (only present when
+    # de-beta is enabled; getattr guards the off/shadow case).
+    # uid-keyed running sums + their timestamped histories (invn/drift are book-keyed, not per-uid).
+    for _n in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum',
+               'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist'):
+        _d = getattr(self, _n, None)
+        if _d is not None:
+            _d.pop(uid, None)
+    _inv = getattr(self, 'debeta_inv', None)
+    if _inv is not None:
+        for _b in list(_inv.keys()):
+            _inv[_b].pop(uid, None)
+    for _n in ('debeta_cp', 'debeta_cp_hist'):    # UID as a maker AND as a counterparty of other makers
+        _cp = getattr(self, _n, None)
+        if _cp is not None:
+            _cp.pop(uid, None)
+            for _m in list(_cp.keys()):
+                _cp[_m].pop(uid, None)
     self.realized_pnl_history[uid] = {}
     if hasattr(self, 'agent_pnl_by_book'):
         self.agent_pnl_by_book.pop(uid, None)

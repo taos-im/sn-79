@@ -4,7 +4,7 @@
 Finance agent instruction classes: limit/market order placement, order
 cancellation, position closing, and agent reset for the intelligent markets protocol.
 """
-from pydantic import PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field
+from pydantic import PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field, ConfigDict
 from typing import Literal, Annotated
 from taos.im.protocol.simulator import *
 from taos.common.protocol import AgentInstruction, BaseModel
@@ -29,6 +29,11 @@ class FinanceAgentInstruction(AgentInstruction):
     type: Literal["PLACE_ORDER_MARKET", "PLACE_ORDER_LIMIT", "CANCEL_ORDERS", "CLOSE_POSITIONS", "RESET_AGENT"]
     
     def serialize(self) -> dict:
+        """Serialize this instruction to the wire dict the engine consumes.
+
+        Returns:
+            dict: ``agentId``, ``delay``, ``type`` and this instruction's ``payload``.
+        """
         return {
             "agentId": self.agentId,
             "delay": self.delay,
@@ -58,12 +63,27 @@ class PlaceOrderInstruction(FinanceAgentInstruction):
             LoanSettlementOption.NONE : No loan repayments
             LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
             NonNegativeInt : Specify a specific order id for which the associated loan will be repaid
+        delegate (str): The ss58 address of the delegate hotkey to/from which stake is moved; empty when not applicable.
+        max_slippage (float | None): Maximum acceptable slippage as a fraction of the best price at execution; None (serialized as 0) means no price limit.
     """
     bookId: UInt32
     direction: Literal[OrderDirection.BUY, OrderDirection.SELL]
-    quantity: PositiveFloat
+    # WIRE NAME != FIELD NAME, and pydantic drops the difference SILENTLY.
+    #
+    # payload() serialises these as "volume", "stpFlag" and "allowPartial"; the fields are quantity, stp
+    # and allow_partial. Anything that re-validates an instruction from its own wire form therefore loses
+    # them without raising, and the field default is applied instead.
+    # 598 forwarded orders reached the engine with stpFlag=CO, whatever the miner asked for, because
+    # {"stpFlag": 2} validates to stp=CANCEL_OLDEST while {"stp": 2} validates to CANCEL_NEWEST.
+    #
+    # The aliases make the wire spelling acceptable on input. populate_by_name keeps the Python spelling
+    # working, which every existing call site uses (quantity=, stp=, allow_partial=), so this is additive.
+    model_config = ConfigDict(populate_by_name=True)
+
+    quantity: PositiveFloat = Field(alias="volume")
     clientOrderId: UInt32 | None
-    stp: Literal[STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH, STP.DECREASE_CANCEL] = STP.CANCEL_OLDEST
+    stp: Literal[STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH, STP.DECREASE_CANCEL] = Field(
+        default=STP.CANCEL_OLDEST, alias="stpFlag")
     currency: Literal[OrderCurrency.BASE, OrderCurrency.QUOTE] = OrderCurrency.BASE
     leverage: NonNegativeFloat = 0.0
     settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | NonNegativeInt = LoanSettlementOption.NONE
@@ -80,18 +100,31 @@ class PlaceMarketOrderInstruction(PlaceOrderInstruction):
 
     Attributes:
         type (Literal['PLACE_ORDER_MARKET']): Fixed to 'PLACE_ORDER_MARKET'.
+        stop_loss (float | None): Stop-loss offset as a signed fraction of the entry price; None places no stop-loss.
+        take_profit (float | None): Take-profit offset as a signed fraction of the entry price; None places no take-profit.
     """
     type: Literal['PLACE_ORDER_MARKET'] = 'PLACE_ORDER_MARKET'
     stop_loss:   float | None = None
     take_profit: float | None = None
 
     def payload(self) -> dict:
+        """The market-order fields the engine expects under ``payload``.
+
+        Returns:
+            dict: Direction, volume, book and the optional execution flags this order carries.
+        """
         d = {
             "direction": self.direction,
             "volume": self.quantity,
             "bookId":self.bookId,
             "clientOrderId":self.clientOrderId,
-            "stpFlag":self.stp,
+            # KEY MUST BE "stp". The C++ reads MSGPACK_NVP("stp", stpFlag)
+            # (ExchangeAgentMessagePayloads.hpp:139 and :310) and the simulation engine is fed by the
+            # same msgpack path (engines/simulation.py:480 packs the response with msgpack.packb).
+            # Emitting "stpFlag" meant msgpack never found the field and every simulation-mode order
+            # kept the struct default STPFlag::CO, so a miner asking for CANCEL_NEWEST silently got
+            # CANCEL_OLDEST. The key must stay "stp".
+            "stp":self.stp,
             "currency":self.currency,
             "leverage":self.leverage,
             "settleFlag":self.settleFlag,
@@ -117,8 +150,10 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
         postOnly (bool): Boolean flag specifying if the order should be placed with Post-Only enforcement.
         timeInForce (Literal[TimeInForce.GTC, TimeInForce.GTT, TimeInForce.IOC, TimeInForce.FOK]): 
             Time-In-Force option to be applied for the order.
-        expiryPeriod (PositiveInt | None): The period in simulation time after which the order should 
+        expiryPeriod (PositiveInt | None): The period in simulation time after which the order should
             be cancelled (valid only with `timeInForce = TimeInForce.GTT`).
+        stop_loss (float | None): Stop-loss offset as a signed fraction of the entry price; None places no stop-loss.
+        take_profit (float | None): Take-profit offset as a signed fraction of the entry price; None places no take-profit.
     """
     type: Literal['PLACE_ORDER_LIMIT'] = 'PLACE_ORDER_LIMIT'
     price: PositiveFloat
@@ -129,6 +164,11 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
     take_profit: float | None = None
 
     def payload(self) -> dict:
+        """The limit-order fields the engine expects under ``payload``.
+
+        Returns:
+            dict: Direction, volume, price, book and the optional execution flags this order carries.
+        """
         d = {
             "direction": self.direction,
             "volume": self.quantity,
@@ -138,7 +178,11 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
             "postOnly" : self.postOnly,
             "timeInForce" : self.timeInForce,
             "expiryPeriod" : self.expiryPeriod,
-            "stpFlag" : self.stp,
+            "stp" : self.stp,
+            # Every key PlaceOrderLimitPayload declares must be present: msgpack skips what it does not
+            # find, leaving the C++ struct default. An absent "currency" reads as BASE, so a
+            # TAO-denominated order would execute as an ALPHA one.
+            "currency":self.currency,
             "leverage":self.leverage,
             "settleFlag":self.settleFlag,
             "delegate": self.delegate,
@@ -165,6 +209,11 @@ class CancelOrderInstruction(BaseModel):
     volume: PositiveFloat | None
 
     def serialize(self) -> dict:
+        """Serialize one cancellation target.
+
+        Returns:
+            dict: The order id, and the volume when this is a partial cancel.
+        """
         return {
             "orderId" : self.orderId,
             "volume" : self.volume
@@ -187,6 +236,11 @@ class CancelOrdersInstruction(FinanceAgentInstruction):
     cancellations: list[CancelOrderInstruction]
 
     def payload(self) -> dict:
+        """The cancellation batch the engine expects under ``payload``.
+
+        Returns:
+            dict: The serialized cancellations and the book they rest on.
+        """
         return {
             "cancellations": [cancellation.serialize() for cancellation in self.cancellations],
             "bookId": self.bookId
@@ -208,6 +262,11 @@ class ClosePositionInstruction(BaseModel):
     volume: PositiveFloat | None
 
     def serialize(self) -> dict:
+        """Serialize one position-close target.
+
+        Returns:
+            dict: The order id of the position being closed, and its close parameters.
+        """
         return {
             "orderId" : self.orderId,
             "volume" : self.volume
@@ -230,6 +289,11 @@ class ClosePositionsInstruction(FinanceAgentInstruction):
     closes: list[ClosePositionInstruction]
 
     def payload(self) -> dict:
+        """The close batch the engine expects under ``payload``.
+
+        Returns:
+            dict: The serialized closes and the book they belong to.
+        """
         return {
             "closes": [close_position.serialize() for close_position in self.closes],
             "bookId": self.bookId
@@ -251,6 +315,11 @@ class ResetAgentsInstruction(FinanceAgentInstruction):
     agentIds: list[UInt32]
 
     def payload(self) -> dict:
+        """The reset target list the engine expects under ``payload``.
+
+        Returns:
+            dict: The agent ids to reset.
+        """
         return {
             "agentIds": self.agentIds
         }

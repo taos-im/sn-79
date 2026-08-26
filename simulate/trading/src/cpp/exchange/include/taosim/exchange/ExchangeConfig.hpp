@@ -27,7 +27,12 @@ struct ExchangeConfig
     decimal_t maintenanceMargin;
     decimal_t initialPrice;
     size_t maxOpenOrders;
+    // Floor on the BASE (alpha) amount of an order.
     decimal_t minOrderSize;
+    // Floor on the QUOTE (TAO) notional of an order, mirroring the chain's minimum stake amount
+    // (SubtensorModule::InitialMinStake). Zero disables the check, which is the case for every
+    // simulation config: only exchange mode settles on chain, so only it carries the constraint.
+    decimal_t minQuoteOrderSize;
 };
 
 [[nodiscard]] ExchangeConfig makeExchangeConfig(pugi::xml_node node);

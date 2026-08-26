@@ -10,11 +10,11 @@ from typing import Any
 from pathlib import Path
 from threading import Thread
 from abc import abstractmethod
-from taos.im.agents import FinanceSimulationAgent
+from taos.im.agents import GenTRXAgent
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 
 
-class FinanceSimulationAIAgent(FinanceSimulationAgent):
+class FinanceSimulationAIAgent(GenTRXAgent):
     """
     Base class for AI-based financial simulation agents.
 
@@ -39,7 +39,22 @@ class FinanceSimulationAIAgent(FinanceSimulationAgent):
         Returns:
             FinanceAgentResponse: The agent's generated response for the current state.
         """
-        self.update(state)
+        # DELEGATE TO THE UNIFIED HANDLE; DO NOT REIMPLEMENT IT.
+        #
+        # This method used to do update -> train -> respond -> report itself, never calling
+        # super().handle(). That bypassed FinanceAgent.handle entirely, which is where exchange-mode
+        # detection, the respond_simulation/respond_exchange dispatch and UnifiedAgentResponse.finalize()
+        # live -- so every AI agent was SIMULATION-ONLY by construction and could not answer an exchange
+        # update at all. It also skipped the SIMULATION/EXCHANGE INSTRUCTIONS logging the acceptance
+        # suite reads, so an AI agent looked silent even when it worked.
+        #
+        # The training trigger is the only thing this class genuinely adds, so run it and hand off.
+        # super().handle() performs update() itself; doing it here as well would double-update.
+        self._ai_train_tick(state)
+        return super().handle(state)
+
+    def _ai_train_tick(self, state: MarketSimulationStateUpdate) -> None:
+        """Kick off interval-based training for each book. Extracted from handle()."""
         for book_id, _book in state.books.items():
             if state.dendrite.hotkey in self.last_train_time and book_id in self.last_train_time[state.dendrite.hotkey] and int(state.timestamp - self.last_train_time[state.dendrite.hotkey][book_id]) > self.train_interval * 1_000_000_000:
                 if self.trained_events[state.dendrite.hotkey][book_id] == 0:
@@ -48,9 +63,6 @@ class FinanceSimulationAIAgent(FinanceSimulationAgent):
                 else:
                     Thread(target=self._train, args=(state.dendrite.hotkey, book_id, state.timestamp), kwargs={'test': True}).start()
 
-        response = self.respond(state)
-        self.report(state, response)
-        return response
 
     def features_file(self, validator : str, book_id: int) -> str:
         """
@@ -148,6 +160,10 @@ class FinanceSimulationAIAgent(FinanceSimulationAgent):
         Update the in-memory model from a newly saved checkpoint, if available.
 
         If a new checkpoint (with `.new` suffix) exists, it replaces the old one.
+
+        Args:
+            validator: Validator the model belongs to.
+            book_id: Book the model serves.
         """
         try:
             new_path = self.checkpoint_file(validator, book_id) + '.new'
@@ -287,6 +303,10 @@ Output Directory : {self.output_dir}
     def init_book(self, validator : str, book_id : int) -> None:
         """
         Initialize model utilized in response processing for the specified book
+
+        Args:
+            validator: Validator the model belongs to.
+            book_id: Book to initialize the model for.
         """
         if not self.reset:
             if validator not in self.models:

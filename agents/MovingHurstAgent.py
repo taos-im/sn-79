@@ -347,6 +347,14 @@ class MovingHurstAgent(GenTRXAgent):
         return response
     
     def entry_or_extend(self, response: FinanceAgentResponse, validator : str, book_id: int, direction:  OrderDirection)-> FinanceAgentResponse:
+        """Queue an entry (or extend an existing position) in the trend direction.
+
+        Args:
+            response: The response to queue on.
+            validator (str): Validator this state came from.
+            book_id (int): Book to trade.
+            direction (OrderDirection): Side the signal points.
+        """
         self.directions[validator][book_id].direction = direction
         if self.directions[validator][book_id].open:    
             self.directions[validator][book_id].amount = self.directions[validator][book_id].amount + 1
@@ -358,6 +366,11 @@ class MovingHurstAgent(GenTRXAgent):
 
 
     def generate_exit_response(self, response: FinanceAgentResponse, validator : str, book_id: int) -> tuple[FinanceAgentResponse, float, float]:
+        """Queue exits for any position the signal no longer supports.
+
+        Returns:
+            tuple: The response and whether an exit was queued.
+        """
         self.directions[validator][book_id].open = False
         close_dir = (
             OrderDirection.BUY
@@ -371,11 +384,17 @@ class MovingHurstAgent(GenTRXAgent):
         return response, total_amount, close_dir
 
     def onEnd(self, event:  SimulationEndEvent):
+        """Handle simulation end by resetting per-validator strategy state."""
         bt.logging.info("[SIMULATION END] Clearing history")
         for validator in list(self.predictors.keys()):
             self.reset(validator)
 
     def reset(self, validator : str):
+        """Reset per-validator strategy state.
+
+        Args:
+            validator (str): Validator whose state to clear.
+        """
         for book_id in self.predictors[validator].keys():
             self.predictors[validator][book_id] = {key: [] for key in self.predKeys}
             self.midquotes[validator][book_id] = [TimestampedPrice(0, self.simulation_config.init_price)]

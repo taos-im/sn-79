@@ -60,6 +60,35 @@ inline constexpr uint32_t kDefaultDecimalPlaces = 8;
     return round(decimal_t{val}, decimalPlaces);
 }
 
+//-------------------------------------------------------------------------
+
+// An on-chain amount is an integer count of rao, and rao is 1e-9, so NINE decimal places are required
+// to hold one exactly. Eight cannot, and the loss is not theoretical: a settled 0.999496465 alpha was
+// recorded as 0.99949646 and a settled 0.999496453 as 0.99949645.
+inline constexpr uint32_t kChainDecimalPlaces = 9;
+
+//-------------------------------------------------------------------------
+
+// Convert a double that carries an on-chain amount.
+//
+// Deliberately ROUNDS where double2decimal truncates, and that is the substance of this function. The
+// value reaches us as `rao / 1e9` computed in Python, and that double can sit a hair BELOW the exact
+// decimal: 6835900/1e9 is 0.006835899999999999789..., not 0.0068359. Truncation therefore drops a whole
+// unit in the last place and turns an exactly-settled 0.0068359 into 0.00683589, a 1e-8 error on a
+// number the chain knew exactly. Truncating at nine places is no better; it yields 0.006835899.
+//
+// Rounding recovers 0.006835900. Chain amounts are non-negative, so trunc(x + half a quantum) is
+// round-half-up, which reuses the existing helper rather than introducing a second rounding mode.
+//
+// double2decimal is left alone. Its truncation is the order-grid behaviour the simulation relies on,
+// and this concerns settled chain amounts only.
+[[nodiscard]] inline decimal_t chain2decimal(double val)
+{
+    static const decimal_t halfQuantum = BloombergLP::bdldfp::DecimalUtil::multiplyByPowerOf10(
+        decimal_t{5}, -static_cast<int>(kChainDecimalPlaces + 1));
+    return round(decimal_t{val} + halfQuantum, kChainDecimalPlaces);
+}
+
 [[nodiscard]] inline PackedDecimal packDecimal(decimal_t val)
 {
     PackedDecimal packed;

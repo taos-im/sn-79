@@ -14,6 +14,8 @@
 
 //-------------------------------------------------------------------------
 
+class MultiBookExchangeAgent;
+
 namespace taosim::simulation
 {
 
@@ -25,6 +27,25 @@ class SimulationManager;
 
 namespace taosim::checkpoint
 {
+
+// Restore the per-book L3 event counters from a checkpoint's "signals" section.
+//
+// ONE implementation, because two was the defect. The exchange-service apply path used
+// `ev.convert(exch->signals())`, msgpack's default convert for
+// std::map<BookId, std::unique_ptr<ExchangeSignals>>, which CREATES new objects and destroys the
+// originals, severing every logger and event-backlog feed connected at configure time. That exact bug was
+// found and fixed on 2026-05-12 (971786f9, "preserve L3EventLogger connections") in the OTHER apply path
+// and survived here for three months, because nobody knew there were two.
+//
+// This removes the bug class rather than the bug: the section is converted into plain integers and
+// assigned to the existing objects, so no code path deserialises an ExchangeSignals at all. The on-disk
+// format is unchanged, because pack<ExchangeSignals> already writes only the counter, making the section
+// a map<BookId, positive integer> on disk either way.
+//
+// NEVER convert the signals map wholesale. There is no custom convert to stop you; msgpack's default
+// will happily replace every object and the only symptom is log files that contain their header and
+// nothing else, which is how this went unnoticed from May to August.
+void restoreSignalCounters(MultiBookExchangeAgent* exchange, const msgpack::object& section);
 
 [[nodiscard]] CheckpointToken postProcessToken(const CheckpointToken& token);
 

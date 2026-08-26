@@ -24,7 +24,7 @@ import time
 import multiprocessing
 
 
-def _worker_main(conn, chain_endpoint, netuid, cores):
+def _worker_main(conn, chain_endpoint, netuid, cores, mechid=0):
     """Worker process entry: sync-on-demand loop. Imports bittensor locally."""
     try:
         if cores:
@@ -48,7 +48,7 @@ def _worker_main(conn, chain_endpoint, netuid, cores):
             try:
                 if subtensor is None:
                     subtensor = bt.Subtensor(network=chain_endpoint)
-                mg = subtensor.metagraph(netuid)
+                mg = subtensor.metagraph(netuid, mechid=mechid)
                 # The synced metagraph holds a live Subtensor (websocket) ref —
                 # the one unpicklable attribute (~0.16MB picklable without it).
                 # The owner reattaches its own subtensor after the swap.
@@ -74,9 +74,10 @@ def _worker_main(conn, chain_endpoint, netuid, cores):
 class MetagraphSyncWorker:
     """Owner-side handle: start/stop the worker and request synced metagraphs."""
 
-    def __init__(self, chain_endpoint, netuid, cores=None, worker_fn=_worker_main):
+    def __init__(self, chain_endpoint, netuid, cores=None, worker_fn=_worker_main, mechid=0):
         self._endpoint = chain_endpoint
         self._netuid = netuid
+        self._mechid = mechid
         self._cores = list(cores) if cores else []
         self._worker_fn = worker_fn
         self._ctx = multiprocessing.get_context("spawn")
@@ -84,10 +85,11 @@ class MetagraphSyncWorker:
         self._conn = None
 
     def start(self) -> None:
+        """Start the background metagraph sync."""
         self._conn, child = self._ctx.Pipe(duplex=True)
         self._proc = self._ctx.Process(
             target=self._worker_fn,
-            args=(child, self._endpoint, self._netuid, self._cores),
+            args=(child, self._endpoint, self._netuid, self._cores, self._mechid),
             daemon=True,
             name="metagraph-sync-worker",
         )
@@ -95,6 +97,7 @@ class MetagraphSyncWorker:
         child.close()
 
     def is_alive(self) -> bool:
+        """Whether the sync worker is currently running."""
         return self._proc is not None and self._proc.is_alive()
 
     def sync(self, timeout: float = 45.0):
@@ -133,6 +136,7 @@ class MetagraphSyncWorker:
             return None
 
     def stop(self) -> None:
+        """Stop the background sync and release the connection."""
         try:
             if self._conn is not None:
                 try:

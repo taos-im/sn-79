@@ -26,7 +26,7 @@ struct L3LogEvent
         OrderWithLogContext,
         TradeWithLogContext,
         CancellationWithLogContext> item;
-    uint32_t id;
+    uint64_t id;
 };
 
 //-------------------------------------------------------------------------

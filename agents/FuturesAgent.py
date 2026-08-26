@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+"""
+A simple example agent which places orders in line with the expectation of price movement due to the futures price connection in the simulator.
+"""
 import bittensor as bt
 
 from taos.common.agents import launch
@@ -12,10 +15,9 @@ from taos.im.utils.streams import subscribe_coinbase_trades
 
 
 import logging
-"""
-A simple example agent which places orders in line with the expectation of price movement due to the futures price connection in the simulator.
-"""
+
 class FuturesAgent(GenTRXAgent):
+    """Example: leveraged directional strategy exercising loans and margin."""
     def initialize(self):
         """
         Initializes properties, variables and quantities that will be used by the agent.
@@ -57,17 +59,21 @@ class FuturesAgent(GenTRXAgent):
         Analyses the latest market state data and generates instructions to be submitted.
         """
         # Initialize a response class associated with the current miner
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         # Iterate over all the book realizations in the state message
         if len(self.sampled_external_prices) >= 2:
             for book_id, book in state.books.items():
                 # Calculate the change in price (return) between the previous two sampled futures price observations
                 price_change = self.sampled_external_prices[-1] - self.sampled_external_prices[-2]
-                if price_change > 0:
+                # A ONE-SIDED BOOK MUST NOT COST THE WHOLE RESPONSE. bids[0]/asks[0] were indexed
+                # unguarded, so any book with an empty side raises IndexError and the agent loses the
+                # entire update, every other book included. Routine in exchange mode, where a sweep can
+                # clear a side outright.
+                if price_change > 0 and book.asks:
                     # If the price change is positive, the simulator background agents are expected to drive the price higher over the next interval
                     # Buy the configured quantity of asset, limiting the purchase price to the current best ask
                     response.limit_order(book_id, OrderDirection.BUY, self.quantity, book.asks[0].price, timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period)
-                elif price_change < 0:
+                elif price_change < 0 and book.bids:
                     # If the price change is negative, the simulator background agents are expected to drive the price lower over the next interval
                     # Sell the configured quantity of asset, limiting the sale price to the current best bid
                     response.limit_order(book_id, OrderDirection.SELL, self.quantity, book.bids[0].price, timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period)

@@ -110,6 +110,10 @@ def _read_first_and_last_nonempty(path: str, tail_chunk: int = 131072) -> tuple[
 
 class SimulationEngine(MarketEngine):
 
+    """The simulation-mechanism engine: drives the C++ simulator and consumes its events.
+
+    Counterpart of the exchange engine, behind the same MarketEngine interface.
+    """
     def __init__(self, config: Any, validator: "Validator") -> None:
         self.config    = config
         self.validator = validator
@@ -131,11 +135,11 @@ class SimulationEngine(MarketEngine):
         self._external_poll_task = None
 
         # Per-book trigger prices snapshot; populated by the optional SL/TP
-        # extension when installed (testnet release omits the extension and
-        # leaves this dict empty).
+        # extension when installed, and left empty otherwise.
         self._live_triggers: dict = {}
         self._sltp_changed: bool = False
         self._sltp_ext = None
+        # Optional component; not part of this tree. Import is guarded.
         try:
             from taos.im.validator.engines.exetrx import SLTPInferenceExtension
             self._sltp_ext = SLTPInferenceExtension(self)
@@ -147,6 +151,7 @@ class SimulationEngine(MarketEngine):
     # ─────────────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
+        """Start the engine's consumers and connect to the simulator."""
         v = self.validator
 
         # ── 1. Load simulation XML config ─────────────────────────────────────
@@ -322,8 +327,8 @@ class SimulationEngine(MarketEngine):
         """Fetch UI-submitted pending orders from the data service and verify them.
 
         Requires the exchange engine for sr25519 verification and UI→LOB translation.
-        When the exchange engine module is unavailable (e.g. the testnet release tree
-        excludes it), this becomes a no-op — sim runs continue without UI injection.
+        The exchange engine is an optional component that is not part of this tree; when it is
+        unavailable this becomes a no-op and sim runs continue without UI injection.
         """
         try:
             from taos.im.validator.engines.exchange import ExchangeEngine
@@ -402,7 +407,10 @@ class SimulationEngine(MarketEngine):
                 )
                 continue
 
-            translated = ExchangeEngine._translate_ui_order(order)
+            # `self=None` is deliberate and must stay positional: the translator is an instance method
+            # whose only use of `self` is a step simulation has no state for. Passing None skips that
+            # step explicitly; omitting the argument would bind `raw` to `self` instead.
+            translated = ExchangeEngine._translate_ui_order(None, order)
             if translated is None:
                 logger.warning(
                     "_fetch_external_orders: unrecognised instruction type uid=%d type=%s, dropping",
@@ -458,6 +466,13 @@ class SimulationEngine(MarketEngine):
         injects trade events into the next tick's state.notices.
         _update_trade_volumes() therefore gets pre-populated notices with no
         adapter needed.
+
+        Args:
+            state: The block's state update.
+            miner_responses: The miners' responses (unused here).
+
+        Returns:
+            list: Always empty in simulation mode.
         """
         return []
 
@@ -470,6 +485,10 @@ class SimulationEngine(MarketEngine):
     def respond(self, raw_message: Any, response: dict) -> None:
         """
         Serialise and write the validator response to /taosim-res via SHM.
+
+        Args:
+            raw_message: The simulator request being answered.
+            response: The validator response to serialize.
         """
         try:
             self.validator.last_response = response
@@ -487,6 +506,12 @@ class SimulationEngine(MarketEngine):
     # ─────────────────────────────────────────────────────────────────────────
 
     def on_start(self, timestamp, event) -> None:
+        """Handle the simulator's start event: reset per-run state.
+
+        Args:
+            timestamp: The simulator's start timestamp.
+            event: The start event payload.
+        """
         v = self.validator
         # Capture the locked simulation_id BEFORE _load_config() rebuilds
         # v.simulation from XML (which resets simulation_id + logDir to None).
@@ -583,6 +608,7 @@ class SimulationEngine(MarketEngine):
     # ─────────────────────────────────────────────────────────────────────────
 
     def on_end(self) -> None:
+        """Handle the simulator's end event: flush and close per-run state."""
         v = self.validator
         logger.info("SIMULATION ENDED")
         v.simulation.logDir = None
@@ -653,6 +679,10 @@ class SimulationEngine(MarketEngine):
         """
         Scan validator's own notices for RDRA/ERDRA and add miner UIDs to `pending`.
         Failed resets trigger a pagerduty alert.
+
+        Args:
+            state: The block's state update.
+            pending: Set of uids to extend with reset targets.
         """
         v = self.validator
         from taos.im.validator.trade import collect_reset_uids
@@ -883,6 +913,7 @@ class SimulationEngine(MarketEngine):
                 extended_hotkeys[uid] = placeholder_axon.hotkey
 
         class ExtendedMetagraph:
+            """Metagraph wrapper carrying the benchmark uids beyond the chain's own."""
             def __init__(self, uids, hotkeys, axons):
                 self.uids = _torch.tensor(uids)
                 self.hotkeys = hotkeys
@@ -902,6 +933,10 @@ class SimulationEngine(MarketEngine):
         from `len(metagraph.hotkeys)`. Otherwise the benchmark UID slides
         with each new registration and overwrites real chain UIDs in the
         meta:agents Redis key.
+
+        Args:
+            old_size: Metagraph size before the resync.
+            new_size: Metagraph size after.
         """
         v = self.validator
         old_effective_max_uids = v.effective_max_uids
@@ -1123,8 +1158,26 @@ class SimulationEngine(MarketEngine):
     # Deregistration handling (moved from validator)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def handle_deregistration(self, uid: int) -> None:
-        """Flag UID for reset, zero its score."""
+    def handle_deregistration(self, uid: int, old_coldkey: str | None = None) -> None:
+        """Flag UID for reset, zero its score.
+
+        `old_coldkey` is accepted and unused here. The validator calls every engine the same way
+        (taos/im/neurons/validator.py:1365 passes uid AND old_coldkey, because the exchange engine needs
+        it to retire the departed miner's settlement-proxy wallet), and this signature took only uid. Every
+        deregistration on the simulation mechanism therefore raised
+        `TypeError: handle_deregistration() takes 2 positional arguments` out of the resync, which failed
+        `_sync_and_check` whole: the departed miner was never flagged for reset, its score never zeroed,
+        and `self.hotkeys` never updated from the metagraph, so the same deregistration re-raised on every
+        subsequent resync and the slot's new occupant inherited the old standing indefinitely. Measured
+        live on 2026-08-05 by the acceptance suite's deregistration stage.
+
+        Simulation has no proxy wallet to retire, so the parameter is deliberately ignored rather than
+        removed from the shared signature: one call site, one shape.
+
+        Args:
+            uid: The deregistered uid.
+            old_coldkey: Accepted for interface parity; unused by this engine.
+        """
         v = self.validator
         v.deregistered_uids.append(uid)
         v.scores[uid] = 0.0
@@ -1230,14 +1283,17 @@ class SimulationEngine(MarketEngine):
 
     @property
     def book_ids(self) -> list[int]:
+        """Readable accessor for the internal field ``_book_ids``."""
         return self._book_ids
 
     @property
     def mode(self) -> str:
+        """The engine's mechanism name: ``'simulation'``."""
         return 'simulation'
 
     @property
     def effective_max_uids(self) -> int:
+        """Uid capacity including benchmark agents beyond the chain's registered set."""
         return getattr(self.validator, 'effective_max_uids', self.validator.subnet_info.max_uids)
 
     # ─────────────────────────────────────────────────────────────────────────

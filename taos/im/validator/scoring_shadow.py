@@ -48,6 +48,7 @@ _STRUCT_NAMES = [
 
 
 def shadow_enabled() -> bool:
+    """Whether the scoring shadow is switched on for this validator."""
     if os.environ.get("SCORING_SHADOW", "0") == "1":
         return True
     try:
@@ -96,6 +97,7 @@ def _rebuild_structs(parts: dict) -> dict:
     out = {}
 
     def dd_float_2(plain):
+        """Recursively round every float in a nested structure to 2 decimals for stable digests."""
         d = defaultdict(lambda: defaultdict(float))
         for uid, books in plain.items():
             inner = defaultdict(float)
@@ -151,12 +153,14 @@ def compute_parity_components(s) -> dict:
     bit-sensitive to real divergence. Kept per-field so a mismatch names the
     diverging structure instead of just failing a combined hash."""
     def sum_books(d):
+        """Sum a per-book mapping into one total."""
         return tuple(
             (int(u), float(sum(sorted(float(x) for x in b.values()))))
             for u, b in sorted(d.items())
         )
 
     def h(v):
+        """Short stable hash of a value, for digest comparison."""
         return hashlib.md5(repr(v).encode()).hexdigest()[:12]
 
     return {
@@ -209,6 +213,12 @@ class ShadowState:
         self.deregistered_uids = []
 
     def pagerduty_alert(self, message, details=None):
+        """Raise a PagerDuty alert from the shadow process.
+
+        Args:
+            message: Incident summary.
+            details: Structured context attached to the incident.
+        """
         print(f"[SHADOW] pagerduty (suppressed): {message}", flush=True)
 
 
@@ -225,9 +235,22 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
 
     Returns {'trading', 'gentrx', 'factors', 'gentrx_ema'} — everything main
     adopts in cutover mode.
+
+    Args:
+        shadow: The shadow's replica structures.
+        sim_ts: Simulation timestamp of the boundary being scored.
+        deregs: Uids deregistered this round.
+        gentrx_scores: Live GenTRX scores.
+        gentrx_ema: Carried GenTRX EMA.
+        trading_ema: Carried trading EMA.
+        trading_ema_n: Carried per-uid EMA counts.
+        trading_ema_ts: Carried per-uid EMA timestamps.
+
+    Returns:
+        The shadow's scoring result for parity comparison.
     """
     from taos.im.validator.reward import (apply_reward_floor, apply_track_record_ema,
-                                          distribute_rewards, score_uids)
+                                          compute_debeta_scores, distribute_rewards, score_uids)
 
     shadow.deregistered_uids = list(deregs)
     all_uids = list(range(shadow.effective_max_uids))
@@ -247,6 +270,10 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         'device': 'cpu',
         'gentrx_scores': dict(gentrx_scores or {}),
         'gentrx_ema': _ema,
+        # Main's get_rewards ships this key from its own accumulators; the replica omitted it, which
+        # (with the config duck also lacking scoring.debeta) silently pinned cutover scoring to the
+        # legacy path. The shadow owns the same fill-stream accumulators via the trade.py update path.
+        'debeta_scores': compute_debeta_scores(shadow),
     }
     trading_scores, gentrx_scores_out = score_uids(validator_data)
     # Track-record EMA: same pre-round state main ships (parity contract with
@@ -288,6 +315,11 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
     main's shipped light fields — the exact dict persistence.build_validator_state
     produces, stream-packed at the same depth and atomically replaced, so the
     file is indistinguishable from a main-side save. The ongoing parity digests
+
+    Args:
+        shadow: The child's replica structures.
+        light: Main-only fields shipped for the save.
+        path: Destination state-file path.
     are the proof the heavy subtrees match main's. Returns bytes written."""
     import msgpack
     from taos.im.validator.persistence import (
@@ -378,7 +410,7 @@ def apply_state_bytes(shadow: ShadowState, raw: bytes) -> int:
         from taos.im.validator.trade import collect_reset_uids, reset_agent_histories
         pending, _failed = collect_reset_uids(state, validator_uid)
         if pending:
-            book_ids = list(range(shadow.simulation_config['book_count']))
+            book_ids = list(shadow.simulation_config.get('book_ids') or range(shadow.simulation_config['book_count']))
             for uid in sorted(pending):
                 reset_agent_histories(shadow, uid, book_ids)
             print(f"[SHADOW] resets applied (derived): {sorted(pending)}", flush=True)
@@ -571,7 +603,7 @@ def _shadow_child_main(sock, cores, parity_ns):
             elif kind == "resets":
                 if shadow is not None:
                     from taos.im.validator.trade import reset_agent_histories
-                    book_ids = list(range(shadow.simulation_config['book_count']))
+                    book_ids = list(shadow.simulation_config.get('book_ids') or range(shadow.simulation_config['book_count']))
                     for uid in payload:
                         reset_agent_histories(shadow, uid, book_ids)
                     print(f"[SHADOW] resets applied: {payload}", flush=True)
@@ -689,6 +721,7 @@ class ScoringShadow:
         self._consecutive_mismatches = 0
 
     def start(self) -> None:
+        """Start the shadow process and its feed."""
         import socket as _socket
         self._sock, child_sock = _socket.socketpair()
         # daemon=False: the child spawns loky workers for shadow scoring, which
@@ -706,6 +739,7 @@ class ScoringShadow:
         self._reader.start()
 
     def is_alive(self) -> bool:
+        """Whether the shadow process is currently running."""
         return self._proc is not None and self._proc.is_alive()
 
     # ── main -> child ────────────────────────────────────────────────────────
@@ -713,6 +747,10 @@ class ScoringShadow:
     def tee(self, raw: bytes, timestamp: int) -> None:
         """Fire-and-forget send of one round's raw state bytes (FIFO executor).
         Bounded: if the child stalls, frames are dropped (shadow-only — never
+
+        Args:
+            raw: One round's raw state bytes.
+            timestamp: The round timestamp.
         block or bloat the main process for the shadow's sake)."""
         if not self.is_alive():
             return
@@ -736,6 +774,10 @@ class ScoringShadow:
 
     def emit_sim_start(self, old_ts: int, new_ts: int) -> None:
         """Simulation restart: the child must run the same history shift.
+
+        Args:
+            old_ts: The previous simulation's time base.
+            new_ts: The new simulation's time base.
         FIFO-ordered with the state tee (old-sim frames before, new-sim after)."""
         if not self.is_alive():
             return
@@ -768,6 +810,16 @@ class ScoringShadow:
         so the child computes during the seconds main's _reward spends queued
         behind _reward_lock — request_scores then collects a (usually) finished
         result instead of holding the lock through the full compute. The same
+
+        Args:
+            timestamp: Tee timestamp.
+            sim_ts: Simulation timestamp of the boundary.
+            deregs: Uids deregistered this round.
+            gentrx_scores: Live GenTRX scores.
+            gentrx_ema: Carried GenTRX EMA.
+            trading_ema: Carried trading EMA.
+            trading_ema_n: Carried per-uid EMA counts.
+            trading_ema_ts: Carried per-uid EMA timestamps.
         inputs are recorded for the verify pin (eager_inputs_for)."""
         if not self.is_alive() or not self.initialized:
             return
@@ -811,6 +863,21 @@ class ScoringShadow:
         pull path runs as before. Returns the result dict {'trading','gentrx',
         'factors','gentrx_ema'} or None on ANY failure — the caller falls back
         to the in-process get_rewards and a dead child is respawned.
+
+        Args:
+            timestamp: The boundary timestamp.
+            sim_ts: Simulation timestamp of the boundary.
+            deregs: Uids deregistered this round.
+            gentrx_scores: Live GenTRX scores.
+            gentrx_ema: Carried GenTRX EMA.
+            timeout: Wait bound in seconds.
+            eager: Inputs were already shipped at tee time.
+            trading_ema: Carried trading EMA.
+            trading_ema_n: Carried per-uid EMA counts.
+            trading_ema_ts: Carried per-uid EMA timestamps.
+
+        Returns:
+            The child's full scoring result.
         """
         import concurrent.futures
         ready = self._score_results.pop(timestamp, None)
@@ -854,6 +921,13 @@ class ScoringShadow:
         the main-only fields (step/scores/hotkeys/miner_stats/...). Returns
         (expect_ts, Future) — the future resolves to (bytes, child_io_secs) on
         success or None on child failure — or None when the offload is
+
+        Args:
+            path: Destination state-file path.
+            light: Main-only fields (step/scores/hotkeys/miner_stats/...).
+
+        Returns:
+            tuple: ``(expect_ts, Future)``; the future resolves to ``(bytes, child_io_secs)``.
         unavailable (caller falls back to the in-process save path)."""
         if not self.is_alive() or not self.initialized or not self._last_teed_ts:
             return None
@@ -994,6 +1068,12 @@ class ScoringShadow:
             ring.pop(next(iter(ring)))
 
     def record_main_digest(self, timestamp: int, digest: str) -> None:
+        """Record the main process's scoring digest for parity comparison.
+
+        Args:
+            timestamp (int): Step timestamp the digest belongs to.
+            digest (str): The main scorer's digest.
+        """
         theirs = self._pending_child_parity.pop(timestamp, None)
         if theirs is not None:
             self._compare_parity(timestamp, digest, theirs)
@@ -1004,6 +1084,15 @@ class ScoringShadow:
                        trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> None:
         """Called after main's get_rewards completes on a scoring round: record
         main's trading scores for comparison and release the child (which is
+
+        Args:
+            timestamp: The scoring round timestamp.
+            sim_ts_used: Simulation timestamp main actually scored on.
+            deregs_used: Deregistrations main actually applied.
+            trading_scores: Main's trading scores, recorded for comparison.
+            trading_ema: Main's carried EMA.
+            trading_ema_n: Main's carried per-uid counts.
+            trading_ema_ts: Main's carried per-uid timestamps.
         holding applies at this boundary) with the exact live inputs main used."""
         theirs = self._pending_child_scores.pop(timestamp, None)
         if theirs is not None:
@@ -1082,6 +1171,7 @@ class ScoringShadow:
             bt.logging.warning(f"[SHADOW] parity reader: {e}")
 
     def stop(self) -> None:
+        """Stop the shadow process and release its resources."""
         try:
             self._executor.submit(lambda: _send_frame(self._sock, ("stop", None)))
             self._executor.shutdown(wait=True)
@@ -1099,9 +1189,21 @@ class ScoringShadow:
             self._proc = None
 
 
+def _num(v, default, cast):
+    """Cast v, or return default when v is genuinely absent. `v or default` would swallow a
+    legitimate zero (see the debeta note in _config_duck)."""
+    if v is None:
+        return cast(default)
+    try:
+        return cast(v)
+    except (TypeError, ValueError):
+        return cast(default)
+
+
 def _config_duck(config):
     """Minimal picklable stand-in exposing exactly the config paths trade.py reads."""
     from types import SimpleNamespace
+    _d = getattr(config.scoring, 'debeta', None)
     return SimpleNamespace(
         scoring=SimpleNamespace(
             activity=SimpleNamespace(
@@ -1109,6 +1211,24 @@ def _config_duck(config):
                 trade_volume_sampling_interval=config.scoring.activity.trade_volume_sampling_interval,
             ),
             kappa=SimpleNamespace(lookback=config.scoring.kappa.lookback),
+            # De-beta gates BOTH the trade.py accumulators and compute_debeta_scores. Omitting it
+            # here silently pinned the CUTOVER child (the authoritative scorer) to the legacy path
+            # while main's flags said enabled - de-beta could never activate in cutover mode.
+            # `is None` tests, never `or default`: a legitimate ZERO must survive the trip to the
+            # child. floor_scale=0 is documented as "disables the floor", w_make=0 means "skill
+            # only", and `or` silently turned both into the default, so the child scored on
+            # parameters the operator had not asked for and no log said so.
+            debeta=SimpleNamespace(
+                enabled=bool(getattr(_d, 'enabled', False)),
+                w_make=_num(getattr(_d, 'w_make', None), 0.30, float),
+                floor_scale=_num(getattr(_d, 'floor_scale', None), 0.5, float),
+                centered_window=_num(getattr(_d, 'centered_window', None), 15, int),
+                min_books=_num(getattr(_d, 'min_books', None), 4, int),
+                p11_strength=_num(getattr(_d, 'p11_strength', None), 0.0, float),
+                mark_mode=str(_d_mark if (_d_mark := getattr(_d, 'mark_mode', None)) is not None
+                              else 'last'),
+                mark_window=_num(getattr(_d, 'mark_window', None), 200, int),
+            ),
         )
     )
 

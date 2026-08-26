@@ -406,7 +406,6 @@ class HighFrequencyTraderAgent:
                 int(bookId)
         )
         # if flag:
-            # FIXME
             # pass
             # LimitOrderPayload.flag = flag
     

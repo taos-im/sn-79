@@ -20,6 +20,7 @@ void ExchangeAgentConfig::configure(pugi::xml_node node)
         setVolumeIncrement(node);
         setBaseDecimals(node);
         setQuoteDecimals(node);
+        setPriceBand(node);
     }
     catch (...) {
         handleException();
@@ -141,6 +142,37 @@ const char* ExchangeAgentConfigException::what() const noexcept
 
 //-------------------------------------------------------------------------
 
-}  // namespace taosim::config
 
 //-------------------------------------------------------------------------
+
+void ExchangeAgentConfig::setPriceBand(pugi::xml_node node)
+{
+    // maxPriceBand: max fractional deviation a match may reach from the book's slow trailing reference.
+    // Absent or <=0 leaves the band disabled, so an existing config behaves exactly as before.
+    if (pugi::xml_attribute attr = node.attribute("maxPriceBand"); !attr.empty()) {
+        const double value = attr.as_double();
+        if (value < 0.0 || value > 1.0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'maxPriceBand' should be in [0,1], was {}", value)};
+        }
+        m_parameters.maxPriceBand = value;
+    }
+    if (pugi::xml_attribute attr = node.attribute("bandRefInterval"); !attr.empty()) {
+        const int64_t value = attr.as_llong();
+        if (value <= 0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'bandRefInterval' should be > 0 (sim ns), was {}", value)};
+        }
+        m_parameters.bandRefInterval = value;
+    }
+    if (pugi::xml_attribute attr = node.attribute("bandRefWindow"); !attr.empty()) {
+        const int64_t value = attr.as_llong();
+        if (value <= 0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'bandRefWindow' should be > 0 (sim ns), was {}", value)};
+        }
+        m_parameters.bandRefWindow = value;
+    }
+}
+
+}  // namespace taosim::config

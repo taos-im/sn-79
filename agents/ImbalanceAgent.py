@@ -19,6 +19,7 @@ from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.agents import GenTRXAgent
 
 class ImbalanceAgent(GenTRXAgent):
+    """Example: trades in the direction of the book's order-flow imbalance."""
     def initialize(self):
         """
         Initializes properties, variables, and components needed by the agent.

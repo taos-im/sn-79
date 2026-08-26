@@ -21,10 +21,10 @@ from typing import Dict, Any
 from collections import defaultdict
 import aiohttp
 from taos.im.protocol import STP
+from taos.im.protocol.instructions import PlaceOrderInstruction
 from taos.im.protocol import MarketSimulationStateUpdate
-# taos.im.protocol.exchange is excluded from the public release; the parse_dict
-# branch below that uses ExchangeStateUpdate is gated on exchange-mode requests
-# which never arrive in a public sim-only deployment.
+# Optional component; not part of this tree. Import is guarded, and the parse_dict branch below that uses
+# ExchangeStateUpdate is gated on exchange-mode requests.
 try:
     from taos.im.protocol.exchange import ExchangeStateUpdate
     _HAS_PROTOCOL_EXCHANGE = True
@@ -36,8 +36,8 @@ except ImportError:
 def _query_fanout_enabled():
     """True if the single-loop fan-out path should be used this round.
 
-    Fan-out is the DEFAULT — the mainnet canary showed it eliminates the ~1s
-    thread-dispatch stagger (query wait 4.0s -> 3.4s) with full response parity.
+    Fan-out is the DEFAULT: it eliminates the ~1s thread-dispatch stagger
+    (query wait 4.0s -> 3.4s) with full response parity.
     Fall back to the legacy thread-per-call path only to disable it:
       - drop a `.query_threaded` sentinel at the repo root — checked every round,
         so it's a live kill-switch with no env-file relaunch or restart; or
@@ -79,6 +79,7 @@ def _log_query_profile(tag, offsets, durations):
 
 
 class DendriteManager:
+    """Owns the dendrite pool used to query miners, recycling connections as they age."""
     @staticmethod
     def configure_session(validator):
         """
@@ -119,6 +120,10 @@ class DendriteManager:
         dendrite._session = None
 
 class QueryService:
+    """Out-of-process miner querying: fans a synapse out to axons and returns the responses.
+
+    Runs as its own process so a slow miner cannot block the validator's step loop.
+    """
     def __init__(self, config):
         """
         Initialize the standalone validator-side query service.
@@ -363,14 +368,11 @@ class QueryService:
                                 volume_cap_logged = True
                             continue
 
-                        if instruction.type in ['PLACE_ORDER_MARKET', 'PLACE_ORDER_LIMIT']:
-                            stp_value = instruction.stp
-                            if hasattr(stp_value, 'value'):
-                                stp_value = stp_value.value
-                            if stp_value == 'NO_STP' or stp_value == 0:
-                                instruction.stp = STP.CANCEL_OLDEST
-                            if engine_mode != 'exchange':
-                                instruction.delegate = synapse.dendrite.hotkey
+                        # delegate exists only on placements (stake moves); cancels/closes have no
+                        # such field and pydantic raises on assignment, which the except below turned
+                        # into silently DROPPING every miner cancel.
+                        if engine_mode != 'exchange' and isinstance(instruction, PlaceOrderInstruction):
+                            instruction.delegate = synapse.dendrite.hotkey
 
                         instructions_per_book[instruction.bookId] += 1
 
@@ -420,9 +422,17 @@ class QueryService:
         _prof_call_durations = []
 
         async def query_uid(uid, axon, synapse):
+            """Send the synapse to one axon and await its response.
+
+            Args:
+                uid: The miner uid, for attribution.
+                axon: The axon to dial.
+                synapse: The synapse to send.
+            """
             loop = asyncio.get_running_loop()
 
             def run_in_thread():
+                """Run one query on the worker thread's event loop."""
                 _t_thread = time.time()
                 _prof_thread_offsets.append(_t_thread - query_start)
                 thread_loop = asyncio.new_event_loop()
@@ -522,6 +532,13 @@ class QueryService:
         _prof_durations = []
 
         async def fire_uid(uid, axon, synapse):
+            """Send without awaiting a response body (fire-and-forget notification).
+
+            Args:
+                uid: The miner uid, for attribution.
+                axon: The axon to dial.
+                synapse: The notification to send.
+            """
             _t = time.time()
             _prof_offsets.append(_t - query_start)
             try:
@@ -698,7 +715,7 @@ class QueryService:
                     if not _HAS_PROTOCOL_EXCHANGE:
                         raise RuntimeError(
                             "Exchange engine mode is not supported in this build "
-                            "(taos.im.protocol.exchange is excluded from the public release)."
+                            "(taos.im.protocol.exchange is not available)."
                         )
                     synapse = ExchangeStateUpdate.parse_dict(request_data)
                     accounts = synapse.accounts or {}

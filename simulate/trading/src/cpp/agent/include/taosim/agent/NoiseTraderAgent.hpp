@@ -67,7 +67,10 @@ private:
     OptimizationResult calculateIndifferencePrice(
         const ForecastResult& forecastResult, double freeBase, double freeQuote);
     OptimizationResult calculateMinimumPrice(
-        const ForecastResult& forecastResult, double freeBase, double freeQuote);
+        const ForecastResult& forecastResult,
+        double freeBase,
+        double freeQuote,
+        double indifferencePrice);
     double calcPositionPrice(
         const ForecastResult& forecastResult, double price, double freeBase, double freeQuote);
     void placeBid(BookId bookId,double volume, double price);
@@ -92,6 +95,7 @@ private:
     // Order placement
     double m_volumeConst;
     double m_balanceCoef;
+    double m_feeReserveFrac;
     double m_price;
     Timestamp m_tau;
     double m_sigma;

@@ -1,6 +1,11 @@
 # Agent Development Guide
 
-This document aims to provide some clarification and guidelines to assist miners in development of trading strategies for deployment in the subnet.  This is not intended as a comprehensive set of instructions, but rather provides an overview of the basic understanding and tools needed to begin the design and implementation of agent logic in the context of τaos simulations.
+This document aims to provide some clarification and guidelines to assist miners in development of trading strategies for deployment in the subnet.  This is not intended as a comprehensive set of instructions, but rather provides an overview of the basic understanding and tools needed to begin the design and implementation of agent logic in the context of the τaos market simulation and exchange.
+
+> **Already running an agent?** 0.6.0 introduces a second, exchange mechanism (localnet only for now;
+> mainnet still runs the simulation mechanism). Your existing agent keeps working in the simulation with
+> no changes. See [MIGRATION_0.6.0.md](MIGRATION_0.6.0.md) for why, and for the steps to trade the
+> exchange as well.
 
 ---
 
@@ -33,7 +38,7 @@ This document aims to provide some clarification and guidelines to assist miners
 
 ## Data
 
-The first piece of the puzzle is understanding the format and content of the data published by validators.  Each request sent by a validator includes the latest (partial L3 + L2) state of all orderbooks in the simulation, a record of all events occurring in the simulation since the last update, and miner-specific information relating to the state of the agent's accounts and those events which involve the agent's orders.  The protocol class which defines how this data is represented practically can be found [here](/taos/im/protocol/__init__.py); the structure is expanded and documented for convenient reference in [The Appendix](#the-marketsimulationstateupdate-class).
+The first piece of the puzzle is understanding the format and content of the data published by validators.  Each request sent by a validator includes the latest (partial L3 + L2) state of all orderbooks in the simulation, a record of all events occurring in the simulation since the last update, and miner-specific information relating to the state of the agent's accounts and those events which involve the agent's orders.  The protocol class which defines how this data is represented practically can be found [here](../taos/im/protocol/__init__.py); the structure is expanded and documented for convenient reference in [The Appendix](#the-marketsimulationstateupdate-class).
 
 ### Processing State Updates
 
@@ -66,7 +71,7 @@ ask_vol = best_ask_level.quantity
 spread = ask - bid
 ```
 
-The book object further contains an `events` field, which is populated with a complete listing of all the events which have occurred since the last state update.  This allows to reconstruct the complete, high-frequency history of the state of the orderbook throughout the previous publishing interval.  Full details of this procedure and usage are beyond the scope of this document, but the [ImbalanceAgent](/agents/ImbalanceAgent.py) sample agent demonstrates how to use this field and the associated tools to make use of a more complete, high-resolution record of the book state evolution.  An example of a simple use of this record is to obtain the price at which the last trade occurred; the `book` class includes a property method which allows to easily retrieve the latest `TradeInfo` object in the `events` record:
+The book object further contains an `events` field, which is populated with a complete listing of all the events which have occurred since the last state update.  This allows to reconstruct the complete, high-frequency history of the state of the orderbook throughout the previous publishing interval.  Full details of this procedure and usage are beyond the scope of this document, but the [ImbalanceAgent](ImbalanceAgent.py) sample agent demonstrates how to use this field and the associated tools to make use of a more complete, high-resolution record of the book state evolution.  An example of a simple use of this record is to obtain the price at which the last trade occurred; the `book` class includes a property method which allows to easily retrieve the latest `TradeInfo` object in the `events` record:
 
 ```python
 last_trade : TradeInfo = book.last_trade
@@ -93,7 +98,7 @@ Note that `MTR` is populated only under the **dynamic fee policy** used in simul
 
 #### Notices
 
-The `notices` field of the state update contains a dictionary mapping UIDs to a list of notifications corresponding to events that have occurred specifically in relation to that UID's previously submitted orders.  When received by a miner, this field contains only the notices corresponding to the receiving agent's actions.  If your agent does not override the default `FinanceSimulationAgent.update` method, specific event types can be handled by defining the appropriate functions in your agent code:
+The `notices` field of the state update contains a dictionary mapping UIDs to a list of notifications corresponding to events that have occurred specifically in relation to that UID's previously submitted orders.  When received by a miner, this field contains only the notices corresponding to the receiving agent's actions.  If your agent does not override the default `FinanceAgentBase.update` method, specific event types can be handled by defining the appropriate functions in your agent code:
 
 - `onStart(self, event : SimulationStartEvent)` : Triggered on start of a new simulation.
 - `onOrderAccepted(self, event : OrderPlacementEvent)` : Triggered when an agent's order is accepted by the simulator.
@@ -106,7 +111,7 @@ The `notices` field of the state update contains a dictionary mapping UIDs to a 
 To specify logic to be executed when a particular type of notice is received, simply define the handler function in your agent class:
 
 ```python
-class MyTradingAgent(FinanceSimulationAgent):
+class MyTradingAgent(FinanceAgent):
     def initialize(self):
         ...
 
@@ -120,6 +125,195 @@ class MyTradingAgent(FinanceSimulationAgent):
 
 Note of course that these notices are part of the state update, and so all events occurring in the previous interval will be processed in sequence when the state is received (i.e. before your `respond` method is called).
 
+These handlers fire in **both** simulation and exchange mode, so an agent that consumes notices this way needs no change when it moves to the exchange. Two mode differences are worth knowing: `onStart` and `onEnd` fire only where a simulation actually starts and ends, since an exchange does neither; and an exception raised inside your own handler is logged and skipped rather than aborting the rest of your notices, so one faulty handler costs you that handler and not your whole response.
+
+## Running in both simulation and exchange mode
+
+The subnet runs two mechanisms: a **simulation** and a live **exchange**. One agent can serve both, and
+by default the same logic does.
+
+### Which class to subclass
+
+```
+FinanceAgentBase            bookkeeping, logging, event hooks; defines respond
+  └── FinanceAgent          adds respond_simulation + respond_exchange  <- subclass this
+        └── GenTRXAgent     the same, plus GenTRX model support
+```
+
+Subclass **`FinanceAgent`** (or `GenTRXAgent` if you want the model helpers). All of the example agents in
+this directory reach `FinanceAgent` through `GenTRXAgent`, so they serve both modes already.
+
+`FinanceAgentBase` is the mode-agnostic base: it does history, logging and event dispatch, and defines
+`respond`, but it has no `respond_exchange` and no exchange branch, so an agent built directly on it is
+never served the exchange path. **It was called `FinanceSimulationAgent` before 0.6.0, and that name still
+works** as an alias, so existing agents need no edit. New agents should name `FinanceAgent`.
+
+### Which method is called
+
+| you implement | called in simulation | called on the exchange |
+|---|---|---|
+| `respond(state)` | yes | yes |
+| `respond_simulation(state)` | yes, instead of `respond` | no |
+| `respond_exchange(state)` | no | yes, instead of `respond` |
+
+`respond_simulation` and `respond_exchange` both fall back to `respond`, so **implementing `respond`
+alone is enough for both modes**. Override one of the others only when you want genuinely different
+behaviour in that mode.
+
+```python
+from taos.im.agents import FinanceAgent
+
+class MyTradingAgent(FinanceAgent):
+    def initialize(self):
+        ...
+
+    def respond(self, state):                 # serves BOTH modes
+        r = self.make_response()
+        ...
+        return r
+```
+
+### Building the response
+
+Use `self.make_response()`. It returns a response object with the same API in both modes and builds the
+correct instruction types for whichever mode is being served. If you override `respond_simulation` or
+`respond_exchange`, pass the mode explicitly (`self.make_response(exchange_mode=True)`) rather than
+relying on the instance attribute, because concurrent requests from both validators share it.
+
+### What differs between the modes
+
+Most logic needs no mode branch: accounts and books are the same objects in both. Where you do need to
+know, read `self.exchange_mode`.
+
+* the state object is `MarketSimulationStateUpdate` in simulation and `ExchangeStateUpdate` on the
+  exchange; both carry the same `books`, `accounts` and `notices` surfaces
+* `onStart` and `onEnd` fire only in simulation, because an exchange does not start or end. Every other
+  notice handler fires in both
+* leverage is inert on the exchange (`maxLeverage` is 0), so leveraged orders are refused there
+* `close_position` and `close_positions` are **simulation only**. Closing a position settles a margin
+  loan, and the exchange has no leverage to settle: the exchange accepts three instructions in total
+  (limit order, market order, cancel), so there is no close-position instruction to send. Calling either
+  on the exchange logs a warning and adds nothing to your response, it does not raise. If your agent
+  closes positions, guard the call with `if not self.exchange_mode:` so the intent is explicit in your
+  own code. `onPositionClosed` and `onPositionCloseFailed` correspondingly never fire there
+* `OrderCurrency` accepts BOTH spellings in BOTH trees: `BASE`/`QUOTE` are canonical and `ALPHA`/`TAO`
+  are aliases of the same members, with the same values -- see the note under the order instructions above
+
+## Exchange venue behaviours that catch people out
+
+These are properties of the live venue, not of the agent API. They apply when your agent runs on the
+exchange mechanism and are the things most likely to make a correct-looking order fail.
+
+### Prices land on a grid, and the grid TRUNCATES
+
+**Read this before you debug a fill that did not happen.**
+
+The book has a fixed number of price decimals. A price you submit is truncated to that grid, not
+rounded to it. That is deliberate: the grid is what makes resting orders comparable.
+
+The consequence is not obvious, because binary floating point does not represent most decimal prices
+exactly. A price computed in Python can sit a hair *below* the value you typed:
+
+```python
+>>> px = round(0.013637092231045785 * 0.5, 4)
+>>> px
+0.0068                                  # what you see
+>>> from decimal import Decimal; Decimal(px)
+Decimal('0.006799999999999999621136392846665330580435693264007568359375')
+```
+
+That is below `0.0068`, so truncation to four places yields **`0.0067`**, a whole tick lower than you
+intended. Your order rests one tick away, and the quote reserved against it is smaller in proportion.
+Measured on a real order: a 3,335,926.3957 buy reserved 22,350.71 TAO rather than the 22,684.30 the
+price implied, a 1.5% difference caused entirely by the last decimal place.
+
+Nothing rejects the order and nothing warns you. It rests at a legal price, just not the one you
+meant.
+
+This applies to **simulation as well as the exchange**: every numeric field arrives through the same
+deserializer, so the behaviour is the same wherever you trade.
+
+**Work in integer ticks and convert once.** Decide how many ticks from a reference price you want to
+be, then build the price from that:
+
+```python
+TICK = 10 ** -price_decimals
+
+def on_grid(price: float) -> float:
+    """Snap to the grid the same way the book will, with the float error removed first."""
+    from decimal import Decimal, ROUND_HALF_UP
+    q = Decimal(1).scaleb(-price_decimals)
+    return float(Decimal(repr(price)).quantize(q, rounding=ROUND_HALF_UP))
+```
+
+`Decimal(repr(price))` is the important part: `repr` gives the shortest decimal that round-trips, so
+`0.0068` stays `0.0068` instead of becoming `0.00679999…`. Quantize, then submit.
+
+Check what you got rather than what you sent: the resting order reported back in the next state
+carries the price the book actually holds. If it differs from your intent, this is why.
+
+### A SELL draws on ONE delegate, so your free balance is not your sell limit
+
+This is the constraint most likely to surprise you, because the number that looks authoritative is the
+wrong one.
+
+Your alpha on a book is held as **delegated stake**, and it can sit with several delegates at once.
+`account.base_balance.free` is the **sum** across all of them. A SELL, though, is a pool swap against
+**one** named delegate, so the most a single order can sell is the largest individual delegate's stake,
+not the sum.
+
+```python
+acct = self.accounts[book_id]
+acct.base_balance.free   # 1.49965345: the SUM across delegates
+acct.delegate_stakes     # {'5AAA…': 0.76217809, '5BBB…': 0.73747536}
+acct.sellable_alpha      # 0.76217809: the largest single delegate, your real cap
+```
+
+Size a SELL against `sellable_alpha`, not `base_balance.free`. Sizing against the sum produces an order
+the engine cannot fill: it is refused as insufficient funds or, if you set `allow_partial=True`,
+filled only up to that delegate's capacity, which is a short fill you did not ask for.
+
+`delegate_stakes` being **empty means NOT REPORTED**, not "no stake". Fall back to `base_balance.free`
+in that case rather than concluding you hold nothing.
+
+### Leverage is refused on the exchange
+
+Exchange mode runs with `maxLeverage=0`. A leveraged order is **rejected at placement**, not quietly
+executed unleveraged, so an agent that requests leverage unconditionally works in simulation and places
+nothing here. Branch on `self.exchange_mode`:
+
+```python
+def leverage(self):
+    if self.exchange_mode:
+        return 0.0
+    return round(random.uniform(self.min_leverage, self.max_leverage), 2)
+```
+
+Returning it from one helper rather than at each call site also keeps any
+`quantity() * (1 + leverage())` sizing consistent. The shipped examples do exactly this.
+
+## Things that will save you time
+
+| Symptom | Cause |
+|---|---|
+| never queried, no error | the axon address you published is not reachable from the validator |
+| order rests a tick off | the grid truncates; see above |
+| order rejected for size | below the minimum order size, or below the minimum stake |
+| SELL rejected for funds while the balance looks sufficient | you sized against `base_balance.free` (the sum) instead of `sellable_alpha` (one delegate) |
+| every order rejected, simulation was fine | you are requesting leverage; exchange mode runs `maxLeverage=0` |
+| reserved less than expected | the reservation is quantity times the **resting** price, not your intended price |
+| no fill on a crossing order | check the resting price first, then the available depth |
+
+## Configuration
+
+`initialize()` reads whatever you put in the `agents` section of your launcher config for your
+class, so parameters belong there rather than hard-coded. `bin/agent_params.sh` lists the
+parameters each shipped example expects.
+
+Fields your agent reads off `self.simulation` (book count, price and volume decimals, initial price,
+maximum open orders, publish interval) come from the exchange itself, so they are correct for the book
+you are trading without you configuring anything.
+
 ## Response
 
 Once a miner has received and analyzed the data, they must make a decision about what instructions they wish to submit to the simulation.  Any trading strategy is possible to implement, but note that the state is only published once every `config.publish_interval` simulation nanoseconds, and miners are only able to submit instructions in response to the state.  This implies that strategies must all operate at >= (`publish_interval / 1e9`) second timescale (we aim to lift/reduce this limitation in future).  Some simple example agent implementations can be found in this directory; **it is not expected that running any of the example agents without modification would lead to successful mining in the subnet**.
@@ -128,7 +322,27 @@ Miners are expected to develop their own custom agent logic and compete to impro
 
 ### The `FinanceAgentResponse` Class
 
-In order to submit instructions to the validator, a miner must respond to the validator request with an instance of the [`FinanceAgentResponse` class](/taos/im/protocol/response.py).  This class contains one property, `instructions`, which holds an array of `FinanceInstruction`, defined to encapsulate the four main instruction types which miners are able to execute : `PlaceMarketOrderInstruction`, `PlaceLimitOrderInstruction`, `CancelOrdersInstruction` and `ClosePositionsInstruction` (defined [here](/taos/im/protocol/instructions.py)).  The class additionally exposes convenience methods which allow to easily attach these instruction types to the `FinanceAgentResponse` instance:
+In order to submit instructions to the validator, a miner must respond to the validator request with an instance of the [`FinanceAgentResponse` class](../taos/im/protocol/response.py).  This class contains one property, `instructions`, which holds an array of `FinanceInstruction`, defined to encapsulate the four main instruction types which miners are able to execute : `PlaceMarketOrderInstruction`, `PlaceLimitOrderInstruction`, `CancelOrdersInstruction` and `ClosePositionsInstruction` (defined [here](../taos/im/protocol/instructions.py)).  The class additionally exposes convenience methods which allow to easily attach these instruction types to the `FinanceAgentResponse` instance:
+
+---
+
+#### Orders below the book's minimum size are rejected
+
+Every book enforces a minimum order quantity. An order whose `quantity` falls below it is rejected
+by the engine rather than partially accepted, and the rejection arrives as an order-rejected notice
+rather than a fill.
+
+The active value is on the state you already receive, so read it instead of assuming a number:
+
+```python
+min_size = float(getattr(state.config, "min_order_size", 0.0) or 0.0)
+if quantity < min_size:
+    return  # too small to be accepted
+```
+
+`min_order_size` is `0.0` only when a book sets no minimum. Shipped configurations set values as
+large as `0.25`, so an agent that hardcodes a small fixed quantity can have every order rejected on
+one book while trading normally on another. Size against the value on the state, per book.
 
 ---
 
@@ -161,9 +375,31 @@ response.market_order(
 | `delay`              | `int`, optional                         | Delay in simulation nanoseconds before the order reaches the market. This delay is added to the delay calculated based on response time. Defaults to `0`.                                                                      |
 | `clientOrderId`      | `int` or `None`, optional               | Optional client-specified order ID for tracking.                                                                                          |
 | `stp`                | `STP`, optional                         | Self-trade prevention strategy (`STP.NO_STP`, `STP.CANCEL_OLDEST`, `STP.CANCEL_NEWEST`, `STP.CANCEL_BOTH`, `STP.DECREASE_CANCEL`). Defaults to `STP.CANCEL_OLDEST`.                             |
-| `currency`           | `OrderCurrency`, optional               | Currency to use for the order quantity (`OrderCurrency.BASE` or `OrderCurrency.QUOTE`). If set to `QUOTE`, the `quantity` will be interpreted as the amount of QUOTE currency to exchange. Defaults to `BASE`.                                 |
+| `currency`           | `OrderCurrency`, optional               | Currency to use for the order quantity (`OrderCurrency.BASE` or `OrderCurrency.QUOTE`). If set to `QUOTE`, the `quantity` will be interpreted as the amount of QUOTE currency to exchange. Defaults to `BASE`. On the exchange these are spelled `ALPHA` and `TAO` -- see [Currency names differ between the two modes](#currency-names-differ-between-the-two-modes). |
 | `leverage`           | `float`, optional                       | Leverage multiplier to apply to the order. The effective order quantity will be `(1+leverage)`. For example, an order for 1.0 BASE with 0.5 leverage will be placed for 1.5 BASE total, where 0.5 is borrowed from the exchange. Must be non-negative. Defaults to `0.0` (no leverage).                                 |
 | `settlement_option`  | `LoanSettlementOption` or `int`, optional | Strategy for settling outstanding margin loans using the proceeds of this order. Options: `LoanSettlementOption.NONE` (no loan repayments), `LoanSettlementOption.FIFO` (repay loans starting from oldest), or an integer order ID to repay the loan associated with a specific order. Defaults to `NONE`. Note: only unleveraged orders (`leverage=0`) can settle loans.                                 |
+
+##### **Currency names differ between the two modes**
+
+`taos.im.protocol` (simulation) and `taos.im.protocol.exchange` are parallel type trees, one per mode.
+The enums line up by **value**, so an agent that passes `OrderDirection.BUY`, `TimeInForce.GTC` or an
+`STP` member from the simulation tree keeps working when the same logic runs on the exchange.
+
+`OrderCurrency` is the one exception, and it is a naming difference only:
+
+| value | simulation | exchange | meaning |
+|---|---|---|---|
+| `0` | `OrderCurrency.BASE` | `OrderCurrency.ALPHA` | the subnet's alpha token |
+| `1` | `OrderCurrency.QUOTE` | `OrderCurrency.TAO` | TAO |
+
+Alpha is the base asset and TAO is the quote, so the two spellings mean the same thing -- and both
+resolve in both trees. `OrderCurrency.BASE` and `OrderCurrency.ALPHA` are the same member, as are `QUOTE`
+and `TAO`, so an agent can import the enum from either tree and use either spelling. Passing the integer
+value works too, and is identical on both.
+
+This was not always true: until 2026-08-20 the simulation tree had only `BASE`/`QUOTE` and the exchange
+tree only `ALPHA`/`TAO`, so a dual-mode agent raised `AttributeError` on whichever tree it had not been
+written against. If you are reading older agent code that carefully imports from one tree, that is why.
 
 ##### **Example**
 ```python
@@ -365,7 +601,7 @@ response.close_positions(
 
 ### Timeout
 
-The query logic of validators enforces a timeout which specifies how long miners may take at maximum to respond to state updates.  The exact value of the timeout is subject to change, and is set in the [validator config](/taos/im/config/__init__.py) as `neuron.timeout` (see the `default` value for the current active setting).  If a response is not received within the timeout, no instructions will be submitted to the simulator for that agent.  It is the miner agent's responsibility to ensure that they receive, decompress and process the state update, as well as generate and return instructions, before the timeout expires.  This requires to allocate sufficient resources (CPU and network bandwidth) and optimize data analysis and other processes involved in trading decision making; it will also benefit the miner to locate nearby to key validators.
+The query logic of validators enforces a timeout which specifies how long miners may take at maximum to respond to state updates.  The exact value of the timeout is subject to change, and is set in the [validator config](../taos/im/config/__init__.py) as `neuron.timeout` (see the `default` value for the current active setting).  If a response is not received within the timeout, no instructions will be submitted to the simulator for that agent.  It is the miner agent's responsibility to ensure that they receive, decompress and process the state update, as well as generate and return instructions, before the timeout expires.  This requires to allocate sufficient resources (CPU and network bandwidth) and optimize data analysis and other processes involved in trading decision making; it will also benefit the miner to locate nearby to key validators.
 
 Parsing state updates is a major source of processing overhead for miners and can lead to timeouts even when the decision-making logic itself runs quickly. To reduce unnecessary work, the miner framework provides a configurable optimization called _lazy loading_. When enabled, deserialization defers the instantiation and validation of the Pydantic models that represent the state until their corresponding data fields are actually accessed.  This approach can drastically shorten the initial parsing time by skipping the construction and validation of unused data structures. As a result, agents that only interact with a subset of the state avoid the overhead of loading components they never use.
 
@@ -385,7 +621,7 @@ When you submit instructions as a miner agent, they’re not executed immediatel
 - This delay is based on how quickly your agent responds to the validator’s state update.  
 - **Faster responses mean your instructions are executed sooner** than those of slower agents.
 
-The logic for calculating these delays is defined in the [`set_delays`](/taos/im/validator/reward.py) function.  
+The logic for calculating these delays is defined in the [`set_delays`](../taos/im/validator/reward.py) function.  
 
 #### The `delay` Parameter
 
@@ -440,9 +676,9 @@ Trading volume plays an important role in determining the rewards assigned to a 
 
 #### Contribution to Reward
 
-The primary component of incentive mechanism of the subnet is the risk-adjusted performance of the strategy, which is calculated using an intra-day Kappa-3 ratio where the returns are obtained as the difference in total inventory value held by the agent between subsequent state updates (see [rewarding logic](/taos/im/validator/reward.py)).  
+The primary component of incentive mechanism of the subnet is the risk-adjusted performance of the strategy, which is calculated using an intra-day Kappa-3 ratio where the returns are obtained as the difference in total inventory value held by the agent between subsequent state updates (see [rewarding logic](../taos/im/validator/reward.py)).  
 
-In order to avoid rewarding miners who do not participate in active trading, as well as to incentivize the creation of volume in the simulated market, the calculated Kappa-3 values are then scaled by a factor derived using the agent's total traded volume over a [configured period](/taos/im/config/__init__.py) (see `scoring.activity.trade_volume_assessment_period`) of simulation time.  It should further be noted that, although any amount of traded volume within each `scoring.activity.trade_volume_sampling_interval` will trigger the volume factor to be assigned a value based on the traded volume during the assessment period, if no trades occur in the previous sampling interval then the volume factor will start to decay.  This is designed to prevent miners from producing a burst of trading activity once within the assessment period, and then stopping trading activity to benefit from the volume factor without maintaining consistent active trading. 
+In order to avoid rewarding miners who do not participate in active trading, as well as to incentivize the creation of volume in the simulated market, the calculated Kappa-3 values are then scaled by a factor derived using the agent's total traded volume over a [configured period](../taos/im/config/__init__.py) (see `scoring.activity.trade_volume_assessment_period`) of simulation time.  It should further be noted that, although any amount of traded volume within each `scoring.activity.trade_volume_sampling_interval` will trigger the volume factor to be assigned a value based on the traded volume during the assessment period, if no trades occur in the previous sampling interval then the volume factor will start to decay.  This is designed to prevent miners from producing a burst of trading activity once within the assessment period, and then stopping trading activity to benefit from the volume factor without maintaining consistent active trading. 
 
 The inclusion of this factor in the scoring has the effect of magnifying the Kappa-3 ratios for miners which have executed more volume during the assessment period.  If the agent achieves a good Kappa-3 ratio while also trading significant volume, they will be rewarded more highly than a miner with the same performance at a lower traded volume.  Similarly, if a miner has high volume and poor Kappa-3 ratio, they will receive a worse score than a miner with the same performance and lower volume.  This discourages maximization of volume without sufficient regard for the performance, while also incentivizing the deployment of strategies which are both optimally risk-managed and highly active.
 
@@ -458,18 +694,24 @@ Explicitly, if a miner has traded more than `scoring.activity.capital_turnover_c
 
 ### Local
 
-You can debug and test your agent logic offline before deploying to testnet or mainnet by making use of the facilities documented [here](/agents/proxy/README.md).  This setup allows to launch the simulator on your machine, and receive messages to the agent via a proxy which fulfils the role of the validator in a local setting.
+You can debug and test your agent logic offline before deploying to testnet or mainnet by making use of the facilities documented [here](proxy/README.md).  This setup allows to launch the simulator on your machine, and receive messages to the agent via a proxy which fulfils the role of the validator in a local setting.
 
 For agents that participate in **GenTRX distributed training** (in addition
 to trading), see:
-- [`agents/proxy/README.md`](/agents/proxy/README.md) — proxy
+- [`agents/proxy/README.md`](proxy/README.md) : proxy
   test with the full GenTRX gradient-server loop (no chain).
-- [`doc/gentrx/miner_setup.md`](/doc/gentrx/miner_setup.md) — production
+- [`doc/gentrx/miner_setup.md`](../doc/gentrx/miner_setup.md) : production
   miner setup (R2 bucket + on-chain commit).
+
+### Public localnet
+
+The exchange runs on a public localnet at `wss://localnet.mvtrx.exchange:443`, which is open for
+testing. This is the place to exercise trading logic against a live exchange before you commit to
+mainnet. Point your miner at it with `-e wss://localnet.mvtrx.exchange:443`.
 
 ### Testnet (Netuid 366)
 
-Once you are satisfied that your agent logic works as intended, we recommend to register a UID on testnet (netuid 366) and deploy your miner as you intend to host it in mainnet environment.  This allows to confirm that all is properly configured for communication with validators, and the resources allocated to the miner are sufficient.  You can request testnet TAO at the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629).
+Once you are satisfied that your agent logic works as intended, we recommend to register a UID on testnet (netuid 366) and deploy your miner as you intend to host it in mainnet environment.  This allows to confirm that all is properly configured for communication with validators, and the resources allocated to the miner are sufficient.  The test network carries no exchange, so use the public localnet above to exercise trading itself.  You can request testnet TAO at the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629).
 
 ### Mainnet (Netuid 79)
 
@@ -481,7 +723,7 @@ Good luck!
 
 ## GenTRX Distributed Training <span id="gentrx"><span>
 
-In addition to trading, miners can participate in **GenTRX** — a distributed training loop that builds a shared generative order-book model. Each training round, a miner downloads recent simulation data from the validator's S3 bucket, trains for a configurable number of steps, and uploads a compressed gradient delta. Validators score the gradient against held-out data; the aggregator (uid 0) aggregates accepted deltas and publishes the next checkpoint.
+In addition to trading, miners can participate in **GenTRX**, a distributed training loop that builds a shared generative order-book model. Each training round, a miner downloads recent simulation data from the validator's S3 bucket, trains for a configurable number of steps, and uploads a compressed gradient delta. Validators score the gradient against held-out data; the aggregator (uid 0) aggregates accepted deltas and publishes the next checkpoint.
 
 **Reward:** 5% of miner rewards are allocated to the GenTRX training pool by default (configurable by validators via `--scoring.gentrx.simulation_share`). This is separate from and additive to trading rewards: a miner that both trades well and trains well earns from both pools.
 
@@ -496,18 +738,19 @@ All example agents support GenTRX distributed training. Training is **off by def
 | [`ImbalanceAgent`](ImbalanceAgent.py) | LOB imbalance signal | Add `gtx_training_enabled=true` to enable |
 | [`MovingHurstAgent`](MovingHurstAgent.py) | Hurst exponent momentum/reversion | Add `gtx_training_enabled=true` to enable |
 | [`OrderOptionAgent`](OrderOptionAgent.py) | Advanced order options demo | Add `gtx_training_enabled=true` to enable |
-| [`SimpleAgent`](SimpleAgent.py) | External signal + OHLC candles | Add `gtx_training_enabled=true` to enable |
 | [`RevengAgent`](RevengAgent.py) | Volume-bucket momentum/reversion | Add `gtx_training_enabled=true` to enable |
 | [`HybridTrainingAgent`](HybridTrainingAgent.py) | Imbalance-driven maker/taker | Training on by default; **template, not a finished strategy** |
-| [`CustomTrainingAgent`](CustomTrainingAgent.py) | None — annotated template | Override `_train_background` to plug in a custom training loop |
+| [`CustomTrainingAgent`](CustomTrainingAgent.py) | None (annotated template) | Override `_train_background` to plug in a custom training loop |
 
-`GenTRXAgent` is the base class for all of the above; it lives in `taos.im.agents` (not in this directory). **To add GenTRX training to a custom strategy**, subclass `GenTRXAgent`, call `super().initialize()` and `super().respond(state)`, and the training loop is inherited. See [`CustomTrainingAgent.py`](CustomTrainingAgent.py) for an annotated example and [`doc/gentrx/integration.md`](/doc/gentrx/integration.md) for the full contract.
+`GenTRXAgent` is the base class for all of the above; it lives in `taos.im.agents` (not in this directory). **To add GenTRX training to a custom strategy**, subclass `GenTRXAgent`, call `super().initialize()` and `super().respond(state)`, and the training loop is inherited. See [`CustomTrainingAgent.py`](CustomTrainingAgent.py) for an annotated example and [`doc/gentrx/integration.md`](../doc/gentrx/integration.md) for the full contract.
 
 > **Note on `HybridTrainingAgent`:** Its docstring explicitly warns that deploying unmodified copies across many miners will cause them to interfere with each other. Use it as a starting point and customize the signal logic.
 
+> **Note on dependencies:** the training path of these agents relies on the `[gentrx]` extra (torch, polars, pyarrow), which a plain install does not pull in. That applies to `CustomTrainingAgent` and `HybridTrainingAgent`, and to any of the others once you pass `gtx_training_enabled=true`. Run `pip install -e ".[gentrx]"` from the repository root before launching them. `RevengAgent`'s optuna optimizer is the exception: optuna is a core dependency, so that agent's trading logic runs after a plain `pip install -e .`.
+
 ### Quick setup
 
-Full instructions are in [`doc/gentrx/miner_setup.md`](/doc/gentrx/miner_setup.md). In brief:
+Full instructions are in [`doc/gentrx/miner_setup.md`](../doc/gentrx/miner_setup.md). In brief:
 
 1. Create a Cloudflare R2 or Hippius bucket and generate write + read API tokens.
 2. Run `python bin/setup_miner_bucket.py …` to verify tokens and commit read credentials on-chain.
@@ -521,7 +764,7 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
 
 | Test | What it covers | Runner |
 |---|---|---|
-| Proxy test (no chain) | Full GenTRX training loop, assignment lifecycle, scoring | [`agents/proxy/README.md`](/agents/proxy/README.md) |
+| Proxy test (no chain) | Full GenTRX training loop, assignment lifecycle, scoring | [`agents/proxy/README.md`](proxy/README.md) |
 
 ---
 ---
@@ -552,7 +795,7 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
 
 - `config`
 
-  Contains details of the simulation configuration ([`MarketSimulationConfig`](/taos/im/protocol/models.py)) used by the sending validator.  Includes simulation parameters, fee settings, and agent configurations.
+  Contains details of the simulation configuration ([`MarketSimulationConfig`](../taos/im/protocol/models.py)) used by the sending validator.  Includes simulation parameters, fee settings, and agent configurations.
 
   The fields which are important for miners are:
 

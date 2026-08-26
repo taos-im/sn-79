@@ -106,12 +106,43 @@ struct ServeHooks
     // decoded request, or is nullptr when decoding failed. Must not throw.
     std::function<
         void(const Request* request, const Response& response, const ServeTiming&)> onServed;
+    // Produce the response for a request whose BYTES are identical to the immediately preceding one,
+    // WITHOUT running the handler. Opt-in: when unset there is no duplicate detection at all and the
+    // handler sees every request, which is what every other user of this channel wants.
+    //
+    // WHY BYTES AND NOT A FIELD. A response timeout on the peer side once caused the same request to
+    // be delivered twice; the handler had no idea and executed it twice, so a single order minted two
+    // trades with the same engine timestamp and the second never settled. The peer-side fix stops
+    // provoking it but does not make it impossible. The request's own step counter looked like the
+    // natural key and is NOT unique per request: the peer sends a reconciliation and an instruction
+    // batch under the same step, so guarding on it would silently drop every second request. The
+    // packed bytes are unique per request by construction, because a re-send transmits the identical
+    // buffer while any genuinely new request differs in at least its instruction sequence numbers.
+    std::function<Response()> onDuplicate;
 };
 
 //-------------------------------------------------------------------------
 
 namespace detail
 {
+
+// FNV-1a over the request bytes. Dependency-free and fast on a few hundred kilobytes; this is a
+// duplicate-delivery discriminator, not a security primitive, and the two cases it must separate are
+// "the identical buffer again" and "a different buffer". Returns non-zero for any non-empty input, so
+// zero can mean "nothing served yet".
+inline std::uint64_t hashRequestBytes(const void* data, std::size_t size) noexcept
+{
+    if (data == nullptr || size == 0) {
+        return 0u;
+    }
+    const auto* p = static_cast<const unsigned char*>(data);
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < size; ++i) {
+        h ^= static_cast<std::uint64_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h == 0u ? 1u : h;
+}
 
 // Pulls the next request: blocks on the req-mq for the byte count,
 // optionally drains the req-sem, then opens and maps the req-shm.
@@ -208,6 +239,9 @@ private:
     IpcChannelDesc m_desc;
     PosixMessageQueue m_reqMq;
     PosixMessageQueue m_resMq;
+    // Fingerprint of the previous request's bytes, for `ServeHooks::onDuplicate`. Zero means "nothing
+    // served yet", which no real request collides with because an empty request is never sent.
+    std::uint64_t m_lastReqHash{};
 };
 
 //-------------------------------------------------------------------------
@@ -246,6 +280,12 @@ void MsgPackServer<Request, Response>::serveOne(
     auto tUnpack = t0;
     auto tHandle = t0;
 
+    // Computed before decoding, so a duplicate costs a hash rather than a decode plus an execution.
+    const std::uint64_t reqHash = hooks.onDuplicate
+        ? detail::hashRequestBytes(received.region.get_address(), received.size)
+        : 0u;
+    const bool isDuplicate = hooks.onDuplicate && reqHash != 0u && reqHash == m_lastReqHash;
+
     Response res = [&]() -> Response {
         try {
             msgpack::object_handle oh = msgpack::unpack(
@@ -253,6 +293,13 @@ void MsgPackServer<Request, Response>::serveOne(
             oh.get().convert(req);
             reqPtr = &req;
             tUnpack = Clock::now();
+            if (isDuplicate) {
+                // Answer, but do not execute. Answering keeps the request/response handshake in lock-step
+                // (the peer is blocked awaiting a reply); not executing is the whole point.
+                Response r = hooks.onDuplicate();
+                tHandle = Clock::now();
+                return r;
+            }
             Response r = handler(static_cast<const Request&>(req));
             tHandle = Clock::now();
             return r;
@@ -287,6 +334,12 @@ void MsgPackServer<Request, Response>::serveOne(
     timing.handle = tHandle - tUnpack;
     timing.pack = tPack - tResReady;
     timing.publish = tPublish - tPack;
+
+    // Recorded after the cycle, so a request that threw before answering does not mark itself served and
+    // suppress its own legitimate retry.
+    if (reqHash != 0u) {
+        m_lastReqHash = reqHash;
+    }
 
     if (hooks.onServed) {
         hooks.onServed(reqPtr, res, timing);

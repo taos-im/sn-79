@@ -78,7 +78,7 @@ setup(
     description="taos",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/taos-im/taos",
+    url="https://github.com/taos-im/sn-79",
     author="taos.im",
     packages=find_packages(),
     include_package_data=True,

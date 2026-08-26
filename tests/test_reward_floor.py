@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""Tests for the soft score floor (anti-farming concentration lever).
+"""Tests for the soft score floor (concentration lever).
 
 `apply_reward_floor` tapers below-percentile trading scores toward zero before the
 Pareto allocation, so a fleet of merely-adequate UIDs stops earning while genuine
@@ -52,9 +52,8 @@ def test_softer_taper_keeps_more_than_sharper():
 
 
 def test_concentration_effect_on_farm_like_vector():
-    # 60 genuine miners above the median + a 40-UID mediocre fleet below it.
-    # (A fleet that IS the majority defines the median and won't be cut — so the
-    # exploited case is exactly the minority-fleet-below-median one modelled here.)
+    # 60 genuine miners above the median + a 40-UID mediocre fleet below it. The taper acts on
+    # position relative to the median, so a vector like this is the one that exercises it.
     honest = list(np.linspace(0.5, 1.0, 60))
     fleet = [0.2] * 40                                # below thr*(1-softness) -> floored
     r = honest + fleet

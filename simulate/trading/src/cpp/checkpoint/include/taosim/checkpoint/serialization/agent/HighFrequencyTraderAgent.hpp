@@ -63,7 +63,15 @@ struct convert<taosim::agent::HighFrequencyTraderAgent>
                 val.convert(v.id());
             }
             else if (key == "pRes") {
-                val.convert(v.pRes());
+                // 2026-08 audit fix D2 migration: pRes was a scalar in pre-batch
+                // checkpoints; broadcast it into the (configure()-sized) per-book
+                // vector instead of throwing msgpack::type_error on restore.
+                if (val.type == msgpack::type::FLOAT64 || val.type == msgpack::type::FLOAT32) {
+                    const double scalar = val.as<double>();
+                    for (auto& p : v.pRes()) p = scalar;
+                } else {
+                    val.convert(v.pRes());
+                }
             }
         }
 

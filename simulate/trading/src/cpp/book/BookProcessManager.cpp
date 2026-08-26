@@ -53,7 +53,11 @@ void BookProcessManager::updateProcesses(Timespan timespan)
             std::vector<double> processValues;
             for (Timestamp t = begin; t <= timespan.end; t += stride) {
                 process->update(t);
-                processValues.push_back(process->value());
+                // loggedValue(): the latent state at t. value() would evaluate at
+                // currentTimestamp() (== timespan.end for every t in this loop) and,
+                // for read-time-interpolating processes, record presentation rather
+                // than state — the CSV is the replay source and must stay latent.
+                processValues.push_back(process->loggedValue());
             }
             bookId2ProcessValues.insert({bookId, std::move(processValues)});
         }
@@ -121,7 +125,7 @@ std::unique_ptr<BookProcessManager> BookProcessManager::fromXML(
         loggers[name] = std::make_unique<BookProcessLogger>(
             simulation->logDir() / processLogFileName,
             container.at(name)
-            | views::transform([](const auto& p) { return p->value(); })
+            | views::transform([](const auto& p) { return p->loggedValue(); })
             | ranges::to<std::vector>,
             simulation);
     }

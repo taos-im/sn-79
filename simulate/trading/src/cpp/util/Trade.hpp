@@ -13,12 +13,46 @@
 #include "util.hpp"
 
 #include <memory>
+#include <optional>
 
 #include <msgpack.hpp>
 
 //-------------------------------------------------------------------------
 
-using TradeID = uint32_t;
+// 64-bit deliberately. The exchange mints from ONE monotonic counter that is never reset
+// and resumes from a persisted high-water mark across restarts, so the width is a hard
+// ceiling on how many trades can ever be identified: at uint32_t that ceiling is
+// 4,294,967,295, past which the counter wraps and reissues an id an earlier trade already
+// used. Two unrelated trades sharing an id is precisely the cross-surface collision the
+// canonical <netuid>:<seq> identity exists to prevent.
+//
+// It also removes a width mismatch that was already live: the settlement structs declare
+// tradeId as optional<uint64_t>, so a large id decoded into a fill but threw std::bad_cast
+// as a staged-correction map KEY, discarding that whole block of the reconciliation.
+//
+// No migration is needed. msgpack encodes integers by VALUE, not by declared type, so the
+// checkpoint's packed counter (checkpoint/serialization/book/Book.hpp) and the correction
+// map keys are byte-identical for any value below 2^32, in both directions; the high-water
+// file is plain text.
+using TradeID = uint64_t;
+
+// THE single place a trade id is assigned. Both fills that the books matched
+// (Book::logTrade) and fills settled straight off the pool reserves
+// (MultiBookExchangeAgent::mintPoolTradeId) call through here, so there is one counter, one
+// increment, and one thing to reason about when asking whether an id can repeat.
+//
+// It is assigned when the fill is CREATED, not when it settles, because the id is the
+// correlation key: it travels out with the settlement request so the validator can stage a correction
+// against it, key the on-chain settlement to it, and hand the same id back on the result.
+// Deferring assignment to settlement would leave that whole chain with nothing to key by.
+[[nodiscard]] inline std::optional<TradeID> assignTradeId(
+    const std::shared_ptr<TradeID>& counter) noexcept
+{
+    // No shared counter means the books hold private sequences, where an id would collide
+    // across books; callers must treat that as "no id" rather than invent one.
+    if (!counter) return std::nullopt;
+    return (*counter)++;
+}
 
 //-------------------------------------------------------------------------
 
@@ -90,6 +124,10 @@ struct TradeContext : public JsonSerializable
     // SL/TP close metadata — 0/0 for regular orders.
     uint8_t aggressingCloseReason{0};   // 0=none, 1=SL, 2=TP
     OrderID aggressingOriginatingOrderId{0};
+    // Who caused the aggressing order to exist, when that is not its owner. Set only for sweep orders,
+    // which the exchange places under its own id after a miner's instruction moved the pool. Used for
+    // attribution and the self-trade guard; fees and settlement follow aggressingAgentId, not this.
+    std::optional<AgentId> initiatorAgentId;
 
     TradeContext() = default;
 
@@ -125,6 +163,10 @@ struct TradeLogContext : public JsonSerializable
     // SL/TP close metadata — 0/0 for regular orders.
     uint8_t aggressingCloseReason{0};   // 0=none, 1=SL, 2=TP
     OrderID aggressingOriginatingOrderId{0};
+    // Who caused the aggressing order, when that is not its owner. Set only on sweep orders, which the
+    // exchange places under its own id after a miner's instruction moved the pool. Read when recording
+    // the counterparty on the resting side's fill; fees and settlement follow aggressingAgentId.
+    std::optional<AgentId> initiatorAgentId;
 
     TradeLogContext() noexcept = default;
 

@@ -26,7 +26,10 @@ struct ExchangeSignals
     UnsyncSignal<void(CancellationWithLogContext)> cancelLog;
     UnsyncSignal<void(taosim::L3LogEvent)> L3;
     UnsyncSignal<void(const FeePolicyWrapper*, taosim::FeeLogEvent)> feeLog;
-    uint32_t eventCounter{};
+    // uint64 to match TradeID, which was widened while this was missed. It is the identity of every L3
+    // record (the "k" field), so it belongs in the same width as the other engine ids. The checkpoint
+    // format is unaffected: it packs as a positive integer and converts back into either width.
+    uint64_t eventCounter{};
 
     ExchangeSignals() noexcept;
 };

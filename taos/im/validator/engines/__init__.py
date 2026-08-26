@@ -20,6 +20,50 @@ from typing import Any, Optional
 # Canonical trade event
 # ─────────────────────────────────────────────────────────────────────────────
 
+def resolve_trade_roles(uid, signal_idx, maker_candidates, counterparty=None):
+    """(maker_uid, taker_uid) for a fill, from what the ENGINE stated about it.
+
+    The engine distinguishes the two kinds of LOB signal:
+
+        signal_index is not None -- derived from an instruction submitted this batch, so this
+                                    agent was the AGGRESSOR: it is the taker.
+        signal_index is None     -- a trade-feed signal: this agent's RESTING order was filled
+                                    by a crossing aggressor, so it is the maker.
+
+    An absent side means the POOL. Settlement is always against the pool and funds never move
+    agent to agent, so the pool is a real counterparty, and because exactly one side is ever
+    absent the representation is unambiguous.
+
+    This replaces two wrong assumptions. `taker_uid = uid` unconditionally recorded a resting
+    fill's agent as the taker, which states the opposite of what happened. And
+    `maker_uid = uid` as the no-counterparty fallback published the agent as its own
+    counterparty: a live notice carried Ma = 171, Ta = 171 while the tape recorded
+    maker_uid = NULL for the same trade, so two surfaces disagreed about one fill.
+
+    `counterparty` is the OTHER side as the engine stated it (Signal.counterparty_agent_id,
+    populated from the trade context's aggressingAgentId). When present it is used directly and
+    the candidate list is ignored: the engine holds this fact, so deriving it here would be
+    inventing an answer to a question already answered. The candidate fallback remains only for
+    signals that predate the field.
+
+    Args:
+        uid: The uid the signal belongs to.
+        signal_idx: The engine's signal index; None means a resting-order fill.
+        maker_candidates: Uids that could be the maker.
+        counterparty: The other side as the engine stated it.
+
+    Returns:
+        tuple: ``(maker_uid, taker_uid)``.
+    """
+    if counterparty is not None and counterparty != uid:
+        return ((uid, counterparty) if signal_idx is None else (counterparty, uid))
+    others = [c for c in (maker_candidates or []) if c is not None and c != uid]
+    if signal_idx is None:
+        # This agent was resting. The aggressor is whoever crossed it; absent that, the pool.
+        return uid, (others[0] if others else None)
+    return (others[0] if others else None), uid
+
+
 @dataclass
 class NormalizedTradeEvent:
     """
@@ -31,13 +75,20 @@ class NormalizedTradeEvent:
 
     book_id  — simulation: book index  |  exchange: netuid
     side     — 0 = buy, 1 = sell
-    maker_uid / taker_uid — both set to uid for AMM fills (no counterparty)
+    maker_uid / taker_uid — order ROLE, as the engine determined it. taker is the aggressing
+        side; maker is the resting side, or None when the fill was against the pool and there
+        is no agent counterparty. Settlement is always against the pool and funds never move
+        agent to agent, so an absent maker is the normal case for a marketable order, and it
+        must never be filled in with the taker's own uid: doing so published the miner as its
+        own counterparty (Ma = Ta = 171 on a live notice) while the tape said maker_uid NULL
+        for the same trade. The engine is the source of truth for this; nothing downstream
+        should re-derive it.
     """
     book_id:   int
     quantity:  float
     price:     float
     side:      int
-    maker_uid: int
+    maker_uid: Optional[int]
     taker_uid: int
     maker_fee: float
     taker_fee: float
@@ -46,17 +97,32 @@ class NormalizedTradeEvent:
     order_uuid:          Optional[str] = field(default=None)   # full exchange-API UUID ('xo' on notices)
     close_reason:        Optional[str] = field(default=None)   # 'SL' | 'TP' | None
     linked_order_id:     Optional[int] = field(default=None)   # originating LOB order id
+    # Engine-minted trade id. Without it this event could not be matched against the
+    # reconciled fill for the same trade, so the two reached the UI as separate fills
+    # (one with an id, one without) and rendered twice.
+    trade_id:            Optional[int] = field(default=None)
+    # The two orders that met. Consumers index these directly ('Ti'/'Mi' in
+    # protocol/models.py::from_json), and they are how the service and UI tie a fill back to the order it
+    # filled. Zero where the producer does not know them: a pre-settlement trade event is raised before
+    # reconciliation names the orders.
+    taker_order_id:      int = 0
+    maker_order_id:      int = 0
 
     def to_notice_dict(self) -> dict:
+        """This trade as the compact notice dict miners receive.
+
+        Returns:
+            dict: An ET notice carrying the trade's ids, sides, amounts and fees.
+        """
         d = {
             'y':  'ET',
             't':  self.timestamp,
             'a':  self.taker_uid,
             'b':  self.book_id,
-            'i':  0,
+            'i':  self.trade_id,
             'c':  None,
-            'Ti': 0,
-            'Mi': 0,
+            'Ti': self.taker_order_id,
+            'Mi': self.maker_order_id,
             'q':  self.quantity,
             'p':  self.price,
             's':  self.side,
@@ -149,6 +215,13 @@ class MarketEngine(ABC):
                     tick's state.notices itself. Returns [].
         Exchange:   send instructions to LOB engine, execute on-chain,
                     convert ExecutionResult[] → NormalizedTradeEvent[].
+
+        Args:
+            state: The block's state update.
+            miner_responses: The miners' responses.
+
+        Returns:
+            list: Canonical trade events (empty in simulation mode).
         """
 
     @abstractmethod
@@ -158,6 +231,10 @@ class MarketEngine(ABC):
 
         Simulation: msgpack.packb(response) → write to /taosim-res socket.
         Exchange:   no-op (on-chain execution is the response).
+
+        Args:
+            raw_message: The request being answered.
+            response: The validator response.
         """
 
     def start(self) -> None:
@@ -218,6 +295,7 @@ class MarketEngine(ABC):
 
     @property
     def book_count(self) -> int:
+        """How many books this engine runs."""
         return len(self.book_ids)
 
     @property
@@ -252,6 +330,10 @@ class MarketEngine(ABC):
         Simulation: scans state.notices for RDRA/ERDRA system notices.
         Exchange:   no-op — deregistrations are detected in resync_metagraph()
                     and placed directly into validator.deregistered_uids.
+
+        Args:
+            state: The block's state update.
+            pending: Set of uids to extend with reset targets.
         """
 
     # ── New engine interface methods ─────────────────────────────────────────
@@ -274,8 +356,20 @@ class MarketEngine(ABC):
         """Restore mode-specific state from dict loaded from disk."""
 
     @abstractmethod
-    def handle_deregistration(self, uid: int) -> None:
-        """Mode-specific deregistration: zero score, flag for reset, etc."""
+    def handle_deregistration(self, uid: int, old_coldkey: str | None = None) -> None:
+        """Mode-specific deregistration: zero score, flag for reset, etc.
+
+        `old_coldkey` names the coldkey that held the slot, for engines that must retire something bound to
+        it (the exchange engine retires the departed miner's settlement-proxy wallet). It is part of the
+        signature HERE, not only on the implementation that needs it, because the validator calls every
+        engine identically and a narrower override raises TypeError out of the metagraph resync rather
+        than failing locally. Optional, because the base validator
+        (taos/common/neurons/validator.py:391) calls it with uid alone.
+
+        Args:
+            uid: The deregistered uid.
+            old_coldkey: The coldkey that held the slot, for engines that retire state bound to it.
+        """
 
     @abstractmethod
     def apply_resets(self, pending: set) -> None:
@@ -287,7 +381,12 @@ class MarketEngine(ABC):
         return self.validator.metagraph
 
     def on_resync_metagraph(self, old_size: int, new_size: int) -> None:
-        """Called when metagraph size changes during resync. Default: no-op."""
+        """Called when metagraph size changes during resync. Default: no-op.
+
+        Args:
+            old_size: Metagraph size before the resync.
+            new_size: Metagraph size after.
+        """
 
     def on_tick(self, state: "NormalizedState") -> None:
         """
@@ -298,5 +397,6 @@ class MarketEngine(ABC):
         """
 
 from taos.im.validator.engines.simulation import SimulationEngine
-# ExchangeEngine is exchange-mode-only; consumers must import it explicitly:
+# ExchangeEngine is an optional exchange-mode component; not part of this tree. Consumers must import it
+# explicitly, under a guard:
 #   from taos.im.validator.engines.exchange import ExchangeEngine, ExchangeConfig

@@ -14,7 +14,7 @@ import time
 from taos.im.validator.metagraph_worker import MetagraphSyncWorker
 
 
-def _echo_worker(conn, endpoint, netuid, cores):
+def _echo_worker(conn, endpoint, netuid, cores, mechid=0):
     """Responds to each sync with a picklable payload carrying its args."""
     conn.send(("ready", None))
     while True:
@@ -25,10 +25,11 @@ def _echo_worker(conn, endpoint, netuid, cores):
         if cmd == "stop":
             break
         if cmd == "sync":
-            conn.send(("ok", pickle.dumps({"endpoint": endpoint, "netuid": netuid})))
+            conn.send(("ok", pickle.dumps(
+                {"endpoint": endpoint, "netuid": netuid, "mechid": mechid})))
 
 
-def _err_worker(conn, endpoint, netuid, cores):
+def _err_worker(conn, endpoint, netuid, cores, mechid=0):
     conn.send(("ready", None))
     while True:
         try:
@@ -41,7 +42,7 @@ def _err_worker(conn, endpoint, netuid, cores):
             conn.send(("err", "chain unreachable"))
 
 
-def _dying_worker(conn, endpoint, netuid, cores):
+def _dying_worker(conn, endpoint, netuid, cores, mechid=0):
     conn.send(("ready", None))
     # exits immediately — simulates a crashed worker
 
@@ -51,7 +52,7 @@ def test_sync_returns_unpickled_payload():
     w.start()
     try:
         out = w.sync(timeout=15.0)
-        assert out == {"endpoint": "ws://x:9944", "netuid": 79}
+        assert out == {"endpoint": "ws://x:9944", "netuid": 79, "mechid": 0}
         # second request on the same worker (persistent loop)
         assert w.sync(timeout=15.0) == out
     finally:

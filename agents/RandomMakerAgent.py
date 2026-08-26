@@ -10,10 +10,8 @@ from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import OrderDirection, STP, TimeInForce, LoanSettlementOption
 import random
 
-"""
-A simple example agent which randomly places limit orders between the best levels of the book.
-"""
 class RandomMakerAgent(GenTRXAgent):
+    """Example: rests random passive quotes, useful as background liquidity."""
     def initialize(self):
         """
         Initializes properties, variables and quantities that will be used by the agent.
@@ -40,9 +38,16 @@ class RandomMakerAgent(GenTRXAgent):
         """
         Obtains a random leverage value for order placement within the bounds defined by the agent strategy parameters.
         """
+        # EXCHANGE MODE RUNS WITH maxLeverage=0, so a leveraged order is REFUSED at placement rather
+        # than executed unleveraged. Returning 0 here rather than at each call site also fixes the
+        # `quantity() * (1 + leverage())` sizing below, which would otherwise inflate an order the
+        # exchange will not accept. Simulation behaviour is unchanged.
+        if self.exchange_mode:
+            return 0.0
         return round(random.uniform(self.min_leverage, self.max_leverage), 2)
 
     def respond_simulation(self, state):
+        """Simulation-mode branch of this agent's per-step response; the strategy itself is shared."""
         price_decimals  = getattr(self.simulation_config, 'priceDecimals',  8)
         volume_decimals = getattr(self.simulation_config, 'volumeDecimals', 8)
         tif           = TimeInForce.GTT

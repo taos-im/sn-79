@@ -30,6 +30,11 @@ struct OrderReject
     OrderDirection direction;
     std::string reason;
     std::optional<ClientOrderID> clientOrderId;
+    // The miner needs to identify WHICH of its orders was refused, and clientOrderId is optional. Both
+    // are in scope at every recording site (errPld->requestPayload), and without them a rejection notice
+    // would have to claim a volume of zero, which is worse than not reporting one.
+    taosim::decimal_t volume{};
+    std::optional<taosim::decimal_t> price;  // absent for a market order, which has no limit
 };
 
 class DistributedProxyAgent : public Agent

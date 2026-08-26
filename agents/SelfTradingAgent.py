@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+"""
+A simple example agent to demonstrate self-trade prevention behaviour.
+"""
 from taos.common.agents import launch
 from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import *
@@ -8,10 +11,8 @@ from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 
 import random
 
-"""
-A simple example agent to demonstrate self-trade prevention behaviour.
-"""
 class SelfTradingAgent(GenTRXAgent):
+    """Example: deliberately crosses its own orders, used to verify self-trade prevention."""
     def initialize(self):
         """
         Initializes properties, variables and quantities that will be used by the agent.
@@ -45,7 +46,7 @@ class SelfTradingAgent(GenTRXAgent):
                 instructions (e.g., limit orders) to submit to the market.
         """
         # Initialize a response class associated with the current miner
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         # Iterate over all the book realizations in the state message
         for book_id, book in state.books.items():
             # If we have already placed orders, set the prices such that we expect to trade against our own orders

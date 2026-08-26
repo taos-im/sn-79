@@ -17,6 +17,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 if __name__ != "__mp_main__":
+    import logging
     import os
     # Must precede `import bittensor` below: bittensor 10.3.2 builds its logging
     # singleton at import time and returns an empty config (disabling logging)
@@ -51,6 +52,7 @@ if __name__ != "__mp_main__":
 
     import bittensor as bt
 
+
     from GenTRX.src.bt_log import gtx_log
 
     import uvicorn
@@ -72,7 +74,14 @@ if __name__ != "__mp_main__":
     from taos.im.protocol.simulator import SimulatorResponseBatch
     from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification
     from taos.im.protocol.events import SimulationStartEvent
-    from taos.im.validator.engines import NormalizedState, SimulationEngine
+    from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine
+
+    # Optional exchange-mode component; not part of this tree. Import is guarded, so a validator without
+    # it starts normally and simply does not surface those notices.
+    try:
+        from taos.im.validator import exchange_notices as _exchange_notices
+    except ImportError:
+        _exchange_notices = None
 
     async def _push_fill_notifications(trade_events: list, url: str) -> None:
         """Fire-and-forget: push fill notifications directly to the data service
@@ -778,6 +787,9 @@ if __name__ != "__mp_main__":
             self.save_state_executor = ThreadPoolExecutor(max_workers=1)
             self.maintenance_executor = ThreadPoolExecutor(max_workers=1)
             self.maintenance_subtensor = bt.Subtensor(self.config.subtensor.chain_endpoint)
+            # sync() (hence should_set_weights + set_weights) runs against
+            # maintenance_subtensor, so its rate-limit read must be mechid-aware too.
+            self._patch_blocks_since_last_update(self.maintenance_subtensor)
 
             # Metagraph sync worker: the resync's substrate scale-decode is a
             # 3-5s GIL burst that stalls whichever round it overlaps — do the
@@ -792,7 +804,8 @@ if __name__ != "__mp_main__":
                 try:
                     from taos.im.validator.metagraph_worker import MetagraphSyncWorker
                     self._mg_worker = MetagraphSyncWorker(
-                        self.subtensor.chain_endpoint, self.config.netuid, cores=_leftover
+                        self.subtensor.chain_endpoint, self.config.netuid, cores=_leftover,
+                        mechid=getattr(self.metagraph, "mechid", 0),
                     )
                     self._mg_worker.start()
                     bt.logging.info(
@@ -980,7 +993,16 @@ if __name__ != "__mp_main__":
             engine_mode = getattr(self.config, 'engine', 'simulation')
             if engine_mode == 'exchange':
                 bt.logging.info("Starting validator in EXCHANGE engine mode")
-                from taos.im.validator.engines.exchange import ExchangeEngine
+                try:
+                    from taos.im.validator.engines.exchange import ExchangeEngine
+                except ImportError as _exc:
+                    # Optional component; not part of this tree. Raised as a clear RuntimeError so
+                    # --engine exchange does not fail on a raw ImportError with no hint that the mode
+                    # itself is the problem.
+                    raise RuntimeError(
+                        "engine=exchange requires the exchange engine module, which this "
+                        "distribution does not include; run with engine=simulation"
+                    ) from _exc
                 self.engine = ExchangeEngine(self.config, self)
                 self.engine._push_fill_notify = _push_fill_notifications
             else:
@@ -1029,21 +1051,28 @@ if __name__ != "__mp_main__":
                 f"with {self.simulation.book_count} books"
             )
             book_count = self.simulation.book_count
+            # Engine's actual traded book-id set (root excluded on the mainnet-fork
+            # -> [1..128]); fall back to 0-based range before the engine is assigned.
+            # NOTE: this method is currently dead (structure init moved to the sim
+            # engine) but kept book-id-correct to avoid a latent 0-based landmine.
+            _bids = (self.engine.book_ids
+                     if getattr(self, 'engine', None) is not None
+                     else list(range(book_count)))
             if not hasattr(self, 'activity_factors') or len(self.activity_factors) < self.effective_max_uids:
                 self.activity_factors = {
-                    uid: {bookId: 0.0 for bookId in range(book_count)}
+                    uid: {bookId: 0.0 for bookId in _bids}
                     for uid in range(self.effective_max_uids)
                 }
             if not hasattr(self, 'pnl_factors') or len(self.pnl_factors) < self.effective_max_uids:
                 self.pnl_factors = {
-                    uid: {bookId: 1.0 for bookId in range(book_count)}
+                    uid: {bookId: 1.0 for bookId in _bids}
                     for uid in range(self.effective_max_uids)
                 }
             if not hasattr(self, 'kappa_values') or len(self.kappa_values) < self.effective_max_uids:
                 self.kappa_values = {
                     uid: {
-                        'books': {bookId: None for bookId in range(book_count)},
-                        'books_weighted': {bookId: 0.0 for bookId in range(book_count)},
+                        'books': {bookId: None for bookId in _bids},
+                        'books_weighted': {bookId: 0.0 for bookId in _bids},
                         'total': None,
                         'average': None,
                         'median': None,
@@ -1062,7 +1091,7 @@ if __name__ != "__mp_main__":
                 self.trade_volumes = {
                     uid: {
                         bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
-                        for bookId in range(book_count)
+                        for bookId in _bids
                     }
                     for uid in range(self.effective_max_uids)
                 }
@@ -1070,13 +1099,13 @@ if __name__ != "__mp_main__":
                 self.initial_balances = {
                     uid: {
                         bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': None}
-                        for bookId in range(book_count)
+                        for bookId in _bids
                     }
                     for uid in range(self.effective_max_uids)
                 }
             if not hasattr(self, 'recent_miner_trades') or len(self.recent_miner_trades) < self.effective_max_uids:
                 self.recent_miner_trades = {
-                    uid: {bookId: [] for bookId in range(book_count)}
+                    uid: {bookId: [] for bookId in _bids}
                     for uid in range(self.effective_max_uids)
                 }
             if not hasattr(self, 'miner_stats') or len(self.miner_stats) < self.effective_max_uids:
@@ -1085,9 +1114,9 @@ if __name__ != "__mp_main__":
                     for uid in range(self.effective_max_uids)
                 }
             if not hasattr(self, 'recent_trades'):
-                self.recent_trades = {bookId: [] for bookId in range(book_count)}
+                self.recent_trades = {bookId: [] for bookId in _bids}
             if not hasattr(self, 'fundamental_price'):
-                self.fundamental_price = {bookId: None for bookId in range(book_count)}
+                self.fundamental_price = {bookId: None for bookId in _bids}
             
             bt.logging.success(f"All structures initialized for {self.effective_max_uids} UIDs")
 
@@ -1317,7 +1346,12 @@ if __name__ != "__mp_main__":
             await save_state_sync(self)
 
         def migrate_sampling_interval(self, old_interval: int, new_interval: int):
-            """Re-align trade volumes from old sampling interval to new interval."""
+            """Re-align trade volumes from old sampling interval to new interval.
+
+            Args:
+                old_interval: The interval the stored volumes were sampled at.
+                new_interval: The configured interval to re-align onto.
+            """
             migrate_sampling_interval(self, old_interval, new_interval)
 
 
@@ -1348,9 +1382,14 @@ if __name__ != "__mp_main__":
                 count += 1
             return count
 
-        def handle_deregistration(self, uid) -> None:
-            """Engine handles primary deregistration; we also reset GenTRX state here."""
-            self.engine.handle_deregistration(uid)
+        def handle_deregistration(self, uid, old_coldkey=None) -> None:
+            """Engine handles primary deregistration; we also reset GenTRX state here.
+
+            Args:
+                uid: The deregistered uid.
+                old_coldkey: The coldkey that held the slot.
+            """
+            self.engine.handle_deregistration(uid, old_coldkey)
             # Reset GenTRX EMA + service score cache so a new miner at the
             # same UID slot doesn't inherit the old miner's score history.
             if hasattr(self, 'gentrx_scores'):
@@ -1443,8 +1482,17 @@ if __name__ != "__mp_main__":
                 previous_metagraph = copy.deepcopy(self.metagraph)
                 bt.logging.debug("Syncing metagraph...")
                 self._sync_metagraph_with_retry()
-            if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):
-                bt.logging.debug("No axon changes!")
+            # Compare the FULL hotkey list, not just its length. A burned_register
+            # SWAP (a UID deregistered + a new miner taking its slot) keeps the count
+            # at max_uids and, if the incoming miner hasn't served its axon yet, leaves
+            # axons unchanged too — so a length+axons check early-returns and SKIPS the
+            # deregistration path below (handle_deregistration → refund old proxy + pop;
+            # ensure_wallets → create the new owner's proxy; register_wallet → link/load
+            # signer). That left a reused-slot's new owner with no proxy (settlements
+            # failed with "no loaded signer"). Detect any hotkey change so the proxy is
+            # rotated on every dereg, incl. slot swaps.
+            if previous_metagraph.axons == self.metagraph.axons and list(self.hotkeys) == list(self.metagraph.hotkeys):
+                bt.logging.debug("No axon or hotkey changes!")
                 # Re-register benchmark buckets even when the metagraph is unchanged,
                 # so a gradient server restart self-heals within one resync cycle.
                 _gtx = getattr(self, '_gentrx', None)
@@ -1464,7 +1512,15 @@ if __name__ != "__mp_main__":
             )
             for uid, hotkey in enumerate(self.hotkeys):
                 if uid < len(self.metagraph.hotkeys) and hotkey != self.metagraph.hotkeys[uid]:
-                    self.handle_deregistration(uid)
+                    # Pass the departing miner's coldkey (pre-sync metagraph) so the
+                    # proxy refund can find an on-disk proxy that isn't in the live
+                    # runtime maps (not persisted across restarts).
+                    _old_ck = (
+                        previous_metagraph.coldkeys[uid]
+                        if uid < len(previous_metagraph.coldkeys)
+                        else None
+                    )
+                    self.handle_deregistration(uid, _old_ck)
 
             old_metagraph_size = len(self.hotkeys)
             new_metagraph_size = len(self.metagraph.hotkeys)
@@ -1479,9 +1535,17 @@ if __name__ != "__mp_main__":
                 # Expand per-UID dicts to cover any UIDs not yet present (new network
                 # registrations, or holes left after benchmark shifting above).
                 _bc = self.simulation.book_count
+                # Engine's actual traded book-id set (root excluded -> [1..128]) so
+                # new UIDs key identically to the engine's own structure init. The
+                # first resync (super().__init__ -> sync() before self.engine exists)
+                # falls back to 0-based range; those defaults are overwritten once the
+                # engine initializes structures from its real book_ids.
+                _bids = (self.engine.book_ids
+                         if getattr(self, 'engine', None) is not None
+                         else list(range(self.simulation.book_count)))
                 _kappa_default = {
-                    'books': {b: None for b in range(_bc)},
-                    'books_weighted': {b: 0.0 for b in range(_bc)},
+                    'books': {b: None for b in _bids},
+                    'books_weighted': {b: 0.0 for b in _bids},
                     'total': None, 'average': None, 'median': None,
                     'normalized_average': 0.0, 'normalized_median': 0.0,
                     'normalized_total': 0.0,
@@ -1495,26 +1559,26 @@ if __name__ != "__mp_main__":
                             'rejections': 0, 'call_time': [],
                         }
                     if _uid not in self.activity_factors:
-                        self.activity_factors[_uid] = {b: 0.0 for b in range(_bc)}
+                        self.activity_factors[_uid] = {b: 0.0 for b in _bids}
                     if _uid not in self.pnl_factors:
-                        self.pnl_factors[_uid] = {b: 1.0 for b in range(_bc)}
+                        self.pnl_factors[_uid] = {b: 1.0 for b in _bids}
                     if _uid not in self.kappa_values:
                         self.kappa_values[_uid] = dict(_kappa_default)
-                        self.kappa_values[_uid]['books'] = {b: None for b in range(_bc)}
-                        self.kappa_values[_uid]['books_weighted'] = {b: 0.0 for b in range(_bc)}
+                        self.kappa_values[_uid]['books'] = {b: None for b in _bids}
+                        self.kappa_values[_uid]['books_weighted'] = {b: 0.0 for b in _bids}
                     if _uid not in self.unnormalized_scores:
                         self.unnormalized_scores[_uid] = 0.0
                     if _uid not in self.initial_balances:
                         self.initial_balances[_uid] = {
                             b: {'BASE': None, 'QUOTE': None, 'WEALTH': None}
-                            for b in range(_bc)
+                            for b in _bids
                         }
                     if _uid not in self.initial_balances_published:
                         self.initial_balances_published[_uid] = False
                     if _uid not in self.inventory_history:
                         self.inventory_history[_uid] = {}
                     if _uid not in self.recent_miner_trades:
-                        self.recent_miner_trades[_uid] = {b: [] for b in range(_bc)}
+                        self.recent_miner_trades[_uid] = {b: [] for b in _bids}
 
             self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
             bt.logging.success(f"Metagraph resync complete: {len(self.hotkeys)} network hotkeys")
@@ -1783,7 +1847,7 @@ if __name__ != "__mp_main__":
             for uid in self.realized_pnl_history.keys():
                 book_totals_dict = _pnl_by_book.get(uid, {})
                 realized_pnl_by_book[uid] = {
-                    book_id: book_totals_dict.get(book_id, 0.0) for book_id in range(book_count)
+                    book_id: book_totals_dict.get(book_id, 0.0) for book_id in self.engine.book_ids
                 }
                 total_realized_pnl[uid] = _pnl_total.get(uid, 0.0)
 
@@ -1827,6 +1891,11 @@ if __name__ != "__mp_main__":
             fee_sums_flat = _nested_snapshot(getattr(self, 'fee_sums', {}))
             roundtrip_volume_sums_flat = _nested_snapshot(self.roundtrip_volume_sums)
 
+            # De-beta (P8) trading score for the reporting snapshot, finalized via the shared helper
+            # (this process owns the fill-stream accumulators); passed as a compact {uid: score} map
+            # rather than shipping the raw per-book sums over IPC. {} when disabled/warming.
+            debeta_scores_flat = compute_debeta_scores(self)
+
             bt.logging.debug(f"Serialized volume sums ({time.time()-serialize_start:.4f}s)")
 
             bt.logging.debug("Building metagraph data...")
@@ -1844,6 +1913,8 @@ if __name__ != "__mp_main__":
                 'dividends': self.metagraph.dividends.tolist(),
                 'active': self.metagraph.active.tolist(),
                 'last_update': self.metagraph.last_update.tolist(),
+                'axon_ips': [str(getattr(ax, 'ip', '')) for ax in self.metagraph.axons] if hasattr(self.metagraph, 'axons') else [],
+                'axon_ports': [int(getattr(ax, 'port', 0)) for ax in self.metagraph.axons] if hasattr(self.metagraph, 'axons') else [],
             }
             bt.logging.debug(f"Built metagraph data ({time.time()-meta_start:.4f}s)")
 
@@ -1946,6 +2017,7 @@ if __name__ != "__mp_main__":
                 # reward). Reported in place of raw kappa_score/combined_score so the dashboard
                 # shows the smoothed standing, not the pre-EMA per-window value.
                 'trading_score_ema': dict(getattr(self, '_trading_score_ema', {}) or {}),
+                'debeta_scores': debeta_scores_flat,
                 'scores': {i: score.item() for i, score in enumerate(self.scores)},
                 'gentrx_scores': {i: score.item() for i, score in enumerate(self.gentrx_scores)},
                 'gentrx_enabled': self._gentrx is not None,
@@ -2410,6 +2482,115 @@ if __name__ != "__mp_main__":
             bt.logging.debug(f"[REWARD] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
             self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._reward(state)))
 
+        def _build_agent_scoring_maps(self) -> dict:
+            """Per-agent scoring maps (scores, kappa, volume, pnl, fees) for the
+            data-service snapshot, computed from the incrementally-maintained
+            accumulators.
+
+            Both the simulation and exchange ingest payloads must carry these so the
+            agent_snapshots row (top-level score/volume_24h/pnl_24h and per_book
+            vol/fee/pnl/kappa) is populated identically in both modes — parity of
+            process. The genuine difference is only in what feeds the accumulators:
+            in exchange, update_trade_volumes(state) folds the RECONCILED
+            NormalizedState (reward() → trade.py), so these reflect only on-chain-
+            settled activity, satisfying "snapshots reflect reconciled data".
+
+            Uses the same two-step atomic outer/inner snapshot as
+            _build_sim_push_payload to stay safe against concurrent trade.py mutation
+            from the reward thread (see the note there).
+
+            NOTE: _build_sim_push_payload still inlines an equivalent computation; it
+            should be consolidated onto this helper once the exchange path is verified
+            in production, so the two cannot drift.
+            """
+            _vs_outer = dict(getattr(self, "volume_sums", {}))
+            _mvs_outer = dict(getattr(self, "maker_volume_sums", {}))
+            _tvs_outer = dict(getattr(self, "taker_volume_sums", {}))
+            _fs_outer = dict(getattr(self, "fee_sums", {}))
+            _rt_outer = dict(getattr(self, "roundtrip_volume_sums", {}))
+            _af_outer = dict(getattr(self, "activity_factors", {}))
+            _snap_kv = dict(getattr(self, "kappa_values", {}))
+            _snap_scores = list(self.scores) if getattr(self, "scores", None) is not None else None
+            _snap_pnl_book = {u: dict(b) for u, b in dict(getattr(self, "agent_pnl_by_book", {})).items()}
+            _snap_pnl_total = dict(getattr(self, "agent_pnl_total", {}))
+            _snap_vs = {u: dict(b) for u, b in _vs_outer.items()}
+            _snap_mvs = {u: dict(b) for u, b in _mvs_outer.items()}
+            _snap_tvs = {u: dict(b) for u, b in _tvs_outer.items()}
+            _snap_fs = {u: dict(b) for u, b in _fs_outer.items()}
+            _snap_rt = {u: dict(b) for u, b in _rt_outer.items()}
+            _snap_af = {u: dict(b) for u, b in _af_outer.items()}
+
+            def _sv(d):
+                return {
+                    str(uid): sum(float(v) for v in list(bks.values()))
+                    for uid, bks in list(d.items())
+                    if bks
+                }
+
+            _vs = _sv(_snap_vs)
+            _mvs = _sv(_snap_mvs)
+            _tvs = _sv(_snap_tvs)
+            _pnl = {str(uid): round(float(v), 6) for uid, v in _snap_pnl_total.items() if v != 0.0}
+            _sc = _snap_scores
+            _sc_dict = {str(i): float(_sc[i]) for i in range(len(_sc))} if _sc is not None else {}
+            _kappa_raw = {}
+            _kappa_score = {}
+            _kappa_penalty = {}
+            _kappa_books = {}
+            _kappa_books_w = {}
+            for _kuid, _kv in _snap_kv.items():
+                if _kv and isinstance(_kv, dict):
+                    if _kv.get("total") is not None:
+                        _kappa_raw[str(_kuid)] = float(_kv["total"])
+                    if _kv.get("normalized_total") is not None:
+                        _kappa_score[str(_kuid)] = float(_kv["normalized_total"])
+                    if _kv.get("penalty") is not None:
+                        _kappa_penalty[str(_kuid)] = float(_kv["penalty"])
+                    _bks = {str(bid): float(v) for bid, v in (_kv.get("books") or {}).items() if v is not None}
+                    if _bks:
+                        _kappa_books[str(_kuid)] = _bks
+                    _bw = {str(bid): float(v) for bid, v in (_kv.get("books_weighted") or {}).items() if v is not None}
+                    if _bw:
+                        _kappa_books_w[str(_kuid)] = _bw
+            return {
+                "agent_scores": _sc_dict,
+                "agent_kappa": _kappa_raw,
+                "agent_kappa_score": _kappa_score,
+                "agent_kappa_penalty": _kappa_penalty,
+                "agent_kappa_books": _kappa_books,
+                "agent_kappa_books_w": _kappa_books_w,
+                "agent_volume": _vs,
+                "agent_maker_volume": _mvs,
+                "agent_taker_volume": _tvs,
+                "agent_pnl": _pnl,
+                "agent_pnl_book": {
+                    str(uid): {str(bid): round(float(v), 6) for bid, v in bks.items() if v != 0}
+                    for uid, bks in _snap_pnl_book.items()
+                    if bks
+                },
+                "agent_volume_book": {
+                    str(uid): {str(bid): round(float(v), 4) for bid, v in bks.items() if v}
+                    for uid, bks in _snap_vs.items()
+                    if bks
+                },
+                "agent_fee_book": {
+                    str(uid): {str(bid): round(float(v), 6) for bid, v in bks.items() if v != 0}
+                    for uid, bks in _snap_fs.items()
+                    if bks
+                },
+                "agent_roundtrip_volume": {
+                    str(uid): round(float(sum(bks.values())), 4) for uid, bks in _snap_rt.items() if bks
+                },
+                "agent_activity_factor": {
+                    str(uid): round(float(sum(bks.values()) / len(bks)), 4) for uid, bks in _snap_af.items() if bks
+                },
+                "agent_median_kappa": {
+                    str(uid): round(float(kv.get("activity_weighted_normalized_median") or 0), 6)
+                    for uid, kv in _snap_kv.items()
+                    if kv
+                },
+            }
+
         def _build_sim_push_payload(self, state) -> dict:
             """Build the MVTRX data-service push payload for a simulation state update.
 
@@ -2643,6 +2824,10 @@ if __name__ != "__mp_main__":
                 "pools":               _sim_pools,
                 "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
                 "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
+                # Separate key from proxy_wallets on purpose: the swap proxy is address-keyed and
+                # permanent, the exchange proxy is uid-keyed and evicted on deregistration. One
+                # key for both would let the service serve a swap wallet as an exchange proxy.
+                "swap_wallets":        getattr(self, 'swap_wallets_published', {}) or {},
                 "reconciliation":      {"fills": _sim_fills, "rejections": _sim_rejects},
                 "notices":             {str(k): list(v) for k, v in (state.notices or {}).items()},
                 "agent_open_orders":   _sim_open_orders,
@@ -2764,7 +2949,16 @@ if __name__ != "__mp_main__":
             start = time.time()
             for uid, accounts in state.accounts.items():
                 for book_id in accounts:
-                    state.accounts[uid][book_id]['v'] = self.volume_sums.get((uid, book_id), 0.0)
+                    # volume_sums IS NESTED BY UID, NOT KEYED BY A TUPLE.
+                    #
+                    # This read a 2-tuple key out of a {uid: {book_id: float}} defaultdict, so it
+                    # missed on every call and wrote 0.0 for every miner. Silent twice over: .get()
+                    # with a default raises nothing, and .get() on a defaultdict does not invoke
+                    # default_factory, so no entry was created to hint at the miss. Every writer uses
+                    # the nested shape (trade.py, persistence.py, both engines) and report.py consumes
+                    # it nested. Measured working: volume_sums[171][5] = 1383.308 reaching the
+                    # state dict and the wire.
+                    state.accounts[uid][book_id]['v'] = self.volume_sums.get(uid, {}).get(book_id, 0.0)
             bt.logging.info(f"Volumes added to state ({time.time()-start:.4f}s).")
 
             # Update variables
@@ -2824,6 +3018,27 @@ if __name__ != "__mp_main__":
                 except Exception as _gex:
                     bt.logging.warning(f"[GTX] handle_state push_state error: {_gex}")
 
+            # Surface settled fills to miners before the synapse goes out.
+            #
+            # Miners received placement and cancel notices but never a fill notice in
+            # only the ingest push consumed them, so a miner could not tell which of its
+            # orders had traded. Merging here: the same consume-once point, just earlier
+            #: puts them on the synapse as well. The id carried is the engine's own
+            # integer, matching TradeEvent.i and what simulation miners already see; the
+            # data service book-qualifies it later for its own surfaces.
+            if self.engine.mode == 'exchange':
+                # Settled fills, refusals and fill notices reach the miner from an optional companion
+                # module that is not part of this tree; without it the validator does not surface them.
+                # Order matters: fills, then refusals, then fill notices, as a miner reading them in
+                # sequence expects.
+                if _exchange_notices is not None:
+                    # One call, one accounting line covering all four kinds. Four separate calls each
+                    # logged only when they had something, so a kind that stopped being delivered was
+                    # silent -- which is how acknowledgements went missing for every miner while fills
+                    # kept flowing and every surface still looked healthy.
+                    _exchange_notices.merge_all(self.engine, state, self.config)
+
+
             # Forward state synapse to miners and collect responses
             start = time.time()
             _rp_fwd0 = start
@@ -2850,11 +3065,17 @@ if __name__ != "__mp_main__":
                             f"ExchangeEngine.execute: {len(trade_events)} trade events "
                             f"injected into state ({time.time()-start:.4f}s)"
                         )
-                        # Fast-path fill notifications: push directly to data service
-                        # without waiting for the 40s ingest pipeline.
-                        _fast_url = getattr(getattr(self.config, 'exchange', None), 'data_service_url', '') or ''
-                        if _fast_url:
-                            asyncio.create_task(_push_fill_notifications(trade_events, _fast_url))
+                        # NOTE: the pre-settlement fast-path fill notify is intentionally
+                        # disabled. trade_events here are the engine's LOB match BEFORE
+                        # on-chain settlement — they carry predicted quantities and no
+                        # tao_volume, so reporting them announces a fill that has not yet
+                        # (and may not exactly) settle. Fills are reported from a single
+                        # authoritative source: the reconciled executed_fills carried by
+                        # the per-block ingest push (neurons/validator.py exchange payload
+                        # → ingest.py executed_fills → push_agent_fill), which reflect the
+                        # actual on-chain-settled amounts. Restore a fast-notify only if
+                        # it is driven from reconciled results, not from this pre-settle
+                        # match.
                 except Exception as _exc:
                     bt.logging.error(f"ExchangeEngine.execute failed: {_exc}")
                 # Refresh state.books/accounts from post-execute LOB state so the
@@ -2868,24 +3089,50 @@ if __name__ != "__mp_main__":
                         state.accounts = _post.accounts
                 except Exception:
                     pass
-                # Inject on-chain fill events into state.books['e'] for the nexus
-                # event stream. The LOB books from reconciliation only carry order
-                # placement/cancel events; actual fill events must come from here.
+                # Inject the SINGLE authoritative fill event into state.books['e'] for
+                # the nexus L3 stream. Post-reconcile, the surfaced fill is the reconciled
+                # executed_fill: on-chain-SETTLED quantity + agent attribution + trade_id.
+                # The predicted LOB match and the raw chain 't' are stripped in _normalize
+                # (that pre-settlement view is deliberately surfaced only in the engine's
+                # first-prediction-step output, never on this post-reconcile payload).
+                # execute()'s trade_events are empty in the async-settlement flow, so the
+                # event is built from the reconciliation (self._pending_ingest_reconciliation,
+                # set post-settlement, consumed at the ingest push below).
+                # Maker/taker attribution comes from a matching trade_event when one is
+                # present (by trade_id); otherwise the reconciliation carries only the
+                # settling agent, surfaced as the maker side (matches the LOB convention
+                # where the miner's resting order is the maker, counterparty = pool).
                 try:
                     _fill_ts_ns = int(time.time() * 1e9)
-                    for _te in _trade_events:
-                        _nid = getattr(_te, 'book_id', None)
+                    _te_by_tid = {}
+                    for _te in (_trade_events or []):
+                        _tid_k = getattr(_te, 'trade_id', None)
+                        if _tid_k is not None:
+                            _te_by_tid[str(_tid_k)] = _te
+                    _recon_now = getattr(self.engine, '_pending_ingest_reconciliation', None) or {}
+                    for _ef in _recon_now.get('executed_fills', []):
+                        _nid = _ef.get('netuid')
                         if _nid is None:
                             continue
+                        _tid = _ef.get('trade_id')
+                        _agent = _ef.get('agent_id')
+                        _te_m = _te_by_tid.get(str(_tid)) if _tid is not None else None
+                        if _te_m is not None:
+                            _ta = getattr(_te_m, 'taker_uid', None)
+                            _ma = getattr(_te_m, 'maker_uid', None)
+                        else:
+                            _ta = None
+                            _ma = _agent
                         _ev = {
-                            'y':   't',
-                            'nid': _nid,
-                            'p':   getattr(_te, 'price',     0.0),
-                            'q':   getattr(_te, 'quantity',  0.0),
-                            's':   getattr(_te, 'side',      0),
-                            'Ta':  getattr(_te, 'taker_uid', None),
-                            'Ma':  getattr(_te, 'maker_uid', None),
-                            't':   getattr(_te, 'timestamp', _fill_ts_ns),
+                            'y':  't',
+                            'nid': int(_nid),
+                            'i':  _tid,
+                            'p':  float(_ef.get('price', 0.0) or 0.0),
+                            'q':  float(_ef.get('alpha_volume', 0.0) or 0.0),
+                            's':  int(_ef.get('direction', 0) or 0),
+                            'Ta': _ta,
+                            'Ma': _ma,
+                            't':  _fill_ts_ns,
                         }
                         _bk = state.books.get(_nid)
                         if _bk is None:
@@ -2894,6 +3141,58 @@ if __name__ != "__mp_main__":
                             _bk = dict(_bk)
                             _bk['e'] = list(_bk.get('e') or []) + [_ev]
                             state.books[_nid] = _bk
+                        # Scoring parity: the reward path
+                        # (trade.update_trade_volumes -> _process_uid_notices)
+                        # accumulates per-UID volume/PnL/fees from state.notices, NOT
+                        # from book['e']. In the async-settlement flow execute() returns
+                        # no trade_events, so notices were empty and settled fills never
+                        # reached scoring (snapshot score/volume = 0 despite rows landing
+                        # in `trades`). Surface the SAME reconciled fill as a settled
+                        # trade notice ('ET') keyed by the settling UID so snapshots
+                        # reflect on-chain-settled activity. Pool fills: the settling
+                        # miner is the aggressor (taker); a matched LOB trade_event
+                        # reuses its maker/taker sides.
+                        if _te_m is not None:
+                            _n_ta = getattr(_te_m, 'taker_uid', None)
+                            _n_ma = getattr(_te_m, 'maker_uid', None)
+                        else:
+                            _n_ta = _agent
+                            _n_ma = None
+                        # Built by the canonical serializer, which is the only producer of an ET notice.
+                        # Consumers reach these keys by subscript, so a key absent from a notice is a
+                        # KeyError that costs a uid its whole volume, PnL and roundtrip for the block.
+                        _notice = NormalizedTradeEvent(
+                            book_id=int(_nid),
+                            quantity=float(_ef.get('alpha_volume', 0.0) or 0.0),
+                            price=float(_ef.get('price', 0.0) or 0.0),
+                            side=int(_ef.get('direction', 0) or 0),
+                            maker_uid=_n_ma,
+                            taker_uid=_n_ta,
+                            maker_fee=float(_ef.get('maker_fee', 0.0) or 0.0),
+                            taker_fee=float(_ef.get('taker_fee', 0.0) or 0.0),
+                            trade_id=_tid,
+                            taker_order_id=int(_ef.get('taker_order_id', 0) or 0),
+                            maker_order_id=int(_ef.get('maker_order_id', 0) or 0),
+                        ).to_notice_dict()
+                        # One ET notice per fill per uid. Two sources describe the same
+                        # fill: this reconciliation-derived one, and the trade-event one
+                        # surfaced to miners before forward(). state.notices feeds BOTH
+                        # the miner synapse and scoring (trade.update_trade_volumes reads
+                        # it), so a second copy would double-count that fill's volume.
+                        # They now share the engine's trade id, so it identifies the
+                        # duplicate.
+                        for _nuid in {_n_ta, _n_ma}:
+                            if _nuid is None:
+                                continue
+                            _existing = state.notices.setdefault(_nuid, [])
+                            if _tid is not None and any(
+                                isinstance(_e, dict)
+                                and (_e.get('y') or _e.get('type')) in ('ET', 'EVENT_TRADE')
+                                and _e.get('i') == _tid
+                                for _e in _existing
+                            ):
+                                continue
+                            _existing.append(_notice)
                 except Exception:
                     pass
                 # Push post-execution state to MVTRX data service on every block
@@ -2907,6 +3206,10 @@ if __name__ != "__mp_main__":
                         _uid = int(_uid_str)
                         if not isinstance(_uid_data, dict):
                             continue
+                        # Seed every uid with an empty list. Without it a uid appears in the payload
+                        # only when it HAS orders, so consumers cannot distinguish "no orders" from
+                        # "no news" and a just-cancelled order lingers as open in stale downstream state.
+                        _agent_orders_detail.setdefault(_uid, [])
                         for _nid_str, _acct in _uid_data.items():
                             if not isinstance(_acct, dict):
                                 continue
@@ -2985,13 +3288,12 @@ if __name__ != "__mp_main__":
                 _live_triggers = dict(getattr(getattr(self, 'engine', None), '_live_triggers', {}))
                 if hasattr(self.engine, '_sltp_changed'):
                     self.engine._sltp_changed = False
-                # Merge ET fill notices from the previous block's _chain_bg into the
-                # current ingest push.  _chain_bg populates _pending_et_notices after
+                # Merge ET fill notices from the previous block's settlement into the
+                # current ingest push. The companion drains the same buffer the synapse merge used,
                 # on-chain execution completes; by the time the next block arrives it is
                 # ready.  Pattern mirrors _pending_reconciliation.
-                _pending_et = dict(getattr(self.engine, '_pending_et_notices', {}) or {})
-                if _pending_et:
-                    self.engine._pending_et_notices = {}
+                _pending_et = (_exchange_notices.drain_pending_for_ingest(self.engine)
+                               if _exchange_notices is not None else {})
                 _state_notices = {str(k): list(v) for k, v in (getattr(state, 'notices', None) or {}).items()}
                 for _et_uid, _et_evs in _pending_et.items():
                     _key = str(_et_uid)
@@ -2999,6 +3301,12 @@ if __name__ != "__mp_main__":
                         _state_notices[_key] = _state_notices[_key] + list(_et_evs)
                     else:
                         _state_notices[_key] = list(_et_evs)
+                # Reconciliation for the DB trades write: consume the dedicated ingest
+                # snapshot (_send_to_lob already cleared _pending_reconciliation before
+                # this push). Same consume-at-push pattern.
+                _pending_recon = dict(getattr(self.engine, '_pending_ingest_reconciliation', None) or {})
+                if _pending_recon:
+                    self.engine._pending_ingest_reconciliation = {}
                 asyncio.create_task(_push_mvtrx({
                     "mode":                "exchange",
                     "network":             getattr(getattr(self.config, 'exchange', None), 'network', '') or '',
@@ -3006,12 +3314,17 @@ if __name__ != "__mp_main__":
                     "block":               _ingest_block,
                     "books":               getattr(state, 'books', {}) or {},
                     "accounts":            getattr(state, 'accounts', {}) or {},
-                    "pools":               getattr(state, 'pools', None),
+                    # Pools carry whether the subnet can settle at all. Without it the UI
+                    # cannot mark a staking-disabled subnet or stop a miner trading one, and the
+                    # only feedback is a failed settlement reporting SubtokenDisabled after the
+                    # fact. A subnet the chain could not be asked about is left ABSENT rather
+                    # than defaulted to enabled.
+                    "pools":               _pools_with_subtoken(self, getattr(state, 'pools', None)),
                     "block_events":        list((getattr(self.engine, '_last_chain_state', None) or {}).get('block_events', [])),
                     "delegates":           dict((getattr(self.engine, '_last_chain_state', None) or {}).get('delegates', {})),
                     "chain_balances":      dict((getattr(self.engine, '_last_chain_state', None) or {}).get('balances', {})),
                     "offex_balances":      dict((getattr(self.engine, '_last_chain_state', None) or {}).get('offex_balances', {})),
-                    "reconciliation":      dict(getattr(self.engine, '_pending_reconciliation', None) or {}),
+                    "reconciliation":      _pending_recon,
                     "notices":             _state_notices,
                     "agent_open_orders":   _agent_open_orders,
                     "agent_orders_detail": _agent_orders_detail,
@@ -3019,8 +3332,18 @@ if __name__ != "__mp_main__":
                     "validator_uid":       self.uid,
                     "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
                 "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
+                # Separate key from proxy_wallets on purpose: the swap proxy is address-keyed and
+                # permanent, the exchange proxy is uid-keyed and evicted on deregistration. One
+                # key for both would let the service serve a swap wallet as an exchange proxy.
+                "swap_wallets":        getattr(self, 'swap_wallets_published', {}) or {},
                     "sltp_triggers":       _live_triggers,
                     "exchange_constraints": _exch_constraints,
+                    # Per-agent scoring maps (score, kappa, volume, pnl, per-book
+                    # vol/fee/pnl) so the exchange agent_snapshots row is populated
+                    # like the sim one — from RECONCILED accumulators (see helper).
+                    # Without these the exchange snapshot stores score/vol/pnl=0 and
+                    # per_book carries only balances → portfolio charts read 0.
+                    **self._build_agent_scoring_maps(),
                 }, url=_ingest_url))
                 # Yield once so the HTTP POST starts sending while the remaining
                 # synchronous work (maintain/reward/save scheduling) runs.
@@ -3197,6 +3520,10 @@ if __name__ != "__mp_main__":
                             "validator_uid":       self.uid,
                             "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
                 "proxy_wallets":       getattr(self, 'proxy_wallets_published', {}) or {},
+                # Separate key from proxy_wallets on purpose: the swap proxy is address-keyed and
+                # permanent, the exchange proxy is uid-keyed and evicted on deregistration. One
+                # key for both would let the service serve a swap wallet as an exchange proxy.
+                "swap_wallets":        getattr(self, 'swap_wallets_published', {}) or {},
                         }, url=getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')))
                 except Exception as _exc:
                     bt.logging.warning(f"MVTRX startup push failed: {_exc}")
@@ -3468,12 +3795,145 @@ if __name__ != "__mp_main__":
     )
 
 if __name__ == "__main__":
+    # Make an unlocatable warning locatable.
+    #
+    # A Pydantic serializer warning fires ~299 times per day complaining that field `i` (the trade id,
+    # declared int) received a string of the form x:0x<extrinsic_hash>:<uid>:<index>:<p|f>. That is a
+    # real identity defect: no such id is ever recorded on the tape, so a consumer handed one cannot
+    # join it to anything. But the warning carries no stack, static search across taos/ and
+    # mvtrx/service did not find the assembly site, and the surrounding frames are stdlib
+    # (the log-queue monitor) or a subprocess, so the warning may not even originate in this process.
+    #
+    # Rather than guess a fix, capture the stack the next time it fires. `warnings` gives the full
+    # traceback when asked, so one run reproduces it (the shape includes :171: as well as :248:, so
+    # the acceptance miner exercises it) and the fix lands with evidence instead of a hypothesis.
+    import traceback
+    import warnings as _warnings
+
+    _seen_ser_warn = [False]
+    _orig_showwarning = _warnings.showwarning
+
+    def _showwarning_with_stack(message, category, filename, lineno, file=None, line=None):
+        text = str(message)
+        if "Pydantic serializer warnings" in text or "UnexpectedValue" in text:
+            if not _seen_ser_warn[0]:
+                _seen_ser_warn[0] = True
+                try:
+                    bt.logging.warning(
+                        "PYDANTIC-SER-WARN (first occurrence, stack follows): "
+                        + text[:300].replace("\n", " ")
+                    )
+                    for _ln in "".join(traceback.format_stack()).splitlines()[-24:]:
+                        bt.logging.warning("PYDANTIC-SER-WARN | " + _ln.strip()[:200])
+                except Exception:
+                    pass
+        return _orig_showwarning(message, category, filename, lineno, file, line)
+
+    _warnings.showwarning = _showwarning_with_stack
+
     from taos.im.validator.update import check_repo, update_validator, check_simulator, rebuild_simulator, restart_simulator
     from taos.im.validator.forward import forward, notify, deliver_gentrx
-    from taos.im.validator.reward import get_rewards
+    from taos.im.validator.reward import get_rewards, compute_debeta_scores
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:
         raise Exception("taos validator requires Ubuntu >= 22.04!")
+
+    def _pools_with_subtoken(validator, pools):
+        """Attach subtoken_enabled to each pool, cheaply and without ever failing the payload.
+
+        Cached for ten minutes in taos.im.validator.subtoken: a subnet owner toggling staking is
+        a rare administrative act, and querying every subnet each block would cost far more than
+        the flag is worth. Any failure returns the pools untouched, because losing the whole
+        ingest payload over an advisory flag would be a poor trade.
+        """
+        try:
+            from taos.im.validator.subtoken import merge_subtoken_flags, subtoken_flags
+            _sub = getattr(getattr(validator, 'subtensor', None), 'substrate', None)
+            # cached_only: this runs inside async handle_state, where a synchronous websocket
+            # round-trip per subnet (~128 of them) stalls the event loop and everything queued
+            # behind it. Serve the cached answer and let the refresh happen on its own thread.
+            _flags = subtoken_flags(_sub, [int(k) for k in (pools or {})], cached_only=True)
+            return merge_subtoken_flags(pools, _flags)
+        except Exception:
+            bt.logging.debug("subtoken flag merge skipped", exc_info=True)
+            return pools or {}
+
+    class _BittensorLogHandler(logging.Handler):
+        """Forward stdlib logging records into bt.logging.
+
+        The validator's engine, chain and reconcile modules log through
+        logging.getLogger(__name__): 242 call sites across 8 modules. bittensor installs
+        its own logging stack and those records reach none of it, so every one of those
+        diagnostics was discarded. Measured on this box: build_reconciliation logs
+        unconditionally at INFO on each reconciliation cycle, yet across three hours and
+        ten settled trades it appeared zero times in the pm2 logs.
+
+        That silence costs twice: it hides the state of a running validator, and it makes
+        paths like the partial-fill remainder restore unobservable exactly when they need
+        checking. Bridging once here fixes all 242 sites without touching a call site, and
+        keeps the %s-style formatting they already use.
+        """
+
+        # bt.logging emits THROUGH a stdlib logger named "bittensor". Without this guard the
+        # bridge is a feedback loop: bt.logging -> stdlib "bittensor" -> this handler ->
+        # bt.logging -> ... Each pass prepended another "[bittensor]", and a single
+        # "Sent query request" line reached 1776 bytes with ~40 nested prefixes before the
+        # filter existed.
+        _SKIP_PREFIXES = ("bittensor", "btlogging", "substrateinterface", "websockets")
+        _local = threading.local()
+
+        def emit(self, record) -> None:
+            name = record.name or ""
+            if name.split(".")[0] in self._SKIP_PREFIXES:
+                return
+            # Reentrancy: anything logged while we are inside bt.logging would come straight
+            # back here. One flag per thread, because bt.logging is called from several.
+            if getattr(self._local, "busy", False):
+                return
+            try:
+                msg = f"[{record.name}] {record.getMessage()}"
+                if record.exc_info:
+                    msg += "\n" + logging.Formatter().formatException(record.exc_info)
+            except Exception:
+                return
+            try:
+                self._local.busy = True
+                if record.levelno >= logging.ERROR:
+                    bt.logging.error(msg)
+                elif record.levelno >= logging.WARNING:
+                    bt.logging.warning(msg)
+                elif record.levelno >= logging.INFO:
+                    bt.logging.info(msg)
+                else:
+                    bt.logging.debug(msg)
+            except Exception:
+                pass
+            finally:
+                self._local.busy = False
+
+    def _bridge_stdlib_logging_to_bittensor() -> None:
+        """Install the bridge on the root logger, once.
+
+        Defaults to INFO rather than DEBUG: several bridged modules log per order at debug
+        level, and this box has filled its disk with engine logs before. Raise it with
+        TAOS_STDLIB_LOG_LEVEL=DEBUG when investigating.
+        """
+        root = logging.getLogger()
+        if any(isinstance(h, _BittensorLogHandler) for h in root.handlers):
+            return
+        name = os.environ.get("TAOS_STDLIB_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, name, logging.INFO)
+        handler = _BittensorLogHandler()
+        handler.setLevel(level)
+        root.addHandler(handler)
+        # The root logger defaults to WARNING, which would drop INFO records before any
+        # handler sees them, so the handler level alone is not enough.
+        if root.level == logging.NOTSET or root.level > level:
+            root.setLevel(level)
+        bt.logging.info(
+            f"stdlib logging bridged into bt.logging at {name} "
+            f"({len(root.handlers)} root handler(s)); "
+            f"set TAOS_STDLIB_LOG_LEVEL to change")
 
     # Apply logging config before any bt.logging calls — bt.logging starts in
     # Default/WARNING state at import time and never auto-applies CLI flags.
@@ -3487,6 +3947,7 @@ if __name__ == "__main__":
         bt.logging.set_debug()
     else:
         bt.logging.set_info()
+    _bridge_stdlib_logging_to_bittensor()
     bt.logging.info("Initializing validator...")
     app = FastAPI()
     validator = Validator()

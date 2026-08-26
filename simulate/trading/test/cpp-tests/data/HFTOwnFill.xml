@@ -1,0 +1,43 @@
+<!--
+  Minimal simulation for HighFrequencyTraderTests: one book, two HFT instances.
+
+  Driven through a bare Simulation (not SimulationManager), so no POSIX IPC object
+  is created and the test cannot collide with any other taosim on the host. The
+  DistributedProxyAgent node is present only because Simulation::configureAgents
+  throws without it; nothing here talks to a proxy.
+
+  Agent order matters: HighFrequencyTraderAgent::configure() throws unless the
+  exchange is already configured (it reads books().size() and initialPrice).
+
+  The HFT attribute set is copied verbatim from the production template
+  (rnd-taos scripts/run/config/simulation_template.xml) so the agent under test is
+  configured the way it actually runs.
+-->
+<Simulation start="0" duration="11" timescale="s" mode="test">
+    <Agents>
+        <MultiBookExchangeAgent name="EXCHANGE" priceDecimals="2" volumeDecimals="4"
+            baseDecimals="4" quoteDecimals="10" remoteAgentCount="2" eps="2e-8"
+            maxLeverage="4" maxLoan="10000" maintenanceMargin="0.25"
+            initialPrice="300.0" minOrderSize="0.25">
+            <Books instanceCount="1" algorithm="PriceTime"/>
+            <Balances>
+                <Base total="100.0" maxLeverage="5" maxLoan="10000"/>
+                <Quote total="5000.0" maxLeverage="5" maxLoan="10000"/>
+            </Balances>
+        </MultiBookExchangeAgent>
+        <HighFrequencyTraderAgent name="HIGH_FREQUENCY_TRADER_AGENT" instanceCount="2"
+            exchange="EXCHANGE" debug="0"
+            minMFLatency="100000000" minOPLatency="1000000" maxOPLatency="50000000"
+            opLatencyScaleRay="0.235" tau="2" delta="750000000" psiHFT_constant="100"
+            gHFT="0.5" sigmaSqr="0.01" kappa="1.6" spread="0.0015"
+            orderMean="2.5" orderSTD="1.0" noiseRay="0.23" shiftPercentage="0.05"
+            sensitivityCoef="100.0" spreadSensitivityExp="1.5"
+            spreadSensitivityBase="0.00015" rateMax="0.0075" marginNoiseSTD="0.00001">
+            <Balances>
+                <Base total="500" maxLeverage="4" maxLoan="10000"/>
+                <Quote total="150000.0" maxLeverage="4" maxLoan="10000"/>
+            </Balances>
+        </HighFrequencyTraderAgent>
+        <DistributedProxyAgent/>
+    </Agents>
+</Simulation>

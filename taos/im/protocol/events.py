@@ -54,12 +54,22 @@ class FinanceEvent(SimulationEvent):
                 return TradeEvent.model_construct(**json)
             case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS":
                 return OrderCancellationsEvent.from_json(json)
+            # model_construct skips validation, which is what the abbreviated wire form wants for
+            # scalars but leaves a container's items as raw dicts. The dispatcher hands those items to
+            # the miner's handler one at a time, and a handler reads `cancellation.orderId`, so the items
+            # have to be events too.
             case "RDCO" | "ERDCO":
-                return OrderCancellationsEvent.model_construct(**json)
+                _ev = OrderCancellationsEvent.model_construct(**json)
+                _ev.c = [OrderCancellationEvent.model_construct(**_i) if isinstance(_i, dict) else _i
+                         for _i in (_ev.c or [])]
+                return _ev
             case "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS":
                 return ClosePositionsEvent.from_json(json)
             case "RDCP" | "ERDCP":
-                return ClosePositionsEvent.model_construct(**json)
+                _ev = ClosePositionsEvent.model_construct(**json)
+                _ev.o = [ClosePositionEvent.model_construct(**_i) if isinstance(_i, dict) else _i
+                         for _i in (_ev.o or [])]
+                return _ev
             case "RESPONSE_DISTRIBUTED_RESET_AGENT" | "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT":
                 return ResetAgentsEvent.from_json(json)
             case "RDRA" | "ERDRA":
@@ -81,6 +91,7 @@ class SimulationStartEvent(FinanceEvent):
     
     @property
     def logDir(self) -> str:
+        """Readable accessor for wire field ``l``; ``logDir`` is its serialized alias."""
         return self.l
     
     @classmethod
@@ -125,6 +136,8 @@ class OrderPlacementEvent(FinanceEvent):
         quantity (float): The size of the order in base currency.
         success (bool): Flag indicating if the order was successfully placed or not.
         message (str): The message associated with the failure in case of unsuccessful placement.
+        leverage (float): The leverage multiplier applied to the order, serialized as wire field ``l`` (0.0 = unleveraged).
+        settleFlag (int): The loan settlement option carried by the order, serialized as wire field ``f`` (-2 when unset).
     """
     b : int | None = Field(alias="bookId", default=None)
     o : int | None = Field(alias="orderId")
@@ -138,38 +151,47 @@ class OrderPlacementEvent(FinanceEvent):
     
     @property
     def bookId(self) -> int | None:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def orderId(self) -> int | None:
+        """Readable accessor for wire field ``o``; ``orderId`` is its serialized alias."""
         return self.o
     
     @property
     def clientOrderId(self) -> int | None:
+        """Readable accessor for wire field ``c``; ``clientOrderId`` is its serialized alias."""
         return self.c
     
     @property
     def side(self) -> int:
+        """Readable accessor for wire field ``s``; ``side`` is its serialized alias."""
         return self.s
     
     @property
     def quantity(self) -> float:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
     
     @property
     def success(self) -> bool:
+        """Readable accessor for wire field ``u``; ``success`` is its serialized alias."""
         return self.u
     
     @property
     def message(self) -> str:
+        """Readable accessor for wire field ``m``; ``message`` is its serialized alias."""
         return self.m
     
     @property
     def leverage(self) -> str:
+        """Readable accessor for wire field ``l``; ``leverage`` is its serialized alias."""
         return self.l
     
     @property
     def settleFlag(self) -> str:
+        """Readable accessor for wire field ``f``; ``settleFlag`` is its serialized alias."""
         return self.f
 
 class LimitOrderPlacementEvent(OrderPlacementEvent):
@@ -184,6 +206,7 @@ class LimitOrderPlacementEvent(OrderPlacementEvent):
     
     @property
     def price(self) -> float:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
             
     @classmethod
@@ -227,6 +250,7 @@ class MarketOrderPlacementEvent(OrderPlacementEvent):
     
     @property
     def currency(self) -> OrderCurrency:
+        """Readable accessor for wire field ``r``; ``currency`` is its serialized alias."""
         return self.r
 
     @classmethod
@@ -280,26 +304,32 @@ class OrderCancellationEvent(BaseModel):
     
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
     
     @property
     def bookId(self) -> int:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def orderId(self) -> int:
+        """Readable accessor for wire field ``o``; ``orderId`` is its serialized alias."""
         return self.o
     
     @property
     def quantity(self) -> float | None:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
     
     @property
     def success(self) -> bool:
+        """Readable accessor for wire field ``u``; ``success`` is its serialized alias."""
         return self.u
     
     @property
     def message(self) -> str:
+        """Readable accessor for wire field ``m``; ``message`` is its serialized alias."""
         return self.m
 
     def __str__(self):
@@ -319,10 +349,12 @@ class OrderCancellationsEvent(FinanceEvent):
     
     @property
     def bookId(self) -> int | None:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def cancellations(self) -> list[OrderCancellationEvent]:
+        """Readable accessor for wire field ``c``; ``cancellations`` is its serialized alias."""
         return self.c
     
     @classmethod
@@ -374,26 +406,32 @@ class ClosePositionEvent(BaseModel):
     
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
     
     @property
     def bookId(self) -> int:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def orderId(self) -> int:
+        """Readable accessor for wire field ``o``; ``orderId`` is its serialized alias."""
         return self.o
     
     @property
     def quantity(self) -> float | None:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
     
     @property
     def success(self) -> bool:
+        """Readable accessor for wire field ``u``; ``success`` is its serialized alias."""
         return self.u
     
     @property
     def message(self) -> str:
+        """Readable accessor for wire field ``m``; ``message`` is its serialized alias."""
         return self.m
 
     def __str__(self):
@@ -413,10 +451,12 @@ class ClosePositionsEvent(FinanceEvent):
     
     @property
     def bookId(self) -> int | None:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def closes(self) -> list[ClosePositionEvent]:
+        """Readable accessor for wire field ``o``; ``closes`` is its serialized alias."""
         return self.o
     
     @classmethod
@@ -480,59 +520,73 @@ class TradeEvent(FinanceEvent):
     
     @property
     def bookId(self) -> int | None:
+        """Readable accessor for wire field ``b``; ``bookId`` is its serialized alias."""
         return self.b
     
     @property
     def tradeId(self) -> int:
+        """Readable accessor for wire field ``i``; ``tradeId`` is its serialized alias."""
         return self.i
     
     @property
     def clientOrderId(self) -> int | None:
+        """Readable accessor for wire field ``c``; ``clientOrderId`` is its serialized alias."""
         return self.c
     
     @property
     def takerAgentId(self) ->int:
+        """Readable accessor for wire field ``Ta``; ``takerAgentId`` is its serialized alias."""
         return self.Ta
     
     @property
     def takerOrderId(self) ->int:
+        """Readable accessor for wire field ``Ti``; ``takerOrderId`` is its serialized alias."""
         return self.Ti
     
     @property
     def takerFee(self) ->float:
+        """Readable accessor for wire field ``Tf``; ``takerFee`` is its serialized alias."""
         return self.Tf
     
     @property
     def makerAgentId(self) ->int:
+        """Readable accessor for wire field ``Ma``; ``makerAgentId`` is its serialized alias."""
         return self.Ma
     
     @property
     def makerOrderId(self) ->int:
+        """Readable accessor for wire field ``Mi``; ``makerOrderId`` is its serialized alias."""
         return self.Mi
     
     @property
     def makerFee(self) ->float:
+        """Readable accessor for wire field ``Mf``; ``makerFee`` is its serialized alias."""
         return self.Mf
     
     @property
     def side(self) ->int:
+        """Readable accessor for wire field ``s``; ``side`` is its serialized alias."""
         return self.s
     
     @property
     def price(self) ->float:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
     
     @property
     def quantity(self) ->float:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
     
     @property
     def makerFeeRate(self) ->float:
+        """The maker fee as a rate (fee amount over traded notional)."""
         denom = self.quantity * self.price
         return self.makerFee / denom if denom else 0.0
 
     @property
     def takerFeeRate(self) ->float:
+        """The taker fee as a rate (fee amount over traded notional)."""
         denom = self.quantity * self.price
         return self.takerFee / denom if denom else 0.0
     
@@ -569,10 +623,12 @@ class ResetAgentEvent(FinanceEvent):
     
     @property
     def success(self) -> bool:
+        """Readable accessor for wire field ``u``; ``success`` is its serialized alias."""
         return self.u
     
     @property
     def message(self) -> str:
+        """Readable accessor for wire field ``m``; ``message`` is its serialized alias."""
         return self.m
     
     def __str__(self):
@@ -590,6 +646,7 @@ class ResetAgentsEvent(FinanceEvent):
     
     @property
     def resets(self) -> list[ResetAgentEvent]:
+        """Readable accessor for wire field ``r``; ``resets`` is its serialized alias."""
         return self.r
     
     @classmethod
@@ -728,3 +785,76 @@ class AgentEventHistory(EventHistory):
             self.start = next(iter(self.events), self.end)
 
         return self
+
+
+
+# This tree's dispatcher first, the other as a fallback: the two cover different subsets of the same wire
+# codes, and a notice must not be lost because it arrived on the path whose tree does not model it.
+def _NOTICE_FACTORY_LIST():
+    out = [FinanceEvent.from_json]
+    try:
+        from taos.im.protocol.exchange.events import ExchangeEvent
+
+        out.append(ExchangeEvent.from_json)
+    except Exception:
+        pass
+    return out
+
+
+def parse_notices(raw):
+    """Build event models from the notices carried on a state update, keyed by int uid.
+
+    NOTICES ARRIVE AS JSON-SHAPED DICTS ON EVERY PATH, because both compress() and decompress() go
+    through msgpack. Handing those dicts straight to consumers made every reader ask what shape it had
+    received, and dict keys stringified in transit made a uid lookup miss unless it was tried twice.
+    Parsing here gives one shape and one key type, so `.type` and `notices[uid]` just work.
+
+    A notice whose type the protocol does not recognise is dropped rather than passed through as a raw
+    dict: every consumer selects by type, so an unparseable notice is unreadable anyway, and keeping it
+    would reintroduce the mixed shape this exists to remove. Dropping is counted and logged, never
+    silent.
+    """
+    if not raw:
+        return raw
+    out = {}
+    unparsed = 0
+    _NOTICE_FACTORIES = _NOTICE_FACTORY_LIST()
+    for uid, events in raw.items():
+        try:
+            key = int(uid)
+        except (TypeError, ValueError):
+            key = uid
+        parsed = []
+        for event in events or []:
+            if not isinstance(event, dict):
+                parsed.append(event)
+                continue
+            built = None
+            for factory in _NOTICE_FACTORIES:
+                try:
+                    built = factory(event)
+                except (KeyError, TypeError, ValueError):
+                    built = None
+                if built is not None:
+                    break
+            # NEVER DROP A NOTICE. An earlier version skipped anything the local dispatcher did not
+            # recognise, on the reasoning that consumers select by type so an unparsed notice is
+            # unreadable anyway. That was wrong twice over: it is perfectly readable as a dict, and this
+            # tree's dispatcher does not cover every code that reaches it -- the exchange one has no
+            # ClosePositionsEvent, so RDCP was discarded and an SL/TP trigger's close notice never
+            # reached the miner. The other tree is tried second, and a code neither knows is passed
+            # through unchanged and reported, because losing a miner's notice is worse than a mixed shape.
+            if built is None:
+                unparsed += 1
+                parsed.append(event)
+                continue
+            parsed.append(built)
+        out[key] = parsed
+    if unparsed:
+        try:
+            import bittensor as bt
+
+            bt.logging.warning(f"Dropped {unparsed} notice(s) of unrecognised type while parsing")
+        except Exception:
+            pass
+    return out

@@ -806,6 +806,87 @@ RetrieveL1ResponsePayload::Ptr RetrieveL1ResponsePayload::fromJson(const rapidjs
 
 //-------------------------------------------------------------------------
 
+void RetrieveL1ExtPayload::jsonSerialize(rapidjson::Document& json, const std::string& key) const
+{
+    auto serialize = [this](rapidjson::Document& json) {
+        json.SetObject();
+        auto& allocator = json.GetAllocator();
+        json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
+    };
+    taosim::json::serializeHelper(json, key, serialize);
+}
+
+//-------------------------------------------------------------------------
+
+RetrieveL1ExtPayload::Ptr RetrieveL1ExtPayload::fromJson(const rapidjson::Value& json)
+{
+    return MessagePayload::create<RetrieveL1ExtPayload>(json["bookId"].GetUint());
+}
+
+//-------------------------------------------------------------------------
+
+void RetrieveL1ExtResponsePayload::jsonSerialize(
+    rapidjson::Document& json, const std::string& key) const
+{
+    auto serialize = [this](rapidjson::Document& json) {
+        json.SetObject();
+        auto& allocator = json.GetAllocator();
+        json.AddMember("timestamp", rapidjson::Value{time}, allocator);
+        json.AddMember(
+            "bestAskPrice", rapidjson::Value{taosim::util::decimal2double(bestAskPrice)}, allocator);
+        json.AddMember(
+            "bestAskVolume", rapidjson::Value{taosim::util::decimal2double(bestAskVolume)}, allocator);
+        json.AddMember(
+            "askTotalVolume", rapidjson::Value{taosim::util::decimal2double(askTotalVolume)}, allocator);
+        json.AddMember(
+            "bestBidPrice", rapidjson::Value{taosim::util::decimal2double(bestBidPrice)}, allocator);
+        json.AddMember(
+            "bestBidVolume", rapidjson::Value{taosim::util::decimal2double(bestBidVolume)}, allocator);
+        json.AddMember(
+            "bidTotalVolume", rapidjson::Value{taosim::util::decimal2double(bidTotalVolume)}, allocator);
+        json.AddMember("tradeCount", rapidjson::Value{tradeStats.tradeCount}, allocator);
+        json.AddMember(
+            "volumeSum", rapidjson::Value{taosim::util::decimal2double(tradeStats.volumeSum)}, allocator);
+        json.AddMember(
+            "notionalSum", rapidjson::Value{taosim::util::decimal2double(tradeStats.notionalSum)}, allocator);
+        json.AddMember("logReturnSum", rapidjson::Value{tradeStats.logReturnSum}, allocator);
+        json.AddMember("logReturnSqSum", rapidjson::Value{tradeStats.logReturnSqSum}, allocator);
+        json.AddMember(
+            "lastTradePrice",
+            rapidjson::Value{taosim::util::decimal2double(tradeStats.lastTradePrice)},
+            allocator);
+        json.AddMember("lastTradeTime", rapidjson::Value{tradeStats.lastTradeTime}, allocator);
+        json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
+    };
+    taosim::json::serializeHelper(json, key, serialize);
+}
+
+//-------------------------------------------------------------------------
+
+RetrieveL1ExtResponsePayload::Ptr RetrieveL1ExtResponsePayload::fromJson(
+    const rapidjson::Value& json)
+{
+    return MessagePayload::create<RetrieveL1ExtResponsePayload>(
+        json["timestamp"].GetUint64(),
+        taosim::json::getDecimal(json["bestAskPrice"]),
+        taosim::json::getDecimal(json["bestAskVolume"]),
+        taosim::json::getDecimal(json["askTotalVolume"]),
+        taosim::json::getDecimal(json["bestBidPrice"]),
+        taosim::json::getDecimal(json["bestBidVolume"]),
+        taosim::json::getDecimal(json["bidTotalVolume"]),
+        taosim::book::BookTradeStats{
+            .tradeCount = json["tradeCount"].GetUint64(),
+            .volumeSum = taosim::json::getDecimal(json["volumeSum"]),
+            .notionalSum = taosim::json::getDecimal(json["notionalSum"]),
+            .logReturnSum = json["logReturnSum"].GetDouble(),
+            .logReturnSqSum = json["logReturnSqSum"].GetDouble(),
+            .lastTradePrice = taosim::json::getDecimal(json["lastTradePrice"]),
+            .lastTradeTime = json["lastTradeTime"].GetUint64()},
+        json["bookId"].GetUint());
+}
+
+//-------------------------------------------------------------------------
+
 void SubscribeEventTradeByOrderPayload::jsonSerialize(
     rapidjson::Document& json, const std::string& key) const
 {

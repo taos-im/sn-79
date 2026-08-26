@@ -10,12 +10,12 @@
 #include "DistributionFactory.hpp"
 #include "RayleighDistribution.hpp"
 #include "Simulation.hpp"
+#include <taosim/util/RootFinding.hpp>
 
 #include <boost/algorithm/string/regex.hpp>
 #include <boost/bimap.hpp>
 
 #include <boost/accumulators/accumulators.hpp>
-#include <unsupported/Eigen/NonLinearOptimization>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/random.hpp>
 
@@ -30,33 +30,6 @@ inline auto investmentPosition = [](double price, double forecast, double varian
     return (std::log(forecast/price) + variance)/(variance*price);
 };
 
-// 1-D Newton-Raphson with central-difference derivative. Drop-in replacement
-// for Eigen::HybridNonLinearSolver::hybrd1 on the scalar residual case used by
-// calculate{Indifference,Minimum}Price. Differs from the prior solver at the
-// convergence-tolerance level — accepted under "tolerance-level diff" policy.
-template <typename F>
-[[nodiscard]] static std::pair<double, bool> solveScalarNewton(
-    F&& residual, double x0, double xtol = 1.49012e-8, int maxIter = 100)
-{
-    double x = x0;
-    constexpr double h = 1e-7;
-    for (int i = 0; i < maxIter; ++i) {
-        const double f = residual(x);
-        if (std::abs(f) < xtol) return {x, true};
-        const double fp = residual(x + h);
-        const double fm = residual(x - h);
-        const double df = (fp - fm) / (2.0 * h);
-        if (!std::isfinite(df) || std::abs(df) < 1e-15) return {x, false};
-        const double dx = f / df;
-        x -= dx;
-        if (!std::isfinite(x)) return {x0, false};
-        if (std::abs(dx) < xtol * std::max(1.0, std::abs(x))) return {x, true};
-    }
-    return {x, false};
-}
-
-//-------------------------------------------------------------------------
-
 NoiseTraderAgent::NoiseTraderAgent(Simulation* simulation) noexcept
     : Agent{simulation}
 {}
@@ -68,7 +41,6 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     Agent::configure(node);
 
     m_rng = &simulation()->rng();
-
 
     pugi::xml_attribute attr;
     static constexpr auto ctx = std::source_location::current().function_name();
@@ -163,7 +135,6 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     m_maxDelay = (attr.empty() || attr.as_ullong() < 1'000'000'000) ? static_cast<Timestamp>(450'000'000'000) : attr.as_ullong();
     attr = node.attribute("minDMD");
     m_minDelay = (attr.empty() || attr.as_ullong() < 100'000'000) ? static_cast<Timestamp>(100'000'000) : attr.as_ullong();
-    // -- END
 
     // BEGIN Order details
     attr = node.attribute("meanVolume");
@@ -174,18 +145,23 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     attr = node.attribute("balanceCoef");
     m_balanceCoef=  (attr.empty() || attr.as_double() <= 0.0) ? 0.5 : attr.as_double();
 
-    m_sigma = node.attribute("sigmaExp").as_double(0.000001);
+    m_sigma = node.attribute("sigmaExp").as_double(0.00001);
+    m_feeReserveFrac = std::clamp(node.attribute("feeReserveFrac").as_double(0.01), 0.0, 0.5);
     m_mWeight = node.attribute("weight").as_double(0.1);
 
-    // for cancellation of limit orders
+    try {
+        (void)simulation()->exchange()->process("magneticfield", 0);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(fmt::format(
+            "{}: requires a Books process named 'magneticfield' (used for the Ising field "
+            "and to hold ACD wakeup state)", name()));
+    }
+
     attr = node.attribute("tau");
     m_tau = (attr.empty() || attr.as_ullong() == 0) ? 120'000'000'000 : attr.as_ullong();
 
-    
     m_state.orderFlag = std::vector<bool>(m_bookCount, false);
 
-    // Cache MagneticField pointer per book — moves the string-keyed process
-    // lookup + RTTI cast out of every handleWakeup / handleRetrieveL1Response.
     m_magneticField.reserve(m_bookCount);
     for (BookId b = 0; b < m_bookCount; ++b) {
         m_magneticField.push_back(dynamic_cast<process::MagneticField*>(
@@ -254,10 +230,6 @@ void NoiseTraderAgent::handleSimulationStart()
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));
 
-            // Merge: testnet's cached m_magneticField[bookId] preserves the perf
-            // lookup; SIMU003's initPsi = omega/(1-alpha-beta) primes the ACD
-            // recursion at its stationary mean so the self-exciting behaviour
-            // isn't frozen at a static exp(maxDelay/3) start.
             const auto field = m_magneticField[bookId];
             const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
             field->insertDurationComp(m_baseName, process::DurationComp{.delay=initPsi, .psi=initPsi});
@@ -312,20 +284,23 @@ void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
-    
+
     uint64_t chosenOne = selectTurn();
     const auto field = m_magneticField[bookId];
     double avgMagnetism = std::abs(field->avgMagnetism());
     const auto lastDurationComp = field->getDurationComp(m_baseName);
     float lastDelay = lastDurationComp.delay;
-    float psi_prev = lastDurationComp.psi; 
+    float psi_prev = lastDurationComp.psi;
     float psi_next = m_omegaDu + m_alphaDu * lastDelay + m_betaDu *psi_prev + m_gammaDu*std::log(1-avgMagnetism);
-    if (isnan(psi_next)) {
+    if (!std::isfinite(psi_next)) {
         psi_next = m_omegaDu/(1-m_alphaDu - m_betaDu);
     }
-    float delay = std::exp(psi_next) * m_acdDelayDist(*m_rng);
-    Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);
-    delay= (float) delay_timestamped;
+    double delayRaw = static_cast<double>(std::exp(psi_next)) * m_acdDelayDist(*m_rng);
+    if (!std::isfinite(delayRaw) || delayRaw > static_cast<double>(m_maxDelay)) {
+        delayRaw = static_cast<double>(m_maxDelay);
+    }
+    Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delayRaw), m_minDelay, m_maxDelay);
+    const float delay = static_cast<float>(delay_timestamped);
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         delay_timestamped,
@@ -429,24 +404,12 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     ForecastResult forecastResult = {.price= m_price*std::exp(adjustedRet), .varianceOfLastLogReturns=m_sigma};
     const auto [indifferencePrice, indifferencePriceConverged] =
         calculateIndifferencePrice(forecastResult, freeBase, freeQuote);
-    if (!indifferencePriceConverged){ 
-          if (sign > 0) {
-                placeBuy(bookId, volume);
-            } else if (sign < 0) {
-                placeSell(bookId, volume);
-            }
-        return;}
+    if (!indifferencePriceConverged) return;
 
+    const auto [minimumPrice, minimumPriceConverged] =
+        calculateMinimumPrice(forecastResult, freeBase, freeQuote, indifferencePrice);
+    if (!minimumPriceConverged) return;
 
-    auto [minimumPrice, minimumPriceConverged] =
-        calculateMinimumPrice(forecastResult, freeBase, freeQuote);
-    if (!minimumPriceConverged) {
-            if (sign > 0) {
-                placeBuy(bookId, volume);
-            } else if (sign < 0) {
-                placeSell(bookId, volume);
-            }
-        return;}
     const auto maximumPrice = forecastResult.price;
     double weight; 
     if (sign*magnetism > 0) {
@@ -464,14 +427,21 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     } else {
         weight = 1- avgMagnetism;
     }
-    const double sampledPrice = samplePrice(minimumPrice*(1+balance),indifferencePrice,maximumPrice*(1-balance),sign,weight);
+    const double sampleLow = std::max(minimumPrice, m_priceIncrement);
+    const double sampleHigh = maximumPrice;
+    if (sampleLow >= sampleHigh) return;
+
+    const double sampledPrice = samplePrice(sampleLow, indifferencePrice, sampleHigh, sign, weight);
     const double price = std::round(sampledPrice / m_priceIncrement) * m_priceIncrement;
+    if (price <= 0.0) return;
     if (sampledPrice < indifferencePrice) {
         volume = calcPositionPrice(forecastResult,sampledPrice,freeBase,freeQuote) - freeBase;
+        volume = std::min(volume, freeQuote / price * (1.0 - m_feeReserveFrac));
         placeBid(bookId,volume,price);
         field->setValAt(m_catUId, 1);
     } else if (sampledPrice > indifferencePrice) {
         volume = freeBase - calcPositionPrice(forecastResult, sampledPrice,freeBase,freeQuote);
+        volume = std::min(volume, freeBase);
         placeAsk(bookId, volume, price);
         field->setValAt(m_catUId, -1);
     }
@@ -480,17 +450,21 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
 double NoiseTraderAgent::samplePrice(double minP, double indiffP, double maxP,
                    int sign, double weight)
 {
-    double i = (indiffP - minP) / (maxP - minP);
+    if (!(maxP > minP)) {
+        return minP;
+    }
+    const double i = std::clamp((indiffP - minP) / (maxP - minP), 0.0, 1.0);
 
     double mode;
     if (sign >= 0) {
-        mode = i * (1.0 - weight);   
+        mode = i * (1.0 - weight);
     }
     else {
         mode = i + (1.0 - i) * weight;
     }
+    mode = std::clamp(mode, 0.0, 1.0);
 
-    double s = 6.0; 
+    double s = 6.0;
     double alpha = mode * (s - 2.0) + 1.0;
     double beta  = (1.0 - mode) * (s - 2.0) + 1.0;
     std::gamma_distribution<double> distA(alpha, 1.0);
@@ -510,21 +484,29 @@ NoiseTraderAgent::OptimizationResult NoiseTraderAgent::calculateIndifferencePric
         return investmentPosition(x, forecastResult.price,
             forecastResult.varianceOfLastLogReturns, freeBase, freeQuote) - freeBase;
     };
-    auto [value, converged] = solveScalarNewton(residual, 1.0);
-    return {.value = value, .converged = converged};
+    const auto upperBound =
+        forecastResult.price * std::exp(forecastResult.varianceOfLastLogReturns);
+    const auto root = util::solveScalarBracketed(residual, m_priceIncrement, upperBound);
+    return {.value = root.value, .converged = root.converged};
 }
 
 //-------------------------------------------------------------------------
 
 NoiseTraderAgent::OptimizationResult NoiseTraderAgent::calculateMinimumPrice(
-    const NoiseTraderAgent::ForecastResult& forecastResult, double freeBase, double freeQuote)
+    const NoiseTraderAgent::ForecastResult& forecastResult,
+    double freeBase,
+    double freeQuote,
+    double indifferencePrice)
 {
     auto residual = [&](double x) {
         return x * (investmentPosition(x, forecastResult.price,
             forecastResult.varianceOfLastLogReturns, freeBase, freeQuote) - freeBase) - freeQuote;
     };
-    auto [value, converged] = solveScalarNewton(residual, 1.0);
-    return {.value = value, .converged = converged};
+    const auto root = util::solveScalarBracketed(residual, m_priceIncrement, indifferencePrice);
+    if (!root.converged && root.status == util::RootStatus::SameSignNegative) {
+        return {.value = m_priceIncrement, .converged = true};
+    }
+    return {.value = root.value, .converged = root.converged};
 }
 
 // -------------------------------------------------------------------------

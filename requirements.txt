@@ -20,10 +20,18 @@ scikit-learn
 posix-ipc
 zstandard
 aiofiles
-# GenTRX distributed training (optional) only needed when --gentrx.enabled true
+# fastapi/uvicorn/httpx are CORE, not optional extras: the validator imports all three unguarded
+# (neurons/validator.py, validator/report.py) and taos.common.agents pulls fastapi on every agent
+# path. Below the optional marker they land in the extra and a plain `pip install -e .` validator
+# dies at import (found in the 0.6.0 pre-deploy review). optuna is core because the shipped
+# RevengAgent example imports it at module level and is selectable after a default install.
+# NOTE: setup.py splits this file at the FIRST comment naming the training suite, so this block
+# must not name it.
 fastapi>=0.110
 uvicorn>=0.29
 httpx>=0.27
+optuna
+# GenTRX distributed training (optional) only needed when --gentrx.enabled true
 boto3>=1.34
 aiobotocore>=2.9
 transformers>=4.48  # >=4.48 clears the deserialization/ReDoS GHSAs in the 4.36 floor
@@ -32,4 +40,3 @@ pyarrow>=14.0
 structlog>=23.2
 sortedcontainers>=2.4
 tqdm>=4.66
-optuna

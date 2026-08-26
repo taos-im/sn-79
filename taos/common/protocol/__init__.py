@@ -28,6 +28,7 @@ from abc import abstractmethod
 # This class contains common classes representing the protcol for miners and validators in the simulation subnet.
 
 class BaseModel(pydantic.BaseModel):    
+    """Project-wide pydantic base: field names, their aliases and alias population all accepted."""
     model_config = ConfigDict(populate_by_name=True, validate_by_name=True, validate_by_alias=True)
 
 class AgentInstruction(BaseModel):    
@@ -36,9 +37,19 @@ class AgentInstruction(BaseModel):
     """
     @abstractmethod
     def payload(self) -> dict:
+        """The instruction-specific fields, provided by each subclass.
+
+        Returns:
+            dict: The subclass's payload for ``serialize``.
+        """
         ...
         
     def serialize(self) -> dict:
+        """Serialize this instruction with its type and payload.
+
+        Returns:
+            dict: The wire form of this instruction.
+        """
         return {
             "payload" : self.payload()
         }
@@ -50,9 +61,19 @@ class AgentResponse(BaseModel):
     agent_id : int
     instructions : list[AgentInstruction] = []
     def add_instruction(self, instruction : AgentInstruction):
+        """Append an instruction to this response.
+
+        Args:
+            instruction (AgentInstruction): The instruction to send this step.
+        """
         self.instructions.append(instruction)
 
     def serialize(self) -> list[dict]:
+        """Serialize every instruction in this response.
+
+        Returns:
+            list[dict]: The wire form of each instruction, in order.
+        """
         return [
             instruction.serialize() for instruction in self.instructions
         ]
@@ -71,10 +92,12 @@ class SimulationStateUpdate(bt.Synapse):
     
     @abstractmethod
     def environment_state(self):
+        """The environment's view of this update, provided by each subclass."""
         ...
     
     @abstractmethod
     def agent_state(self):
+        """The agent-specific view of this update, provided by each subclass."""
         ...
 
     # Optional request output, filled by recieving axon.
@@ -91,21 +114,35 @@ class SimulationStateUpdate(bt.Synapse):
 class SimulationEvent(BaseModel):
     """
     Base class representing an event that has occurred within the simulator which is to be published by validator to miners.
+
+    EXTRA FIELDS ARE KEPT, NOT IGNORED. The validator stamps fields on a notice that no event class
+    declares -- `cr` (the SL/TP close reason), `xo` (the external-order UUID the data service keys on),
+    `seq`. With pydantic's default `extra='ignore'` those are dropped the moment a wire dict becomes a
+    model, and `model_dump()` cannot emit what was never kept: the notice arrives looking complete and
+    is silently missing the one field its consumer selects on. Measured 2026-08-18, once notices began
+    parsing into models on both paths: an SL/TP trigger closed the position correctly and the close
+    notice reached the miner with `cr` gone, so the scenario reported a trigger that never fired.
     """
+    model_config = ConfigDict(populate_by_name=True, validate_by_name=True, validate_by_alias=True,
+                              extra="allow")
+
     y : str = Field(alias="type")
     t : int = Field(alias="timestamp")
     a : int | None = Field(alias="agentId")
     
     @property
     def type(self) -> str:
+        """Readable accessor for wire field ``y``; ``type`` is its serialized alias."""
         return self.y
     
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
     
     @property
     def agentId(self) -> int | None:
+        """Readable accessor for wire field ``a``; ``agentId`` is its serialized alias."""
         return self.a
     
 class EventNotification(bt.Synapse):

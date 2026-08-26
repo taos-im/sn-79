@@ -29,6 +29,11 @@ public:
 
     virtual void update(Timestamp timestamp) = 0;
     [[nodiscard]] virtual double value() const = 0;
+    // Value recorded to the per-process CSV (the replay source). Defaults to value();
+    // processes whose value() is a read-time transform of latent state (e.g. the
+    // interpolating FundamentalPrice) override this to record the latent path, so the
+    // CSV's meaning is independent of presentation options.
+    [[nodiscard]] virtual double loggedValue() const { return value(); }
     [[nodiscard]] virtual uint64_t count() const { return 0; }
 
     [[nodiscard]] auto&& valueSignal(this auto&& self) noexcept { return self.m_valueSignal; }

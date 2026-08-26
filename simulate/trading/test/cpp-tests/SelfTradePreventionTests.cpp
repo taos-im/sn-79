@@ -112,6 +112,16 @@ std::pair<MarketOrder::Ptr, OrderErrorCode> placeMarketOrder(
     return {marketOrderPtr, orderResult.ec};
 }
 
+// A miner's whole batch of orders carries ONE timestamp, so two orders on the same book in the
+// same batch are separate instructions that share one. Pinning the clock reproduces that.
+std::optional<Timestamp> g_pinnedOrderTimestamp{};
+
+struct PinnedOrderTimestamp
+{
+    explicit PinnedOrderTimestamp(Timestamp ts) { g_pinnedOrderTimestamp = ts; }
+    ~PinnedOrderTimestamp() { g_pinnedOrderTimestamp.reset(); }
+};
+
 template<typename... Args>
 requires std::constructible_from<PlaceOrderLimitPayload, Args..., BookId>
 std::pair<LimitOrder::Ptr, OrderErrorCode> placeLimitOrder(
@@ -127,9 +137,18 @@ std::pair<LimitOrder::Ptr, OrderErrorCode> placeLimitOrder(
     const auto payload = MessagePayload::create<PlaceOrderLimitPayload>(
         std::forward<Args>(args)..., bookId, Currency::BASE, std::nullopt, postOnly, timeInForce, std::nullopt, stpFlag);
     const auto orderResult = exchange->clearingManager().handleOrder(LimitOrderDesc{.agentId = agentId, .payload = payload});
+    // DISTINCT TIMESTAMPS, because equal ones mean "same instruction" to the engine. Book.cpp stands STP
+    // down when iop->timestamp() == order->timestamp(): that is the sweep-and-its-target case, where
+    // cancelling the resting side would destroy the very order the sweep exists to fill. Passing
+    // Timestamp{} for every order therefore told the engine these were all one instruction, STP correctly
+    // never fired, and the test asserted that it had. Separate instructions carry separate timestamps in
+    // production, so a monotonic counter is what this test actually means.
+    static Timestamp s_testOrderClock{};
+    ++s_testOrderClock;
+    const Timestamp orderTimestamp = g_pinnedOrderTimestamp.value_or(s_testOrderClock);
     auto limitOrderPtr = exchange->books()[bookId]->placeLimitOrder(
         OrderClientContext{agentId},
-        Timestamp{},
+        orderTimestamp,
         orderResult.orderSize,
         payload->direction,
         payload->price,
@@ -258,6 +277,37 @@ TEST_F(SelfTradePreventionTest, LimitOrderBuyCO)
               "bid,301,2,297,1,291,3\n"));
     //-------------------------------------------------------------------------
 
+}
+
+//-------------------------------------------------------------------------
+
+// SEPARATE INSTRUCTIONS CAN SHARE A TIMESTAMP, so STP must not key off timestamp equality.
+//
+// Simulation::m_time.current is set per delivered message to instr.delay, a per-batch offset, so a
+// miner's whole batch carries one timestamp. Measured on the running exchange: agent 4 registered
+// 126 orders stamped 12893798, one per book, plus groups of 122 and 118. Today's traffic happens to
+// place at most one order per book per batch, which is the only reason Book.cpp's
+// `iop->timestamp() != order->timestamp()` guard does not misfire. Two orders on the SAME book in
+// one batch -- a bid and an ask, or two ladder levels -- are separate instructions sharing a
+// timestamp, and the guard reads them as one instruction and stands STP down.
+TEST_F(SelfTradePreventionTest, SameBatchTimestampStillPrevents)
+{
+    PinnedOrderTimestamp pinned{Timestamp{4242}};
+
+    placeLimitOrder(exchange, agent1, bookId, OrderDirection::SELL, 3_dec, 301_dec, DEC(0.));
+
+    EXPECT_THAT(
+        normalizeOutput(taosim::util::captureOutput([&] { book->printCSV(); })),
+        StrEq("ask,301,3,303,2,307,8\n"
+              "bid,297,1,291,3\n"));
+
+    // Same agent, same book, same batch timestamp: CO must cancel the resting sell and rest the buy.
+    placeLimitOrder(exchange, agent1, bookId, OrderDirection::BUY, 2_dec, 301_dec, DEC(0.));
+
+    EXPECT_THAT(
+        normalizeOutput(taosim::util::captureOutput([&] { book->printCSV(); })),
+        StrEq("ask,303,2,307,8\n"
+              "bid,301,2,297,1,291,3\n"));
 }
 
 // //-------------------------------------------------------------------------

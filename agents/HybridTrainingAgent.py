@@ -67,6 +67,7 @@ class HybridTrainingAgent(GenTRXAgent):
 
     # ------------------------------------------------------------------
     def initialize(self) -> None:
+        """Set up strategy state for the hybrid rule/model strategy."""
         super().initialize()
         cfg = self.config
 
@@ -163,6 +164,7 @@ class HybridTrainingAgent(GenTRXAgent):
         self, state: MarketSimulationStateUpdate
     ) -> FinanceAgentResponse:
         # GenTRX: data packaging + model poll + training trigger.
+        """Produce this block's response by combining the rule signal with the model's."""
         response = super().respond(state)
         validator = state.dendrite.hotkey
 

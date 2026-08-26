@@ -145,7 +145,6 @@ std::mt19937& Simulation::rng() const noexcept
 
 void Simulation::receiveMessage(Message::Ptr msg)
 {
-    // TODO: Do something?
 }
 
 //-------------------------------------------------------------------------
@@ -173,7 +172,20 @@ void Simulation::configure(const pugi::xml_node& node)
     m_time.step = node.attribute("step").as_ullong(1);
     m_time.current = node.attribute("current").as_ullong(m_time.start);
 
-    m_rng = std::mt19937{std::random_device{}()};
+    // An explicit `rngSeed` attribute makes runs reproducible; without one the legacy
+    // non-deterministic random_device stands. The block index is mixed
+    // in so parallel blocks configured from the same XML don't share a stream
+    // (splitmix-style scramble rather than +blockIdx, which would make adjacent
+    // seeds collide across blocks).
+    if (auto seedAttr = node.attribute("rngSeed"); !seedAttr.empty()) {
+        uint64_t s = seedAttr.as_ullong() ^ (0x9E3779B97F4A7C15ULL * (m_blockIdx + 1));
+        s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+        s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+        s ^= s >> 31;
+        m_rng = std::mt19937{static_cast<std::mt19937::result_type>(s)};
+    } else {
+        m_rng = std::mt19937{std::random_device{}()};
+    }
 
     m_config = [node] -> std::string {
         std::ostringstream oss;
@@ -250,7 +262,8 @@ void Simulation::configureAgents(pugi::xml_node node)
                                         taosim::accounting::RoundParams{
                                             .baseDecimals = params.baseIncrementDecimals,
                                             .quoteDecimals = params.quoteIncrementDecimals
-                                        })
+                                        },
+                                        &m_rng)
                                     };
                             }
                             else {
@@ -262,7 +275,8 @@ void Simulation::configureAgents(pugi::xml_node node)
                                             taosim::accounting::RoundParams{
                                                 .baseDecimals = params.baseIncrementDecimals,
                                                 .quoteDecimals = params.quoteIncrementDecimals
-                                            });
+                                            },
+                                            &m_rng);
                                     })
                                     | ranges::to<std::vector>
                                 );
@@ -392,9 +406,17 @@ void Simulation::deliverMessage(const Message::Ptr& msg)
             // millions of dispatches per tick across 30k+ agents).
             Agent* const agentPtr = m_localAgentManager->findByName(target);
             if (agentPtr == nullptr) {
-                // Silent skip retained for parity with the pre-refactor behaviour
-                // (lower_bound miss returned without throwing in the common case).
-                return;
+                // A message addressed to a name no agent answers to is DROPPED. Say so, once per name:
+                // this was silent, and a whole class of defect looks like "the component never produced
+                // the message" from every other surface. `continue`, not `return`: a miss on one target
+                // must not also drop the message for the targets after it.
+                static std::set<std::string> reported;
+                if (reported.insert(target).second) {
+                    fmt::println(
+                        "[WARN] message to unknown target '{}' dropped (type {}); no agent answers to "
+                        "that name", target, msg->type);
+                }
+                continue;
             }
             agentPtr->receiveMessage(msg);
         }

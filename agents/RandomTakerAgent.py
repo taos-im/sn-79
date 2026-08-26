@@ -10,10 +10,8 @@ from taos.im.agents import GenTRXAgent
 from taos.im.protocol.models import OrderDirection, STP, LoanSettlementOption, OrderCurrency
 import random
 
-"""
-A simple example agent which randomly places market orders.
-"""
 class RandomTakerAgent(GenTRXAgent):
+    """Example: takes liquidity at random intervals, useful as background flow."""
     def initialize(self):
         """
         Initialize properties, variables and quantities that will be used by the agent.
@@ -44,9 +42,16 @@ class RandomTakerAgent(GenTRXAgent):
         """
         Obtains a random leverage value for order placement within the bounds defined by the agent strategy parameters.
         """
+        # EXCHANGE MODE RUNS WITH maxLeverage=0, so a leveraged order is REFUSED at placement rather
+        # than executed unleveraged. Returning 0 here rather than at each call site also fixes the
+        # `quantity() * (1 + leverage())` sizing below, which would otherwise inflate an order the
+        # exchange will not accept. Simulation behaviour is unchanged.
+        if self.exchange_mode:
+            return 0.0
         return round(random.uniform(self.min_leverage, self.max_leverage), 2) if self.min_leverage != self.max_leverage else self.max_leverage
 
     def respond_simulation(self, state):
+        """Simulation-mode branch of this agent's per-step response; the strategy itself is shared."""
         volume_decimals = getattr(self.simulation_config, 'volumeDecimals', 8)
         # Initialize a response class associated with the current miner
         response = self.make_response()

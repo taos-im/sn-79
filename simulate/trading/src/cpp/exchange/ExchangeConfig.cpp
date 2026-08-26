@@ -55,7 +55,10 @@ ExchangeConfig makeExchangeConfig(pugi::xml_node node)
             .as_ullong(std::numeric_limits<decltype(ExchangeConfig::maxOpenOrders)>::max()),
         .minOrderSize = std::max(
             util::double2decimal(node.attribute("minOrderSize").as_double()),
-            util::pow(10_dec, -decimal_t{node.attribute("volumeDecimals").as_uint()}))
+            util::pow(10_dec, -decimal_t{node.attribute("volumeDecimals").as_uint()})),
+        // Unlike minOrderSize this takes no representational floor: absent means absent, so the check
+        // stays inert wherever the attribute is not declared, which is every simulation config.
+        .minQuoteOrderSize = util::double2decimal(node.attribute("minQuoteOrderSize").as_double(0.0))
     };
 }
 

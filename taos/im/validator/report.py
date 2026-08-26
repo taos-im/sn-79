@@ -43,10 +43,26 @@ async def _push_to_mvtrx_data_service(state_dict: dict, url: str) -> None:
     await _push(state_dict, url)
 
 
+# Exposition warm-up ceiling. The reporting subprocess restarts with the
+# validator; its Prometheus registries start EMPTY and are not repopulated until
+# the first publish_metrics completes (the validator spends several minutes on
+# wallet loading + balance refresh + bootstrap first). Serving /metrics during
+# that window returns empty gauges, which the scraper records as false zeros —
+# the source of the dashboard dip on every restart. We withhold exposition
+# (HTTP 503 = a scrape gap, not zeros) until the first publish, but never
+# indefinitely: after this many seconds we serve whatever we have so a validator
+# that genuinely never publishes can't wedge /metrics at 503 and hide the box.
+_EXPOSITION_WARMUP_MAX_SECONDS = 600
+
+
 class ReportingService:
     # Shared validator state pushed in via IPC before each report (not set in
     # __init__). Annotation-only declarations — no runtime effect — so static
     # analysis resolves these attributes.
+    """Out-of-process reporting: consumes validator state snapshots and serves metrics.
+
+    Runs as its own process so a slow scrape or a large snapshot can never block a validator step.
+    """
     kappa_values: dict
     activity_factors: dict
     pnl_factors: dict
@@ -84,6 +100,11 @@ class ReportingService:
         self.running = True
         self.prometheus_initialized = False
         self.current_sim_id = None
+        # Exposition warm-up guard: /metrics is withheld (503) until the first
+        # publish_metrics fully processes a payload, so a cold restart serves a
+        # scrape gap instead of empty-gauge false zeros. See _metrics_ready().
+        self._first_publish_done = False
+        self._exposition_start = time.monotonic()
         
         _pfx = getattr(config, 'ipc_prefix', 'validator')
         bt.logging.info(f"Reporting service IPC prefix: {_pfx!r}")
@@ -117,6 +138,20 @@ class ReportingService:
         self.report_executor = ThreadPoolExecutor(max_workers=1)        
         self._init_prometheus()
         
+    def _metrics_ready(self):
+        """Whether the /metrics endpoints may serve exposition yet.
+
+        Ready once the first publish_metrics has fully processed a payload
+        (`_first_publish_done`), OR once the bounded warm-up ceiling has elapsed
+        — the ceiling ensures a validator that never publishes cannot wedge
+        /metrics at 503 forever (we then serve whatever we have). Before either,
+        the endpoints return 503 so the scraper records a gap rather than the
+        empty-gauge zeros that cause the dashboard dip on restart.
+        """
+        if self._first_publish_done:
+            return True
+        return (time.monotonic() - self._exposition_start) >= _EXPOSITION_WARMUP_MAX_SECONDS
+
     def _start_metrics_server(self):
         """
         Start a FastAPI server exposing per-registry Prometheus metric endpoints.
@@ -126,48 +161,82 @@ class ReportingService:
         """
         app = FastAPI()
 
+        def _warmup_response():
+            # None => ready to serve; an empty 200 => still warming up. We return
+            # 200 (not 503) so the scraper records a scrape GAP (absent series, no
+            # false zeros) WITHOUT flipping up=0 / firing target-down alerts on every
+            # restart. The body carries only a comment, so no gauge series are emitted.
+            if self._metrics_ready():
+                return None
+            return Response(content=b"# metrics warming up\n", status_code=200, media_type=CONTENT_TYPE_LATEST)
+
         @app.get("/metrics")
         def all_metrics():
             """All metrics combined (backwards compatibility)"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             output = b''.join([generate_latest(r) for r in self.registries.values()])
             return Response(content=output, media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/validator")
         def validator_metrics():
             """Validator-specific metrics: counters, validator_gauges, neuron_info"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_validator), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/simulation")
         def simulation_metrics():
             """Simulation metrics: simulation_gauges"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_simulation), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/miner")
         def miner_metrics():
             """Miner metrics: miner_gauges, miners"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_miner), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/agent")
         def agent_metrics():
             """Miner metrics: agent_gauges"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_agent), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/books")
         def book_metrics():
             """Book metrics: book_gauges, books"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_books), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/trades")
         def trade_metrics():
             """Trade metrics: trades, miner_trades"""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_trades), media_type=CONTENT_TYPE_LATEST)
 
         @app.get("/metrics/gentrx")
         def gentrx_metrics():
             """GenTRX distributed-training metrics: pool allocation, per-miner EMA scores."""
+            warming = _warmup_response()
+            if warming is not None:
+                return warming
             return Response(content=generate_latest(self.registry_gentrx), media_type=CONTENT_TYPE_LATEST)
 
         def run_server():
+            """Serve the metrics endpoint until the process is stopped."""
             uvicorn.run(app, host="0.0.0.0", port=self.config.prometheus.port, log_level="debug")
 
         self.metrics_server_thread = threading.Thread(target=run_server, daemon=True)
@@ -255,7 +324,7 @@ class ReportingService:
         ], carry_forward=False)
         self.registry_books.register(self.prometheus_books)
         self.prometheus_miners = Gauge('miners', 'Gauge summaries for miner metrics.', [
-            'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id', 'hotkey', 'coldkey',
+            'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port',
             'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
             'inventory_value', 'inventory_value_change', 'pnl', 'pnl_change', 'total_realized_pnl',
             'total_daily_volume', 'min_daily_volume', 'average_daily_volume',
@@ -266,7 +335,7 @@ class ReportingService:
             'unnormalized_score', 'score',
             'miner_gauge_name'
         ], registry=self.registry_miner)
-        self.prometheus_miner_identity = Gauge('miner_identity', 'Per-miner identity (hotkey/coldkey) for historical attribution; value always 1.0, re-series on re-registration.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey'], registry=self.registry_miner)
+        self.prometheus_miner_identity = Gauge('miner_identity', 'Per-miner identity (hotkey/coldkey/axon) for historical attribution; value always 1.0, re-series on re-registration or axon change.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port'], registry=self.registry_miner)
         self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid', 'sim_id'], registry=self.registry_validator)
         self.prometheus_gentrx_gauges = Gauge('gentrx_gauges', 'GenTRX distributed-training validator metrics.', ['wallet', 'netuid', 'sim_id', 'gentrx_gauge_name'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_scores = Gauge('gentrx_miner_scores', 'Per-miner GenTRX EMA score (validator-smoothed).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
@@ -542,6 +611,7 @@ class ReportingService:
                     'step_rates', 'fundamental_price', 'shared_state_rewarding',
                     'current_block', 'uid', 'metagraph_data', 'validator_config']:
             setattr(self, key, data[key])
+        self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.gentrx_scores = data.get('gentrx_scores', {})
         self.gentrx_enabled = data.get('gentrx_enabled', False)
         self.gentrx_training = data.get('gentrx_training', {})
@@ -549,6 +619,7 @@ class ReportingService:
         self.gentrx_config = data.get('gentrx_config', {})
         
         class SimpleState:
+            """Minimal stand-in for validator state, carrying just what reporting reads."""
             pass
         self.last_state = SimpleState()
         self.last_state.accounts = data['last_state']['accounts']
@@ -556,6 +627,7 @@ class ReportingService:
         self.last_state.notices = data['last_state']['notices']
         
         class SimpleMetagraph:
+            """Minimal stand-in for the metagraph, carrying just what reporting reads."""
             pass
         self.metagraph = SimpleMetagraph()
         for key, value in self.metagraph_data.items():
@@ -569,11 +641,11 @@ class ReportingService:
                 from taos.im.protocol.exchange_config import ExchangeConfig
             except ImportError:
                 # Exchange-engine sim_data only ever arrives when --engine exchange
-                # is active. The public release excludes the exchange engine + its
-                # config model; reaching this branch there means a misconfiguration.
+                # is active. Optional component; not part of this tree, so reaching
+                # this branch means a misconfiguration.
                 raise RuntimeError(
                     "Exchange engine mode is not supported in this build "
-                    "(taos.im.protocol.exchange_config is excluded from the public release). "
+                    "(taos.im.protocol.exchange_config is not available). "
                     "Run with --engine simulation (default)."
                 )
             self.simulation = ExchangeConfig(**sim_data)
@@ -678,7 +750,13 @@ class ReportingService:
 
         if not is_observe:
             await report(self)
-    
+
+        # A payload has now been fully processed (gauges populated for the
+        # non-observe path; observe mode legitimately keeps empty registries).
+        # Release the exposition warm-up guard so /metrics stops returning 503.
+        # Only ever flips false->true; never withheld again once running.
+        self._first_publish_done = True
+
     def pagerduty_alert(self, message, details=None):
         """
         Log a critical alert message (stub — the reporting service has no PagerDuty hook).
@@ -910,11 +988,21 @@ class _SnapshotCollector:
 
     def evict(self, labels):
         # Mark a series for removal at the next update() — mirrors gauge.remove().
+        """Drop the series for one label set.
+
+        Args:
+            labels: The label values identifying the series.
+        """
         self._pending_evict.add(labels)
 
     def update(self, cycle_values):
         # copy-then-swap keeps collect() (running on the scrape thread) lock-free
         # and torn-read-safe: collect() only ever sees a fully-built snapshot.
+        """Replace the collector's gauges with this cycle's values.
+
+        Args:
+            cycle_values: Mapping of label sets to gauge values.
+        """
         if not self._carry_forward:
             # Replace: the family is re-emitted in full every cycle, so this
             # cycle's values ARE the complete exposition — no merge/carry-forward
@@ -931,15 +1019,36 @@ class _SnapshotCollector:
         self._snapshot = merged
 
     def clear(self):
+        """Drop every stored series."""
         self._snapshot = {}
         self._pending_evict = set()
 
     def collect(self):
+        # add_metric stores values unchecked and prometheus_client calls float() at serialisation
+        # time, so a single bad sample would 500 the entire /metrics endpoint, not just this family.
+        # Skip (and count) unusable samples so every other series stays exposed.
+        """Yield the stored series to the Prometheus client."""
         snapshot = self._snapshot
         family = GaugeMetricFamily(self._name, self._documentation, labels=self._labelnames)
         add_metric = family.add_metric
+        _dropped = 0
         for labels, value in snapshot.items():
+            if value is None:
+                _dropped += 1
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                _dropped += 1
+                continue
             add_metric([str(label) for label in labels], value)
+        if _dropped:
+            # bt.logging, not the stdlib logger: this module has no logger and a stdlib one would not
+            # reach pm2's captured output, so the warning would exist and be invisible.
+            bt.logging.warning(
+                f"{self._name}: {_dropped} unusable sample(s) skipped during collection (value was None "
+                f"or non-numeric); the remaining series are exposed normally"
+            )
         yield family
 
 
@@ -1453,6 +1562,7 @@ async def report(self: ReportingService) -> None:
             'kappa_values': self.kappa_values,
             'unnormalized_scores': self.unnormalized_scores,
             'scores': self.scores,
+            'debeta_scores': getattr(self, 'debeta_scores', {}) or {},
             'gentrx_scores': self.gentrx_scores,
             'book_count': self.simulation.book_count,
             'simulation_config': {
@@ -1595,10 +1705,27 @@ async def report(self: ReportingService) -> None:
                         # from labels into the gauge value keyed by miner_trade_gauge_name.
                         # role is encoded 0=maker / 1=taker; timestamp emitted in seconds.
                         for slot, (miner_trade, role) in enumerate(reversed(self.recent_miner_trades[uid][bookId])):
+                            _ts = getattr(miner_trade, 't', None)
+                            if _ts is None:
+                                # Malformed trade notice (missing timestamp) must never abort
+                                # the entire metrics publish — skip this one slot.
+                                continue
                             side = miner_trade.side if role == 'taker' else int(not miner_trade.side)
-                            fee = miner_trade.makerFee if role == 'maker' else miner_trade.takerFee
+                            # Same principle as the timestamp guard above: one malformed slot must
+                            # never abort the entire metrics publish. takerFee/makerFee are
+                            # properties over Tf/Mf, and a trade restored from state before the
+                            # notice fix has neither, which took metrics down four times in 40
+                            # minutes. Skipped, not defaulted: a fabricated zero fee would
+                            # misreport cost wherever fees are real.
+                            try:
+                                fee = miner_trade.makerFee if role == 'maker' else miner_trade.takerFee
+                            except AttributeError:
+                                bt.logging.debug(
+                                    f"metrics: skipping a miner trade with no fee field (role {role})"
+                                )
+                                continue
                             for name, val in (
-                                ("timestamp", miner_trade.timestamp / 1e9),
+                                ("timestamp", _ts / 1e9),
                                 ("price", miner_trade.price),
                                 ("volume", miner_trade.quantity),
                                 ("fee", fee),
@@ -1704,6 +1831,8 @@ async def report(self: ReportingService) -> None:
                 agent_id=agentId,
                 hotkey=(self.metagraph.hotkeys[agentId] if len(getattr(self.metagraph, 'hotkeys', [])) > agentId else ""),
                 coldkey=(self.metagraph.coldkeys[agentId] if len(getattr(self.metagraph, 'coldkeys', [])) > agentId else ""),
+                axon_ip=(self.metagraph.axon_ips[agentId] if len(getattr(self.metagraph, 'axon_ips', [])) > agentId else ""),
+                axon_port=(str(self.metagraph.axon_ports[agentId]) if len(getattr(self.metagraph, 'axon_ports', [])) > agentId else ""),
                 timestamp=self.simulation_timestamp,
                 timestamp_str=duration_from_timestamp(self.simulation_timestamp),
                 placement=m['placement'],
@@ -1745,6 +1874,8 @@ async def report(self: ReportingService) -> None:
                 agent_id=agentId,
                 hotkey=(self.metagraph.hotkeys[agentId] if len(getattr(self.metagraph, 'hotkeys', [])) > agentId else ""),
                 coldkey=(self.metagraph.coldkeys[agentId] if len(getattr(self.metagraph, 'coldkeys', [])) > agentId else ""),
+                axon_ip=(self.metagraph.axon_ips[agentId] if len(getattr(self.metagraph, 'axon_ips', [])) > agentId else ""),
+                axon_port=(str(self.metagraph.axon_ports[agentId]) if len(getattr(self.metagraph, 'axon_ports', [])) > agentId else ""),
             )
         bt.logging.debug(f"Miner metrics collected ({time.time()-start:.4f}s).")
         

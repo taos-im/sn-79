@@ -38,6 +38,10 @@ export BT_NO_PARSE_CLI_ARGS=false
 #   -o <path>              Output path     (default: checkpoints/GenTRX/latest.pt)
 #   -s 1                   Skip pm2 delete (keep existing process, just regenerate launcher)
 #   -x 0                   Skip tmux window setup
+#   -N <name>              pm2 process name (default: gradient-server). The launchers pass a
+#                          suffixed name so two stacks on one host don't replace each other.
+#   -U                     Opt in to updating on launch (git pull + pip install -e .). Off by
+#                          default so a running node never jumps to an unpinned upstream HEAD.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # set -a auto-exports every var the sourced file sets, so any child process
@@ -109,8 +113,8 @@ GRAD_PORT=8100
 GRAD_BIND=127.0.0.1
 VALIDATOR_UID=""
 # Training-data shard for the gradient server's --mode (simulation|exchange).
-# Distinct from -m/-G, which is the ROLE (aggregator|sibling). Callers
-# (run_mvtrx.sh / run_validator.sh) pass -M "$MODE" so an exchange stack's
+# Distinct from -m/-G, which is the ROLE (aggregator|sibling). The launcher
+# scripts (run_validator.sh, run_miner.sh) pass -M "$MODE" so an exchange stack's
 # aggregator uses the gentrx/<net>/exchange/ prefix instead of simulation.
 GRAD_TRAIN_MODE="simulation"
 CHECKPOINT_PATH=checkpoints/GenTRX/best.pt
@@ -128,9 +132,10 @@ USE_TMUX=1
 # `pip install -e .`, so a running node never silently jumps to an unpinned
 # upstream HEAD. Pass -U to update on launch; -n is kept as a no-op alias.
 SKIP_UPDATE=1
-# pm2 process name. Per-env launchers (run_mvtrx.sh) pass a suffixed name
-# (e.g. gradient-server-sim-local) so multiple stacks on one host don't
-# clobber each other's instance — pm2 start with an existing name REPLACES it.
+# pm2 process name. The launcher scripts (run_validator.sh, run_miner.sh) pass
+# a suffixed name (e.g. gradient-server-sim-local) so multiple stacks on one
+# host don't clobber each other's instance: pm2 start with an existing name
+# REPLACES it.
 GRADIENT_SERVER_NAME="${GRADIENT_SERVER_NAME:-gradient-server}"
 
 while getopts m:G:e:u:p:b:V:c:d:o:E:B:w:W:k:s:l:x:nUN:M: flag; do
@@ -337,11 +342,12 @@ if [ "$SKIP_UPDATE" = "0" ]; then
     echo "Updating gradient server (opt-in via -U)"
     git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
     # Honour the committed lockfile when present so the update resolves the
-    # pinned, reproducible dependency set rather than floating to newer releases.
+    # pinned, reproducible dependency set rather than floating to newer releases. The gradient
+    # server needs the [gentrx] extra (boto3/transformers/polars), not just the core set.
     if [ -f "$REPO_ROOT/constraints.txt" ]; then
-        pip install -e . -c "$REPO_ROOT/constraints.txt"
+        pip install -e ".[gentrx]" -c "$REPO_ROOT/constraints.txt"
     else
-        pip install -e .
+        pip install -e ".[gentrx]"
     fi
 fi
 

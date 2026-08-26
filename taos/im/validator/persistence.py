@@ -23,10 +23,108 @@ import bittensor as bt
 
 from taos.im.utils.save import save_state_worker
 from taos.im.protocol.models import TradeInfo
+from taos.im.validator.debeta import sum_hist_2level, sum_hist_1level
 from taos.im.protocol.events import TradeEvent
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
+
+
+def sanitize_recent_trades(book_trades) -> tuple[list, int]:
+    """Drop restored trades whose id is not the engine's integer id.
+
+    A trade id must be the raw engine integer: it goes back into the engine as `ExecutedFill`, where
+    `tradeId` is `std::optional<uint64_t>`, and a string there throws `std::bad_cast` and drops the
+    whole batch. `TradeInfo.model_construct` skips validation (hot path), so a bad id passes silently
+    on load and only bites later at `model_dump`, in a different module, as a serializer warning.
+
+    Such an id cannot be repaired. The only known producer was a synthetic
+    `x:<extrinsic>:<agent>:<direction>:<p|f>` fallback, since deleted; no id of that shape was ever
+    written to the tape, so there is nothing to join it to and guessing one would recreate exactly the
+    identity divergence the fallback caused.
+
+    A missing or null id is KEPT: a pre-settlement trade legitimately has no id yet, and dropping
+    those would lose real trades, which is worse than the warning.
+    """
+    kept: list = []
+    dropped = 0
+    for t in book_trades:
+        tid = t.get("i") if isinstance(t, dict) else None
+        if tid is None:
+            kept.append(t)
+            continue
+        if isinstance(tid, bool) or isinstance(tid, float):
+            dropped += 1
+            continue
+        if isinstance(tid, int):
+            if tid < 0:
+                dropped += 1
+                continue
+            kept.append(t)
+            continue
+        # A msgpack round-trip can stringify a number; that id IS joinable, so coerce rather than drop.
+        try:
+            coerced = int(str(tid).strip())
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        if coerced < 0:
+            dropped += 1
+            continue
+        fixed = dict(t)
+        fixed["i"] = coerced
+        kept.append(fixed)
+    return kept, dropped
+
+
+def sanitize_miner_trades(book_trades) -> tuple[list, int]:
+    """Drop restored miner trades that cannot answer the questions their consumers ask of them.
+
+    `recent_miner_trades` holds [notice_dict, role] pairs and is restored with
+    `TradeEvent.model_construct(**t)`, which skips validation. `takerFee` is a property returning
+    `self.Tf`, so an entry persisted without the fee fields comes back as an object with no such
+    attribute and metrics publishing dies on it: 'TradeEvent' object has no attribute 'Tf', four times
+    in the 40 minutes after the producer was fixed, because the buffer keeps five entries per uid per
+    book and the old ones survive until fresh trades displace them.
+
+    Not repaired, dropped. A fee cannot be reconstructed after the fact, and substituting zero would
+    understate cost wherever fees are real, which is worse than losing one historical slot from a
+    rolling five-entry buffer.
+    """
+    kept: list = []
+    dropped = 0
+    for entry in book_trades or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            dropped += 1
+            continue
+        notice = entry[0]
+        if not isinstance(notice, dict) or "Mf" not in notice or "Tf" not in notice:
+            dropped += 1
+            continue
+        # The id must satisfy the SAME rule as sanitize_recent_trades, through the same function.
+        #
+        # These two sanitisers drifted: this one validated fees and ignored the id, the other validated
+        # the id and ignored fees. An entry with good fees and a synthetic
+        # x:0x<extrinsic>:<uid>:<direction>:<p|f> id therefore passed both, and the stack capture caught
+        # it still tripping the serializer at validator.py:1894 (_prepare_reporting_data) four minutes
+        # after this sanitiser had run. Two implementations of one criterion is the defect; sharing the
+        # implementation is the fix.
+        id_ok, id_dropped = sanitize_recent_trades([notice])
+        if id_dropped or not id_ok:
+            dropped += 1
+            continue
+        kept.append([id_ok[0], entry[1]])
+    return kept, dropped
+
+
+def _snap_hist3(h):
+    """Deep-copy a {k1:{k2:{ts:val}}} de-beta history for persistence (tolerate concurrent mutation)."""
+    return {k1: {k2: dict(tsd) for k2, tsd in d2.items()} for k1, d2 in (h or {}).items()}
+
+
+def _snap_hist2(h):
+    """Deep-copy a {k:{ts:val}} de-beta history for persistence."""
+    return {k: dict(tsd) for k, tsd in (h or {}).items()}
 
 
 def build_validator_state(
@@ -79,6 +177,20 @@ def build_validator_state(
         "taker_volume_sums": volume_sums_snapshots['taker_volume_sums'],
         "self_volume_sums": volume_sums_snapshots['self_volume_sums'],
         "roundtrip_volume_sums": volume_sums_snapshots['roundtrip_volume_sums'],
+        # De-beta (P8/E5/P11) fill-stream accumulators, windowed exactly like trade_volumes. Persist the
+        # TIMESTAMPED HISTORIES (making window + skill window) + the reconstruction STATE (per-book
+        # inventory + last price); the running sums are rebuilt from the histories on load, so
+        # running == sum(history within window) holds by construction. Only populated when de-beta is
+        # enabled; empty/absent otherwise.
+        "debeta_capbuy_hist": _snap_hist3(getattr(self, 'debeta_capbuy_hist', {})),
+        "debeta_capsell_hist": _snap_hist3(getattr(self, 'debeta_capsell_hist', {})),
+        "debeta_mtm_hist": _snap_hist3(getattr(self, 'debeta_mtm_hist', {})),
+        "debeta_invsum_hist": _snap_hist3(getattr(self, 'debeta_invsum_hist', {})),
+        "debeta_cp_hist": _snap_hist3(getattr(self, 'debeta_cp_hist', {})),
+        "debeta_invn_hist": _snap_hist2(getattr(self, 'debeta_invn_hist', {})),
+        "debeta_drift_hist": _snap_hist2(getattr(self, 'debeta_drift_hist', {})),
+        "debeta_inv": {b: dict(u) for b, u in getattr(self, 'debeta_inv', {}).items()},
+        "debeta_plast": dict(getattr(self, 'debeta_plast', {})),
         # Persist the rolling request/timeout accumulators so a restart doesn't
         # reset them and force a fresh ~100-request (~12 min) blackout before the
         # miner_gauges requests/timeouts/call_time series reappear in Grafana.
@@ -89,6 +201,7 @@ def build_validator_state(
 
 
 def snapshot_miner_stats(self: Validator):
+    """Serialize per-miner statistics for the saved-state file."""
     return {
         uid: {
             "requests": s.get("requests", 0),
@@ -122,6 +235,7 @@ def build_save_light_fields(self: Validator) -> dict:
 
 
 def snapshot_inventory_history(self: Validator):
+    """Serialize the inventory history for the saved-state file."""
     result = {}
     for uid in range(self.effective_max_uids):
         if uid in self.inventory_history and self.inventory_history[uid]:
@@ -130,6 +244,7 @@ def snapshot_inventory_history(self: Validator):
 
 
 def snapshot_realized_pnl_history(self: Validator):
+    """Serialize the realized-PnL history for the saved-state file."""
     result = {}
     for uid in range(self.effective_max_uids):
         if uid in self.realized_pnl_history:
@@ -138,6 +253,11 @@ def snapshot_realized_pnl_history(self: Validator):
 
 
 def snapshot_2_level_dict(self: Validator, source_dict):
+    """Serialize a ``{uid: {book: value}}`` mapping for the saved-state file.
+
+    Args:
+        source_dict: The two-level mapping to serialize.
+    """
     result = {}
     for uid in range(self.effective_max_uids):
         if uid in source_dict:
@@ -146,6 +266,7 @@ def snapshot_2_level_dict(self: Validator, source_dict):
 
 
 def snapshot_volume_sums(self: Validator):
+    """Serialize per-miner volume sums for the saved-state file."""
     return {
         'volume_sums':           snapshot_2_level_dict(self, self.volume_sums),
         'maker_volume_sums':     snapshot_2_level_dict(self, self.maker_volume_sums),
@@ -156,6 +277,7 @@ def snapshot_volume_sums(self: Validator):
 
 
 def snapshot_trade_volumes(self: Validator):
+    """Serialize per-miner trade-volume windows for the saved-state file."""
     result = {}
     for uid in range(self.effective_max_uids):
         if uid not in self.trade_volumes:
@@ -168,6 +290,7 @@ def snapshot_trade_volumes(self: Validator):
 
 
 def snapshot_roundtrip_volumes(self: Validator):
+    """Serialize per-miner roundtrip volumes for the saved-state file."""
     result = {}
     for uid in range(self.effective_max_uids):
         if uid not in self.roundtrip_volumes:
@@ -177,6 +300,7 @@ def snapshot_roundtrip_volumes(self: Validator):
 
 
 def snapshot_open_positions(self: Validator):
+    """Serialize per-miner open positions for the saved-state file."""
     result = {}
     for uid in range(self.effective_max_uids):
         if uid not in self.open_positions:
@@ -1027,7 +1151,13 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
         self.pnl_factors[uid] = {k: v for k, v in self.pnl_factors[uid].items() if k in book_ids_set}
 
     def load_volume_sums(data, name, valid_ids):
-        """Load volume sums and prune books not in valid_ids."""
+        """Load volume sums and prune books not in valid_ids.
+
+        Args:
+            data: The saved-state payload.
+            name: The field to load.
+            valid_ids: Book ids to keep; others are pruned.
+        """
         result = defaultdict(lambda: defaultdict(float))
 
         if name not in data:
@@ -1075,6 +1205,46 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.self_volume_sums = load_volume_sums(validator_state, "self_volume_sums", book_ids_set)
     self.fee_sums = load_volume_sums(validator_state, "fee_sums", book_ids_set)
     self.roundtrip_volume_sums = load_volume_sums(validator_state, "roundtrip_volume_sums", book_ids_set)
+    # De-beta fill-stream accumulators — restore the TIMESTAMPED HISTORIES so a restart continues the
+    # windowed making/skill/counterparty assessment instead of zeroing it (empty when de-beta was off;
+    # harmless). Running sums are rebuilt from the histories (running == sum(history within window)), so a
+    # restart cannot desync them. The reconstruction STATE (per-book inventory + last price) is restored
+    # directly so the MTM path continues correctly.
+    def _load_hist3(name):
+        return {int(k1): {int(k2): {int(ts): float(v) for ts, v in (tsd or {}).items()}
+                          for k2, tsd in (d2 or {}).items()}
+                for k1, d2 in (validator_state.get(name) or {}).items()}
+
+    def _load_hist2(name):
+        return {int(k): {int(ts): float(v) for ts, v in (tsd or {}).items()}
+                for k, tsd in (validator_state.get(name) or {}).items()}
+
+    def _dd2(sums):
+        return defaultdict(lambda: defaultdict(float),
+                           {u: defaultdict(float, b) for u, b in sums.items()})
+
+    self.debeta_capbuy_hist = _load_hist3("debeta_capbuy_hist")
+    self.debeta_capsell_hist = _load_hist3("debeta_capsell_hist")
+    self.debeta_mtm_hist = _load_hist3("debeta_mtm_hist")
+    self.debeta_invsum_hist = _load_hist3("debeta_invsum_hist")
+    self.debeta_cp_hist = _load_hist3("debeta_cp_hist")
+    self.debeta_invn_hist = _load_hist2("debeta_invn_hist")
+    self.debeta_drift_hist = _load_hist2("debeta_drift_hist")
+    # rebuild running sums from the histories
+    self.capture_buy_sums = _dd2(sum_hist_2level(self.debeta_capbuy_hist))
+    self.capture_sell_sums = _dd2(sum_hist_2level(self.debeta_capsell_hist))
+    self.debeta_mtm = _dd2(sum_hist_2level(self.debeta_mtm_hist))
+    self.debeta_invsum = _dd2(sum_hist_2level(self.debeta_invsum_hist))
+    self.debeta_cp = sum_hist_2level(self.debeta_cp_hist)
+    self.debeta_invn = sum_hist_1level(self.debeta_invn_hist)
+    self.debeta_drift = sum_hist_1level(self.debeta_drift_hist)
+    # reconstruction STATE (pfirst is vestigial in the windowed path — drift replaces it)
+    self.debeta_pfirst = {}
+    self.debeta_plast = {int(b): float(v) for b, v in (validator_state.get("debeta_plast") or {}).items()}
+    self.debeta_inv = defaultdict(lambda: defaultdict(float), {
+        int(b): defaultdict(float, {int(u): float(v) for u, v in (us or {}).items()})
+        for b, us in (validator_state.get("debeta_inv") or {}).items()
+    })
 
     bt.logging.info("Processing roundtrip volumes...")
     self.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
@@ -1563,24 +1733,43 @@ def load_state(self: Validator) -> None:
                 else:
                     bt.logging.debug(f"Skipping initial_balances for UID {uid} (exceeds effective_max_uids={self.effective_max_uids})")
 
-            self.recent_trades = {
-                book_id: [TradeInfo.model_construct(**t) for t in book_trades]
-                for book_id, book_trades in simulation_state.get("recent_trades", {}).items()
-            }
+            self.recent_trades = {}
+            _rt_dropped = 0
+            for book_id, book_trades in simulation_state.get("recent_trades", {}).items():
+                _clean, _n = sanitize_recent_trades(book_trades)
+                _rt_dropped += _n
+                self.recent_trades[book_id] = [TradeInfo.model_construct(**t) for t in _clean]
+            if _rt_dropped:
+                bt.logging.warning(
+                    f"recent_trades: dropped {_rt_dropped} restored trade(s) whose id is not the "
+                    f"engine's integer id (unjoinable to any recorded trade; see sanitize_recent_trades)"
+                )
             loaded_recent_miner_trades = simulation_state.get("recent_miner_trades", {})
             self.recent_miner_trades = {
                 uid: {bookId: [] for bookId in self.engine.book_ids}
                 for uid in range(self.effective_max_uids)
             }
+            _mt_dropped = [0]
             if loaded_recent_miner_trades:
                 for uid, uid_miner_trades in loaded_recent_miner_trades.items():
                     if uid < self.effective_max_uids:
+                        _mt_clean = {}
+                        for book_id, trades in uid_miner_trades.items():
+                            _c, _n = sanitize_miner_trades(trades)
+                            _mt_dropped[0] += _n
+                            _mt_clean[book_id] = [[TradeEvent.model_construct(**t), r] for t, r in _c]
                         self.recent_miner_trades[uid] = {
-                            book_id: [[TradeEvent.model_construct(**t), r] for t, r in trades]
-                            for book_id, trades in uid_miner_trades.items()
+                            book_id: v
+                            for book_id, v in _mt_clean.items()
                         }
                     else:
                         bt.logging.debug(f"Skipping recent_miner_trades for UID {uid} (exceeds effective_max_uids={self.effective_max_uids})")
+                if _mt_dropped[0]:
+                    bt.logging.warning(
+                        f"recent_miner_trades: dropped {_mt_dropped[0]} restored trade(s) with no fee "
+                        f"fields (a fee cannot be reconstructed; metrics publishing read them as "
+                        f"attributes and died: 'TradeEvent' object has no attribute 'Tf')"
+                    )
 
             bt.logging.success("Loaded simulation state")
         else:

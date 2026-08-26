@@ -43,12 +43,6 @@ class SubnetHyperparameters(InfoBase):
         alpha_high (int): High value of alpha.
         alpha_low (int): Low value of alpha.
         liquid_alpha_enabled (bool): Flag indicating if liquid alpha is enabled.
-        alpha_sigmoid_steepness (float):
-        yuma_version (int): Version of yuma.
-        subnet_is_active (bool): Indicates if subnet is active after START CALL.
-        transfers_enabled (bool): Flag indicating if transfers are enabled.
-        bonds_reset_enabled (bool): Flag indicating if bonds are reset enabled.
-        user_liquidity_enabled (bool): Flag indicating if user liquidity is enabled.
     """
 
     rho: int

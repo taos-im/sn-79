@@ -41,6 +41,21 @@ def test_kappa3_none_on_deregistered():
     assert kappa_3(1, _series([1.0, 2.0, 3.0, 4.0]), **k) is None
 
 
+def test_kappa3_deregistered_ignores_matching_cache():
+    """Regression: on a UID replacement the reused slot's realized_pnl_history stays byte-identical to
+    the old occupant's until reset lands, so its fingerprint matches the cache. The dereg guard must
+    still win — the cache must NOT hand the still-deregistered slot the old miner's kappa."""
+    from taos.im.utils.kappa import _get_pnl_fingerprint
+    hist = _series([1.0, 2.0, 3.0, 4.0])
+    cache = {1: (_get_pnl_fingerprint(hist), {"sentinel": "OLD_OCCUPANT"})}
+    k = dict(_K)
+    k["deregistered_uids"] = [1]
+    assert kappa_3(1, hist, cache=cache, **k) is None
+    # a NON-deregistered uid with a matching cache is still served (the cache itself is not broken)
+    cache2 = {2: (_get_pnl_fingerprint(hist), {"sentinel": "VALID"})}
+    assert kappa_3(2, hist, cache=cache2, **_K) == {"sentinel": "VALID"}
+
+
 def test_kappa3_returns_book_structure_for_sufficient_data():
     out = kappa_3(1, _series([1.0, 2.0, 1.5, 2.5, 1.0]), **_K)
     assert out is not None

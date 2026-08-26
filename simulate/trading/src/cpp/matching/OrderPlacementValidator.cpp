@@ -7,10 +7,58 @@
 #include "MultiBookExchangeAgent.hpp"
 #include "Simulation.hpp"
 
+#include <algorithm>
+#include <limits>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::matching
 {
+
+namespace
+{
+
+//-------------------------------------------------------------------------
+
+// A reservation is sized by predicting how far an order will sweep. With a price band active that
+// prediction is unsafe in a way that cannot be repaired by capping it: the band can stop the sweep at
+// MATCH time, after the reservation is set, leaving the volume resting at the order's OWN price and
+// later filled there. Two failures were traced to exactly that -
+//   book #118 #6702 : BUY 43.0093@330.69 reserved at the 300.19 ask, filled at 330.69
+//   book #19  #11229: BUY 12.6981@371.06 reserved at the 300.70 ask, filled at 371.06
+// - each ending in "freeing X exceeding reservation of Y" and a terminated engine.
+//
+// So when a band is active a BUY predicts NO sweep and reserves its whole volume at its limit price,
+// which is the most it can ever pay per unit and therefore covers every execution path the band can
+// force. Sells reserve BASE (volume, price-independent), so they only need the band-aware floor.
+//
+// Band OFF is bit-for-bit unchanged: bandLimit returns the numeric_limits sentinels, so the order's
+// own price is returned and the prediction runs exactly as before. That property is what keeps every
+// band-off determinism result and all three organic pairs valid, and detprove checks it.
+[[nodiscard]] decimal_t sweepCap(
+    const book::Book::Ptr& book, decimal_t price, OrderDirection direction) noexcept
+{
+    if (direction == OrderDirection::BUY) {
+        const auto cap = book->bandLimit(true);
+        if (cap == std::numeric_limits<decimal_t>::max()) return price;   // band off
+        // With the band now TWO-SIDED (both sweep loops enforce [lo, hi]), the earlier narrowing -
+        // "an order priced within the band cannot be stopped by it" - is false: a buy sweeping asks
+        // that rest BELOW lo is stopped by the new lower bound regardless of its own price, the
+        // predicted cheap fills never execute, the volume rests at the order's price and the
+        // reservation blows up exactly as before (measured: FreeException at sim step 0, freeing
+        // 1587.96 against a 22.76 reservation). So under an ACTIVE band every buy predicts no sweep
+        // and reserves its full volume at its limit price. Band off remains bit-for-bit unchanged.
+        return 0_dec;
+    }
+    const auto floor = book->bandLimit(false);
+    if (floor == std::numeric_limits<decimal_t>::min()) return price;    // band off
+    return std::max(price, floor);
+}
+
+//-------------------------------------------------------------------------
+
+}  // namespace
+
 
 //-------------------------------------------------------------------------
 
@@ -146,6 +194,14 @@ OrderPlacementValidator::ExpectedResult
         volumeWeightedPrice = util::round(volumeWeightedPrice, m_params.quoteIncrementDecimals);
         if (volumeWeightedPrice > 0_dec) instantTrade = true;
 
+        // Both currency branches above have accumulated the quote total this buy would consume, which
+        // is the amount that has to settle on chain. A walk that consumed nothing settles nothing, so
+        // it is left to the paths that already handle an unfillable order.
+        if (!payload->skipMinSizeCheck && volumeWeightedPrice > 0_dec
+                && !checkMinQuoteOrderSize(agentId, volumeWeightedPrice)) {
+            return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
+        }
+
         if (payload->leverage == 0_dec){
             if (!quoteBalance->canReserve(volumeWeightedPrice)) {
                 instantTrade = false;
@@ -186,11 +242,20 @@ OrderPlacementValidator::ExpectedResult
         if (payload->currency == Currency::BASE){
             volume = payload->volume * util::dec1p(payload->leverage);
             orderSize = payload->volume;
+            // This branch never walks the book, so the proceeds are estimated at the best bid rather
+            // than by replaying the match. That over-states what a deeper walk would realise, making
+            // the floor permissive rather than strict: it refuses orders that cannot possibly settle,
+            // and does not refuse one that merely might. A strict version would have to duplicate the
+            // matching walk here.
+            if (!payload->skipMinSizeCheck && book->bestBid() > 0_dec
+                    && !checkMinQuoteOrderSize(agentId, volume * book->bestBid())) {
+                return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
+            }
             m_exchange->simulation()->logDebug(
                 "{} | AGENT #{} BOOK {} : CALCULATED PRE-RESERVATION OF {} BASE FOR SELL VOLUME-BASED ORDER {}x{}@MARKET",
                 m_exchange->simulation()->currentTimestamp(), agentId, m_exchange->simulation()->bookIdCanon(book->id()), volume,
                 util::dec1p(payload->leverage), payload->volume);
-        } 
+        }
         else if (payload->currency == Currency::QUOTE){
             decimal_t volumeWeightedPrice{};
             bool done = false;
@@ -229,6 +294,10 @@ OrderPlacementValidator::ExpectedResult
             }
 
             if (!payload->skipMinSizeCheck && volume < m_exchange->config2().minOrderSize) {
+                return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
+            }
+            // The proceeds this walk would realise, and so the amount that has to settle on chain.
+            if (!payload->skipMinSizeCheck && !checkMinQuoteOrderSize(agentId, volumeWeightedPrice)) {
                 return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
             }
 
@@ -316,6 +385,23 @@ OrderPlacementValidator::ExpectedResult
         return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
     }
 
+    // A BASE-currency order states alpha, so its notional needs the price; a QUOTE-currency order
+    // states the notional directly. Checked here rather than inside checkMinOrderSizeLimit because the
+    // floor is agent-scoped and only this scope knows who placed the order. There is no
+    // skipMinSizeCheck on a limit payload, so this matches checkMinOrderSizeLimit above in applying
+    // unconditionally.
+    {
+        const auto totalAmount = util::round(payload->volume * util::dec1p(payload->leverage),
+            payload->currency == Currency::BASE
+                ? m_params.volumeIncrementDecimals : m_params.quoteIncrementDecimals);
+        const auto quoteNotional = payload->currency == Currency::BASE
+            ? totalAmount * payload->price
+            : totalAmount;
+        if (!checkMinQuoteOrderSize(agentId, quoteNotional)) {
+            return std::unexpected{OrderErrorCode::MINIMUM_ORDER_SIZE_VIOLATION};
+        }
+    }
+
 
     if (!checkTimeInForce(book, payload, agentId, 0_dec)) { //###
         return std::unexpected{OrderErrorCode::CONTRACT_VIOLATION};
@@ -345,7 +431,7 @@ OrderPlacementValidator::ExpectedResult
             bool done = false;
             for (auto it = book->sellQueue().cbegin(); it != book->sellQueue().cend(); ++it) {
                 const auto& level = *it;
-                if (payload->price < level.price()) break;
+                if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                 for (const auto tick : level) {
                     if (book->orderToClientInfo().at(tick->id()).agentId == agentId){    // STP
                         if (payload->stpFlag == STPFlag::CO || payload->stpFlag == STPFlag::CN || payload->stpFlag == STPFlag::CB)
@@ -393,7 +479,7 @@ OrderPlacementValidator::ExpectedResult
             bool done = false;
             for (auto it = book->sellQueue().cbegin(); it != book->sellQueue().cend(); ++it) {
                 const auto& level = *it;
-                if (payload->price < level.price()) break;
+                if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                 for (const auto tick : level) {
                     if (book->orderToClientInfo().at(tick->id()).agentId == agentId){    // STP
                         if (payload->stpFlag == STPFlag::CO || payload->stpFlag == STPFlag::CN || payload->stpFlag == STPFlag::CB)
@@ -621,7 +707,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -634,7 +720,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -653,7 +739,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -666,7 +752,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -683,7 +769,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * feeCoeff, m_params.volumeIncrementDecimals);
@@ -693,7 +779,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume(), m_params.volumeIncrementDecimals);
@@ -714,7 +800,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -728,7 +814,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -747,7 +833,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -761,7 +847,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -778,7 +864,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (payload->price < level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * tick->price() * feeCoeff,
@@ -789,7 +875,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (payload->price > level.price()) break;
+                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * tick->price(), m_params.quoteIncrementDecimals);
@@ -1314,6 +1400,22 @@ bool OrderPlacementValidator::checkPostOnly(
             return payload->price > book->bestBid();
         }
     }
+}
+
+//-------------------------------------------------------------------------
+
+bool OrderPlacementValidator::checkMinQuoteOrderSize(
+    AgentId agentId, decimal_t quoteNotional) const noexcept
+{
+    const auto minQuoteOrderSize = m_exchange->config2().minQuoteOrderSize;
+    if (minQuoteOrderSize <= 0_dec) return true;
+    // A guard, not a live distinction: exchange mode strips every agent but the exchange and the proxy
+    //, so every order placed there is already a remote one, and the
+    // floor is undeclared in simulation configs. It exists so that a config which one day mixes local
+    // background agents with on-chain settlement cannot have a chain-derived minimum thin its book,
+    // since a local agent's fills never reach the chain.
+    if (agentId < 0) return true;
+    return util::round(quoteNotional, m_params.quoteIncrementDecimals) >= minQuoteOrderSize;
 }
 
 //-------------------------------------------------------------------------

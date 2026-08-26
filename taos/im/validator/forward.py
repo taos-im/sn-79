@@ -103,6 +103,12 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
 
         data_start = time.time()
         extended_metagraph = self.get_extended_metagraph()
+        # WHAT ACTUALLY GOES ON THE WIRE, per uid. A refusal notice has been proven built, routed and
+        # merged onto state.notices, and the miner still reports an empty list for its own uid, so the
+        # loss is in this hop and nothing on either side of it says so.
+        _nz = {u: len(v) for u, v in (synapse.notices or {}).items() if v}
+        if _nz:
+            bt.logging.info(f"NOTICEWIRE packing notices for uids {_nz}")
         request_data = {
             'books': synapse.books,
             'accounts': synapse.accounts,

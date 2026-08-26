@@ -16,7 +16,7 @@ from GenTRX.src.gradient_store import (
     network_from_subtensor,
 )
 
-_CUSTOM_EP = "ws://3.144.11.157:9945"  # a localnet node — not finney, not loopback
+_CUSTOM_EP = "ws://198.51.100.7:9945"  # a custom node: not finney, not loopback (RFC5737 doc range)
 
 
 @pytest.fixture(autouse=True)

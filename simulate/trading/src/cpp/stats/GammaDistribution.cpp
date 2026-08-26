@@ -30,8 +30,6 @@ GammaDistribution::GammaDistribution(double shape, double scale)
     shape = checkArg(shape, "shape");
     scale = checkArg(scale, "scale");
 
-    // fmt::println("shape = {}, scale = {}", shape, scale);
-
     m_samplingDistribution = decltype(m_samplingDistribution){shape, scale};
     m_distribution = decltype(m_distribution){shape, scale};
 }
