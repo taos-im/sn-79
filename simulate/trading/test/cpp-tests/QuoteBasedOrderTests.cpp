@@ -268,8 +268,6 @@ TEST_P(QuoteOrderTest, LimitOrders)
     printOrderbook(book);
     const auto bookStateVolume = normalizeOutput(taosim::util::captureOutput([&] { book->printCSV(); }));
 
-    // fmt::println("{}",bookStateVolume);
-
     cancelAll();
     EXPECT_THAT(
         normalizeOutput(taosim::util::captureOutput([&] { book->printCSV(); })),
@@ -667,8 +665,6 @@ TEST_P(ResidualTest, MarketOrders)
         testOrder.volume, testOrder.leverage);
     printOrderbook(book);
     // const auto bookStateVolume = normalizeOutput(taosim::util::captureOutput([&] { book->printCSV(); }));
-
-    // fmt::println("{}",bookStateVolume);
 
     // cancelAll();
     // EXPECT_THAT(

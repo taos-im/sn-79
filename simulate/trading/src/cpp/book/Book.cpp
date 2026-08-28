@@ -4,8 +4,14 @@
  */
 #include <taosim/book/Book.hpp>
 
+#include <algorithm>
+#include <vector>
+
 #include <taosim/simulation/SimulationException.hpp>
 #include "Simulation.hpp"
+// For the STP cancel notice: the resting order's owner must be TOLD its order is gone, and the
+// cancellation here never had an instruction behind it, so no response path exists to say so.
+#include <taosim/message/ExchangeAgentMessagePayloads.hpp>
 
 #include <range/v3/action/remove_if.hpp>
 
@@ -44,6 +50,75 @@ Book::Book(
             : fmt::format("Creating unique tradeIdCounter ({}) for book {}", *m_tradeIdCounter, simulation->bookIdCanon(id)));
 
     setupL2Signal();
+}
+
+//-------------------------------------------------------------------------
+
+void Book::recordBandTrade(
+    Timestamp ts, taosim::decimal_t price, AgentId maker, AgentId taker) noexcept
+{
+    if (price <= 0_dec) return;
+    // Self-trades are excluded, mirroring the Ma==Ta guard in accumulate_book_capture. Without this a
+    // miner walks the reference by trading with itself at the band edge for the cost of fees only, which
+    // removes the sustained-capital cost that is the whole deterrent.
+    if (maker == taker) return;
+    m_bandLastPrice = price;
+    if (!m_bandSeeded) {
+        m_bandSeeded = true;
+        m_bandLastSampleTs = ts;
+        m_bandSamples.push_back(price);
+        m_bandRefCached = price;
+    }
+    sampleBandRef(ts);
+}
+
+//-------------------------------------------------------------------------
+
+void Book::sampleBandRef(Timestamp ts) noexcept
+{
+    const auto& params = m_simulation->exchange()->config().parameters();
+    const auto interval = params.bandRefInterval;
+    const auto window = params.bandRefWindow;
+    if (interval <= 0 || m_bandLastPrice <= 0_dec) return;
+    const size_t maxSamples =
+        static_cast<size_t>(std::max<int64_t>(1, window / interval));
+    bool pushed = false;
+    // Catch up whole intervals. During a quiet stretch the prevailing price is re-sampled, so the window
+    // never empties and the band never silently disables itself (a gap longer than the window previously
+    // dropped every trade and reopened an unbounded sweep).
+    while (m_bandSeeded && static_cast<int64_t>(ts - m_bandLastSampleTs) >= interval) {
+        m_bandLastSampleTs += interval;
+        m_bandSamples.push_back(m_bandLastPrice);
+        if (m_bandSamples.size() > maxSamples) m_bandSamples.pop_front();
+        pushed = true;
+    }
+    if (!pushed) return;
+    // Median, recomputed only on a push (once per interval) and cached, so the match hot path stays O(1).
+    std::vector<taosim::decimal_t> tmp{m_bandSamples.begin(), m_bandSamples.end()};
+    const size_t mid = tmp.size() / 2;
+    std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+    m_bandRefCached = tmp[mid];
+}
+
+//-------------------------------------------------------------------------
+
+taosim::decimal_t Book::bandRef() const noexcept
+{
+    return m_bandRefCached;
+}
+
+//-------------------------------------------------------------------------
+
+taosim::decimal_t Book::bandLimit(bool isBuy) const noexcept
+{
+    const double band = m_simulation->exchange()->config().parameters().maxPriceBand;
+    const auto ref = m_bandRefCached;
+    if (band <= 0.0 || ref <= 0_dec) {
+        return isBuy ? std::numeric_limits<taosim::decimal_t>::max()
+                     : std::numeric_limits<taosim::decimal_t>::min();
+    }
+    const auto bnd = taosim::util::double2decimal(band);
+    return isBuy ? ref * taosim::util::dec1p(bnd) : ref * taosim::util::dec1m(bnd);
 }
 
 //-------------------------------------------------------------------------
@@ -122,6 +197,7 @@ void Book::placeOrder(const MarketOrder::Ptr& order)
 {
     using namespace taosim::util;
 
+    m_order2clientCtx[order->id()].instrSeq = m_simulation->currentInstructionSeq();
     const auto clientCtx = m_order2clientCtx.at(order->id());
     const auto slip = order->maxSlippage();
     const auto priceDecimals =
@@ -158,6 +234,7 @@ void Book::placeOrder(const MarketOrder::Ptr& order)
 
 void Book::placeOrder(const LimitOrder::Ptr& order)
 {
+    m_order2clientCtx[order->id()].instrSeq = m_simulation->currentInstructionSeq();
     const auto clientCtx = m_order2clientCtx.at(order->id());
 
     if (order->direction() == OrderDirection::BUY) {
@@ -391,6 +468,19 @@ void Book::unregisterLimitOrder(const LimitOrder::Ptr& order)
 
 taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosim::decimal_t minPrice)
 {
+    // PRICE BAND, single enforcement point: applied here rather than at the market-order call
+    // sites so it binds EVERY aggressor. A band on market orders alone is evaded by a limit order
+    // priced deep through the book, which matches at the far level and prints the same excursion.
+    // LULD prohibits any trade outside the band, not merely market-order executions.
+    sampleBandRef(m_simulation->currentTimestamp());
+    minPrice = std::max(minPrice, bandLimit(false));
+    // BOTH bounds, not just the sweep's adverse side. Enforcing only the floor here left the upside
+    // open: a resting bid parked ABOVE ref*(1+band) is hit by a sell-aggressor and prints far outside
+    // the band (measured: 315 prints up to +27.6% in one arm, every one a sell-aggressor above the
+    // band and none below - the exact spike-ring mechanic of parking an order and feeding into it).
+    // LULD prohibits ANY print outside [lo, hi]; with the band off bandLimit(true) is the max
+    // sentinel, so this line is inert and band-off runs stay byte-identical.
+    const auto bandHi = bandLimit(true);
     using namespace taosim::util;
 
     taosim::decimal_t processedQuote = {};
@@ -409,7 +499,8 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
     order->setVolume(taosim::util::round(order->volume(), volumeDecimals));
     order->setLeverage(taosim::util::round(order->leverage(), volumeDecimals));
 
-    while (order->volume() > 0_dec && bestBuyDeque->price() >= minPrice) {
+    while (order->volume() > 0_dec && bestBuyDeque->price() >= minPrice
+           && bestBuyDeque->price() <= bandHi) {
         LimitOrder::Ptr iop = bestBuyDeque->getFirstActiveOrder();
         if (!iop) {
             // All orders on this level are ghosts, advance to next level
@@ -421,8 +512,70 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
             continue;
         }
         const auto iopAgentId = m_order2clientCtx[iop->id()].agentId;
-        if (agentId == iopAgentId && order->stpFlag() != STPFlag::NONE){
-            bestBuyDeque = preventSelfTrade(bestBuyDeque, iop, order, agentId);
+        // COMPARE WHO ACTED, not who owns the aggressing order.
+        //
+        // In exchange mode a resting order is usually taken by a sweep the exchange places under its own
+        // id (agent -1) once a miner's instruction has moved the pool through it. Comparing the owner
+        // therefore never matched (-1 != the miner) and self-trade prevention could not fire at all:
+        // zero SELF TRADE PREVENTION lines existed across the lifetime of an exchange process. The
+        // miner was nonetheless on both sides of the event its own instruction caused, which is exactly
+        // what STP exists to stop. initiatorAgentId is set only on sweep orders and names the miner
+        // whose instruction caused them; for every ordinary order it is empty and this is unchanged.
+        const auto actingAgentId =
+            m_order2clientCtx[order->id()].initiatorAgentId.value_or(agentId);
+        // ONLY ORDERS THAT WERE ALREADY RESTING WHEN THIS TAKER ARRIVED.
+        //
+        // `iop` is the resting order, `order` the incoming aggressor. A sweep the exchange creates at
+        // submission to fill a just-placed marketable order arrives in the SAME event as that order,
+        // so the "resting" side was never resting when the taker turned up -- it is the very order the
+        // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
+        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
+        //   sweep SELL #149 (1.0x1061.3652@MARKET)
+        //   SELF TRADE PREVENTION CANCELED ORDER 148
+        // Nothing filled, nothing rested, no notice, both directions, and the miner could not opt out.
+        //
+        // "Already resting" MUST be decided on order id, not timestamp. Simulation::m_time.current is
+        // set per delivered message to instr.delay, a per-batch offset that is NOT monotonic across
+        // batches, so an order resting since an earlier batch can carry a LARGER timestamp than the
+        // taker arriving now. Comparing timestamps therefore silently stops protecting exactly the
+        // orders STP exists to protect. Order ids are minted monotonically, so a lower id is precisely
+        // "was on the book first", and it keeps STP firing for the case it was added for: a miner with
+        // an EXISTING resting order that submits a separate instruction moving the pool through it.
+        // Same instruction => NOT already resting. Different instruction => order id decides.
+        //
+        // Two distinct hazards, and fixing one alone reintroduces the other. Across batches the
+        // timestamp is useless: Simulation::m_time.current is set per delivered message to
+        // instr.delay, a per-batch offset that is NOT monotonic, so an order resting since an earlier
+        // batch can carry the LARGER timestamp and silently lose STP protection. Within one
+        // instruction the order id is useless: the engine's eager sweep is minted immediately after
+        // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
+        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
+        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        //
+        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
+        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
+        // batch are separate instructions that share one. Measured 2026-08-14 on the running
+        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
+        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
+        // because the sweep inherits ctx.delay from the same batch.
+        //
+        // Dispatch identity is carried explicitly now and compared exactly. It FAILS CLOSED: an
+        // absent seq never compares equal, so the simulation path -- which never dispatches
+        // instructions and is therefore never stamped -- reduces to the order-id test alone, which
+        // is what this expression already evaluated to there.
+        const auto& aggSeq = m_order2clientCtx[order->id()].instrSeq;
+        const auto& restSeq = m_order2clientCtx[iop->id()].instrSeq;
+        const bool sameInstruction = aggSeq.has_value() && aggSeq == restSeq;
+        const bool alreadyResting = !sameInstruction && iop->id() < order->id();
+        if (actingAgentId == iopAgentId && order->stpFlag() != STPFlag::NONE && alreadyResting){
+            // actingAgentId, NOT agentId: the guard above has already proved
+            // actingAgentId == iopAgentId, so this is the RESTING ORDER'S OWNER. agentId is the
+            // aggressor's own id, which for an exchange-placed sweep is -1 -- and cancelAndLog
+            // builds the cancellation event from whatever it is handed, so passing -1 addresses
+            // the cancellation to a non-agent and the owner is never notified.
+            bestBuyDeque = preventSelfTrade(bestBuyDeque, iop, order, actingAgentId);
             if (bestBuyDeque == nullptr)
                 break;
             continue;
@@ -448,6 +601,9 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
                 iop->id(),
                 usedVolume,
                 bestBuyDeque->price());
+            recordBandTrade(
+                m_simulation->currentTimestamp(), bestBuyDeque->price(),
+                m_order2clientCtx[iop->id()].agentId, m_order2clientCtx[order->id()].agentId);
         }
 
         order->removeLeveragedVolume(usedVolume);
@@ -500,6 +656,16 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
 
 taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taosim::decimal_t maxPrice)
 {
+    // PRICE BAND, single enforcement point: applied here rather than at the market-order call
+    // sites so it binds EVERY aggressor. A band on market orders alone is evaded by a limit order
+    // priced deep through the book, which matches at the far level and prints the same excursion.
+    // LULD prohibits any trade outside the band, not merely market-order executions.
+    sampleBandRef(m_simulation->currentTimestamp());
+    maxPrice = std::min(maxPrice, bandLimit(true));
+    // BOTH bounds - mirror of the buy-queue fix: a resting ask parked BELOW ref*(1-band) lifted by a
+    // buy-aggressor printed under the band (measured: 101 prints, every one a buy-aggressor below
+    // the band). Inert when the band is off (bandLimit(false) is the min sentinel).
+    const auto bandLo = bandLimit(false);
     using namespace taosim::util;
 
     taosim::decimal_t processedQuote = {};
@@ -518,7 +684,8 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
     order->setVolume(taosim::util::round(order->volume(), volumeDecimals));
     order->setLeverage(taosim::util::round(order->leverage(), volumeDecimals));
 
-    while (order->volume() > 0_dec && bestSellDeque->price() <= maxPrice) {
+    while (order->volume() > 0_dec && bestSellDeque->price() <= maxPrice
+           && bestSellDeque->price() >= bandLo) {
         LimitOrder::Ptr iop = bestSellDeque->getFirstActiveOrder();
         if (!iop) {
             // All orders on this level are ghosts, advance to next level
@@ -530,8 +697,67 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
             continue;
         }
         const auto iopAgentId = m_order2clientCtx[iop->id()].agentId;
-        if (agentId == iopAgentId && order->stpFlag() != STPFlag::NONE){
-            bestSellDeque = preventSelfTrade(bestSellDeque, iop, order, agentId);
+        // COMPARE WHO ACTED, not who owns the aggressing order.
+        //
+        // In exchange mode a resting order is usually taken by a sweep the exchange places under its own
+        // id (agent -1) once a miner's instruction has moved the pool through it. Comparing the owner
+        // therefore never matched (-1 != the miner) and self-trade prevention could not fire at all:
+        // zero SELF TRADE PREVENTION lines existed across the lifetime of an exchange process. The
+        // miner was nonetheless on both sides of the event its own instruction caused, which is exactly
+        // what STP exists to stop. initiatorAgentId is set only on sweep orders and names the miner
+        // whose instruction caused them; for every ordinary order it is empty and this is unchanged.
+        const auto actingAgentId =
+            m_order2clientCtx[order->id()].initiatorAgentId.value_or(agentId);
+        // ONLY ORDERS THAT WERE ALREADY RESTING WHEN THIS TAKER ARRIVED.
+        //
+        // `iop` is the resting order, `order` the incoming aggressor. A sweep the exchange creates at
+        // submission to fill a just-placed marketable order arrives in the SAME event as that order,
+        // so the "resting" side was never resting when the taker turned up -- it is the very order the
+        // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
+        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
+        //   sweep SELL #149 (1.0x1061.3652@MARKET)
+        //   SELF TRADE PREVENTION CANCELED ORDER 148
+        // Nothing filled, nothing rested, no notice, both directions, and the miner could not opt out.
+        //
+        // "Already resting" MUST be decided on order id, not timestamp. Simulation::m_time.current is
+        // set per delivered message to instr.delay, a per-batch offset that is NOT monotonic across
+        // batches, so an order resting since an earlier batch can carry a LARGER timestamp than the
+        // taker arriving now. Comparing timestamps therefore silently stops protecting exactly the
+        // orders STP exists to protect. Order ids are minted monotonically, so a lower id is precisely
+        // "was on the book first", and it keeps STP firing for the case it was added for: a miner with
+        // an EXISTING resting order that submits a separate instruction moving the pool through it.
+        // Same instruction => NOT already resting. Different instruction => order id decides.
+        //
+        // Two distinct hazards, and fixing one alone reintroduces the other. Across batches the
+        // timestamp is useless: Simulation::m_time.current is set per delivered message to
+        // instr.delay, a per-batch offset that is NOT monotonic, so an order resting since an earlier
+        // batch can carry the LARGER timestamp and silently lose STP protection. Within one
+        // instruction the order id is useless: the engine's eager sweep is minted immediately after
+        // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
+        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
+        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        //
+        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
+        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
+        // batch are separate instructions that share one. Measured 2026-08-14 on the running
+        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
+        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
+        // because the sweep inherits ctx.delay from the same batch.
+        //
+        // Dispatch identity is carried explicitly now and compared exactly. It FAILS CLOSED: an
+        // absent seq never compares equal, so the simulation path -- which never dispatches
+        // instructions and is therefore never stamped -- reduces to the order-id test alone, which
+        // is what this expression already evaluated to there.
+        const auto& aggSeq = m_order2clientCtx[order->id()].instrSeq;
+        const auto& restSeq = m_order2clientCtx[iop->id()].instrSeq;
+        const bool sameInstruction = aggSeq.has_value() && aggSeq == restSeq;
+        const bool alreadyResting = !sameInstruction && iop->id() < order->id();
+        if (actingAgentId == iopAgentId && order->stpFlag() != STPFlag::NONE && alreadyResting){
+            // See the buy path: actingAgentId is the resting owner here, agentId is the
+            // aggressor (-1 for an exchange sweep), and the cancellation event is built from it.
+            bestSellDeque = preventSelfTrade(bestSellDeque, iop, order, actingAgentId);
             if (bestSellDeque == nullptr)
                 break;
             continue;
@@ -558,6 +784,9 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
                 iop->id(),
                 usedVolume,
                 bestSellDeque->price());
+            recordBandTrade(
+                m_simulation->currentTimestamp(), bestSellDeque->price(),
+                m_order2clientCtx[iop->id()].agentId, m_order2clientCtx[order->id()].agentId);
         }
 
         order->removeLeveragedVolume(usedVolume);
@@ -626,6 +855,26 @@ taosim::book::TickContainer* Book::preventSelfTrade(
                 now, agentId, m_id, 
                 volume.has_value() ? fmt::format("{} volume of ", volume.value()) : "",
                 orderId);
+            // TELL THE OWNER. cancelLog above is a LOGGING signal (L2/L3 feeds); no agent message ever
+            // carried this cancellation, so the miner's order vanished silently -- an STP cancel has no
+            // instruction behind it, hence no response path. Dispatch the same response shape a miner
+            // cancel gets, addressed to the owner, delivered through the proxy like every other notice.
+            // Exchange-service mode only: simulation miners see the cancellation as a book event on
+            // state.books[id].e, and a notice as well would fire onOrderCancelled twice there.
+            if (auto* proxy = m_simulation->proxy(); proxy != nullptr && proxy->exchangeServiceMode()) {
+                m_simulation->dispatchMessage(
+                    m_simulation->currentTimestamp(),
+                    0,
+                    m_simulation->exchange()->name(),
+                    proxy->name(),
+                    "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+                    MessagePayload::create<DistributedAgentResponsePayload>(
+                        agentId,
+                        MessagePayload::create<CancelOrdersResponsePayload>(
+                            std::vector<OrderID>{orderId},
+                            MessagePayload::create<CancelOrdersPayload>(
+                                std::vector{taosim::event::Cancellation{orderId, volume}}, m_id))));
+            }
             return true;
         } else {
             m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION OF ORDER {} FAILED", now, agentId, m_id, orderId);

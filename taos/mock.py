@@ -10,6 +10,7 @@ from typing import List
 
 
 class MockSubtensor(bt.MockSubtensor):
+    """In-memory subtensor stand-in for tests: registers neurons without a chain."""
     def __init__(self, netuid, n=16, wallet=None, network="mock"):
         super().__init__(network=network)
 
@@ -38,6 +39,7 @@ class MockSubtensor(bt.MockSubtensor):
 
 
 class MockMetagraph(bt.Metagraph):
+    """In-memory metagraph stand-in for tests, populated from the mock subtensor."""
     def __init__(self, netuid=1, network="mock", subtensor=None):
         super().__init__(netuid=netuid, network=network, sync=False)
 
@@ -70,6 +72,19 @@ class MockDendrite(bt.Dendrite):
         run_async: bool = True,
         streaming: bool = False,
     ):
+        """Mimic a dendrite call against mock axons, returning canned responses.
+
+        Args:
+            axons: Mock axons to "query".
+            synapse: The synapse to send.
+            timeout: Per-call timeout in seconds.
+            deserialize: Whether to return deserialized responses.
+            run_async: Run calls concurrently.
+            streaming: Streaming-response mode flag.
+
+        Returns:
+            The canned responses, one per axon.
+        """
         if streaming:
             raise NotImplementedError("Streaming not implemented yet.")
 

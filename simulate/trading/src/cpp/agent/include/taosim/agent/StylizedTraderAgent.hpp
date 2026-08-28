@@ -10,13 +10,14 @@
 #include "Distribution.hpp"
 #include "Order.hpp"
 
-#include <boost/circular_buffer.hpp>
+#include <taosim/util/TradeStatsEstimator.hpp>
+
 
 //-------------------------------------------------------------------------
 
-// Forward declarations to avoid pulling MagneticField/Process headers into the
-// public agent header just for cached-pointer member types.
-namespace taosim::process { class MagneticField; class Process; }
+// Forward declaration to avoid pulling the Process header into the public agent
+// header just for a cached-pointer member type.
+namespace taosim::process { class Process; }
 
 namespace taosim::agent
 {
@@ -41,8 +42,7 @@ public:
     [[nodiscard]] auto&& regimeChangeProb(this auto&& self) noexcept { return self.m_regimeChangeProb; }
     [[nodiscard]] auto&& regimeState(this auto&& self) noexcept { return self.m_regimeState; }
     [[nodiscard]] auto&& topLevel(this auto&& self) noexcept { return self.m_topLevel; }
-    [[nodiscard]] auto&& priceHist(this auto&& self) noexcept { return self.m_priceHist; }
-    [[nodiscard]] auto&& logReturns(this auto&& self) noexcept { return self.m_logReturns; }
+    [[nodiscard]] auto&& lastMid(this auto&& self) noexcept { return self.m_lastMid; }
     [[nodiscard]] auto&& tradePrice(this auto&& self) noexcept { return self.m_tradePrice; }
 
     virtual void configure(const pugi::xml_node& node) override;
@@ -71,6 +71,7 @@ private:
     void handleTradeSubscriptionResponse();
     void handleWakeup(Message::Ptr &msg);
     void handleRetrieveL1Response(Message::Ptr msg);
+    void handleRetrieveL1ExtResponse(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
     void handleLimitOrderPlacementErrorResponse(Message::Ptr msg);
     void handleCancelOrdersResponse(Message::Ptr msg);
@@ -83,7 +84,10 @@ private:
     OptimizationResult calculateIndifferencePrice(
         const ForecastResult& forecastResult, double freeBase, double freeQuote);
     OptimizationResult calculateMinimumPrice(
-        const ForecastResult& forecastResult, double freeBase, double freeQuote);
+        const ForecastResult& forecastResult,
+        double freeBase,
+        double freeQuote,
+        double indifferencePrice);
     double calcPositionPrice(const ForecastResult& forecastResult, double price, double freeBase, double freeQuote);
     void placeLimitBuy(
         BookId bookId,
@@ -135,10 +139,12 @@ private:
     Timestamp m_tau;
     Timestamp m_tauHist;
     Timestamp m_historySize;
+    double m_horizonSeconds{};
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     std::string m_baseName;
     uint32_t m_catUId;
     double m_wealthFrac{0.01};
+    double m_feeReserveFrac{0.01};
     float m_omegaDu;
     float m_alphaDu;
     float m_betaDu;
@@ -153,18 +159,10 @@ private:
     std::vector<float> m_regimeChangeProb;
     std::vector<RegimeState> m_regimeState;
     std::vector<TopLevel> m_topLevel;
-    std::vector<boost::circular_buffer<double>> m_priceHist;
-    std::vector<boost::circular_buffer<double>> m_logReturns;
-    // Incrementally-maintained sum and sum-of-squares of m_logReturns[bookId],
-    // updated on every push (with proper subtraction on circular-buffer eviction).
-    // Used by forecast() to derive mean (compC) and population variance in O(1)
-    // instead of re-scanning the entire history each tick.
-    std::vector<double> m_logReturnSum;
-    std::vector<double> m_logReturnSqSum;
-    // Cached per-bookId process pointers, populated once at configure() —
-    // eliminates the per-tick string lookup + RTTI cast through
-    // exchange()->process("magneticfield"/"fundamental", bookId).
-    std::vector<taosim::process::MagneticField*> m_magneticField;
+    std::vector<double> m_lastMid;
+    std::vector<taosim::util::TradeStatsEstimator> m_varEst;
+    double m_varHalflifeSeconds{};
+    bool m_varJumpRobust{};
     std::vector<taosim::process::Process*> m_fundamental;
 };
 

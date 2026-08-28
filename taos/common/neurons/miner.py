@@ -53,11 +53,36 @@ class BaseMinerNeuron(BaseNeuron):
 
     @classmethod
     def add_args(cls, parser: argparse.ArgumentParser):
+        """Add miner CLI arguments to the parser."""
         super().add_args(parser)
         add_miner_args(cls, parser)
 
     def __init__(self, config=None):
         super().__init__(config=config)
+
+        # Miners need a reasonably-recent metagraph (uid/hotkey/axon + stake for
+        # blacklist/priority), but the resync's substrate scale-decode is a
+        # multi-second GIL burst on a 129-subnet chain that would stall the axon
+        # (query timeouts). Offload the fetch+decode to a subprocess — the same
+        # MetagraphSyncWorker the validator uses — so it runs off the main GIL and
+        # can never block the query/response path; resync_metagraph() consumes its
+        # result. Falls back to inline sync if the worker can't start.
+        self._mg_worker = None
+        try:
+            from taos.im.validator.metagraph_worker import MetagraphSyncWorker
+
+            _mg_ep = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", "") or ""
+            self._mg_worker = MetagraphSyncWorker(_mg_ep, self.config.netuid)
+            self._mg_worker.start()
+        except Exception as e:
+            bt.logging.warning(f"miner metagraph sync worker unavailable ({e}); using inline resync")
+            self._mg_worker = None
+
+        # Init to now so the FIRST run()-loop sync() is throttled (skips the heavy
+        # metagraph resync) — __init__ already built a fresh metagraph. This lets
+        # run() reach axon.start() immediately instead of blocking on a resync,
+        # which otherwise leaves the axon not-listening and the miner un-queryable.
+        self._last_mg_sync = time.time()
 
         # Warn if allowing incoming requests from anyone.
         if self.config.blacklist.allow_non_validators:
@@ -96,7 +121,22 @@ class BaseMinerNeuron(BaseNeuron):
         module_spec.loader.exec_module(agent_module)
         agent_class = getattr(agent_module, self.config.agent.name)
         self.agent = agent_class(self.uid, self.config.agent.params, self.config.neuron.full_path)
-    
+
+    def should_sync_metagraph(self):
+        """Throttle miner metagraph resync. Default (MINER_SYNC_INTERVAL unset/0) keeps
+        base behaviour. On a mainnet-shaped chain the resync (neurons_lite fetch +
+        256-neuron decode) is heavy enough to starve the axon → validator query
+        timeouts; set MINER_SYNC_INTERVAL=<seconds> to resync sparsely so the miner
+        stays responsive (the __init__ metagraph is sufficient for serving/uid)."""
+        iv = float(os.environ.get("MINER_SYNC_INTERVAL", "0") or 0)
+        if iv <= 0:
+            return True
+        now = time.time()
+        if now - getattr(self, "_last_mg_sync", 0.0) < iv:
+            return False
+        self._last_mg_sync = now
+        return True
+
     async def forward(
         self, synapse: SimulationStateUpdate
     ) -> SimulationStateUpdate:
@@ -151,6 +191,14 @@ class BaseMinerNeuron(BaseNeuron):
         return self.blacklist(synapse)
     
     def priority_update(self, synapse: EventNotification) -> float:
+        """Priority for an incoming notification synapse.
+
+        Args:
+            synapse (EventNotification): The incoming notification.
+
+        Returns:
+            float: Stake-derived priority.
+        """
         return self.priority(synapse)
 
     def blacklist(
@@ -227,7 +275,7 @@ class BaseMinerNeuron(BaseNeuron):
         Returns:
             float: A priority score derived from the stake of the calling entity.
 
-        Miners may recieve messages from multiple entities at once. This function determines which request should be
+        Miners may receive messages from multiple entities at once. This function determines which request should be
         processed first. Higher values indicate that the request should be processed first. Lower values indicate
         that the request should be processed later.
 
@@ -276,21 +324,31 @@ class BaseMinerNeuron(BaseNeuron):
         if self.subtensor is not None and hasattr(self.subtensor, "serve_axon"):
             served = False
             attempts = 0
-            while not served:
-                try:                    
+            # Bound the serve retries: serve_axon can fail with ServingRateLimitExceeded
+            # when the axon was published recently (common after restarts). The
+            # previously-published on-chain axon info stays valid, so we must NOT block
+            # here forever — start the axon regardless so it listens + is queryable.
+            max_serve_attempts = int(os.environ.get("MINER_SERVE_ATTEMPTS", "3"))
+            while not served and attempts < max_serve_attempts:
+                try:
                     bt.logging.info(
                         f"Serving miner axon at {self.axon.external_ip}:{self.axon.external_port} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
                     )
                     attempts += 1
                     served = self.subtensor.serve_axon(netuid=self.config.netuid, axon=self.axon)
                     if not served:
-                        bt.logging.error(f"Failed to serve axon! Retrying (Attempt {attempts})")
-                        time.sleep(30)
+                        bt.logging.error(f"Failed to serve axon! Retrying (Attempt {attempts}/{max_serve_attempts})")
+                        time.sleep(10)
                     else:
                         bt.logging.success("Published axon to chain.")
                 except Exception as ex:
-                    bt.logging.error(f"Exception when attempting to serve axon - Retrying in 5 secs (Attempt {attempts}) : {ex}")
+                    bt.logging.error(f"Exception when attempting to serve axon - Retrying in 5 secs (Attempt {attempts}/{max_serve_attempts}) : {ex}")
                     time.sleep(5)
+            if not served:
+                bt.logging.warning(
+                    "Axon serve did not succeed within attempts (likely ServingRateLimitExceeded); "
+                    "starting axon anyway — the previously-published on-chain axon info remains valid."
+                )
         else:
             raise Exception("Cannot serve axon - invalid subtensor.  Check bittensor version and configuration and try again.")        
 
@@ -299,7 +357,15 @@ class BaseMinerNeuron(BaseNeuron):
 
         bt.logging.info(f"Miner starting at block {self.block} with UID {self.uid}")
 
-        # This loop maintains the miner's operations until intentionally stopped.
+        # This loop maintains the miner's operations until intentionally stopped. A dropped chain
+        # connection (e.g. the local node restarting) must NOT terminate the loop: previously a single
+        # sync() exception escaped to the outer handler, run() returned, and the miner wedged silently —
+        # the process stayed alive so pm2 reported it 'online' while the axon served a stale/unreachable
+        # state and nothing resynced. Now each iteration is guarded: on failure rebuild the subtensor +
+        # metagraph in place, and only exit (for a clean pm2 restart) if the chain stays unreachable
+        # across many consecutive attempts.
+        consecutive_sync_failures = 0
+        max_sync_failures = int(os.environ.get("MINER_MAX_SYNC_FAILURES", "12"))
         try:
             while not self.should_exit:
                 # Check if we should exit.
@@ -307,7 +373,28 @@ class BaseMinerNeuron(BaseNeuron):
                     break
 
                 # Sync metagraph
-                self.sync()
+                try:
+                    self.sync()
+                    consecutive_sync_failures = 0
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    consecutive_sync_failures += 1
+                    bt.logging.warning(
+                        f"Miner sync failed ({consecutive_sync_failures}/{max_sync_failures}); chain "
+                        f"connection likely dropped (node restart?). Reconnecting.\n{traceback.format_exc()}"
+                    )
+                    self._recover_chain_connection()
+                    if consecutive_sync_failures >= max_sync_failures:
+                        bt.logging.error(
+                            f"Miner could not re-establish the chain connection after "
+                            f"{consecutive_sync_failures} attempts; exiting for a clean pm2 restart."
+                        )
+                        try:
+                            self.axon.stop()
+                        except Exception:
+                            pass
+                        os._exit(1)
                 self.step += 1
                 time.sleep(bt.BLOCKTIME * 10)
 
@@ -320,6 +407,31 @@ class BaseMinerNeuron(BaseNeuron):
         # In case of unforeseen errors, the miner will log the error and continue operations.
         except Exception:
             bt.logging.error(traceback.format_exc())
+
+    def _recover_chain_connection(self):
+        """Rebuild the subtensor websocket + metagraph handle after a chain drop (e.g. the local node
+        restarting) and re-publish the axon, so the miner self-heals instead of wedging with a dead
+        connection while pm2 still reports it 'online'. The _mg_worker subprocess already self-respawns
+        on its next sync(); this repairs the primary subtensor used by check_registered/update_block and
+        the inline-resync fallback."""
+        try:
+            with self._subtensor_lock:
+                _ep = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", "") or ""
+                self.subtensor = bt.Subtensor(network=_ep) if _ep else bt.Subtensor(config=self.config)
+                _mechid = int(getattr(self, "_mechid", 0) or 0)
+                self.metagraph = self.subtensor.metagraph(self.config.netuid, mechid=_mechid)
+                bt.logging.info("Rebuilt subtensor + metagraph after chain drop.")
+        except Exception:
+            bt.logging.warning(f"Subtensor rebuild failed (node still unreachable?):\n{traceback.format_exc()}")
+            return
+        # Re-publish the axon so its on-chain serve record is refreshed against the new connection. A
+        # ServingRateLimitExceeded here is harmless (the prior serve stays valid), so it's best-effort.
+        try:
+            if hasattr(self.subtensor, "serve_axon"):
+                self.subtensor.serve_axon(netuid=self.config.netuid, axon=self.axon)
+                bt.logging.info("Re-published axon after reconnect.")
+        except Exception:
+            bt.logging.debug(f"Axon re-serve after reconnect failed (rate limit ok):\n{traceback.format_exc()}")
 
     def run_in_background_thread(self):
         """
@@ -372,11 +484,21 @@ class BaseMinerNeuron(BaseNeuron):
         """Resyncs the metagraph and updates the hotkeys and moving averages based on the new metagraph."""
         bt.logging.trace("resync_metagraph()")
 
-        # Sync the metagraph.
-        self.metagraph.sync(subtensor=self.subtensor)    
+        # Sync the metagraph OFF the main GIL via the subprocess worker so the axon
+        # keeps serving during the multi-second substrate scale-decode. Fall back to
+        # inline sync only if the worker is unavailable or returns nothing.
+        if getattr(self, "_mg_worker", None) is not None:
+            _mg = self._mg_worker.sync()
+            if _mg is not None:
+                self.metagraph = _mg
+                return
+            bt.logging.warning("metagraph worker returned None; inline sync this cycle")
+        self.metagraph.sync(subtensor=self.subtensor)
 
     def save_state(self):
+        """Persist miner state; the base miner keeps none."""
         pass
 
     def load_state(self):
+        """Restore miner state; the base miner keeps none."""
         pass

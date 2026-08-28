@@ -106,7 +106,7 @@ class StylizedTraderAgent:
         self.orderFlag = {i : False for i in range(self.bookCount)}      
         self.Tinit= self.duration
         
-        #FIXME quick fix for longer test
+        # NOTE: horizon extended for longer tests.
         self.n_trades = max(20, int(np.ceil(50* (1 + self.fundWeight) / (1 + self.chartWeight))))
 
         # Historical price and return initializations

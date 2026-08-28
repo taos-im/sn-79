@@ -1,5 +1,17 @@
 #!/bin/sh
 set -e
+
+# Cap parallel build jobs by AVAILABLE RAM, never by core count alone: (avail_mb - 6144) / 2560.
+# Heavy C++ TUs peak ~2.5GB each; reserve 6GB for whatever else the box is running and hard-cap at 12.
+# Uncapped -j$(nproc) on a many-core box is a 48-64GB spike that can take the whole host down.
+_mem_mb=$(free -m | awk '/^Mem:/{print $7}')
+BUILD_JOBS=$(( (_mem_mb - 6144) / 2560 ))
+[ "$BUILD_JOBS" -lt 1 ] && BUILD_JOBS=1
+_nproc=$(nproc)
+[ "$BUILD_JOBS" -gt "$_nproc" ] && BUILD_JOBS=$_nproc
+[ "$BUILD_JOBS" -gt 12 ] && BUILD_JOBS=12
+echo "Build parallelism: -j${BUILD_JOBS}  (${_mem_mb}MB available, ${_nproc} cores)"
+
 echo $PATH
 echo 'apt update'
 apt-get update
@@ -69,11 +81,12 @@ fi
 python -m pip install -U pyopenssl cryptography
 
 echo "Installing taos"
-# Use the committed lockfile when present for a reproducible dependency set.
+# Use the committed lockfile when present for a reproducible dependency set. Validators run the
+# gradient-training aggregation, so the [gentrx] extra is not optional on this path.
 if [ -f constraints.txt ]; then
-    python -m pip install -e . -c constraints.txt
+    python -m pip install -e ".[gentrx]" -c constraints.txt
 else
-    python -m pip install -e .
+    python -m pip install -e ".[gentrx]"
 fi
 
 cd simulate/trading
@@ -115,7 +128,7 @@ if ! g++ -dumpversion | grep -q "14"; then
 					tar -xf gcc-14.1.0.tar.gz
 					cd gcc-14.1.0
 					./configure -v --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu --prefix=/usr/local/gcc-14.1.0 --enable-checking=release --enable-languages=c,c++ --disable-multilib --program-suffix=-14.1.0
-					make -j"$(nproc)"
+					make -j"$BUILD_JOBS"
 					make install
 					cd ..
 					rm -r gcc-14.1.0
@@ -166,7 +179,7 @@ if ! cmake --version | grep -q "3.29.7"; then
 		tar zxvf cmake-3.29.7.tar.gz
 		cd cmake-3.29.7
 		./bootstrap --parallel="$(nproc)"
-		make -j"$(nproc)"
+		make -j"$BUILD_JOBS"
 		make install
 		cd ..
 		rm cmake-3.29.7.tar.gz

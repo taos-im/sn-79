@@ -10,6 +10,11 @@ from taos.common.protocol import SimulationStateUpdate, AgentResponse, EventNoti
 
 # Defining an abstract base class for simulation agents
 class SimulationAgent(ABC):
+    """Abstract base every agent process implements.
+
+    Attributes:
+        uid (int): The agent's uid on the subnet, set at launch.
+    """
     def __init__(self, uid, config, log_dir = None):
         """
         Initializer method that sets up the agent's unique ID and configuration.
@@ -103,6 +108,11 @@ class SimulationAgent(ABC):
         ...
 
 def launch(agent_class):
+    """Run an agent class as the miner's strategy process.
+
+    Args:
+        agent_class: The agent subclass to instantiate and serve.
+    """
     import argparse
     import uvicorn
     from taos.common.config import ParseKwargs

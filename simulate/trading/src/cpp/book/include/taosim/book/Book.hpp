@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <deque>
 #include "CSVPrintable.hpp"
 #include "IHumanPrintable.hpp"
 
@@ -88,6 +89,11 @@ public:
 
     void invalidateTopOfBook() noexcept { m_topOfBook.invalidate(); }
 
+    [[nodiscard]] taosim::decimal_t bandRef() const noexcept;
+    void recordBandTrade(Timestamp ts, taosim::decimal_t price, AgentId maker, AgentId taker) noexcept;
+    void sampleBandRef(Timestamp ts) noexcept;
+    [[nodiscard]] taosim::decimal_t bandLimit(bool isBuy) const noexcept;
+
 private:
     struct TopOfBook
     {
@@ -107,6 +113,20 @@ private:
 
     Simulation* m_simulation;
     BookId m_id;
+    // Slow trailing reference for the price band. Deliberately NOT bestBid/bestAsk: a band referenced to
+    // top-of-book ratchets, because a match consumes the level and the next order gets fresh headroom.
+    // This EMA moves only a little per trade, so walking it demands sustained volume rather than a burst.
+    // Band reference: the MEDIAN of prices SAMPLED once per bandRefInterval of sim time.
+    // Sampling (not per-trade averaging) is deliberate and closes two attacks: a burst of orders inside
+    // one interval contributes at most ONE sample, so trade COUNT cannot drag the reference; and a
+    // minimum-size "dust" print can only ever be one sample, not a vote proportional to its frequency.
+    // The median then requires >50% of the window's samples to be captured, i.e. sustained control over
+    // most of bandRefWindow, which is real capital and real time rather than a single batch.
+    std::deque<taosim::decimal_t> m_bandSamples;
+    taosim::decimal_t m_bandLastPrice{};      // prevailing price; survives quiet periods (never resets)
+    taosim::decimal_t m_bandRefCached{};      // median, recomputed only when a sample is pushed
+    Timestamp m_bandLastSampleTs{};
+    bool m_bandSeeded{false};
     size_t m_maxDepth;
     size_t m_detailedDepth;
     BookSignals m_signals;
@@ -163,7 +183,10 @@ template<typename... Args>
 void Book::logTrade(Args&&... args)
 {
     static_assert(std::constructible_from<Trade, TradeID, Args...>);
-    const auto trade = Trade::create((*m_tradeIdCounter)++, std::forward<Args>(args)...);
+    // Assigned through the one shared entry point, so pool fills and matched fills
+    // cannot drift into separate id spaces. A book always has a counter here.
+    const auto trade = Trade::create(
+        assignTradeId(m_tradeIdCounter).value(), std::forward<Args>(args)...);
     m_signals.trade(trade, m_id);
 }
 
@@ -173,7 +196,17 @@ void Book::dumpCSVLOB(auto begin, auto end, uint32_t depth) const
 {
     while (depth > 0 && begin != end) {
         const taosim::decimal_t totalVolume = [&] {
-            taosim::decimal_t totalVolume;
+            // INITIALISE THE ACCUMULATOR. decimal_t is bdldfp::Decimal128, whose default constructor leaves
+            // the value INDETERMINATE, so this summed each level starting from garbage. Two symptoms, one
+            // cause, both visible in SelfTradePreventionTest.LimitOrderBuyCO:
+            //   * level totals off by ~1e-10 (0.9999999999, 6.9999999999, 4.9999999998 where 1, 7, 5 belong)
+            //     when the garbage happened to be a tiny negative;
+            //   * whole levels MISSING from the dump, because `totalVolume > 0_dec` below tested a garbage
+            //     sum and skipped a level that genuinely had volume.
+            // Display-only: dumpCSVLOB feeds printCSV, which is test and debug output. Stored order volumes,
+            // reservations, fills and accounting never pass through here, which is why the acceptance run's
+            // invariants and notional identities all held while this test failed.
+            taosim::decimal_t totalVolume = 0_dec;
             for (auto it = begin->begin(); it != begin->end(); ++it) {
                 const auto& order = *it;
                 totalVolume += order->totalVolume();

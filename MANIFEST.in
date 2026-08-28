@@ -1,0 +1,20 @@
+# Data files a non-editable install needs.
+#
+# setup.py sets include_package_data=True and there is no setuptools-scm, so
+# this file is the only thing that puts non-.py files into the sdist/wheel.
+
+# Read by setup.py at BUILD time: without these, building from an sdist fails.
+include requirements.txt
+include constraints.txt
+include README.md
+include LICENSE
+
+# Read at RUN time: config.benchmark.agents defaults to
+# ../config/benchmark_agents.json, resolved inside the installed package.
+include taos/im/config/*.json
+recursive-include taos *.json
+
+# Operator secrets and runtime state that happen to live in the config dir.
+# Nothing above selects them, so these are deliberate no-ops (sdist warns that
+# they matched nothing) kept as a guard against a future broader include rule.
+global-exclude *.enc *.db *.db-wal *.db-shm

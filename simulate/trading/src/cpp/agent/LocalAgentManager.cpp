@@ -82,10 +82,6 @@ void LocalAgentManager::createAgentsInstanced(
             return lhs->name() < rhs->name();
         });
 
-    // Populate by-name index for O(1) lookup in Simulation::deliverMessage.
-    // (Previously a std::lower_bound over the sorted vector — O(log N) string
-    // comparisons per dispatched message; with 30k+ agents and millions of
-    // messages per tick that was a real hot spot.)
     m_byName.reserve(m_agents.size());
     for (const auto& agent : m_agents) {
         m_byName.emplace(agent->name(), agent.get());

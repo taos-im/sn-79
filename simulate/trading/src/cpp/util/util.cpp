@@ -4,6 +4,8 @@
  */
 #include "util.hpp"
 
+#include <taosim/xml/helpers.hpp>
+
 #include <boost/algorithm/string.hpp>
 #include <fmt/format.h>
 
@@ -81,7 +83,6 @@ double getClosestPreviousEntry(const std::string& filename, long long currentTim
             }
         }
         } catch (...) {
-            // fmt::println('Something went wrong');
         }
     }
 
@@ -96,7 +97,7 @@ Nodes parseSimulationFile(const fs::path& path)
     pugi::xml_parse_result parseResult = doc.load_file(path.c_str());
     assert(parseResult);
 
-    pugi::xml_node simulationNode = doc.child("Simulation");
+    pugi::xml_node simulationNode = xml::rootNode(doc);
     pugi::xml_attribute start = simulationNode.attribute("start");
     pugi::xml_attribute duration = simulationNode.attribute("duration");
     assert(simulationNode && start && duration);

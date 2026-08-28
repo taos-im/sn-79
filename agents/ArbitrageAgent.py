@@ -41,6 +41,7 @@ from taos.im.protocol.models import OrderDirection, STP, TimeInForce
 
 
 class ArbitrageAgent(GenTRXAgent):
+    """Example: arbitrages the spread between the pool price and the book on one venue."""
     def initialize(self):
         """Initialise arbitrage parameters (all overridable via --agent.params)."""
         # Pure trader — no GenTRX training/collection/inference.
@@ -87,9 +88,11 @@ class ArbitrageAgent(GenTRXAgent):
         return
 
     def respond_simulation(self, state):
+        """Simulation-mode branch of this agent's per-step response; the strategy itself is shared."""
         return self._arb(state, exchange=False)
 
     def respond_exchange(self, state):
+        """Exchange-mode branch of this agent's per-step response; the strategy itself is shared."""
         return self._arb(state, exchange=True)
 
     def _top(self, levels):

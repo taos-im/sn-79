@@ -263,9 +263,20 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
             p.baseIncrementDecimals, p.quoteIncrementDecimals);
     }
 
-    // TODO: This monstrosity should be split up somehow.
+    // TODO: split this function up.
     try {
         m_config2 = taosim::exchange::makeExchangeConfig(node);
+
+        // Stated at startup so a run's own log is evidence of which floors were active, rather than
+        // that having to be inferred from whichever config file is on disk when someone later looks.
+        // Must come AFTER m_config2 is assigned: printed before it, this reported 0.0 for both floors
+        // on a correctly configured exchange.
+        if (simulation()->blockIdx() == 0) {
+            fmt::println(
+                "Exchange order floors: minOrderSize={} alpha, minQuoteOrderSize={} quote{}",
+                m_config2.minOrderSize, m_config2.minQuoteOrderSize,
+                m_config2.minQuoteOrderSize <= 0_dec ? " (quote floor DISABLED)" : "");
+        }
 
         const auto booksNode = node.child("Books");
         const uint32_t bookCount = booksNode.attribute("instanceCount").as_uint();
@@ -372,6 +383,8 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
         }
 
         m_L3Record = taosim::event::L3RecordContainer{bookCount};
+        m_bookTradeStats.assign(bookCount, taosim::book::BookTradeStats{});
+        m_acdClocks.assign(bookCount, taosim::book::AcdClockRegistry{});
 
         m_L2Loggers.resize(bookCount);
         m_L3EventLoggers.resize(bookCount);
@@ -573,7 +586,8 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                         balancesNode,
                         taosim::accounting::RoundParams{
                             .baseDecimals = m_config.parameters().baseIncrementDecimals,
-                            .quoteDecimals = m_config.parameters().quoteIncrementDecimals}));
+                            .quoteDecimals = m_config.parameters().quoteIncrementDecimals},
+                        &simulation()->rng()));
                 accountTemplate.activeOrders().emplace_back();
             }
             return accountTemplate;
@@ -1400,6 +1414,9 @@ void MultiBookExchangeAgent::handleLocalMessage(const Message::Ptr&  msg)
     else if (msg->type == "RETRIEVE_L1") {
         handleLocalRetrieveL1(msg);
     }
+    else if (msg->type == "RETRIEVE_L1_EXT") {
+        handleLocalRetrieveL1Ext(msg);
+    }
     else if (msg->type == "RETRIEVE_L2") {
         handleLocalRetrieveL2(msg);
     }
@@ -1417,6 +1434,9 @@ void MultiBookExchangeAgent::handleLocalMessage(const Message::Ptr&  msg)
     }
     else if (msg->type == "SUBSCRIBE_EVENT_ORDER_TRADE") {
         handleLocalTradeByOrderSubscription(msg);
+    }
+    else if (msg->type == "SUBSCRIBE_EVENT_TRADE_OWN") {
+        handleLocalOwnTradeSubscription(msg);
     }
     else {
         handleLocalUnknownMessage(msg);
@@ -1468,9 +1488,15 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr&  ms
                     OrderErrorCode2StrView(orderResult.ec).data())));
     }
 
+    // The sweep path arrives here: the order belongs to EXCHANGE, but the payload may name the miner
+    // whose instruction caused it. Carry that through so the self-trade guard and the counterparty on
+    // the resulting fill can see who actually acted.
+    auto sweepCtx = OrderClientContext(
+        accounts().lookupLocalAgentId(msg->source), payload->clientOrderId, payload->delegate,
+        payload->currency);
+    sweepCtx.initiatorAgentId = payload->initiatorAgentId;
     const auto order = m_books[payload->bookId]->placeMarketOrder(
-        OrderClientContext(
-            accounts().lookupLocalAgentId(msg->source), payload->clientOrderId, payload->delegate, payload->currency),
+        std::move(sweepCtx),
         msg->arrival,
         orderResult.orderSize,
         payload->direction,
@@ -1723,30 +1749,51 @@ void MultiBookExchangeAgent::handleLocalClosePositions(const Message::Ptr&  msg)
 
 //-------------------------------------------------------------------------
 
-void MultiBookExchangeAgent::handleLocalRetrieveL1(const Message::Ptr&  msg)
+namespace
 {
-    const auto payload = std::static_pointer_cast<RetrieveL1Payload>(msg->payload);
 
-    const auto book = m_books[payload->bookId];
-
+// Shared by both L1 handlers so the two responses can never disagree on what the
+// top of book is.
+struct TopOfBook
+{
     taosim::decimal_t bestAskPrice{};
-    taosim::decimal_t bestAskVolume{}, askTotalVolume{};
+    taosim::decimal_t bestAskVolume{};
+    taosim::decimal_t askTotalVolume{};
     taosim::decimal_t bestBidPrice{};
-    taosim::decimal_t bestBidVolume{}, bidTotalVolume{};
+    taosim::decimal_t bestBidVolume{};
+    taosim::decimal_t bidTotalVolume{};
+};
+
+[[nodiscard]] TopOfBook topOfBook(const taosim::book::Book::Ptr& book)
+{
+    TopOfBook res{};
 
     if (!book->sellQueue().empty()) {
         const auto& bestSellLevel = book->sellQueue().front();
-        bestAskPrice = bestSellLevel.price();
-        bestAskVolume = bestSellLevel.volume();
-        askTotalVolume = book->sellQueue().volume();
+        res.bestAskPrice = bestSellLevel.price();
+        res.bestAskVolume = bestSellLevel.volume();
+        res.askTotalVolume = book->sellQueue().volume();
     }
 
     if (!book->buyQueue().empty()) {
         const auto& bestBuyLevel = book->buyQueue().back();
-        bestBidPrice = bestBuyLevel.price();
-        bestBidVolume = bestBuyLevel.volume();
-        bidTotalVolume = book->buyQueue().volume();
+        res.bestBidPrice = bestBuyLevel.price();
+        res.bestBidVolume = bestBuyLevel.volume();
+        res.bidTotalVolume = book->buyQueue().volume();
     }
+
+    return res;
+}
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
+void MultiBookExchangeAgent::handleLocalRetrieveL1(const Message::Ptr&  msg)
+{
+    const auto payload = std::static_pointer_cast<RetrieveL1Payload>(msg->payload);
+
+    const auto top = topOfBook(m_books[payload->bookId]);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -1756,12 +1803,38 @@ void MultiBookExchangeAgent::handleLocalRetrieveL1(const Message::Ptr&  msg)
         "RESPONSE_RETRIEVE_L1",
         MessagePayload::create<RetrieveL1ResponsePayload>(
             simulation()->currentTimestamp(),
-            bestAskPrice,
-            bestAskVolume,
-            askTotalVolume,
-            bestBidPrice,
-            bestBidVolume,
-            bidTotalVolume,
+            top.bestAskPrice,
+            top.bestAskVolume,
+            top.askTotalVolume,
+            top.bestBidPrice,
+            top.bestBidVolume,
+            top.bidTotalVolume,
+            payload->bookId));
+}
+
+//-------------------------------------------------------------------------
+
+void MultiBookExchangeAgent::handleLocalRetrieveL1Ext(const Message::Ptr&  msg)
+{
+    const auto payload = std::dynamic_pointer_cast<RetrieveL1ExtPayload>(msg->payload);
+
+    const auto top = topOfBook(m_books[payload->bookId]);
+
+    simulation()->dispatchMessage(
+        simulation()->currentTimestamp(),
+        1,
+        name(),
+        msg->source,
+        "RESPONSE_RETRIEVE_L1_EXT",
+        MessagePayload::create<RetrieveL1ExtResponsePayload>(
+            simulation()->currentTimestamp(),
+            top.bestAskPrice,
+            top.bestAskVolume,
+            top.askTotalVolume,
+            top.bestBidPrice,
+            top.bestBidVolume,
+            top.bidTotalVolume,
+            m_bookTradeStats.at(payload->bookId),
             payload->bookId));
 }
 
@@ -1903,6 +1976,26 @@ void MultiBookExchangeAgent::handleLocalTradeByOrderSubscription(const Message::
 
 //-------------------------------------------------------------------------
 
+void MultiBookExchangeAgent::handleLocalOwnTradeSubscription(const Message::Ptr&  msg)
+{
+    const auto& sub = msg->source;
+
+    if (!m_localOwnTradeSubscribers.add(sub)) {
+        return fastRespondToMessage(
+            msg,
+            "ERROR",
+            MessagePayload::create<ErrorResponsePayload>(
+                fmt::format("Agent {} is already subscribed to own trade events", sub)));
+    }
+
+    fastRespondToMessage(
+        msg,
+        MessagePayload::create<SuccessResponsePayload>(
+            fmt::format("Agent {} subscribed successfully to own trade events", sub)));
+}
+
+//-------------------------------------------------------------------------
+
 void MultiBookExchangeAgent::handleLocalUnknownMessage(const Message::Ptr&  msg)
 {
     if (msg->source == name()) { return; }
@@ -1999,6 +2092,38 @@ void MultiBookExchangeAgent::notifyTradeSubscribers(const TradeWithLogContext::P
                 tradeWithCtx->logContext->bookId));
     }
 
+    // Own-fill delivery. A party to the trade is notified whether it was the aggressor
+    // (the fill precedes its own placement response) or the resting side (the fill
+    // arrives whenever a counterparty does), which the by-order route below cannot do
+    // since that subscription is only established after matching. Remote agents are
+    // served by the DISTRIBUTED_PROXY_AGENT fan-out in tradeCallback instead.
+    const auto& tradeCtx = *tradeWithCtx->logContext;
+    auto notifyOwn = [&](AgentId agentId) {
+        if (agentId >= AgentId{}) return;
+        const auto& idMap = accounts().idBimap().right;
+        const auto it = idMap.find(agentId);
+        if (it == idMap.end()) return;
+        const LocalAgentId& sub = it->second;
+        if (!m_localOwnTradeSubscribers.contains(sub)) return;
+        // Already served above; a subscriber of both feeds must not net the fill twice.
+        if (m_localTradeSubscribers.contains(sub)) return;
+        if (simulation()->m_replayMode && !simulation()->isReplacedAgent(sub)) return;
+        simulation()->dispatchMessage(
+            now,
+            Timestamp{},
+            name(),
+            sub,
+            "EVENT_TRADE",
+            MessagePayload::create<EventTradePayload>(
+                *(tradeWithCtx->trade), tradeCtx, tradeCtx.bookId));
+    };
+    notifyOwn(tradeCtx.aggressingAgentId);
+    // Self-match: deliver once. Consumers net both legs out of a single message, so a
+    // second delivery would double-count.
+    if (tradeCtx.restingAgentId != tradeCtx.aggressingAgentId) {
+        notifyOwn(tradeCtx.restingAgentId);
+    }
+
     notifyTradeSubscribersByOrderID(tradeWithCtx, tradeWithCtx->trade->aggressingOrderID());
     notifyTradeSubscribersByOrderID(tradeWithCtx, tradeWithCtx->trade->restingOrderID());
 }
@@ -2067,6 +2192,9 @@ void MultiBookExchangeAgent::orderLogCallback(Order::Ptr order, OrderContext ctx
 {
     if (order->totalVolume() == 0_dec) return;
     m_L3Record.at(ctx.bookId).push(taosim::event::OrderEvent(order, ctx));
+    // The probe: the push above demonstrably lands (retainFrom counts it every batch) while the relay
+    // slot inside ExchangeSignals never fires, so the emit below is either not reached or reaches a
+    // signal with no slots. This reports which, once, including how many slots the signal actually has.
     m_signals.at(ctx.bookId)->orderLog(OrderWithLogContext(
         order, std::make_shared<OrderLogContext>(ctx.agentId, ctx.bookId)));
 }
@@ -2114,12 +2242,17 @@ void MultiBookExchangeAgent::tradeCallback(Trade::Ptr trade, BookId bookId)
         .trade = trade
     });
 
+    m_bookTradeStats.at(bookId).record(
+        trade->price(), trade->volume(), simulation()->currentTimestamp());
+
     auto tradeCtx = TradeContext(bookId, aggressiveClientInfo.agentId, restingClientInfo.agentId, fees);
+    tradeCtx.initiatorAgentId             = aggressiveClientInfo.initiatorAgentId;
     tradeCtx.aggressingCloseReason        = aggressiveClientInfo.closeReason;
     tradeCtx.aggressingOriginatingOrderId = aggressiveClientInfo.originatingOrderId;
     m_L3Record.at(bookId).push(taosim::event::TradeEvent(trade, std::move(tradeCtx)));
 
     auto logCtx = std::make_shared<TradeLogContext>(aggressiveClientInfo.agentId, restingClientInfo.agentId, bookId, fees);
+    logCtx->initiatorAgentId = aggressiveClientInfo.initiatorAgentId;
     logCtx->aggressingCloseReason        = aggressiveClientInfo.closeReason;
     logCtx->aggressingOriginatingOrderId = aggressiveClientInfo.originatingOrderId;
     auto tradeWithCtx = std::make_shared<TradeWithLogContext>(trade, logCtx);

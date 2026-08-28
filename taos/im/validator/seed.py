@@ -139,6 +139,11 @@ def seed(config):
             _log_dir_changed = False
     
     def on_coinbase_trade(trade: dict):
+        """Handle one Coinbase trade message and record it as seed flow.
+
+        Args:
+            trade (dict): The exchange's trade payload.
+        """
         nonlocal last_seed, seed_count, pending_seed_data
         nonlocal last_external, external_count, pending_external_data
         nonlocal next_sampled_external
@@ -154,6 +159,11 @@ def seed(config):
                 record_external(trade)
 
     def on_binance_trade(trade: dict):
+        """Handle one Binance trade message and record it as seed flow.
+
+        Args:
+            trade (dict): The exchange's trade payload.
+        """
         nonlocal last_seed, seed_count, pending_seed_data
         nonlocal last_external, external_count, pending_external_data
 
@@ -166,6 +176,11 @@ def seed(config):
                 record_external(trade)
 
     def record_seed(trade: dict) -> None:
+        """Record a fundamental-seed trade for the simulation to consume.
+
+        Args:
+            trade (dict): Normalised trade with price, size and side.
+        """
         nonlocal seed_count, pending_seed_data, last_seed, seed_filename, seed_file
         
         try:
@@ -201,6 +216,11 @@ def seed(config):
             bt.logging.error(f"Exception in seed handling: Seed={seed} | Error={ex}")
                     
     def record_external(trade: dict) -> None:
+        """Record an external-venue trade used for calibration rather than seeding.
+
+        Args:
+            trade (dict): Normalised trade with price, size and side.
+        """
         nonlocal external_count, pending_external_data, last_external
         nonlocal external_filename, external_file, sampled_external_filename
         nonlocal sampled_external_file, sampled_external_count
@@ -252,6 +272,7 @@ def seed(config):
     seed_client = None
     
     def connect() -> None:
+        """Open (or re-open) the upstream websocket and subscribe to the configured symbols."""
         nonlocal last_reconnect_time, seed_exchange, seed_client
         time_since_reconnect = time.time() - last_reconnect_time
         if time_since_reconnect < reconnect_cooldown:
@@ -290,6 +311,7 @@ def seed(config):
                 break
     
     def check_seeds():
+        """Verify seed flow is still arriving and reconnect the sources that have gone quiet."""
         nonlocal last_seed, seed_count, last_external, external_count
         nonlocal next_external_sampling_time, next_sampled_external, last_sampled_external
         nonlocal sampled_external_count, seed_file, external_file, sampled_external_file

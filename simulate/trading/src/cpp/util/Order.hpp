@@ -303,6 +303,30 @@ struct OrderClientContext
     // SL/TP close metadata — populated only for exchange-triggered market closes.
     uint8_t closeReason{0};       // 0=none, 1=SL, 2=TP
     OrderID originatingOrderId{0}; // LOB ID of the position order that spawned the SL/TP
+    // WHO CAUSED this order to exist, when that differs from who owns it.
+    //
+    // Set only on sweep orders, which the exchange places under its own id (agent -1) to reconcile the
+    // book with the pool after a miner's instruction moved the price. `agentId` stays -1 because the
+    // exchange funds the sweep and the initiating miner never receives its volume, so fees and
+    // settlement must not follow this field. It exists so the two places that need to know WHO acted,
+    // rather than who paid, can ask: the self-trade guard, and the counterparty recorded on the fill.
+    // Empty means the order is its own initiator, which is every ordinary order.
+    std::optional<AgentId> initiatorAgentId;
+
+    // WHICH INSTRUCTION created this order, so "was already resting" can be asked exactly.
+    //
+    // Two orders belong to one instruction precisely when the exchange minted them while dispatching
+    // that instruction: a marketable order and the sweep raised to fill it. That pair must be exempt
+    // from self-trade prevention, because cancelling the resting side destroys the order the sweep
+    // exists to fill. Everything else, including two orders a miner sends in the SAME batch, is a
+    // separate instruction and must remain subject to STP.
+    //
+    // Empty means "not minted under instruction dispatch", which covers every simulation-mode order.
+    // The comparison therefore FAILS CLOSED: an empty seq never compares equal, so the guard falls
+    // back to order-id ordering and STP protects rather than stands down. A plain integer defaulting
+    // to 0 would do the opposite -- every unstamped order would look like one instruction and STP
+    // would silently never fire anywhere.
+    std::optional<uint64_t> instrSeq;
 
     OrderClientContext() noexcept = default;
 
@@ -319,7 +343,23 @@ struct OrderClientContext
 
     [[nodiscard]] static OrderClientContext fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(agentId, clientOrderId, delegate, currency);
+    // EVERY FIELD, not the original four. This map omitted closeReason, originatingOrderId,
+    // initiatorAgentId and instrSeq, so any context crossing msgpack would silently lose them.
+    //
+    // It is unreachable today -- nothing packs an OrderClientContext: no Order map includes the context,
+    // SLTPContainer holds three but declares no MSGPACK map at all, and there are no direct pack sites.
+    // That is exactly why it is fixed NOW: no data exists in the old encoding, so there is no migration
+    // question, and it becomes a wire-compatibility problem the moment anything packs a context, which is
+    // what checkpointing the SL/TP trigger registry would do.
+    //
+    // The two optionals do not fail the same way, which is why the omission mattered. An empty instrSeq
+    // fails CLOSED by design: it never compares equal, so the guard falls back to order-id ordering and
+    // STP protects. An empty initiatorAgentId means "the order is its own initiator", so a sweep that
+    // lost the field is indistinguishable from an ordinary order and both the self-trade guard and the
+    // counterparty recorded on the fill change behaviour silently.
+    MSGPACK_DEFINE_MAP(
+        agentId, clientOrderId, delegate, currency,
+        closeReason, originatingOrderId, initiatorAgentId, instrSeq);
 };
 
 //-------------------------------------------------------------------------

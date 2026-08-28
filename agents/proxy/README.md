@@ -38,7 +38,7 @@ The distributed agent/proxy setup is configured by means of a JSON configuration
     - `output` : Path the gradient server writes the latest checkpoint to. \[default=`"checkpoints/GenTRX/latest.pt"`\]
     - `interval` : Seconds between aggregation rounds. \[default=`30`\]
     - `min_score` : Reject gradients scoring below this threshold. \[default=`-0.1`\]
-    - `mode` : Engine mode the gradient server is associated with — currently `"simulation"`.
+    - `mode` : Engine mode the gradient server is associated with (currently `"simulation"`).
   - `minio` : Local MinIO bring-up.
     - `port` : S3 API port. \[default=`9000`\]
     - `console` : Web console port. \[default=`9091`\]
@@ -56,18 +56,18 @@ The file `proxy.py` contains an implementation of a handler for processing messa
 ```
 This agent publishes the full state of the simulation to the configured port on localhost at an interval defined in simulation time via the `Simulation.step` field in the XML.  The Python proxy receives messages published from the simulator by this agent, parses them to a `MarketSimulationStateUpdate` synapse format, and forwards to the configured list of (locally hosted) distributed trading agents.  The proxy then awaits responses from the distributed agents, and when received will validate, parse to the correct format and return the instructions to the simulator for processing. 
 
-For the full local test stack — proxy + agents + simulator (and, with `--train`, MinIO + gradient server) — use the orchestrated runner from the repo root: `./agents/proxy/run [--train]`.  To launch only the proxy FastAPI server directly (useful for debugging the proxy in isolation, without the simulator or agents), run from this directory:
+For the full local test stack (proxy + agents + simulator and, with `--train`, MinIO + gradient server), use the orchestrated runner from the repo root: `./agents/proxy/run [--train]`.  To launch only the proxy FastAPI server directly (useful for debugging the proxy in isolation, without the simulator or agents), run from this directory:
 ```shell
 python proxy.py --config <config_file='config.json'>
 ```
 
 ## Agents
 
-Some example agent implementations are present in the directory above this one; all trading agents must inherit the `FinanceSimulationAgent` class, and override two key functions:
+Some example agent implementations are present in the directory above this one; all trading agents must inherit the `FinanceAgent` class (which serves both the simulation and the exchange; `FinanceSimulationAgent` is a pre-0.6.0 alias of its base and has no exchange path), and override two key functions:
 - `initalize(self)` : Executed at the start of operation, used to construct and initialize any parameters or structures used throughout the agent operation.
 - `respond(self, state)` : This function is called whenever a new `MarketSimulationStateUpdate` is received from the proxy, and should contain the core trading logic.
 
-Instructions for order placement/cancellation are submitted by attachment to a `FinanceAgentResponse` class; the `respond` function should always initialize an empty reponse as `response = FinanceAgentResponse(agent_id=self.uid)`, with instructions then added in the logic via the convenience methods defined on this class:
+Instructions for order placement/cancellation are submitted by attachment to a response object; the `respond` function should always initialize an empty response as `response = self.make_response()`, with instructions then added in the logic via the convenience methods defined on it. `make_response()` returns a mode-aware response that finalizes to the type the current mechanism requires, so the same code serves both the simulation and the exchange. Constructing `FinanceAgentResponse(agent_id=self.uid)` directly still works but is simulation-only:
 - `response.market_order(self, book_id : int, direction : OrderDirection, quantity : float, delay : int = 0, clientOrderId : int | None = None, stp : STP = STP.CANCEL_OLDEST, currency : OrderCurrency = OrderCurrency.BASE)` : Place a market order on the specified `book_id` for `quantity`. The direction of the order as buy or sell is specified via the `OrderDirection` enum as either `OrderDirection.BUY`  or `OrderDirection.SELL`.  Order will be submitted to book after `delay` simulation timesteps, using the `clientOrderId` and self-trade prevention rule passed.  By specifying `currency=OrderCurrency.QUOTE`, the `quantity` will be interpreted as the desired QUOTE value that should be executed in fulfilment of the order.
 - `response.limit_order(self, book_id : int, direction : OrderDirection, quantity : float, price : float, delay : int = 0, clientOrderId : int | None = None, stp : STP = STP.CANCEL_OLDEST, postOnly : bool = False, timeInForce : TimeInForce = TimeInForce.GTC, expiryPeriod : int | None = None)` : Place a limit order on the specified `book_id` for `quantity`@`price`.  Order will be submitted to book after `delay` simulation timesteps, using the client id passed.  Advanced order options can also be supplied, including the self-trade prevention rule, post-only enforcement, time-in-force options (GTC, GTT, IOC or FOK), and an expiry period for use with `GTT` option.
 - `response.cancel_order(self, book_id : int, order_id : int, quantity : float | None = None, delay : int = 0)` : Cancel the order with ID `order_id` on the specified `book_id` after the given simulation delay.
@@ -129,10 +129,10 @@ You should observe logs from the proxy indicating start of the simulation, recei
 The `run` script wires up the proxy, agents, simulator, and (in `--train` mode) MinIO + gradient server, then arranges them in a tmux session.
 
 ```bash
-# Trading-only — proxy + simulator + agents, no S3 or gradient server
+# Trading-only: proxy + simulator + agents, no S3 or gradient server
 ./agents/proxy/run
 
-# Training mode — adds MinIO, gradient server, and GenTRX training
+# Training mode: adds MinIO, gradient server, and GenTRX training
 ./agents/proxy/run --train
 
 # Headless (no tmux), useful for CI or single-terminal debugging
@@ -146,8 +146,8 @@ The `run` script wires up the proxy, agents, simulator, and (in `--train` mode) 
 
 The config defaults to `agents/proxy/config.json`. Reference examples are alongside it:
 
-- `agents/proxy/config.example.json` — minimal trading-only template
-- `agents/proxy/config.train.example.json` — full training-mode template
+- `agents/proxy/config.example.json` : minimal trading-only template
+- `agents/proxy/config.train.example.json` : full training-mode template
 
 Tmux layout (training mode):
 

@@ -37,6 +37,20 @@ void setAttribute(pugi::xml_node node, std::string_view name, const T& value)
 
 //-------------------------------------------------------------------------
 
+// The document's root, under either accepted name.
+//
+// Exchange-mode configs are rooted at <Exchange> because calling an exchange deployment a "Simulation"
+// misdescribes it, while simulation configs stay at <Simulation>. BOTH must keep working, and not only
+// for the configs on disk: every checkpoint ever written carries the root name it was written under, so
+// a reader that accepted only the new name would fail to load existing checkpoints.
+[[nodiscard]] inline pugi::xml_node rootNode(pugi::xml_node doc)
+{
+    if (auto node = doc.child("Simulation")) return node;
+    return doc.child("Exchange");
+}
+
+//-------------------------------------------------------------------------
+
 inline size_t removeChildren(pugi::xml_node node, std::function<bool(pugi::xml_node)> criterion)
 {
     size_t removeCounter{};

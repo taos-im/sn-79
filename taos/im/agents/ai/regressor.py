@@ -221,6 +221,13 @@ Output Directory : {self.output_dir}
             data (dict): Dictionary with 'predictors' and 'target' entries.
         """
         def append_to_csv(file_path: str, data: dict, include_header: bool = False):
+            """Append one row to a CSV file, writing the header first when asked.
+
+            Args:
+                file_path (str): Destination file.
+                data (dict): Column values for this row.
+                include_header (bool): Write the header before the row.
+            """
             df = pd.DataFrame(data)
             df.to_csv(file_path, index=False, mode='a', header=include_header)
 

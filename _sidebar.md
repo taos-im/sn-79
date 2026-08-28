@@ -1,4 +1,4 @@
-<!-- /_sidebar.md — global sidebar, absolute paths so clicks don't compound -->
+<!-- /_sidebar.md: global sidebar, absolute paths so clicks don't compound -->
 * **SN-79**
   * [Overview](/README.md)
   * [Agent Development Guide](/agents/README.md)

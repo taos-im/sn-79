@@ -104,6 +104,14 @@ def network_from_subtensor(name: str | None, netuid: int | None = None) -> str:
         # Local loopback — always testnet (localnet)
         if name.startswith(("ws://127.", "ws://localhost", "wss://127.", "wss://localhost")):
             return NETWORK_TESTNET
+        # Custom private-chain hosts (e.g. wss://localnet.example.org):
+        # classify by host substring so netuid 79 on a seeded localnet is not
+        # misread as mainnet by the netuid fallback below.
+        _low = name.lower()
+        if "localnet" in _low:
+            return NETWORK_LOCALNET
+        if "testnet" in _low:
+            return NETWORK_TESTNET
     # Netuid-based fallback for ambiguous / "unknown" network names. Triggered
     # when the operator passed only --subtensor.chain_endpoint <custom-url>.
     if netuid is not None:
@@ -129,6 +137,16 @@ def network_from_config(subtensor_config: Any, netuid: int | None = None) -> str
         return network_from_subtensor(None, netuid=netuid)
     chain_endpoint = getattr(subtensor_config, "chain_endpoint", "") or ""
     if any(m in chain_endpoint for m in ("localhost", "127.0.0.1", "::1")):
+        return NETWORK_TESTNET
+    # Custom private-chain endpoints hosted on a real domain (e.g.
+    # wss://localnet.example.org) must be classified by the endpoint
+    # host, NOT the netuid fallback below: a mainnet-SEEDED localnet keeps
+    # netuid 79, which the fallback misreads as mainnet and points the bucket
+    # prefix at gentrx/mainnet/... instead of the correct gentrx/localnet/....
+    _ep = chain_endpoint.lower()
+    if "localnet" in _ep:
+        return NETWORK_LOCALNET
+    if "testnet" in _ep:
         return NETWORK_TESTNET
     return network_from_subtensor(
         getattr(subtensor_config, "network", None), netuid=netuid

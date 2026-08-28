@@ -1,7 +1,7 @@
-# **τaos** ☯ **‪ي‬n 79**<!-- omit in toc -->
+# **MVTRX**: Bittensor SN79<!-- omit in toc -->
 # Dashboard Guide<!-- omit in toc -->
 
-This document serves to provide details on the data displayed at the [τaos dashboard](https://taos.simulate.trading).
+This document serves to provide details on the data displayed at the [MVTRX dashboard](https://taos.simulate.trading).
 
 - [Validator Page](#validator-page)
   - [Validator Info](#validator-info)
@@ -241,11 +241,11 @@ The Agents table provides summary performance information for all miners in the 
 
 - **Kappa3 Score** - Activity-weighted median normalized realized Kappa3 ratio with outlier penalty applied, for the latest assessment window.
 
-- **Trading Score** - Combined trading-side score blending the Kappa3 Score with the PnL Score for the latest assessment window.  This is the trading half of incentive; the GenTRX half is below.
+- **Trading Score** - The agent's *standing*: an age-annealed EMA of the trading-side score (Kappa3 Score blended with PnL Score).  This smoothed track record, not the latest-window value, is what drives rank - so a high live Median Kappa3 raises it only gradually (at a rate bounded by the EMA half-life) rather than immediately, and it climbs while skill is sustained.  This is the trading half of incentive; the GenTRX half is below.
 
 - **GenTRX Score** - The miner's EMA-smoothed GenTRX training reward, mirrored from the [GenTRX Page](#gentrx-page).  The final Score blends this with the Trading Score by the configured GenTRX Pool Share.
 
-- **Score** - Final composite score determining agent ranking; an exponential moving average of the blended trading and GenTRX components.
+- **Score** - Final composite score that determines ranking (**Pos**): the blended Trading Score + GenTRX standing after the reward floor and Pareto redistribution, which concentrates reward toward the top of the board and tapers the middle.  A strong Trading Score can still map to a low Score/Pos while mid-pack.
 
 - **ΔInv (QUOTE)** - Total change in miner inventory value since the start of simulation.
 
@@ -448,7 +448,7 @@ The Agent page also surfaces the selected miner's per-round GenTRX outcomes alon
 
 - **GenTRX Generalization - Own vs Held-Out** - For the selected agent, per-round own-data score and held-out validation score.  `score_own` is the gradient's improvement on the miner's own training data; `score_held` is its improvement on a held-out shard the miner never sees.  A persistent gap (own ≫ held) means the gradient is over-fitting; the `overfitting` series flags rounds where the validator detected this.
 
-- **GenTRX Gradient Health & Outcomes** - For the selected agent, per-round gradient outcomes.  `accepted` flags rounds whose gradient cleared the score threshold and was applied this round; `rollback` flags rounds where this gradient was selected during a rollback; `grad_norm` is the L2 norm of the submitted gradient — useful for spotting collapsing or exploding gradients.
+- **GenTRX Gradient Health & Outcomes** - For the selected agent, per-round gradient outcomes.  `accepted` flags rounds whose gradient cleared the score threshold and was applied this round; `rollback` flags rounds where this gradient was selected during a rollback; `grad_norm` is the L2 norm of the submitted gradient, useful for spotting collapsing or exploding gradients.
 
 ### Daily Volume Plot
 
@@ -497,7 +497,7 @@ The BASE and QUOTE balances and loans for the agent are plotted for each book as
 
 ## GenTRX Page
 
-This page surfaces the state and health of the GenTRX distributed-training workload — the model-training side of incentive that runs alongside trading-simulation scoring.  Each round, validators score gradients submitted by miners, aggregate those that improve the held-out loss, and roll back if a round regresses.
+This page surfaces the state and health of the GenTRX distributed-training workload: the model-training side of incentive that runs alongside trading-simulation scoring.  Each round, validators score gradients submitted by miners, aggregate those that improve the held-out loss, and roll back if a round regresses.
 
 ### Status
 
@@ -517,9 +517,9 @@ The top of the page summarises the current state of the training run.  The first
 
 - **Active Miners** - Miners currently assigned a GenTRX gradient slot.
 
-- **Delivered** - Fraction of assigned miners that fetched their assignment from the validator (`GET /gentrx/assignment`).  Low values point at miners not polling for work — this is the validator → miner direction, not the gradient submission.
+- **Delivered** - Fraction of assigned miners that fetched their assignment from the validator (`GET /gentrx/assignment`).  Low values point at miners not polling for work; this is the validator → miner direction, not the gradient submission.
 
-- **Scored** - Fraction of assigned miners whose gradient reached the validator, parsed cleanly, and completed scoring without error.  Drops here mean upload, parse, or scoring failures — check gradient format and round version.
+- **Scored** - Fraction of assigned miners whose gradient reached the validator, parsed cleanly, and completed scoring without error.  Drops here mean upload, parse, or scoring failures; check gradient format and round version.
 
 - **Accepted** - Fraction of assigned miners whose gradient cleared the score threshold and was applied to the model (`n_accepted / n_assigned`).  This is the end-to-end yield of the round; only this group earns reward this round.
 
@@ -529,7 +529,7 @@ The top of the page summarises the current state of the training run.  The first
 
 Two timeseries plots tracking model improvement and rollbacks across rounds.
 
-- **Model Loss — Before & After Aggregation** - Held-out loss before (orange) and after (green) each round's accepted gradients.  The gap is per-round improvement.  When the lines converge, training is plateauing and higher-quality gradients are needed.
+- **Model Loss: Before and After Aggregation** - Held-out loss before (orange) and after (green) each round's accepted gradients.  The gap is per-round improvement.  When the lines converge, training is plateauing and higher-quality gradients are needed.
 
 - **Loss Improvement per Round** - Per-round change in held-out loss.  Green bars = the round helped, red = rollback.
 

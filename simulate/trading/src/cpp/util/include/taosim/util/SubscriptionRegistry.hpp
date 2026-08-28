@@ -26,6 +26,8 @@ public:
 
     [[nodiscard]] std::span<const T> subs() const noexcept { return m_subs; }
 
+    [[nodiscard]] bool contains(const T& sub) const noexcept { return m_registry.contains(sub); }
+
     bool add(const T& sub) noexcept
     {
         if (m_registry.contains(sub)) {

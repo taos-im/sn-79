@@ -54,11 +54,25 @@ def _balance_fields(
 
 
 class FeeTier(BaseModel):
+    """One tier of a volume-tiered fee schedule.
+
+    Attributes:
+        volume_required (float): Rolling traded volume required to qualify for this tier.
+        maker_fee (float): Maker fee rate charged at this tier.
+        taker_fee (float): Taker fee rate charged at this tier.
+    """
     volume_required : float
     maker_fee : float
     taker_fee : float
 
 class FeePolicy(BaseModel):
+    """The venue's fee schedule as published on the state update.
+
+    Attributes:
+        fee_type (str): Which fee scheme is active.
+        params (dict): Scheme-specific parameters, exactly as the engine published them.
+        tiers (list[FeeTier]): Volume tiers when the scheme is tiered; empty otherwise.
+    """
     fee_type : str
     params : dict
     tiers : list[FeeTier]
@@ -124,6 +138,7 @@ class MarketSimulationConfig(BaseModel):
 
         fee_policy (FeePolicy | None): The fee policy applied to trades.
 
+        min_order_size (float): Minimum order volume accepted by the engine; orders below this size are rejected. Default 0.0 (no minimum).
         max_open_orders (int | None): Maximum number of open orders per agent.
 
         max_leverage (float): Maximum leverage allowed for agents.
@@ -539,34 +554,42 @@ class Order(BaseModel):
 
     @property
     def type(self) -> str:
+        """Readable accessor for wire field ``y``."""
         return self.y
 
     @property
     def id(self) -> int:
+        """Readable accessor for wire field ``i``; ``id`` is its serialized alias."""
         return self.i
 
     @property
     def client_id(self) -> int | None:
+        """Readable accessor for wire field ``c``; ``client_id`` is its serialized alias."""
         return self.c
 
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
 
     @property
     def quantity(self) -> float:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
 
     @property
     def side(self) -> int:
+        """Readable accessor for wire field ``s``; ``side`` is its serialized alias."""
         return self.s
 
     @property
     def price(self) -> float | None:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
     
     @property
     def leverage(self) -> float:
+        """Readable accessor for wire field ``l``; ``leverage`` is its serialized alias."""
         return self.l
 
     @classmethod
@@ -582,6 +605,12 @@ class Order(BaseModel):
     def from_json(self, json : dict):
         """
         Method to extract model data from simulation account representation in the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         # Use field-name kwargs (i, c, t, q, s, p, l) rather than aliases.
         # pydantic v2 model_construct does not resolve aliases; alias kwargs
@@ -607,20 +636,29 @@ class LevelInfo(BaseModel):
 
     @property
     def price(self) -> float:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
 
     @property
     def quantity(self) -> float:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
 
     @property
     def orders(self) -> list[Order]:
+        """Readable accessor for wire field ``o``; ``orders`` is its serialized alias."""
         return self.o
 
     @classmethod
     def from_json(self, json : dict):
         """
         Method to transform simulator format model to the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         if 'o' not in json:
             orders = None
@@ -661,50 +699,62 @@ class TradeInfo(BaseModel):
 
     @property
     def type(self) -> str:
+        """Readable accessor for wire field ``y``."""
         return self.y
 
     @property
     def id(self) -> int:
+        """Readable accessor for wire field ``i``; ``id`` is its serialized alias."""
         return self.i
 
     @property
     def side(self) -> int:
+        """Readable accessor for wire field ``s``; ``side`` is its serialized alias."""
         return self.s
 
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
 
     @property
     def quantity(self) -> float:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
 
     @property
     def price(self) -> float:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
 
     @property
     def taker_id(self) -> int:
+        """Readable accessor for wire field ``Ti``; ``taker_id`` is its serialized alias."""
         return self.Ti
 
     @property
     def taker_agent_id(self) -> int:
+        """Readable accessor for wire field ``Ta``; ``taker_agent_id`` is its serialized alias."""
         return self.Ta
 
     @property
     def taker_fee(self) -> float | None:
+        """Readable accessor for wire field ``Tf``; ``taker_fee`` is its serialized alias."""
         return self.Tf
 
     @property
     def maker_id(self) -> int:
+        """Readable accessor for wire field ``Mi``; ``maker_id`` is its serialized alias."""
         return self.Mi
 
     @property
     def maker_agent_id(self) -> int:
+        """Readable accessor for wire field ``Ma``; ``maker_agent_id`` is its serialized alias."""
         return self.Ma
 
     @property
     def maker_fee(self) -> float | None:
+        """Readable accessor for wire field ``Mf``; ``maker_fee`` is its serialized alias."""
         return self.Mf
 
     @classmethod
@@ -720,6 +770,12 @@ class TradeInfo(BaseModel):
     def from_json(self, json : dict):
         """
         Method to extract model data from simulation event in the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return TradeInfo.model_construct(i=json['i'], t=json['t'], q=json['q'], s=json['s'], p=json['p'],
                          Ta=json['Ta'], Ti=json['Ti'], Ma=json['Ma'], Mi=json['Mi'],
@@ -744,22 +800,27 @@ class Cancellation(BaseModel):
 
     @property
     def type(self) -> str:
+        """Readable accessor for wire field ``y``."""
         return self.y
 
     @property
     def orderId(self) -> int:
+        """Readable accessor for wire field ``i``; ``orderId`` is its serialized alias."""
         return self.i
 
     @property
     def timestamp(self) -> int:
+        """Readable accessor for wire field ``t``; ``timestamp`` is its serialized alias."""
         return self.t
 
     @property
     def price(self) -> float:
+        """Readable accessor for wire field ``p``; ``price`` is its serialized alias."""
         return self.p
 
     @property
     def quantity(self) -> float | None:
+        """Readable accessor for wire field ``q``; ``quantity`` is its serialized alias."""
         return self.q
 
     @classmethod
@@ -773,6 +834,12 @@ class Cancellation(BaseModel):
     def from_json(self, json : dict):
         """
         Method to extract model data from simulation event in the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return Cancellation.model_construct(i=json['i'], t=json['t'], p=json['p'], q=json['q'])
 
@@ -959,6 +1026,13 @@ class L2Snapshot(BaseModel):
         return self
     
 class History:
+    """A rolling window of events on one book.
+
+    Attributes:
+        start (int): Timestamp of the oldest retained event.
+        end (int): Timestamp of the newest event.
+        retention_mins (int | None): Retention horizon in minutes; None keeps everything.
+    """
     start : int
     end : int
     retention_mins : int | None
@@ -1329,6 +1403,7 @@ class L2History(History):
         Args:
             snapshots (dict[int, L2Snapshot]): Initial snapshots to populate history.
             trades (dict[int, TradeInfo]): Initial trades to populate history.
+            publish_interval (int): Interval between snapshot publications; the history start is set one interval before the first snapshot.
             retention_mins (int | None): Optional retention window in minutes.
         """
         self.snapshots = snapshots
@@ -1397,6 +1472,14 @@ class L2History(History):
             self.snapshots[time] = self.snapshots[time].reconcile(existing_volumes, config, depth)
     
     def ohlc(self, interval: float):
+        """Sample the L2 trade series into OHLC bars.
+
+        Args:
+            interval (float): Bar width in seconds.
+
+        Returns:
+            dict: Timestamp-keyed OHLC bars.
+        """
         return self.sample(self.trade(), interval, 'ohlc')
 
     def midquote(self, sampling_secs: float | None = None) -> dict[int, float]:
@@ -1556,26 +1639,32 @@ class Book(BaseModel):
     
     @property
     def trades(self) -> dict[int, TradeInfo]:
+        """Trades in this book's event window, keyed by timestamp."""
         return {t.timestamp : t for t in self.events if t.type == 't'}
     
     @property
     def orders(self) -> dict[int, Order]:
+        """Order placements in this book's event window, keyed by timestamp."""
         return {o.timestamp : o for o in self.events if o.type == 'o'}
     
     @property
     def cancellations(self) -> dict[int, Cancellation]:
+        """Cancellations in this book's event window, keyed by timestamp."""
         return {c.timestamp : c for c in self.events if c.type == 'c'}
     
     @property
     def trade_prices(self) -> dict[int, float]:
+        """Trade prices keyed by timestamp."""
         return {ts : t.price for ts, t in self.trades.items()}
     
     @property
     def last_trade(self) -> TradeInfo:
+        """The most recent trade in the window."""
         return self.trades[max(self.trades)]
     
     @property
     def OHLC(self) -> dict:       
+        """Open/high/low/close of the window's trade prices; empty dict when no trades exist."""
         trade_prices = self.trade_prices 
         if len(trade_prices) > 0:
             return {
@@ -1589,18 +1678,22 @@ class Book(BaseModel):
         
     @property
     def traded_volume(self) -> float:       
+        """Total quote-denominated volume traded in the window (sum of quantity x price)."""
         return sum([t.quantity * t.price for t in self.trades.values()])
     
     @property
     def traded_volumes(self) -> dict:
+        """Quote-denominated volume per trade, keyed by timestamp."""
         return {ts: t.quantity * t.price for ts,t in self.trades.items()}
         
     @property
     def trade_imbalance(self) -> float:       
+        """Net signed base quantity traded over the window: buys minus sells."""
         return sum([t.quantity for t in self.trades.values() if t.side == OrderDirection.BUY]) - sum([t.quantity for t in self.trades.values() if t.side == OrderDirection.SELL])
     
     @property 
     def trade_imbalances(self) -> dict[int,float]:        
+        """Running cumulative trade imbalance, keyed by trade timestamp."""
         return dict(zip(
             self.trades.keys(),
             accumulate(t.quantity if t.side == OrderDirection.BUY else -t.quantity for t in self.trades.values())
@@ -1608,19 +1701,23 @@ class Book(BaseModel):
     
     @property
     def order_volume(self) -> float:       
+        """Total base quantity across order placements in the window."""
         return sum([o.quantity for o in self.orders.values()])
 
     @property 
     def order_volumes(self) -> dict[int,float]:
+        """Placed order quantity per placement, keyed by timestamp."""
         return {ts : o.quantity for ts, o in self.orders.items()}
     
     @property
     def order_imbalance(self) -> float:       
+        """Net signed placed quantity over the window: buy orders minus sell orders."""
         return sum([o.quantity for o in self.orders.values() if o.side == OrderDirection.BUY]) - sum([o.quantity for o in self.orders.values() if o.side == OrderDirection.SELL])
    
     # THIS IS NOT NEEDED MOST LIKELY 
     @property 
     def order_imbalances(self) -> dict[int,float]:
+        """Running cumulative order imbalance, keyed by placement timestamp."""
         return dict(zip(
             self.orders.keys(),
             accumulate(o.quantity if o.side == OrderDirection.BUY else -o.quantity for o in self.orders.values())
@@ -1661,6 +1758,15 @@ class Book(BaseModel):
     
     @classmethod
     def from_ypy(cls, json: YpyObject, depth : int = 21) -> 'Book':
+        """Build a Book from a ypy shared object, keeping at most ``depth`` levels per side.
+
+        Args:
+            json (YpyObject): The shared-document book node.
+            depth (int): Maximum levels per side to retain.
+
+        Returns:
+            Book: The parsed book.
+        """
         book_id = json['bookId']
         bids = []
         for i, lvl in enumerate(json['bid']):
@@ -1942,12 +2048,12 @@ class Book(BaseModel):
         config: MarketSimulationConfig
     ) -> tuple[EventHistory, bool, list[str]]:
         """
-        Append the book's events to an existing L2History.
+        Append the book's events to an existing EventHistory.
 
         Args:
+            timestamp (int): Timestamp up to which the book's events are collected.
             history (EventHistory): Existing history to append to.
             config (MarketSimulationConfig): Simulation configuration.
-            depth (int | None): Optional depth to limit levels.
 
         Returns:
             tuple:
@@ -1981,28 +2087,40 @@ class Balance(BaseModel):
 
     @property
     def currency(self) -> str:
+        """Readable accessor for wire field ``c``; ``currency`` is its serialized alias."""
         return self.c
 
     @property
     def total(self) -> float:
+        """Readable accessor for wire field ``t``; ``total`` is its serialized alias."""
         return self.t
 
     @property
     def free(self) -> float:
+        """Readable accessor for wire field ``f``; ``free`` is its serialized alias."""
         return self.f
 
     @property
     def reserved(self) -> float:
+        """Readable accessor for wire field ``r``; ``reserved`` is its serialized alias."""
         return self.r
 
     @property
     def initial(self) -> float:
+        """Readable accessor for wire field ``i``; ``initial`` is its serialized alias."""
         return self.i
 
     @classmethod
     def from_json(self, currency : str, json : dict):
         """
         Method to transform simulator format model to the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            currency: The order's quantity currency.
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return Balance.model_construct(c=currency, t=json['t'], f=json['f'], r=json['r'], i=json['i'])
 
@@ -2021,20 +2139,29 @@ class Fees(BaseModel):
 
     @property
     def volume_traded(self) -> float | None:
+        """Readable accessor for wire field ``v``; ``volume_traded`` is its serialized alias."""
         return self.v
 
     @property
     def maker_fee_rate(self) -> float:
+        """Readable accessor for wire field ``m``; ``maker_fee_rate`` is its serialized alias."""
         return self.m
 
     @property
     def taker_fee_rate(self) -> float:
+        """Readable accessor for wire field ``t``; ``taker_fee_rate`` is its serialized alias."""
         return self.t
 
     @classmethod
     def from_json(self, json : dict):
         """
         Method to transform simulator format model to the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return Fees.model_construct(v=json['v'], m=json['m'], t=json['t'])
     
@@ -2042,12 +2169,22 @@ class OrderCurrency(IntEnum):
     """
     Enum to represent the currency in which the quantity of an order is specified.
 
+    The venue's names for the same two currencies are ALPHA and TAO; both are accepted as aliases, so one
+    agent can use either spelling in either mode.
+
     Attributes:
-        BASE (int): Quantity is specified in BASE currency.
-        QUOTE (int): Quantity is specified in QUOTE currency.
+        BASE (int): Quantity is specified in BASE currency, i.e. subnet alpha. Alias: ALPHA.
+        QUOTE (int): Quantity is specified in QUOTE currency, i.e. TAO. Alias: TAO.
+        ALPHA (int): Alias of BASE.
+        TAO (int): Alias of QUOTE.
     """
+    # Both spellings resolve in both trees and modes; the wire values are 0 (BASE/ALPHA) and 1 (QUOTE/TAO).
+    # IntEnum makes a later name with an equal value an alias of the earlier one, so
+    # `OrderCurrency.ALPHA is OrderCurrency.BASE` holds and either spelling resolves.
     BASE=0
     QUOTE=1
+    ALPHA=0
+    TAO=1
     
 class Loan(BaseModel):
     """
@@ -2068,28 +2205,39 @@ class Loan(BaseModel):
 
     @property
     def order_id(self) -> int:
+        """Readable accessor for wire field ``i``; ``order_id`` is its serialized alias."""
         return self.i
 
     @property
     def amount(self) -> float:
+        """Readable accessor for wire field ``a``; ``amount`` is its serialized alias."""
         return self.a
 
     @property
     def currency(self) -> OrderCurrency:
+        """Readable accessor for wire field ``c``; ``currency`` is its serialized alias."""
         return self.c
 
     @property
     def base_collateral(self) -> float:
+        """Readable accessor for wire field ``bc``; ``base_collateral`` is its serialized alias."""
         return self.bc
 
     @property
     def quote_collateral(self) -> float:
+        """Readable accessor for wire field ``qc``; ``quote_collateral`` is its serialized alias."""
         return self.qc
 
     @classmethod
     def from_json(self, json : dict):
         """
         Method to transform simulator format model to the format required by the MarketSimulationStateUpdate synapse.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return Loan.model_construct(i=json['i'], a=json['a'], c=OrderCurrency(json['c']), bc=json['bc'], qc=json['qc'])
     
@@ -2113,6 +2261,8 @@ class Account(BaseModel):
         loans (dict[int, Loan]): Mapping from order ID to Loan objects representing open loans.
         fees (Fees | None): The current fee structure for the account.
         traded_volume (float | None): Total volume traded by the account. Defaults to None.
+        delegate_stakes (dict[str, float]): This account's alpha stake on THIS book, broken down by
+            the delegate hotkey holding it. See the note below on why the total is not enough.
     """
     i : int = Field(alias="agent_id")
     b : int = Field(alias="book_id")
@@ -2126,61 +2276,112 @@ class Account(BaseModel):
     l : dict[int, Loan] = Field(alias="loans", default={})
     f : Fees | None = Field(alias="fees")
     v : float | None = Field(alias="traded_volume", default=None)
+    # A TOTAL IS NOT A SPENDABLE AMOUNT, and until now the total was all a miner could see.
+    #
+    # base_balance.free is alpha summed across every delegate the account holds stake with. A pool SELL
+    # is checked against ONE delegate's stake (Pool.cpp: "rejected; delegateStake ({}) less than
+    # alphaSpent ({})"), so an order sized from the total can be refused INSUFFICIENT_FUNDS while the
+    # account plainly holds enough.free 1.49965345, largest single
+    # delegate 0.76217809, a SELL of 1.0 refused -- and the miner had no field that would have told it.
+    #
+    # dTAO makes the split normal: a coldkey accumulates alpha under whichever hotkeys it staked to.
+    #
+    # NOT A RE-SLICE OF base_balance. This is chain stake at snapshot time; base_balance is the engine's
+    # own accounting including reservations and its per-batch reconcile. They track each other closely and
+    # WILL diverge transiently -- sum(delegate_stakes) == base_balance.free is not an invariant and must
+    # not be asserted as one.
+    #
+    # `locked` is deliberately omitted: the validator has it, but the SELL path checks only `stake`, and
+    # exposing a field the engine ignores invites miners to reason about it.
+    #
+    # Empty means NOT REPORTED (an older validator, or chain state unavailable this step) -- it does not
+    # mean the account holds no stake. Default-empty keeps every existing miner working unchanged.
+    ds : dict[str, float] = Field(alias="delegate_stakes", default_factory=dict)
+
+    @property
+    def delegate_stakes(self) -> dict[str, float]:
+        """This account's alpha on this book, per delegate hotkey. Empty means not reported."""
+        return self.ds
+
+    @property
+    def sellable_alpha(self) -> float:
+        """The most alpha ONE order can sell here: the largest single delegate's stake.
+
+        Sizing from base_balance.free is what produces INSUFFICIENT_FUNDS on an account that visibly
+        holds enough, because a pool SELL draws on one delegate. Returns 0.0 when the breakdown was not
+        reported, which a caller must treat as "unknown", NOT as "nothing to sell" -- falling back to
+        base_balance.free is the correct behaviour there, since that is the pre-existing contract.
+        """
+        return max(self.ds.values()) if self.ds else 0.0
 
     @property
     def agent_id(self) -> int:
+        """Readable accessor for wire field ``i``; ``agent_id`` is its serialized alias."""
         return self.i
 
     @property
     def book_id(self) -> int:
+        """Readable accessor for wire field ``b``; ``book_id`` is its serialized alias."""
         return self.b
 
     @property
     def base_balance(self) -> Balance:
+        """Readable accessor for wire field ``bb``; ``base_balance`` is its serialized alias."""
         return self.bb
 
     @property
     def quote_balance(self) -> Balance:
+        """Readable accessor for wire field ``qb``; ``quote_balance`` is its serialized alias."""
         return self.qb
 
     @property
     def base_loan(self) -> float:
+        """Readable accessor for wire field ``bl``; ``base_loan`` is its serialized alias."""
         return self.bl
 
     @property
     def quote_loan(self) -> float:
+        """Readable accessor for wire field ``ql``; ``quote_loan`` is its serialized alias."""
         return self.ql
 
     @property
     def base_collateral(self) -> float:
+        """Readable accessor for wire field ``bc``; ``base_collateral`` is its serialized alias."""
         return self.bc
 
     @property
     def quote_collateral(self) -> float:
+        """Readable accessor for wire field ``qc``; ``quote_collateral`` is its serialized alias."""
         return self.qc
 
     @property
     def orders(self) -> list[Order]:
+        """Readable accessor for wire field ``o``; ``orders`` is its serialized alias."""
         return self.o
 
     @property
     def loans(self) -> dict[int, Loan]:
+        """Readable accessor for wire field ``l``; ``loans`` is its serialized alias."""
         return self.l
 
     @property
     def fees(self) -> Fees | None:
+        """Readable accessor for wire field ``f``; ``fees`` is its serialized alias."""
         return self.f
 
     @property
     def traded_volume(self) -> float | None:
+        """Readable accessor for wire field ``v``; ``traded_volume`` is its serialized alias."""
         return self.v
     
     @property
     def own_quote(self) -> float:
+        """Quote the account actually owns: total minus loan plus collateral."""
         return self.quote_balance.total - self.quote_loan + self.quote_collateral
     
     @property
     def own_base(self) -> float:
+        """Base the account actually owns: total minus loan plus collateral."""
         return self.base_balance.total - self.base_loan + self.base_collateral
     
     @classmethod
@@ -2188,6 +2389,12 @@ class Account(BaseModel):
         """
         Construct an Account from simulator JSON into an Account model,
         using model_construct and manually populating nested classes.
+
+        Args:
+            json: The simulator-format payload.
+
+        Returns:
+            The model in synapse format.
         """
         return cls.model_construct(
             i=json["i"],
@@ -2261,6 +2468,14 @@ class LoanSettlementOption(IntEnum):
     
     @classmethod
     def from_string(cls, name):
+        """Parse a LoanSettlementOption from its name.
+
+        Args:
+            name: The option's name, e.g. ``'NONE'``.
+
+        Returns:
+            LoanSettlementOption: The matching option.
+        """
         match name:
             case 'NONE':
                 return LoanSettlementOption.NONE
@@ -2372,22 +2587,26 @@ class LazyBook(Book):
 
     @property
     def id(self) -> int:
+        """The book id, read from the raw wire dict without parsing the rest."""
         return self._raw.get("i")
 
     @property
     def bids(self):
+        """Bid levels, parsed lazily on first access."""
         if self._bids is None:
             self._bids = LazyLevels(self._raw.get("b", []))
         return self._bids
 
     @property
     def asks(self):
+        """Ask levels, parsed lazily on first access."""
         if self._asks is None:
             self._asks = LazyLevels(self._raw.get("a", []))
         return self._asks
 
     @property
     def events(self):
+        """Book events, parsed lazily on first access into their event models."""
         if self._events is None:
             raw_events = self._raw.get("e", [])
             parsed_events = []
@@ -2411,8 +2630,13 @@ class LazyBook(Book):
 
     def parse(self) -> Book:
         """Return fully parsed Book object."""
+            # r IS THE MAKER-TAKER RATIO, and it has to be passed explicitly: model_construct sets only
+            # the fields named here, so an omitted one stays at its default of None however faithfully the
+            # wire carried it. MTR is a property returning this field, so the accessor a miner is
+            # documented to use returned None on every book in BOTH mechanisms.
         return Book.model_construct(
             i=self._raw.get("i"),
+            r=self._raw.get("r"),
             b=self.bids.parse(),
             a=self.asks.parse(),
             e=self.events
@@ -2443,10 +2667,12 @@ class LazyBooks(Mapping):
         return len(self._raw_books)
 
     def items(self):
+        """Iterate ``(book_id, book)`` pairs, parsing each book lazily."""
         for k in self._raw_books:
             yield k, self[k]
 
     def values(self):
+        """Iterate books, parsing each lazily."""
         for k in self._raw_books:
             yield self[k]
 
@@ -2469,6 +2695,7 @@ class LazyAccount:
 
     @property
     def data(self):
+        """The parsed account, built on first access via ``model_construct`` (no re-validation)."""
         if self._parsed is None:
             bb = Balance.model_construct(**self._raw.get("bb", {}))
             qb = Balance.model_construct(**self._raw.get("qb", {}))
@@ -2494,7 +2721,10 @@ class LazyAccount:
                 o=orders,
                 l=loans,
                 f=fees,
-                v=self._raw.get("v")
+                v=self._raw.get("v"),
+                # model_construct applies defaults for absent fields, so an older validator that does not
+                # send "ds" yields {} -- documented on the field as NOT REPORTED, never as "no stake".
+                ds=self._raw.get("ds", {}) or {},
             )
             self._raw = None
         return self._parsed
@@ -2537,10 +2767,12 @@ class LazyAccounts(Mapping):
         return len(self._raw_accounts)
 
     def items(self):
+        """Iterate ``(agent_id, accounts)`` pairs, parsing lazily."""
         for k in self._raw_accounts:
             yield k, self[k]
 
     def values(self):
+        """Iterate per-agent account maps, parsing lazily."""
         for k in self._raw_accounts:
             yield self[k]
 

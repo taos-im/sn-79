@@ -61,11 +61,14 @@ def ttl_cache(maxsize: int = 128, typed: bool = False, ttl: int = -1):
     hash_gen = _ttl_hash_gen(ttl)
 
     def wrapper(func: Callable) -> Callable:
+        """Decorator body implementing the TTL cache around ``func``."""
         @lru_cache(maxsize, typed)
         def ttl_func(ttl_hash, *args, **kwargs):
+            """The cached call, keyed by the current TTL bucket."""
             return func(*args, **kwargs)
 
         def wrapped(*args, **kwargs) -> Any:
+            """Call through the TTL cache, deriving the bucket from the clock."""
             th = next(hash_gen)
             return ttl_func(th, *args, **kwargs)
 

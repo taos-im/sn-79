@@ -16,7 +16,7 @@ For when to pick which, see [`miner_setup.md` § Choosing your trading mode](min
 
 ```mermaid
 classDiagram
-    FinanceSimulationAgent <|-- GenTRXAgent
+    FinanceAgentBase <|-- GenTRXAgent
     GenTRXAgent <|-- HybridTrainingAgent
     GenTRXAgent <|-- CustomTrainingAgent
     GenTRXAgent <|-- RandomMakerAgent
@@ -24,7 +24,7 @@ classDiagram
     GenTRXAgent <|-- ImbalanceAgent
     GenTRXAgent <|-- YourTradingAgent
 
-    class FinanceSimulationAgent {
+    class FinanceAgentBase {
         <<framework>>
         +config
         +uid
@@ -54,7 +54,7 @@ classDiagram
     }
 ```
 
-One process on the miner host. The trading agent inherits from `GenTRXAgent`, which inherits from `FinanceSimulationAgent`. All state owned by `GenTRXAgent` lives under `self._gtx` so subclasses have one reserved attribute on `self` rather than the full set. The three responsibilities (`respond()`, inference, training thread) share the agent's process and CUDA device. The training thread runs in the background while `respond()` handles per-tick state; restarting the trading agent therefore restarts training too.
+One process on the miner host. The trading agent inherits from `GenTRXAgent`, which inherits from `FinanceAgent` and in turn `FinanceAgentBase`. All state owned by `GenTRXAgent` lives under `self._gtx` so subclasses have one reserved attribute on `self` rather than the full set. The three responsibilities (`respond()`, inference, training thread) share the agent's process and CUDA device. The training thread runs in the background while `respond()` handles per-tick state; restarting the trading agent therefore restarts training too.
 
 ### Split
 

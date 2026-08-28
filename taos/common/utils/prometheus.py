@@ -15,6 +15,7 @@ class prometheus:
 
     # Prometheus global logging levels.
     class level(Enum):
+        """Prometheus verbosity levels: OFF, INFO, DEBUG."""
         OFF = "OFF"
         INFO = "INFO"
         DEBUG = "DEBUG"
@@ -112,8 +113,8 @@ class prometheus:
     def config(cls) -> "bt.Config":
         """
         Get config from the argument parser
-        
-        Return: bt.Config object
+
+        Returns: bt.Config object
         """
         parser = argparse.ArgumentParser()
         cls.add_args(parser=parser)
@@ -129,7 +130,12 @@ class prometheus:
 
     @classmethod
     def add_args(cls, parser: argparse.ArgumentParser, prefix: str = None):
-        """Accept specific arguments from parser"""
+        """Accept specific arguments from parser
+
+        Args:
+            parser: The argument parser to extend.
+            prefix: Optional prefix for the argument names.
+        """
         try:
             parser.add_argument(
                 "--prometheus.port",

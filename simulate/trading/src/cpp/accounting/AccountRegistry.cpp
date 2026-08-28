@@ -110,9 +110,28 @@ void AccountRegistry::registerJson(const rapidjson::Value& json)
             m_idBimap.left.insert({nameC, agentId});
             m_idLookup.emplace(nameC, agentId);
         }
+        // ONE QUOTE PER AGENT, NOT ONE PER BOOK.
+        //
+        // TAO is a single balance shared across every book: helpers::makeHoldings builds a fresh account
+        // by creating one Balance and handing the same shared_ptr to every book. Balances::fromJson
+        // cannot know that, so it allocates a NEW quote per entry, and a checkpoint restore therefore
+        // handed each book its own independent TAO balance.
+        //
+        // reconcileSimulationBalances then re-links only holdings().front().quote to the chain value, so
+        // book 0 tracked reality and every other book kept whatever the checkpoint held. Reported
+        // per-book balances then diverge from the one the engine enforces, so an order sized from any
+        // book but the first is sized against a balance the engine does not believe in.
+        std::shared_ptr<taosim::accounting::Balance> sharedQuote;
         for (const rapidjson::Value& balanceJson : accountJson["balances"].GetArray()) {
             const BookId bookId = balanceJson["bookId"].GetUint();
             m_accounts.at(agentId).at(bookId) = Balances::fromJson(balanceJson);
+            // The first restored book donates the object; every later book points at it, so a
+            // reservation or a reconcile against any book is visible from all of them.
+            if (!sharedQuote) {
+                sharedQuote = m_accounts.at(agentId).at(bookId).quote;
+            } else {
+                m_accounts.at(agentId).at(bookId).quote = sharedQuote;
+            }
             fmt::println("AGENT #{} BOOK {} : RESTORED BALANCES : QUOTE {} | BASE {}",
                 agentId, bookId,
                 *m_accounts.at(agentId).at(bookId).quote, m_accounts.at(agentId).at(bookId).base);

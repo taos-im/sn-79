@@ -168,7 +168,13 @@ decimal_t Balance::freeReservation(OrderID id, BookId bookId, std::optional<deci
     amount = roundAmount(amount);
 
     if (FreeInfo info = canFree(id, amount); info.status != FreeStatus::FREEABLE) {
-        throw FreeException{fmt::format("{}: In book #{}, {}", ctx, bookId, info.toString())};
+        // Include the whole balance, not just the amount pair. Diagnosing the price-band abort from
+        // "amount X exceeds reservation Y" alone was impossible: the two figures matched neither the
+        // order's base volume nor its quote notional, so which ledger and which call site were
+        // involved could not be determined without re-running. The balance shows total/reserved/free
+        // and every outstanding reservation, which identifies both.
+        throw FreeException{fmt::format("{}: In book #{}, {} || balance {}",
+            ctx, bookId, info.toString(), *this)};
     }
 
     if (!amount.has_value()) {

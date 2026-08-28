@@ -24,12 +24,16 @@ downloads/
 eggs/
 .eggs/
 lib/
+# being invisible to git, so a clone would have had none of them.
+# suites' phase libraries, and this one was worse than uncommittable: dereg_simulation.sh (the whole
+# deregistration half of the dual-mechanism phase) and preflight.sh (all of phase 1) existed only on
+# the box that wrote them, so a clone would have run a ladder with two stages silently absent. The
+# is still ignored.
 lib64/
 parts/
 sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -37,7 +41,6 @@ MANIFEST
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -78,7 +81,6 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs/_build/
 
 # PyBuilder
 .pybuilder/
@@ -97,7 +99,6 @@ ipython_config.py
 # .python-version
 
 # pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
 #   However, in case of collaboration, if having platform-specific dependencies or dependencies
 #   having no cross-platform support, pipenv may install dependencies that don't work, or not
 #   install all needed dependencies.
@@ -107,7 +108,6 @@ ipython_config.py
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
 #poetry.lock
 
 # pdm
@@ -115,10 +115,8 @@ ipython_config.py
 #pdm.lock
 #   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
 #   in version control.
-#   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
 # Celery stuff
@@ -163,21 +161,13 @@ cython_debug/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
 
 # Misc
-cmd.txt
-reuse_annot.py
-setup.sh
-agents/data
-simulate/trading/src/python
 
 testing/
 scripts/
-!mvtrx/scripts/
 
 # Model checkpoints — runtime state (training artifacts, large binaries)
 checkpoints/
@@ -185,16 +175,12 @@ checkpoints/
 **/*.staging/
 
 # GenTRX runtime artifacts
-data/live/
-data/localnet_test/
 agents/*/miner_buckets.json
-agents/gentrx_proxy/config.json
 
-taos/im/config/proxy_passwords.enc
-taos/im/config/batch_signer_ledger.db
-taos/im/config/benchmark_agents_test.json
-burn.py
-.claude/
+# The swap proxy keeps its own encrypted password store by the same mechanism (see
+# swap_wallet_manager.py). It was not listed here, so an operator running the swap rail would have
+# had wallet passwords sitting committable in the worktree. Found 2026-08-24 by the file this
+# session's own tests left behind.
 
 # Query-path fan-out runtime toggles (see query.py:_query_fanout_enabled)
 .query_threaded
@@ -202,10 +188,3 @@ burn.py
 # Kappa fingerprint-cache runtime toggles (see kappa.py:_kappa_cache_enabled)
 .kappa_nocache
 .kappa_cache
-
-# Session/agent progress notes (operator state — never track or publish)
-runbooks/progress/doing/
-runbooks/progress/done/
-
-# runbooks/testing holds test RUNBOOKS (docs), not test-output — exempt from 'testing/' above
-!runbooks/testing/

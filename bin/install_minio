@@ -2,17 +2,13 @@
 # install_minio — idempotent local MinIO installer for dev mode.
 #
 # Downloads the MinIO server binary + mc client to /usr/local/bin/ if they're
-# not already present.  Called by run_mvtrx.sh when GENTRX_ENABLED=1 and the
+# not already present.  Called by the launchers when GENTRX_ENABLED=1 and the
 # GENTRX_VALIDATOR_S3_* env vars are unset/empty (i.e. dev mode wants a local
-# S3 backend, not a remote one).
+# S3 backend, not a remote one). Production env files supply their own
+# GENTRX_VALIDATOR_S3_* and skip this path.
 #
 # Skips silently if MinIO is already installed (any standalone binary on PATH,
 # or TAOS_MINIO_BIN points at one).
-#
-# Authorisation: dev box owner has asked the launcher to auto-install MinIO
-# for local-dev configs ("create one and wire up run_mvtrx/validator to
-# download, install and run in dev mode"). Production env files supply their
-# own GENTRX_VALIDATOR_S3_* and skip this path.
 #
 # Usage: bin/install_minio [<install-dir>]
 #   install-dir defaults to /usr/local/bin (overridable via MINIO_INSTALL_DIR).

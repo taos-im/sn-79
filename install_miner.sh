@@ -28,13 +28,13 @@ fi
 if ! command -v tmux
 then
 	echo 'Installing tmux...'
-	apt-get install tmux
+	apt-get install -y tmux
 fi
 
 if ! command -v pyenv && [ ! -d "$HOME/.pyenv" ]
 then
     echo 'Installing pyenv'
-    sudo apt install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+    apt-get install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
     # Fetch the installer to a file first (fail on HTTP error, no partial-pipe
     # execution) rather than piping the network stream straight into bash.
     _pyenv_installer="$(mktemp)"
@@ -74,5 +74,7 @@ if [ -f constraints.txt ]; then
 else
     python -m pip install -e ".${_TAOS_EXTRAS}"
 fi
-mkdir -p ~/.taos
-cp -r agents ~/.taos/agents
+mkdir -p ~/.taos/agents
+# Copy CONTENTS, not the directory: `cp -r agents ~/.taos/agents` nests
+# agents/agents on any re-run once the destination exists.
+cp -r agents/. ~/.taos/agents/

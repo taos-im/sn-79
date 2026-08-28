@@ -14,6 +14,8 @@
 #include "Balance.hpp"
 #include "Collateral.hpp"
 
+#include <random>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::accounting
@@ -85,7 +87,11 @@ public:
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Balances fromJson(const rapidjson::Value& json);
-    [[nodiscard]] static Balances fromXML(pugi::xml_node node, const RoundParams& roundParams);
+    // rng: when supplied, the pareto wealth draw uses THIS stream instead of a local
+    // std::random_device one, which is what makes a seeded run reproducible. Passing nullptr keeps
+    // the historical device-seeded behaviour, so runs without an rngSeed are unchanged.
+    [[nodiscard]] static Balances fromXML(
+        pugi::xml_node node, const RoundParams& roundParams, std::mt19937* rng = nullptr);
 
 private:
     [[nodiscard]] std::vector<std::pair<OrderID, decimal_t>> settleLoan(

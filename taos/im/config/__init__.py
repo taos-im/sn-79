@@ -27,8 +27,7 @@ from loguru import logger
 from taos.common.config import add_validator_args
 from taos.im.config.simulation import add_simulation_args
 # taos.im.config.exchange is loaded lazily inside add_im_validator_args when
-# engine='exchange' is requested — the module is in the private overlay and
-# absent from the public release tree.
+# engine='exchange' is requested. Not part of this tree; import is guarded.
 
 
 def _detect_engine_mode() -> str:
@@ -106,9 +105,9 @@ def add_im_validator_args(cls, parser):
         "--scoring.score_ema_halflife",
         type=int,
         help="Half-life in simulation nanoseconds of the per-UID track-record EMA applied to the "
-             "trading score BEFORE the reward floor + Pareto allocation. Counters the convex-payoff "
-             "(trader's option) exploit of one-sided window scoring: one hot window converts into "
-             "standing only gradually, and later bad windows forfeit unearned standing — the market "
+             "trading score BEFORE the reward floor + Pareto allocation. Standing is earned across "
+             "multiple windows rather than from one: a single strong window converts into standing "
+             "only gradually, and later weak windows forfeit unearned standing — the market "
              "analogue of multi-period track records / deferred compensation. Expressed as sim-time "
              "so it is independent of the scoring cadence; 0 disables. Default equals "
              "scoring.kappa.lookback (the 3h assessment window): the standing's memory horizon "
@@ -200,6 +199,83 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="Weight applied to Realized PnL evaluation in final score calculation",
         default=0.21,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.enabled",
+        action="store_true",
+        help="Enable the combined de-beta trading score (P8): balanced two-sided spread capture "
+             "(making) + drift-stripped directional skill (kappa-of-alpha), rank-combined by w_make. "
+             "Full-replace of the kappa+pnl trading score (Option A). Default OFF: when off the "
+             "legacy kappa+pnl path is used unchanged.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.w_make",
+        type=float,
+        help="De-beta operator dial: weight on the making (liquidity) rank vs (1-w_make) on the "
+             "drift-stripped skill rank. Conservative launch weight 0.30 (skill-led); raise toward "
+             "0.50-0.65 to emphasise liquidity provision.",
+        default=0.30,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.centered_window",
+        type=int,
+        help="Half-window (in trades) for the non-lagging centered mid used by the making "
+             "spread-capture component.",
+        default=15,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.floor_scale",
+        type=float,
+        help="E5 magnitude floor for kappa-of-alpha: a per-book |alpha| must clear "
+             "floor_scale*median(|alpha|) to count (kappa is magnitude-blind; kills tiny-consistent "
+             "spam). 0 disables the floor.",
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.min_books",
+        type=int,
+        help="Activation guard ONLY: if fewer than this many miners receive a positive de-beta score "
+             "in a cycle, that cycle scores on the legacy path (warmup / cold-accumulator safety). "
+             "It does NOT set the per-miner qualifying-book requirement: the skill leg's own minimum "
+             "book count is fixed at 4 inside kappa_of_alpha/kappa_floored and is not configurable.",
+        default=4,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.p11_strength",
+        type=float,
+        help="P11 counterparty-diversity discount strength on the making leg: making *= "
+             "(1 - strength*max(0,excess_concentration)). 0 disables (default). 1.0 fully removes a "
+             "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
+             "sacrificial-feeder hole in the making metric.",
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.mark_mode",
+        type=str,
+        choices=["last", "vwap", "median"],
+        help="M1 settlement-style marking: value inventory MTM on a rolling reference over the "
+             "last mark_window prints instead of the last trade (the settlement-window analogue "
+             "used by real venues), so a single manufactured print cannot revalue a position. "
+             "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
+             "'median' = window median (robust: moving it needs a sustained majority of prints). "
+             "Default 'last': last-trade marking, byte-identical to 0.6.0.",
+        default="last",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.mark_window",
+        type=int,
+        help="Window length in prints for the rolling settlement mark (mark_mode vwap/median). "
+             "Inert while mark_mode=last.",
+        default=200,
     )
 
     parser.add_argument(
@@ -410,11 +486,11 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="Shape parameter for Pareto distribution used in allocating rewards. Lower "
              "= steeper payout curve concentrated on top performers. 1.0 concentrated ~51% of "
-             "reward on the top-5 UIDs, over-amplifying whichever strategy tops Kappa (currently "
-             "directional-luck/farm winners in the up-market); 1.42 (the pre-0.5.4 curve) halves "
-             "that to ~33% and restores honest mid-tier reward, at ~0 cost to genuine-earner share, "
-             "with the soft floor kept on to still blunt bulk-registration farms. Re-sharpen once "
-             "the drift + inventory-risk fixes make the top genuinely skilled.",
+             "reward on the top-5 UIDs, over-amplifying whichever strategy currently tops Kappa; "
+             "the default spreads that to about a third and restores mid-tier reward at negligible "
+             "cost to the highest genuine earners. Sharpen it again once the top of the board is "
+             "reliably skill-driven.",
+             
         default=1.42,
     )
 
@@ -487,8 +563,8 @@ def add_im_validator_args(cls, parser):
         except ImportError as e:
             raise RuntimeError(
                 "engine='exchange' requested but taos.im.config.exchange is not "
-                "available in this release — exchange-mode runs require the "
-                "private overlay (taos-im/mvtrx-overlay) to be laid down."
+                "available: exchange-mode engine runs require components that are "
+                "not part of this repository."
             ) from e
         add_exchange_args(cls, parser)
     else:

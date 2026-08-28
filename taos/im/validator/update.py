@@ -641,5 +641,6 @@ def check_simulator(self : Validator) -> bool:
         return False
 
 
-# SL/TP service helpers (check / notify-sim-dir / restart) live in the optional
-# taos.im.validator.exetrx module — testnet release omits them.
+# SL/TP service helpers (check / notify-sim-dir / restart) live in an optional component that is
+# not part of this tree; the call sites below are guarded.
+# Optional component; not part of this tree.

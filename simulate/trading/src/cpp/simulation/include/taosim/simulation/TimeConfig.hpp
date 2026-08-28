@@ -92,6 +92,15 @@ inline constexpr Timestamp kLogWindowMin =
 inline constexpr Timestamp kLogWindowMax =
     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::days(99)).count();
 
+// Above this, a timestamp is a real Unix time in nanoseconds; below it, simulation-relative.
+//
+// 1e18 ns is 2001-09-09. Simulation clocks start at zero and kLogWindowMax caps a run's windows at 99
+// days (8.6e15 ns), two orders of magnitude below the floor, so the two domains cannot be confused.
+// Used to decide whether a log file's window should be named as a calendar date or as the simulation's
+// own DDHHMMSS offset, and deliberately NOT a mode flag: the first log sink is opened while the
+// simulation is still being constructed, before any chain block has been seen.
+inline constexpr Timestamp kWallClockEpochFloor = 1'000'000'000'000'000'000ull;
+
 [[nodiscard]] std::string logFormatTime(auto t)
 {
     const auto days = std::chrono::duration_cast<std::chrono::days>(t);

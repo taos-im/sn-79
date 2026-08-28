@@ -334,16 +334,21 @@ Balances Balances::fromJson(const rapidjson::Value& json)
 
 //-------------------------------------------------------------------------
 
-Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams)
+Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams, std::mt19937* rng)
 {
+    // A local std::random_device stream here made every run draw different starting wealth, which is
+    // why two runs of an identical config diverged the moment agents began trading (~0.3s of sim time)
+    // even with the simulation's own rngSeed pinned. Reproducibility is a precondition for any A/B that
+    // attributes a difference to one parameter, so the caller can hand in a seeded stream instead.
+    std::mt19937 localRng{std::random_device{}()};
+    std::mt19937& wealthRng = rng ? *rng : localRng;
     if (std::string_view{node.attribute("type").as_string()} == "pareto") {
         const auto scale = node.attribute("scale").as_double();
         const auto shape = node.attribute("shape").as_double();
         const auto wealth = node.attribute("wealth").as_double();
         const auto price = node.attribute("price").as_double();
         const auto symbol = node.attribute("symbol").as_string();
-        std::mt19937 rng{std::random_device{}()};
-        const auto u = std::uniform_real_distribution{0.0, 1.0}(rng);
+        const auto u = std::uniform_real_distribution{0.0, 1.0}(wealthRng);
         const auto r = scale * std::pow(1.0 - u, -1.0 / shape);
         return Balances({
             .base = Balance{
@@ -354,16 +359,15 @@ Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams)
         });
     }
     else if (std::string_view{node.attribute("type").as_string()} == "pareto-50") {
-        std::mt19937 rng{std::random_device{}()};
         const auto scale = node.attribute("scale").as_double();
         const auto shape = node.attribute("shape").as_double();
         const auto minWealth = node.attribute("wealth").as_double();
         const auto maxWealth = node.attribute("cap").as_double();
-        const auto u2 = std::uniform_real_distribution{0.0,1.0}(rng);
+        const auto u2 = std::uniform_real_distribution{0.0,1.0}(wealthRng);
         const auto wealth = std::min(minWealth/std::pow(u2,1.0/1.16), maxWealth);
         const auto price = node.attribute("price").as_double();
         const auto symbol = node.attribute("symbol").as_string();
-        const auto u = std::uniform_real_distribution{0.0, 1.0}(rng);
+        const auto u = std::uniform_real_distribution{0.0, 1.0}(wealthRng);
         const auto r = scale * std::pow(1.0 - u, -1.0 / shape);
         return Balances({
             .base = Balance{

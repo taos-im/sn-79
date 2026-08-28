@@ -115,6 +115,7 @@ def subscribe_coinbase_trades(
         on_sampled(trade)
 
     def monitor_stream():
+        """Watch the stream for silence and reconnect when it goes quiet."""
         def check():
             """
             Validates stream activity and triggers sampling callback if needed.
@@ -146,6 +147,7 @@ def subscribe_coinbase_trades(
             return True
 
         def connect():
+            """Open (or re-open) the upstream connection."""
             global client
             while True:
                 client, ex = connect_coinbase([symbol], _on_trade)

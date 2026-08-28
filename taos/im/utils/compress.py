@@ -37,6 +37,15 @@ def compress(
     """
     Compress a payload using either JSON (legacy, version < 45)
     or Msgpack (version >= 45), wrapped in Base64 text.
+
+    Args:
+        payload: The object to compress.
+        level: Compression level.
+        engine: Compression engine name.
+        version: Protocol version selecting the codec.
+
+    Returns:
+        str: The Base64-wrapped compressed payload.
     """
     try:
         if version < 45:
@@ -60,6 +69,14 @@ def decompress(
     - version < 45 → JSON
     - version >= 45 → Msgpack
     Supports Base64-encoded transport, and old dict container format.
+
+    Args:
+        payload: The compressed payload.
+        engine: Compression engine name.
+        version: Protocol version selecting the codec.
+
+    Returns:
+        The decompressed object.
     """
     try:
         if isinstance(payload, str):

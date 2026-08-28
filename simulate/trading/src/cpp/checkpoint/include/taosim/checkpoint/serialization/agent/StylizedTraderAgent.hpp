@@ -59,13 +59,12 @@ struct convert<taosim::agent::StylizedTraderAgent>
                 using T = std::remove_cvref_t<decltype(v.topLevel())>;
                 v.topLevel() = val.as<T>();
             }
-            else if (key == "priceHist") {
-                using T = std::remove_cvref_t<decltype(v.priceHist())>;
-                v.priceHist() = val.as<T>();
-            }
-            else if (key == "logReturns") {
-                using T = std::remove_cvref_t<decltype(v.logReturns())>;
-                v.logReturns() = val.as<T>();
+            else if (key == "lastMid") {
+                // Was "priceHist", a full ring buffer of which only the last element was
+                // ever read. Checkpoints written before this change carry the old key and
+                // will not restore this field; the agent reseeds it on the first L1.
+                using T = std::remove_cvref_t<decltype(v.lastMid())>;
+                v.lastMid() = val.as<T>();
             }
         }
 
@@ -80,7 +79,8 @@ struct pack<taosim::agent::StylizedTraderAgent>
     msgpack::packer<Stream>& operator()(
         msgpack::packer<Stream>& o, const taosim::agent::StylizedTraderAgent& v) const
     {
-        o.pack_map(7);
+        // MUST match the number of key/value pairs packed below.
+        o.pack_map(6);
 
         o.pack("tauF");
         o.pack(v.tauF());
@@ -97,11 +97,8 @@ struct pack<taosim::agent::StylizedTraderAgent>
         o.pack("topLevel");
         o.pack(v.topLevel());
 
-        o.pack("priceHist");
-        o.pack(v.priceHist());
-
-        o.pack("logReturns");
-        o.pack(v.logReturns());
+        o.pack("lastMid");
+        o.pack(v.lastMid());
 
         return o;
     }

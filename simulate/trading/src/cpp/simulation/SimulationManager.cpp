@@ -644,7 +644,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
     pugi::xml_document doc;
     doc.load_file(configPath.c_str());
     fmt::println(" - '{}' loaded successfully", configPath.c_str());
-    pugi::xml_node node = doc.child("Simulation");
+    pugi::xml_node node = xml::rootNode(doc);
 
     auto mngr = std::make_unique<SimulationManager>();
 
@@ -832,7 +832,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromCheckpoint(
     if (pugi::xml_parse_result result = doc.load_file(configPath.c_str()); !result) {
         throw checkpoint::CheckpointError{};
     }
-    pugi::xml_node simuNode = doc.child("Simulation");
+    pugi::xml_node simuNode = xml::rootNode(doc);
     xml::setAttribute(simuNode, "current", *ckptTimestamp);
     const filesystem::TempPath tempConfigPath{"config.xml"};
     doc.save_file(tempConfigPath);
@@ -858,7 +858,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromReplay(const replay::R
     const fs::path configPath = desc.dir / "config.xml";
     doc.load_file(configPath.c_str());
     fmt::println(" - '{}' loaded successfully", configPath.c_str());
-    pugi::xml_node node = doc.child("Simulation");
+    pugi::xml_node node = xml::rootNode(doc);
     node.attribute("id").set_value(
         fmt::format("{}-replay", desc.dir.filename().c_str()).c_str());
     

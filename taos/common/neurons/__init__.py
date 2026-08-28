@@ -46,14 +46,17 @@ class BaseNeuron(ABC):
 
     @classmethod
     def check_config(cls, config: "bt.Config"):
+        """Validate the merged config before the neuron starts."""
         check_config(cls, config)
 
     @classmethod
     def add_args(cls, parser):
+        """Add this neuron's CLI arguments to the parser."""
         add_args(cls, parser)
 
     @classmethod
     def config(cls):
+        """Build the neuron's config from its argument parser."""
         return config(cls)
 
     subtensor: "bt.Subtensor"
@@ -63,6 +66,7 @@ class BaseNeuron(ABC):
 
     @property
     def block(self):
+        """The current chain block number."""
         return ttl_get_block(self)
 
     def __init__(self, config=None):
@@ -124,7 +128,21 @@ class BaseNeuron(ABC):
                 self.subtensor = bt.Subtensor(network=_chain_ep)
             else:
                 self.subtensor = bt.Subtensor(config=self.config)
-            self.metagraph = self.subtensor.metagraph(self.config.netuid)
+            # Metagraph must be mechid-aware: per-mechanism storages (Weights,
+            # LastUpdate, Incentive, Bonds) live at storage index
+            # netuid + mechid*GLOBAL_MAX_SUBNET_COUNT. Without mechid the
+            # should_set_weights guard reads mechid-0 LastUpdate for every
+            # engine, so an exchange validator (mechid 1) can never set weights.
+            _mechid = getattr(self.config.neuron, "mechid", None)
+            if _mechid is None:
+                _mechid = 1 if getattr(self.config, "engine", "simulation") == "exchange" else 0
+            self.metagraph = self.subtensor.metagraph(self.config.netuid, mechid=_mechid)
+            self._mechid = int(_mechid)
+            # Weight-setting reads must be mechid-aware. Applied to the primary
+            # subtensor here; subclasses that set weights through additional
+            # connections (e.g. the im validator's maintenance_subtensor) must
+            # call this on those too.
+            self._patch_blocks_since_last_update(self.subtensor)
 
         # bt 10.3.x's substrate websocket is not thread-safe — concurrent
         # ws.recv() from different threads raises ConcurrencyError. Serialize
@@ -245,6 +263,41 @@ class BaseNeuron(ABC):
         """
         return True
 
+    def _patch_blocks_since_last_update(self, subtensor):
+        """Make ``subtensor.blocks_since_last_update`` read this validator's
+        mechanism storage index (netuid + mechid*GLOBAL_MAX_SUBNET_COUNT, 4096).
+
+        set_weights writes LastUpdate at the mechanism index, but the SDK reads
+        netuid-level LastUpdate (mechid 0). For mechid > 0 both the SDK's own
+        set_weights rate-limit guard AND should_set_weights would otherwise gate
+        on the wrong mechanism's LastUpdate. Must be applied to EVERY subtensor
+        the validator sets weights through — the im validator swaps in
+        maintenance_subtensor inside its sync path, so that one needs it too.
+        No-op for mechid 0 / mock; delegates to the SDK for other netuids and on
+        any query error.
+        """
+        mechid = int(getattr(self, "_mechid", 0) or 0)
+        if not mechid or getattr(self.config, "mock", False) or subtensor is None:
+            return
+        nid = int(self.config.netuid)
+        idx = nid + mechid * 4096
+        orig = subtensor.blocks_since_last_update
+
+        def _mechid_blocks_since_last_update(netuid, uid, block=None, _orig=orig, _idx=idx, _nid=nid, _st=subtensor):
+            if int(netuid) != _nid:
+                return _orig(netuid, uid, block)
+            try:
+                lu = _st.substrate.query("SubtensorModule", "LastUpdate", [_idx])
+                vals = lu.value if lu is not None else None
+                last = int(vals[uid]) if vals and uid < len(vals) else 0
+                cur = block if block is not None else _st.get_current_block()
+                return cur - last
+            except Exception:
+                return _orig(netuid, uid, block)
+
+        subtensor.blocks_since_last_update = _mechid_blocks_since_last_update
+        bt.logging.info(f"blocks_since_last_update → mechanism storage index {idx} (mechid {mechid})")
+
     def should_set_weights(self) -> bool:
         """
         Method to check whether weights should be set by the neuron at the current block.
@@ -253,12 +306,25 @@ class BaseNeuron(ABC):
         if self.step == 0 or self.config.neuron.disable_set_weights:
             return False
 
-        last_updated = self.metagraph.last_update[self.uid].item()
-        bt.logging.trace(f"Last Update : {last_updated} | Rate Limit : {self.hyperparams.weights_rate_limit} | Current Block : {self.current_block}")
-        return (
-            last_updated < self.current_block - self.hyperparams.weights_rate_limit # attempt to set weights as soon as weights rate limiting allows
-            and self.neuron_type != "MinerNeuron" # don't set weights if you're a miner
-        )  
+        # Miners never set weights.
+        if self.neuron_type == "MinerNeuron":
+            return False
+
+        # Gate on the SAME primitive the SDK's set_weights uses
+        # (blocks_since_last_update), so taos never says "set" while the SDK's
+        # internal rate-limit guard silently skips (or vice-versa). That
+        # primitive is made mechid-aware in __init__ for mechid > 0, so an
+        # exchange validator checks LastUpdate at its mechanism storage index,
+        # not the base netuid. Falls back to the metagraph on any query error.
+        try:
+            blocks_since = self.subtensor.blocks_since_last_update(self.config.netuid, self.uid)
+        except Exception as e:
+            bt.logging.warning(f"blocks_since_last_update failed, using metagraph fallback: {e}")
+            blocks_since = self.current_block - int(self.metagraph.last_update[self.uid].item())
+        bt.logging.trace(
+            f"Blocks since last update : {blocks_since} | Rate Limit : {self.hyperparams.weights_rate_limit} | Current Block : {self.current_block}"
+        )
+        return blocks_since > self.hyperparams.weights_rate_limit
 
     def save_state(self):
         """
@@ -277,6 +343,13 @@ class BaseNeuron(ABC):
         )
 
     def pagerduty_alert(self, incident_text : str, method : str = "unknown", dedup_key : str | None = None, details : dict | None = None, event_class : str = "ERROR", severity : str = "error"):
+        """Raise a PagerDuty incident.
+
+        Args:
+            incident_text (str): Incident summary.
+            method (str): Caller context recorded on the incident.
+            dedup_key (str | None): Stable key so repeats update one incident instead of opening more.
+        """
         bt.logging.error("PD: " + incident_text + (f"\nDetails : {details}" if details else ''))
         if self.config.alerting.pagerduty.integration_key:
             triggerPagerDutyIncident(

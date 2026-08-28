@@ -77,6 +77,11 @@ private:
     [[nodiscard]] bool checkPostOnly(
         taosim::book::Book::Ptr book, PlaceOrderLimitPayload::Ptr payload, AgentId agentId, decimal_t takerFeeRate) const noexcept;
     [[nodiscard]] bool checkMinOrderSizeLimit(PlaceOrderLimitPayload::Ptr payload) const noexcept;
+    // The chain settles in the quote currency and refuses amounts below its minimum stake, so an order
+    // whose notional sits under that floor could rest, be hit, and then fail settlement. Inert when the
+    // floor is undeclared, which is the case in simulation mode, and inert for local agents, whose
+    // fills never reach the chain.
+    [[nodiscard]] bool checkMinQuoteOrderSize(AgentId agentId, decimal_t quoteNotional) const noexcept;
 
     Parameters m_params;
     MultiBookExchangeAgent* m_exchange;

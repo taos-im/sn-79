@@ -125,11 +125,6 @@ OrderResult ClearingManager::handleOrder(const OrderDesc& orderDesc)
         m_exchange->books()[bookId]->bestBid(), m_exchange->books()[bookId]->bestAsk(),
         validationResult.amount, validationResult.leverage, validationResult.direction, m_exchange->simulation()->bookIdCanon(bookId));
 
-
-    // if (validationResult.leverage > 0_dec){
-    //     throw std::runtime_error(fmt::format("Stopped to check the order with lev:{}", validationResult.leverage));
-    // }
-    
     m_exchange->simulation()->logDebug(
         "{} | AGENT #{} BOOK {} : RESERVATION OF {} BASE + {} QUOTE (={} {}) CREATED FOR {} ORDER #{} ({}x{}@{}) | BEST {} : {} | MAX LEV : {}", 
         m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
@@ -218,13 +213,39 @@ void ClearingManager::handleCancelOrder(const CancelOrderDesc& cancelDesc)
     accounting::Account& account = accounts()[agentId];
     accounting::Balances& balances = account[bookId];
 
-    const auto freed = [&] {
+    const auto freed = [&] -> accounting::ReservationAmounts {
+        // A CANCEL MUST ALWAYS BE ABLE TO REMOVE THE ORDER.
+        //
+        // freeReservation THROWS when there is no reservation to free, and the throw propagates out of
+        // handleBatch, which drops the whole CANCEL_ORDERS instruction. The order then stays on the
+        // book permanently, uncancellable, and any cancel_all loop spins on it forever.
+        //
+        // An order CAN legitimately reach this point with nothing backing it. The eager sweep frees the
+        // whole reservation predicting a full fill, and a remainder restored by reconciliation is left
+        // bare unless restoreReservation succeeds (it is wrapped in a try that only logs). Collapsing
+        // per-book quote objects onto the shared one did it too, until that path learned to migrate
+        // reservations across.
+        //
+        // `unregisterLimitOrderCallback` already guards exactly this way; this path did not, which is the
+        // whole asymmetry. `freed` is used only for the debug line below, so skipping the free changes
+        // nothing else. A stranded reservation is an accounting discrepancy; an uncancellable order is a
+        // loss of function, and the discrepancy is the better failure.
+        if (!balances.canFree(orderId)) {
+            m_exchange->simulation()->logDebug(
+                "{} | AGENT #{} BOOK {} : CANCEL of order #{} found no reservation to free; "
+                "cancelling anyway",
+                m_exchange->simulation()->currentTimestamp(),
+                agentId,
+                m_exchange->simulation()->bookIdCanon(bookId),
+                orderId);
+            return {};
+        }
         if (order->direction() == OrderDirection::BUY) {
             return balances.freeReservation(
                 orderId,
                 order->price(),
-                m_exchange->books()[bookId]->bestBid(), 
-                m_exchange->books()[bookId]->bestAsk(), 
+                m_exchange->books()[bookId]->bestBid(),
+                m_exchange->books()[bookId]->bestAsk(),
                 order->direction(),
                 m_exchange->simulation()->bookIdCanon(bookId),
                 // volumeToCancel < order->totalVolume()
@@ -252,7 +273,6 @@ void ClearingManager::handleCancelOrder(const CancelOrderDesc& cancelDesc)
         }
     }();
 
-    // if (volumeToCancel == order->totalVolume()) {
     if (volumeToCancel >= order->volume()) {
         account.activeOrders()[bookId].erase(order);
         // balances.releaseReservation(order->id());
@@ -387,7 +407,6 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
 
         const auto totalPrice = [&] {
             if (auto limitOrder = std::dynamic_pointer_cast<LimitOrder>(aggressingOrder)) {
-                // if (!reservation.has_value()) {
                 if (reservation == 0_dec) {
                     
                     m_exchange->simulation()->logError(

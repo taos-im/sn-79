@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Equivalence tests for the O(1) fundamental-CSV tail-read.
 
-load_fundamental used to readlines() the entire ever-growing fundamental CSV to
+load_fundamental must not readlines() the entire ever-growing fundamental CSV to
 take just the first line (book ids) and last non-empty line (latest prices) —
 O(file) under both the GIL and _reward_lock, ~9s/scoring round after 20h of sim.
 _read_first_and_last_nonempty replaces the scan; these tests pin that it returns

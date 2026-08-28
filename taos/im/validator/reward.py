@@ -28,6 +28,8 @@ import random
 import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
+
+from taos.im.validator.debeta import book_alphas_from_drift, median_abs_floor, debeta_scores
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
 
@@ -35,7 +37,7 @@ if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
 
 
-def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, num_books, lookback_threshold, sampled_timestamp, sampling_interval):
+def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, book_ids, lookback_threshold, sampled_timestamp, sampling_interval):
     """STEP 3 helper: per-book lookback / latest roundtrip volumes for one miner.
 
     Pure extraction from calculate_kappa_score; logic unchanged.
@@ -47,7 +49,7 @@ def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, num_books, lookback_thr
     if uid in roundtrip_volumes:
         uid_rt_volumes = roundtrip_volumes[uid]
 
-        for book_id in range(num_books):
+        for book_id in book_ids:
             if book_id in uid_rt_volumes:
                 rt_volumes = uid_rt_volumes[book_id]
 
@@ -83,7 +85,7 @@ def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, num_books, lookback_thr
                 latest_roundtrip_timestamps[book_id] = 0
     else:
         # UID not in roundtrip_volumes, initialize all books to zero
-        for book_id in range(num_books):
+        for book_id in book_ids:
             miner_roundtrip_volumes[book_id] = 0.0
             latest_roundtrip_volumes[book_id] = 0.0
             latest_roundtrip_timestamps[book_id] = 0
@@ -348,13 +350,15 @@ def calculate_kappa_score(
     sampling_interval = config['activity']['trade_volume_sampling_interval']
     sampled_timestamp = (simulation_timestamp // sampling_interval) * sampling_interval
     
-    # Get number of books from normalized_kappas keys
-    num_books = len(normalized_kappas)
-    
+    # The actual traded book-id set for this UID (netuids, e.g. [1..128] with
+    # root excluded). Iterating this instead of range(len) is what stops the
+    # top netuid being dropped and a phantom book 0 being invented / KeyError'd.
+    book_ids = list(normalized_kappas.keys())
+
     # Compute compact roundtrip volumes for this UID
     miner_roundtrip_volumes, latest_roundtrip_volumes, latest_roundtrip_timestamps = (
         _aggregate_roundtrip_volumes(
-            uid, roundtrip_volumes, num_books, lookback_threshold, sampled_timestamp, sampling_interval
+            uid, roundtrip_volumes, book_ids, lookback_threshold, sampled_timestamp, sampling_interval
         )
     )
 
@@ -491,7 +495,8 @@ def calculate_pnl_score(
     miner_wealth: float,
     book_count: int,
     max_inactive_books_ratio: float,
-    config: Dict
+    config: Dict,
+    book_ids: list = None,
 ) -> float:
     """
     Calculate normalized P&L score using per-book daily returns with median aggregation.
@@ -577,11 +582,13 @@ def calculate_pnl_score(
     min_daily = config.get('min_daily_return', -1.0)
     max_daily = config.get('max_daily_return', 1.0)
     
-    # Calculate daily return ratio per book
+    # Calculate daily return ratio per book. Iterate the actual traded book-id
+    # set (netuids) when provided; fall back to 0-based range for legacy callers.
+    _bids = list(range(book_count)) if book_ids is None else list(book_ids)
     books_with_pnl = []  # Books that traded
     books_inactive = []  # Books with no P&L
-    
-    for book_id in range(book_count):
+
+    for book_id in _bids:
         book_pnl = book_realized_pnl.get(book_id, 0.0)
         
         if book_pnl == 0.0:
@@ -598,7 +605,7 @@ def calculate_pnl_score(
     
     # ===== STEP 3: HANDLE INACTIVE BOOKS =====
     # Calculate max allowed inactive books
-    max_inactive_books = int(max_inactive_books_ratio * book_count)
+    max_inactive_books = int(max_inactive_books_ratio * len(_bids))
     num_inactive = len(books_inactive)
     
     # Determine which books to include in scoring
@@ -767,7 +774,8 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
             miner_wealth=simulation_config['miner_wealth'],
             book_count=simulation_config['book_count'],
             max_inactive_books_ratio=config['max_inactive_books_ratio'],
-            config=pnl_config.get('normalization', {})
+            config=pnl_config.get('normalization', {}),
+            book_ids=simulation_config.get('book_ids'),
         )
 
     # ===== STEP 3: GenTRX COMPONENT =====
@@ -821,6 +829,18 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     trading_score = max(0.0, min(1.0, trading_score))
     gentrx_score = max(0.0, min(1.0, gentrx_score))
 
+    # ===== STEP 4b: DE-BETA (P8) OPTION A — full-replace of the trading score =====
+    # When enabled AND the de-beta produced a cycle-wide score map (coverage guard passed upstream),
+    # the drift-stripped making+skill rank REPLACES the kappa+pnl trading score. The downstream
+    # track-record EMA + floor + Pareto pipeline is applied to it unchanged (so the newcomer-warmup
+    # seed and de-concentration guards still hold). A uid absent from the map (never traded) -> 0.
+    debeta_cfg = config.get('debeta', {}) or {}
+    debeta_map = validator_data.get('debeta_scores') or {}
+    debeta_applied = False
+    if debeta_cfg.get('enabled') and debeta_map:
+        trading_score = max(0.0, min(1.0, float(debeta_map.get(uid, 0.0))))
+        debeta_applied = True
+
     if kappa_values.get(uid):
         uid_kappa = kappa_values[uid]
         uid_kappa['pnl_score'] = pnl_score if pnl_score_weight > 0 else None
@@ -828,6 +848,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['kappa_weight'] = kappa_weight
         uid_kappa['pnl_score_weight'] = pnl_score_weight
         uid_kappa['gentrx_simulation_share'] = gentrx_sim_share
+        uid_kappa['debeta_score'] = float(debeta_map.get(uid, 0.0)) if debeta_applied else None
         uid_kappa['trading_score'] = trading_score
         uid_kappa['final_score'] = trading_score
 
@@ -877,7 +898,8 @@ def score_uids(validator_data: Dict) -> Tuple[Dict[int, float], Dict[int, float]
                 simulation_config['grace_period'],
                 deregistered_uids,
                 simulation_config['book_count'],
-                cache=kappa_cache
+                cache=kappa_cache,
+                book_ids=simulation_config.get('book_ids')
             )
             kappa_values[uid] = kappa_result
             fingerprint = _get_pnl_fingerprint(realized_pnl_value)
@@ -918,7 +940,8 @@ def score_uids(validator_data: Dict) -> Tuple[Dict[int, float], Dict[int, float]
             deregistered_uids,
             simulation_config['book_count'],
             cache=kappa_cache,
-            cores=actual_cores
+            cores=actual_cores,
+            book_ids=simulation_config.get('book_ids')
         )
         kappa_values.update(kappa_results)
         kappa_cache.update(cache_updates)
@@ -991,6 +1014,47 @@ def apply_reward_floor(rewards: list, config: Dict) -> list:
     return (arr * factor).tolist()
 
 
+def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
+    """Finalize the de-beta (P8) per-uid trading score from the fill-stream accumulators
+    (self.capture_buy_sums/capture_sell_sums + self.debeta_mtm/invsum/invn/pfirst/plast, populated
+    in trade.update_trade_volumes). making = balanced two-sided spread capture; skill =
+    kappa-of-alpha with alpha = MTM_pnl - mean_inventory*drift (drift-beta stripped); rank-combined
+    by w_make. Returns {} when disabled, on error, or while the accumulators are still warming
+    (coverage guard) so callers fall back to the legacy kappa+pnl path. Computed in-process (this is
+    where the accumulators live) and used by both get_rewards (weights) and the reporting snapshot."""
+    dcfg = getattr(getattr(self, 'config', None), 'scoring', None)
+    dcfg = getattr(dcfg, 'debeta', None)
+    if not (dcfg and getattr(dcfg, 'enabled', False)):
+        return {}
+    try:
+        # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
+        # full-run p_last-p_first. Equals book_alphas_from_mtm over a non-pruned run (asserted in tests).
+        alphas = book_alphas_from_drift(
+            getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
+            getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
+        )
+        floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
+        p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
+        cp = {int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()} if p11_strength > 0 else None
+        scores = debeta_scores(
+            {u: dict(b) for u, b in getattr(self, 'capture_buy_sums', {}).items()},
+            {u: dict(b) for u, b in getattr(self, 'capture_sell_sums', {}).items()},
+            alphas,
+            floor=floor,
+            w_make=float(dcfg.w_make),
+            cp=cp,
+            p11_strength=p11_strength,
+        )
+        warm = sum(1 for v in scores.values() if v > 0.0)
+        if warm < int(dcfg.min_books):
+            bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
+            return {}
+        return scores
+    except Exception:
+        bt.logging.exception("De-beta score computation failed; falling back to legacy scoring")
+        return {}
+
+
 def build_scoring_config(self: 'Validator') -> Dict:
     """Plain-dict scoring/rewarding config exactly as score_uids consumes it.
 
@@ -1019,6 +1083,16 @@ def build_scoring_config(self: 'Validator') -> Dict:
                     'min_daily_return': self.config.scoring.pnl.normalization.min_daily_return,
                     'max_daily_return': self.config.scoring.pnl.normalization.max_daily_return,
                 }
+            },
+            'debeta': {
+                'enabled': bool(getattr(getattr(self.config.scoring, 'debeta', None), 'enabled', False)),
+                'w_make': float(getattr(getattr(self.config.scoring, 'debeta', None), 'w_make', 0.30)),
+                'centered_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 15)),
+                'floor_scale': float(getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.5)),
+                'min_books': int(getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 4)),
+                'p11_strength': float(getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0)),
+                'mark_mode': str(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_mode', 'last') or 'last'),
+                'mark_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_window', 200) or 200),
             },
             'gentrx': {
                 'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
@@ -1065,6 +1139,15 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
         'volumeDecimals': self.simulation.volumeDecimals,
         'grace_period': self.simulation.grace_period,
         'book_count': self.simulation.book_count,
+        # Actual traded book-id set (netuids), NOT range(book_count). On the
+        # mainnet-fork localnet this is [1..128] (root/netuid-0 excluded), so
+        # every scoring/reporting loop must iterate this set rather than assume
+        # 0-based contiguous ids. Flows to the shadow scorer for parity.
+        'book_ids': (
+            list(self.engine.book_ids)
+            if getattr(self, 'engine', None) is not None
+            else list(range(self.simulation.book_count))
+        ),
     }
 
 
@@ -1073,19 +1156,33 @@ def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: in
                            ema: Dict, ema_n: Dict, last_ts, scorable=None):
     """Age-annealed track-record EMA on the trading score, applied BEFORE floor+Pareto.
 
-    Counters the trader's-option exploit of one-sided window scoring (a max-variance
-    strategy collecting on up-windows and flooring at 0 on down-windows) the way real
-    allocators do: multi-period track records / deferred compensation. alpha derives from
+    Standing is earned over multiple periods rather than from a single window, the way real
+    allocators assess performance: multi-period track records / deferred compensation, so a
+    single strong window converts into standing only gradually. alpha derives from
     the sim-time gap (cadence-independent half-life); the age-annealed floor
     alpha_eff = max(alpha_dt, 1/(k+1)) makes a young miner's standing track its live
     performance inside the immunity window (k=1 puts >=50% weight on the new window),
-    converging to the half-life EMA as a track record accumulates — with every window
-    counting from the start, so there is no immunity pass-through to farm.
+    converging to the half-life EMA as a track record accumulates, with every window
+    counting from the start.
 
     Mutates `ema`/`ema_n` in place (per-UID value and application count); returns
     (smoothed_scores, new_last_ts). Deregistered UIDs are reset so a new occupant of the
     slot starts a fresh track record. Shared by main (get_rewards) and the scoring
     shadow/cutover child (shadow_score) so both sides stay in exact parity.
+
+    Args:
+        scores: This round's trading scores, mutated toward the EMA.
+        all_uids: Uids the vector is aligned to.
+        deregs: Uids deregistered this round (their standing resets).
+        ts: Round timestamp.
+        halflife: EMA halflife in seconds.
+        ema: Carried EMA state.
+        ema_n: Carried per-uid observation counts.
+        last_ts: Carried per-uid last-update timestamps.
+        scorable: Which uids are scorable this round.
+
+    Returns:
+        The age-annealed scores.
     """
     # Deregistered/vacant slots (uid in deregs until re-registration — engines/exchange.py
     # appends on dereg, removes on re-register) are excluded from the EMA entirely: cleared here
@@ -1130,9 +1227,9 @@ def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: in
             # the first nonzero score (k=0 => alpha 1 => standing = live score) gives a
             # genuine newcomer its real standing immediately. The guard is ema_n 0: once a
             # UID has been scored it always updates, so an established miner going silent
-            # still decays toward 0 (trader's-option protection preserved). Not gameable — a
-            # skipped round earns nothing, and the seed requires a genuine nonzero Kappa
-            # that decays away unless sustained. (The `scorable` arg is retained for
+            # still decays toward 0, so the multi-period property is preserved. A skipped round
+            # earns nothing, and a seeded standing requires a genuine nonzero Kappa that decays
+            # away unless it is sustained. (The `scorable` arg is retained for
             # signature/caller stability; the score-based guard supersedes it.)
             if cur == 0 and ema_n.get(uid, 0) == 0:
                 continue
@@ -1185,6 +1282,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         'realized_pnl_history': realized_pnl_history,
         'config': build_scoring_config(self),
         'simulation_config': build_simulation_config_dict(self),
+        'debeta_scores': _pin.get('debeta_scores') if 'debeta_scores' in _pin else compute_debeta_scores(self),
         'simulation_timestamp': _pin.get('simulation_timestamp', self.simulation_timestamp),
         'uids': all_uids,
         'deregistered_uids': _pin.get('deregistered_uids', self.deregistered_uids),

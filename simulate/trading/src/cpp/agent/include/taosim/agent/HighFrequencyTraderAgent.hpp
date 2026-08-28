@@ -12,6 +12,8 @@
 
 #include <boost/circular_buffer.hpp>
 
+#include <taosim/util/TradeStatsEstimator.hpp>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::agent
@@ -52,10 +54,11 @@ public:
     virtual void receiveMessage(Message::Ptr msg) override;
 
 private:
+
     void handleSimulationStart();
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
-    void handleRetrieveL1Response(Message::Ptr msg);
+    void handleRetrieveL1ExtResponse(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
     void handleLimitOrderPlacementErrorResponse(Message::Ptr msg);
     void handleMarketOrderPlacementResponse(Message::Ptr msg);
@@ -64,6 +67,7 @@ private:
     void handleCancelOrdersErrorResponse(Message::Ptr msg);
     void handleTrade(Message::Ptr msg);
 
+    [[nodiscard]] double effectiveSigmaSqr(BookId bookId) const;
     void placeOrder(BookId bookId, const TopLevelWithVolumes& topLevel);
     std::optional<PlaceOrderLimitPayload::Ptr> makeOrder(
         BookId bookId, OrderDirection direction, double volume, double limitPrice, double wealth);
@@ -86,7 +90,15 @@ private:
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     double m_orderMean;
     double m_orderSTD;
-    std::vector<double> m_orderSizes;
+    std::vector<double> m_orderSizeBid;
+    std::vector<double> m_orderSizeAsk;
+    std::vector<int> m_lastInvSign;
+    std::vector<taosim::util::TradeStatsEstimator> m_varEst;
+    double m_varHalflifeSeconds{};
+    bool m_varJumpRobust{};
+    double m_varGain{};
+    double m_varRatioCap{};
+    int m_undercutTicks{};
     double m_noiseRay;
     std::unique_ptr<taosim::stats::Distribution> m_priceShiftDistribution;
     Timestamp m_minMFLatency;
@@ -102,7 +114,12 @@ private:
     double m_spreadSensitivityBase;
     double m_maxLoan;
     bool m_debug;
-    
+    int m_spreadMode;
+    int m_minSpreadTicks;
+    int m_numLevels;
+    int m_levelSpacingTicks;
+    double m_spreadRefPrice;
+    int m_rebalanceGateMode{0};
     // State.
     std::vector<TopLevelWithVolumes> m_topLevel;
     std::vector<double> m_inventory;
@@ -112,7 +129,7 @@ private:
     std::vector<double> m_deltaHFT;
     std::vector<Timestamp> m_tauHFT;
     std::vector<TimestampedPrice> m_lastPrice;
-    double m_pRes;
+    std::vector<double> m_pRes;
     AgentId m_id;
 };
 

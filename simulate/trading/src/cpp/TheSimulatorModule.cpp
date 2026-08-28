@@ -241,6 +241,47 @@ PYBIND11_EMBEDDED_MODULE(thesimulator, m)
         .def_readwrite("bookId", &RetrieveL1ResponsePayload::bookId)
         ;
 
+    py::class_<taosim::book::BookTradeStats>(m, "BookTradeStats")
+        .def(py::init<>())
+        .def_readwrite("tradeCount", &taosim::book::BookTradeStats::tradeCount)
+        .def_readwrite("volumeSum", &taosim::book::BookTradeStats::volumeSum)
+        .def_readwrite("notionalSum", &taosim::book::BookTradeStats::notionalSum)
+        .def_readwrite("logReturnSum", &taosim::book::BookTradeStats::logReturnSum)
+        .def_readwrite("logReturnSqSum", &taosim::book::BookTradeStats::logReturnSqSum)
+        .def_readwrite("lastTradePrice", &taosim::book::BookTradeStats::lastTradePrice)
+        .def_readwrite("lastTradeTime", &taosim::book::BookTradeStats::lastTradeTime)
+        ;
+
+    py::class_<RetrieveL1ExtPayload, MessagePayload, RetrieveL1ExtPayload::Ptr>(
+        m, "RetrieveL1ExtPayload")
+        .def(py::init<>())
+        .def_readwrite("bookId", &RetrieveL1ExtPayload::bookId)
+        ;
+
+    py::class_<RetrieveL1ExtResponsePayload, MessagePayload, RetrieveL1ExtResponsePayload::Ptr>(
+        m, "RetrieveL1ExtResponsePayload")
+        .def(
+            py::init<
+                Timestamp,
+                decimal_t,
+                decimal_t,
+                decimal_t,
+                decimal_t,
+                decimal_t,
+                decimal_t,
+                taosim::book::BookTradeStats,
+                BookId>())
+        .def_readwrite("time", &RetrieveL1ExtResponsePayload::time)
+        .def_readwrite("bestAskPrice", &RetrieveL1ExtResponsePayload::bestAskPrice)
+        .def_readwrite("bestAskVolume", &RetrieveL1ExtResponsePayload::bestAskVolume)
+        .def_readwrite("askTotalVolume", &RetrieveL1ExtResponsePayload::askTotalVolume)
+        .def_readwrite("bestBidPrice", &RetrieveL1ExtResponsePayload::bestBidPrice)
+        .def_readwrite("bestBidVolume", &RetrieveL1ExtResponsePayload::bestBidVolume)
+        .def_readwrite("bidTotalVolume", &RetrieveL1ExtResponsePayload::bidTotalVolume)
+        .def_readwrite("tradeStats", &RetrieveL1ExtResponsePayload::tradeStats)
+        .def_readwrite("bookId", &RetrieveL1ExtResponsePayload::bookId)
+        ;
+
     py::class_<
         SubscribeEventTradeByOrderPayload,
         MessagePayload,

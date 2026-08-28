@@ -53,9 +53,9 @@ def _get_pnl_fingerprint(realized_pnl_values):
     return (count, total, sum_squares, min_val, max_val)
 
 
-def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max, 
+def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
            min_lookback, min_realized_observations, grace_period, deregistered_uids, book_count,
-           cache=None) -> dict:
+           cache=None, book_ids=None) -> dict:
     """
     Calculates realized Kappa-3 ratio based on actual P&L from completed round-trip trades.
     
@@ -83,15 +83,21 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
         Dict containing realized Kappa-3 metrics, or None on error
     """
     try:
+        # Deregistration / empty-history guard MUST precede the fingerprint-cache lookup. On a UID
+        # replacement the reused slot's realized_pnl_history stays byte-identical to the old occupant's
+        # until reset_agent_histories lands (it waits on the simulator RDRA notice), so the fingerprint
+        # matches and a cache hit would otherwise hand the new (still-deregistered, not-yet-traded) slot
+        # the deregistered miner's cached kappa, bypassing this guard and feeding the score EMA off
+        # someone else's score. Guard first, then cache.
+        if uid in deregistered_uids or not realized_pnl_values:
+            return None
+
         if cache is not None:
             current_fingerprint = _get_pnl_fingerprint(realized_pnl_values)
             if uid in cache:
                 cached_fingerprint, cached_kappa = cache[uid]
                 if cached_fingerprint == current_fingerprint:
                     return cached_kappa
-
-        if uid in deregistered_uids or not realized_pnl_values:
-            return None
         timestamps = sorted(realized_pnl_values.keys())
         # Explicit assessment window: restrict to the last `lookback` ns of
         # observations instead of relying on the upstream prune to bound the
@@ -106,7 +112,10 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
             return None
 
         num_values = len(timestamps)
-        book_ids = list(range(book_count))
+        # Iterate the actual traded book-id set when provided (e.g. [1..128] with
+        # root/netuid-0 excluded); fall back to 0-based range(book_count) for
+        # legacy/sim callers that don't pass an explicit set.
+        book_ids = list(range(book_count)) if book_ids is None else list(book_ids)
         num_books = len(book_ids)
         
         np_realized_pnl = np.zeros((num_books, num_values), dtype=np.float64)
@@ -233,7 +242,7 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
 
 def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
                   min_lookback, min_realized_observations, grace_period, deregistered_uids, book_count,
-                  cache=None, build_cache_updates=True):
+                  cache=None, build_cache_updates=True, book_ids=None):
     """
     Process a batch of UIDs for Kappa-3 calculation with realized P&L only.
     
@@ -260,8 +269,8 @@ def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
     for uid, realized_pnl_value in realized_pnl_values.items():
         kappa_values = kappa_3(
             uid, realized_pnl_value, tau, lookback, norm_min, norm_max,
-            min_lookback, min_realized_observations, grace_period, 
-            deregistered_uids, book_count, cache=cache
+            min_lookback, min_realized_observations, grace_period,
+            deregistered_uids, book_count, cache=cache, book_ids=book_ids
         )
         results[uid] = kappa_values
         # Only build cache_updates when the cache is active. With the cache off
@@ -330,8 +339,8 @@ def _kappa_cache_enabled():
 
 
 def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_max,
-                  min_lookback, min_realized_observations, grace_period, deregistered_uids, 
-                  book_count, cache=None, cores=None):
+                  min_lookback, min_realized_observations, grace_period, deregistered_uids,
+                  book_count, cache=None, cores=None, book_ids=None):
     """
     Parallel processing of Kappa-3 calculations with realized P&L only.
     
@@ -375,6 +384,12 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
         for batch in batches:
             remaining_uids = []
             for uid in batch:
+                # Dereg guard precedes the cache hit (same reason as kappa_3): a still-deregistered reused
+                # slot keeps the old occupant's fingerprint until reset lands, so a cache hit here would
+                # serve the old kappa. Route dereg uids to the worker, whose kappa_3 guard returns None.
+                if uid in deregistered_uids:
+                    remaining_uids.append(uid)
+                    continue
                 realized_pnl_value = realized_pnl_values.get(uid, {})
                 fingerprint = _get_pnl_fingerprint(realized_pnl_value)
                 if uid in cache:
@@ -437,7 +452,7 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
             {uid: realized_pnl_values.get(uid, {}) for uid in batch},
             tau, lookback, norm_min, norm_max, min_lookback, min_realized_observations,
             grace_period, deregistered_uids, book_count,
-            cache=cache, build_cache_updates=_cache_on
+            cache=cache, build_cache_updates=_cache_on, book_ids=book_ids
         )
         for batch in batches
     ]

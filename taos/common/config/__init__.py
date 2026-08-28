@@ -157,6 +157,7 @@ def add_miner_args(cls, parser):
         "--agent.params",
         nargs='*',
         action=ParseKwargs,
+        default=argparse.Namespace(),
         help="Arbitrary user-defined parameters relevant to their specific agent implementation.  Pass in format `--agent.params p_0=x p_1=y ...`"
     )
 
@@ -257,6 +258,12 @@ def _prune_default_shadow_configs(cfg, parser):
         legit.add((key,))
 
     def walk(node, path):
+        """Walk a config tree depth-first, yielding each node with its path.
+
+        Args:
+            node: The current subtree.
+            path: Dotted path to ``node``.
+        """
         if not isinstance(node, bt.Config):
             return
         for key in list(node.keys()):

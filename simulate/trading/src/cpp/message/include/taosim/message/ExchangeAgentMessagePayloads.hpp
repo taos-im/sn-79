@@ -5,6 +5,8 @@
 #pragma once
 
 #include <taosim/book/Book.hpp>
+#include <taosim/book/BookTradeStats.hpp>
+#include <taosim/book/serialization/BookTradeStats.hpp>
 #include <taosim/decimal/serialization/decimal.hpp>
 #include "Cancellation.hpp"
 #include "ClosePosition.hpp"
@@ -59,6 +61,11 @@ struct PlaceOrderMarketPayload : public MessagePayload
     std::optional<ClientOrderID> clientOrderId;
     STPFlag stpFlag{STPFlag::CO};
     SettleFlag settleFlag{SettleType::FIFO};
+    // Agent-settable, same meaning as on the limit payload: when false, a swap that cannot be filled
+    // in full is refused rather than filled short. It matters here only because a SELL draws on ONE
+    // named delegate, so the executable size is the delegate's stake and not the summed free balance
+    // the agent sized against. Defaults true, which is the historical behaviour.
+    bool allowPartial{true};
     taosim::decimal_t maxSlippage;
     std::string delegate;
     std::optional<taosim::decimal_t> stopLoss;
@@ -67,6 +74,9 @@ struct PlaceOrderMarketPayload : public MessagePayload
     bool skipMinSizeCheck{};
     uint8_t closeReason{};        // 0=none, 1=SL, 2=TP — set by SL/TP dispatch only
     OrderID originatingOrderId{}; // LOB ID of the position order that triggered SL/TP
+    // Set by sweepCrossing only, and deliberately NOT serialised: the sweep message is created and
+    // consumed inside this process, so this never has to survive a wire hop. See OrderClientContext.
+    std::optional<AgentId> initiatorAgentId;
 
     PlaceOrderMarketPayload() noexcept = default;
 
@@ -135,6 +145,7 @@ struct PlaceOrderMarketPayload : public MessagePayload
         clientOrderId,
         MSGPACK_NVP("stp", stpFlag),
         settleFlag,
+        allowPartial,
         MSGPACK_NVP("max_slippage", maxSlippage),
         delegate,
         MSGPACK_NVP("stopLoss", stopLoss),
@@ -698,6 +709,92 @@ struct RetrieveL1ResponsePayload : public MessagePayload
         bestBidPrice,
         bestBidVolume,
         bidTotalVolume,
+        bookId);
+};
+
+//-------------------------------------------------------------------------
+
+struct RetrieveL1ExtPayload : public MessagePayload
+{
+    using Ptr = std::shared_ptr<RetrieveL1ExtPayload>;
+
+    BookId bookId;
+
+    RetrieveL1ExtPayload() = default;
+
+    RetrieveL1ExtPayload(BookId bookId) noexcept : bookId{bookId} {}
+
+    virtual void jsonSerialize(
+        rapidjson::Document& json, const std::string& key = {}) const override;
+
+    [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
+
+    MSGPACK_DEFINE_MAP(bookId);
+};
+
+//-------------------------------------------------------------------------
+
+// L1 plus the book's cumulative trade statistics. A separate message from
+// RETRIEVE_L1 rather than an extension of it, so existing pollers and any remote
+// client keep their wire format untouched.
+struct RetrieveL1ExtResponsePayload : public MessagePayload
+{
+    using Ptr = std::shared_ptr<RetrieveL1ExtResponsePayload>;
+
+    Timestamp time{};
+    taosim::decimal_t bestAskPrice{};
+    taosim::decimal_t bestAskVolume{};
+    taosim::decimal_t askTotalVolume{};
+    taosim::decimal_t bestBidPrice{};
+    taosim::decimal_t bestBidVolume{};
+    taosim::decimal_t bidTotalVolume{};
+    // Monotonic since the run began. Difference two reads for interval statistics;
+    // no normalization is applied here, so the reader owns the choice of whether
+    // realized variance is expressed per trade, per unit time, or annualized.
+    taosim::book::BookTradeStats tradeStats{};
+    BookId bookId{};
+
+    RetrieveL1ExtResponsePayload() noexcept = default;
+
+    RetrieveL1ExtResponsePayload(Timestamp time, BookId bookId) noexcept
+        : time{time}, bookId{bookId}
+    {}
+
+    RetrieveL1ExtResponsePayload(
+        Timestamp time,
+        taosim::decimal_t bestAskPrice,
+        taosim::decimal_t bestAskVolume,
+        taosim::decimal_t askTotalVolume,
+        taosim::decimal_t bestBidPrice,
+        taosim::decimal_t bestBidVolume,
+        taosim::decimal_t bidTotalVolume,
+        taosim::book::BookTradeStats tradeStats,
+        BookId bookId) noexcept
+        : time{time},
+          bestAskPrice{bestAskPrice},
+          bestAskVolume{bestAskVolume},
+          askTotalVolume{askTotalVolume},
+          bestBidPrice{bestBidPrice},
+          bestBidVolume{bestBidVolume},
+          bidTotalVolume{bidTotalVolume},
+          tradeStats{tradeStats},
+          bookId{bookId}
+    {}
+
+    virtual void jsonSerialize(
+        rapidjson::Document& json, const std::string& key = {}) const override;
+
+    [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
+
+    MSGPACK_DEFINE_MAP(
+        MSGPACK_NVP("timestamp", time),
+        bestAskPrice,
+        bestAskVolume,
+        askTotalVolume,
+        bestBidPrice,
+        bestBidVolume,
+        bidTotalVolume,
+        tradeStats,
         bookId);
 };
 

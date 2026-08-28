@@ -8,6 +8,8 @@
 #include <taosim/checkpoint/serialization/process/RNG.hpp>
 #include <taosim/serialization/msgpack/Eigen/VectorXd.hpp>
 
+#include <cmath>
+
 //-------------------------------------------------------------------------
 
 namespace msgpack
@@ -30,6 +32,10 @@ struct convert<taosim::process::FundamentalPrice>
         }
 
         auto& s = v.state();
+
+        // TASK 4b: old checkpoints predate the reveal anchors; if absent, rebuild them
+        // from value/dJ after the loop so a restore never snaps the revealed price to X0.
+        bool sawAnchors = false;
 
         for (const auto& [k, val] : o.via.map) {
             auto key = k.as<std::string_view>();
@@ -65,8 +71,22 @@ struct convert<taosim::process::FundamentalPrice>
             else if (key == "lastSeedTime") {
                 val.convert(s.lastSeedTime);
             }
+            else if (key == "logDiffPrev") {
+                val.convert(s.logDiffPrev);
+                sawAnchors = true;
+            }
+            else if (key == "logDiffCur") {
+                val.convert(s.logDiffCur);
+                sawAnchors = true;
+            }
         }
-        
+
+        if (!sawAnchors) {
+            // Restored from a pre-anchor checkpoint: both anchors collapse onto the
+            // restored level, so the reveal is flat at `value` until the next seed.
+            s.logDiffPrev = s.logDiffCur = std::log(s.value) - s.dJ;
+        }
+
         return o;
     }
 };
@@ -80,7 +100,7 @@ struct pack<taosim::process::FundamentalPrice>
     {
         const auto& s = v.state();
 
-        o.pack_map(10);
+        o.pack_map(12);
 
         o.pack("value");
         o.pack(s.value);
@@ -111,6 +131,12 @@ struct pack<taosim::process::FundamentalPrice>
 
         o.pack("lastSeedTime");
         o.pack(s.lastSeedTime);
+
+        o.pack("logDiffPrev");
+        o.pack(s.logDiffPrev);
+
+        o.pack("logDiffCur");
+        o.pack(s.logDiffCur);
 
         return o;
     }

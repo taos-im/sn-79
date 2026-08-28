@@ -22,6 +22,7 @@ from sklearn.metrics import accuracy_score
 
 
 class SimpleRegressorAgent(FinanceSimulationAIRegressorAgent):
+    """Example: trades a linear-regressor prediction from the shared AI agent base."""
     def print_config(self):
         """Prints the agent's current strategy configuration."""
         bt.logging.info(f"""
@@ -199,7 +200,7 @@ Output Directory           : {self.output_dir}
         Returns:
             taos.im.protocol.FinanceAgentResponse : The response which will be attached to the synapse for return to the querying validator.
         """
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         start = time.time()
 
         for book_id, book in state.books.items():

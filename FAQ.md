@@ -1,6 +1,6 @@
 <div align="center">
 
-# **τaos** ☯ **‪ي‬n 79**<!-- omit in toc -->
+# **MVTRX**: Bittensor SN79<!-- omit in toc -->
 ### **Decentralized Simulation of Automated Trading in Intelligent Markets:** <!-- omit in toc -->
 ### **Risk-Averse Agent Optimization** <!-- omit in toc -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
@@ -9,7 +9,7 @@
 
 </div>
 
-#### 1. How does τaos differ from other finance-related subnets?
+#### 1. How does MVTRX differ from other finance-related subnets?
 
 Other finance-related subnets, at least to our knowledge at time of writing, focus on incentivizing the creation and deployment of trading strategies which act against particular real-world markets, and seek to extract value from the trading signals produced by miners.  While this approach has some promise, τaos has more general aspirations to provide value across a broad spectrum of use cases within the financial industry.  By providing an environment where miners trade in many statistically similar but independently evolving simulated markets simultaneously, we not only encourage the study and development of much more robust trading strategies, but also produce vast quantities of high-resolution, maximally detailed data which can be used by traders, researchers, institutions and regulators to better understand and account for the underlying risks present in all markets.
 
@@ -25,13 +25,17 @@ There are then a few additional transformations applied to avoid manipulation an
 
 This FAQ is a good entry point, after which it is recommended to go through the [README](/README.md).  Once you are familiar with the subnet function and vision, and decide you want to get involved, you can check out the [agents readme](/agents/README.md) for more detailed information on how to design and develop strategies for the τaos framework.  Before getting into mining on testnet or mainnet, we recommend also to set up a local testing environment using the ["proxy" validator](/agents/proxy/README.md) tools which enable to launch a local instance of the simulation engine and confirm how your strategy behaves and performs against the background market.
 
-Once you have developed and tested your strategy locally, you may next wish to inspect the current behaviour and performance of existing miners in the subnet via the [taos.simulate.trading dashboard](https://taos.simulate.trading) (an updated version of this dashboard as well as documentation to assist in interpreting the visualizations are upcoming).To get an idea of the expected performance of your strategy and validate your hosting and networking configuration, you can request testnet TAO via the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629), register a UID in our test netuid 366 and deploy and [monitor](https://testnet.simulate.trading) your miner here.  We continously run a validator in testnet using the latest code and configurations.  Once you are confident that your agent has what it takes, register to mainnet and join the comptetition!  If you have any questions or concerns, reach out to us at our [Discord Channel](https://discord.com/channels/799672011265015819/1353733356470276096).
+Once you have developed and tested your strategy locally, you may next wish to inspect the current behaviour and performance of existing miners in the subnet via the [taos.simulate.trading dashboard](https://taos.simulate.trading) (an updated version of this dashboard as well as documentation to assist in interpreting the visualizations are upcoming).  To get an idea of the expected performance of your strategy and validate your hosting and networking configuration, you can request testnet TAO via the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629), register a UID in our test netuid 366 and deploy and [monitor](https://testnet.simulate.trading) your miner here.  We continuously run a validator in testnet using the latest code and configurations.  Once you are confident that your agent has what it takes, register to mainnet and join the competition!  If you have any questions or concerns, reach out to us at our [Discord Channel](https://discord.com/channels/799672011265015819/1353733356470276096).
 
 **Note that the example miners given in the /agents directory are not expected to perform well in the subnet - you need to develop a smart custom algorithm to compete**
 
-#### 4. Is there a τaos testnet?
+#### 4. Is there an MVTRX testnet?
 
 Yes, netuid 366 with monitoring via [testnet.simulate.trading](https://testnet.simulate.trading).
+
+The Bittensor test network carries no exchange, so netuid 366 is not the place to exercise trading.
+For that there is a public localnet at `wss://localnet.mvtrx.exchange:443`, which runs the exchange
+and is open for testing. Point the run scripts at it with `-e wss://localnet.mvtrx.exchange:443`.
 
 #### 5. How do I monitor my miner?
 
@@ -85,7 +89,7 @@ Kappa-3 is calculated from realized P&L values which explicitly include all trad
 
 Currently, the scoring framework does not directly penalize order cancellations or the repeated submission of identical orders. The system focuses on realized profitability and round-trip trading volume. However, we recognize that excessive cancellations or unchanging re-posts can place unnecessary load on the simulation and may represent inefficient behavior rather than legitimate market-making.
 
-Future refinements may apply operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new executions. We may also consider simpler guardrails at the agent level—for example, raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
+Future refinements may apply operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new executions. We may also consider simpler guardrails at the agent level, for example raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
 
 #### 15. How does the scoring system encourage participation across all books?
 

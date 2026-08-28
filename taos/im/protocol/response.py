@@ -74,12 +74,19 @@ class FinanceAgentResponse(AgentResponse):
                                 e.g. an order placed for 1.0 BASE with 0.5 leverage will be placed for a total quantity of 1.5 BASE, where 0.5 is borrowed from the exchange.
                                 Must be non-negative. Defaults to 0.0 (no leverage).
             settlement_option (LoanSettlementOption | int, optional): Strategy for settling outstanding margin loans using the proceeds of this order. Options:
-                                LoanSettlementOption.NONE : No loan repayments
-                                LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
-                                int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
+                                    - LoanSettlementOption.NONE : No loan repayments
+                                    - LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
+                                    - int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
                                 Defaults to NONE.
-                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged 
+                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged
                                 positions on both sides of the book simultaneously.
+            max_slippage (float | None, optional): Maximum acceptable slippage as a fraction of the best price at execution; a market BUY fills only up to
+                                `best_ask * (1 + max_slippage)` and a SELL only down to `best_bid * (1 - max_slippage)`.
+                                Defaults to None (no price limit).
+            stop_loss (float | None, optional): Stop-loss offset as a signed fraction of the entry price (negative places the stop below entry, as for a BUY).
+                                Defaults to None (no stop-loss).
+            take_profit (float | None, optional): Take-profit offset as a signed fraction of the entry price (positive places the target above entry, as for a BUY).
+                                Defaults to None (no take-profit).
 
         Returns:
             None
@@ -152,8 +159,12 @@ class FinanceAgentResponse(AgentResponse):
                                     LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
                                     int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
                                 Defaults to NONE.
-                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged 
+                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged
                                 positions on both sides of the book simultaneously.
+            stop_loss (float | None, optional): Stop-loss offset as a signed fraction of the entry price (negative places the stop below entry, as for a BUY).
+                                Defaults to None (no stop-loss).
+            take_profit (float | None, optional): Take-profit offset as a signed fraction of the entry price (positive places the target above entry, as for a BUY).
+                                Defaults to None (no take-profit).
 
         Returns:
             None

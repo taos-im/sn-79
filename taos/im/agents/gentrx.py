@@ -196,6 +196,20 @@ class _GenTRXState:
     only declares them.
     """
 
+    # SAFE DEFAULTS, so a bare state object never raises AttributeError.
+    #
+    # These are only annotations below; without class-level values, reading any field before
+    # initialize() populates it is an AttributeError that kills the MINER, not just the agent. That is
+    # exactly what gtx_enabled=false produces: initialize() returns early by design, leaving the object
+    # bare, while miner.py:99 still calls _ensure_model_version() on every startup. Guarding each read
+    # site was whack-a-mole -- model, then gentrx_inited, then store, each found only by crashing.
+    # Defaults fix the class of bug instead of its instances. initialize() overwrites all of them, so
+    # an enabled agent is unaffected.
+    enabled: bool = True
+    gentrx_inited: bool = False
+    model = None
+    store = None
+
     # ---- Data collection config (gtx_* params) ----
     output_dir: Path
     flush_interval_ns: int
@@ -291,12 +305,52 @@ class GenTRXAgent(FinanceAgent):
     """
 
     def initialize(self) -> None:
+        """Set up the agent: strategy state, per-book records and the training-server link when configured."""
         bt.logging.set_info()
 
         # All GenTRX-owned state lives under self._gtx; subclasses see one
         # reserved attribute on self instead of every internal name.
         self._gtx = _GenTRXState()
         g = self._gtx
+
+        # gtx_enabled=false: FULL off switch, not just "do not train".
+        #
+        # gtx_collect_data and gtx_training_enabled gate collection and training, but the setup BELOW
+        # runs regardless: bucket prefix, S3 stores, checkpoint resolution. That work is expensive in
+        # both memory and startup latency
+        # start and the miner serving its axon, and a miner that cannot answer for that long is not
+        # usable. It also holds substantial RSS on a box where RAM is the binding constraint.
+        #
+        # A caller that wants GenTRX genuinely off had no way to say so. This is that way. Every gtx_*
+        # feature flag is forced off and setup is skipped, so the agent behaves as a pure trader: the
+        # event hooks below all short-circuit on collect_data/training_enabled/inference_enabled.
+        # GenTRX IS OPT-IN: with no gtx_* settings at all, it must not initialise. (Operator decision,
+        # 2026-08-09.) Defaulting `enabled` to True meant every agent inheriting GenTRXAgent paid the
+        # full setup cost -- bucket prefix, S3 stores, checkpoint resolution -- whether or not anyone
+        # asked for it, which is what put 563s to >944s between process start and the axon serving.
+        #
+        # Explicit gtx_enabled always wins. Otherwise presence of ANY other gtx_* setting is read as
+        # intent to use GenTRX, so existing configs that set gtx_training_enabled/gtx_collect_data keep
+        # working without also having to learn about this flag.
+        # Read intent from the VALUE, not the presence of the key: several agents set
+        # gtx_training_enabled/gtx_collect_data to False in their own initialize() to opt out, and
+        # treating that as "a gtx_* setting exists" would switch GenTRX back ON for exactly the agents
+        # trying to turn it off.
+        _gtx_asked = any(
+            _cfg_bool(self.config, _k, False)
+            for _k in ("gtx_training_enabled", "gtx_collect_data", "gtx_inference_enabled")
+        )
+        g.enabled = _cfg_bool(self.config, "gtx_enabled", _gtx_asked)
+        if not g.enabled:
+            g.collect_data = False
+            g.training_enabled = False
+            g.inference_enabled = False
+            # miner.py:99 reads _gtx.model unconditionally when the agent exposes _gtx, so the state
+            # object must still answer for it or the MINER dies at startup with AttributeError. Leaving
+            # a half-built state object behind is how a "disable" flag turns into an outage.
+            g.model = None
+            bt.logging.info("[GTX] disabled via gtx_enabled=false; skipping all GenTRX setup")
+            return
 
         # ---- Data collection config (gtx_* params) ----
         # Default resolves to <repo>/agents/data/<uid>/ via __file__-anchored
@@ -314,7 +368,7 @@ class GenTRXAgent(FinanceAgent):
         # Set gtx_collect_data=false on pure training agents that read data from
         # S3. In-memory event processing still runs to keep the inference buffer
         # live.
-        g.collect_data = _cfg_bool(self.config, "gtx_collect_data", True)
+        g.collect_data = _cfg_bool(self.config, "gtx_collect_data", False)  # opt-in, like training
         # Live dicts are sealed into columnar batches every chunk_size rows so
         # the in-memory list[dict] cost stays bounded to one chunk.
         g.chunk_size = max(1, int(getattr(self.config, "gtx_chunk_size", 10_000)))
@@ -506,6 +560,11 @@ class GenTRXAgent(FinanceAgent):
 
         @self.router.post("/gentrx/assignment")
         async def receive_assignment(request: Request):
+            """Accept a training assignment pushed by the miner's training server.
+
+            Args:
+                request (Request): The HTTP request carrying the assignment.
+            """
             payload = await request.json()
             gtx_log.info(
                 "[GTX] assignment received: round=%s model_v=%s data=%d files",
@@ -532,6 +591,12 @@ class GenTRXAgent(FinanceAgent):
         short-circuits subsequent calls.
         """
         g = self._gtx
+        # gtx_enabled=false skips initialize() entirely, so this state object is intentionally bare.
+        # miner.py:99 still calls _ensure_model_version() -> here on every startup, so without this
+        # guard a disabled agent dies reading a field that was never meant to exist. Check `enabled`
+        # first, before any other field is touched.
+        if not getattr(g, "enabled", True):
+            return
         if g.gentrx_inited:
             return
         g.gentrx_inited = True
@@ -598,10 +663,15 @@ class GenTRXAgent(FinanceAgent):
         except ImportError:
             pass
 
-        # Bootstrap from S3 only if no local checkpoint was loaded in initialize().
-        # After bootstrap, model versions are pulled on-demand by _maybe_train
-        # using the model_version named in each assignment, no background poll.
-        if g.model is None:
+        # Bootstrap from S3 only if no local checkpoint was loaded in initialize()
+        # AND the miner actually needs a model (training or inference on). A plain
+        # trading miner (gtx_training_enabled=false, gtx_n_trajectories=0) needs no
+        # model, so skip the bootstrap entirely — otherwise _ensure_model_version does
+        # on-chain aggregator-bucket discovery + an S3 checkpoint scan, which hangs/errors
+        # on a bare localnet (no S3/aggregator) and prevents the agent from ever serving.
+        # This is why sample agents lacking an _ensure_model_version no-op placed no
+        # orders even with training disabled: the bootstrap ran regardless.
+        if g.model is None and (g.training_enabled or g.inference_enabled):
             self._ensure_model_version()
 
         mode_parts = []
@@ -643,7 +713,11 @@ class GenTRXAgent(FinanceAgent):
         the drain at handle() makes it independent of any customized respond.
         """
         response = super().handle(state)
-        if getattr(self, "_gtx", None) is not None:
+        # The presence of _gtx is not the same question as whether GenTRX is ON. A disabled agent
+        # (gtx_enabled=false) still HAS the state object, so this drained the training queue on every
+        # state update and raised on fields initialize() deliberately never set -- once per query, which
+        # is what turned a working agent into nine tracebacks in one dwell.
+        if getattr(self, "_gtx", None) is not None and getattr(self._gtx, "enabled", True):
             self._drive_training()
         return response
 
@@ -681,9 +755,23 @@ class GenTRXAgent(FinanceAgent):
         # (FinanceAgent.handle dispatches update() before respond() each tick),
         # so this is the earliest the actual run mode is known. Subsequent
         # ticks short-circuit on the guard flag.
+        """Produce this block's response by delegating to the mode-specific branch.
+
+        Returns:
+            The response carrying whatever instructions the strategy queued.
+        """
         self._ensure_gentrx_inited()
 
         response = self.make_response()
+
+        # gtx_enabled=false: behave as a plain trader. Everything below is GenTRX inference and reads
+        # state that initialize() deliberately never populated, so without this the agent raised on
+        # EVERY query (38 AttributeErrors on price_scale in one dwell) -- it served, was queried on both
+        # mechanisms, and then threw instead of responding. Returning the empty response here is what
+        # makes "GenTRX off" mean "no GenTRX behaviour" rather than "broken agent"; subclasses that add
+        # their own order logic after super().respond() still run normally.
+        if not getattr(self._gtx, "enabled", True):
+            return response
 
         if self._gtx.price_scale is None:
             # Exchange mode: ExchangeConfig has volumeDecimals but NO
@@ -832,6 +920,7 @@ class GenTRXAgent(FinanceAgent):
             self._gtx.tlog.error(f"forward client setup failed: {exc}")
 
     def onEnd(self, event: SimulationEndEvent) -> None:
+        """Handle simulation end: flush per-run state so the next run starts clean."""
         gtx_log.info("Simulation ended — flushing all book buffers.")
         for book_id in list(self._gtx.books):
             self._flush_book(book_id)
@@ -1852,6 +1941,12 @@ class GenTRXAgent(FinanceAgent):
         # flag is set BEFORE the inner _ensure_model_version recursion bottoms
         # out, so this never loops.
         self._ensure_gentrx_inited()
+        # gtx_enabled=false leaves the state object bare by design, and _ensure_gentrx_inited returns
+        # immediately in that case -- so every field read below (store, model, ...) is still unset.
+        # miner.py:99 calls this on every startup regardless of the flag, so bail here too or a disabled
+        # agent takes the miner down with it.
+        if not getattr(self._gtx, "enabled", True):
+            return False
         if assignment is not None:
             store = self._get_aggregator_store_for_assignment(assignment)
         elif self._gtx.store is not None:
@@ -2200,6 +2295,13 @@ def _cfg_bool(config: Any, key: str, default: bool) -> bool:
     if isinstance(val, bool):
         return val
     if isinstance(val, int):
+        return bool(val)
+    # FLOATS ARRIVE HERE ROUTINELY, because ParseKwargs (taos/common/config/__init__.py) calls float()
+    # on every --agent.params value it can. So `gtx_enabled=0` reaches this as 0.0, which is NOT an int,
+    # and str(0.0) is "0.0" -- not in the string table below, so it fell through to `default` and the
+    # flag silently kept its default value.
+    # A flag that silently ignores a caller's explicit 0 is worse than one that rejects it.
+    if isinstance(val, float):
         return bool(val)
     s = str(val).strip().lower()
     if s in ("true", "1", "yes"):

@@ -47,13 +47,3 @@ def test_explicit_decimals_override_canonical_default(tmp_path):
     agg._process_tick(_tick(sim_id="SIM_B", price_decimals=3, volume_decimals=5))
     assert agg._price_scale == 10**3
     assert agg._vol_scale == 10**5
-
-
-# def test_fallback_to_canonical_defaults_when_decimals_missing(tmp_path, caplog):
-#     """A bound tick without decimals falls back to simulation_0.xml values."""
-#     agg = _make_aggregator(tmp_path)
-#     agg._process_tick(_tick(sim_id="SIM_C"))
-#     assert agg._price_scale == 10**DEFAULT_PRICE_DECIMALS
-#     assert agg._vol_scale == 10**DEFAULT_VOLUME_DECIMALS
-#     assert DEFAULT_PRICE_DECIMALS == 2 and DEFAULT_VOLUME_DECIMALS == 4
-#     assert any("falling back" in r.message for r in caplog.records)

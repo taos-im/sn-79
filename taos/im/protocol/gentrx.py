@@ -43,6 +43,7 @@ class GenTRXAssignment(bt.Synapse):
     @model_validator(mode="before")
     @classmethod
     def set_name_type(cls, values):
+        """Coerce the assignment's name field to a string before validation."""
         if isinstance(values, (bytes, bytearray)):
             try:
                 values = json.loads(values)

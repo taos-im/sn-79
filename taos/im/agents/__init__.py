@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 from dataclasses import dataclass
+import argparse
+import contextvars
 import os
 import json
 import msgpack
@@ -16,10 +18,15 @@ from threading import Thread, Lock
 from abc import ABC, abstractmethod
 from taos.common.agents import SimulationAgent
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, FinanceEventNotification
-# taos.im.protocol.exchange is excluded from the public release (exchange-mode
-# only). Sentinel classes keep type hints and isinstance() checks valid; code
-# paths that operate on real instances are gated by self._exchange_mode and
-# never invoked in public sim-only deployments.
+# REQUEST-SCOPED MODE. One agent instance serves both validators concurrently, so an instance attribute
+# races: whichever request ran update() last would decide the mode for both, and a simulation request can
+# end up building an exchange response. A ContextVar is per-task, so each in-flight request carries its
+# own answer. make_response() prefers an explicit argument, then this, then the instance attribute.
+_REQUEST_EXCHANGE_MODE: "contextvars.ContextVar[bool | None]" = contextvars.ContextVar(
+    "taos_request_exchange_mode", default=None
+)
+
+# Optional component; not part of this tree. Import is guarded with sentinel classes.
 try:
     from taos.im.protocol.exchange import ExchangeStateUpdate, ExchangeAgentResponse
     from taos.im.protocol.exchange.models import OrderCurrency as ExchangeOrderCurrency
@@ -44,15 +51,13 @@ from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 class RollingWindow:
     """
     Rolling window configuration for price sampling.
+
     Attributes:
         min (int): Minimum number of samples required before signals are considered reliable.
         max (int): Maximum length of the rolling buffer (in samples).
         samples (int): If max is not used or multi-scale approach
         num_windows (int): Multi-scale approaches
         sampling_interval (int): timestamps per sample (sec or nanosec)
-    
-    Parameter Tuning Guidelines:
-        - TODO
     """
     min: int
     max: int
@@ -66,14 +71,14 @@ class Thresholds:
     Threshold configuration for generating trading signals.
 
     Attributes:
-        signal (float): 
-        tolerance (float): 
-        model (float): 
+        signal (float): Central threshold on prediction strength; strengths beyond ``signal +/- tolerance`` produce momentum/reversion signals.
+        tolerance (float): Half-width of the neutral band around ``signal``; strengths within the band produce HOLD.
+        model (float): Minimum prediction confidence required to act; predictions below it are treated as NOISE.
 
     Parameter Tuning Guidelines:
-        - Increase signal_threshold to reduce trading frequency, focus on strong trends.
+        - Increase signal to reduce trading frequency, focus on strong trends.
         - Increase tolerance to reduce overtrading in noisy markets.
-        - Adjust model_threshold to filter out unreliable signals.
+        - Adjust model to filter out unreliable signals.
     """
     signal: float
     tolerance: float
@@ -95,16 +100,15 @@ class Positions:
     
 class Signals(IntEnum):
     """
-    Enum to represent signals coming from the model
+    Enum to represent discrete trading signals derived from model predictions.
 
     Attributes:
-        ENTRY (int): Open a new position
-        EXIT (int): Close current position 
-        HOLD (int): Hold or extend current position
-        NOISE (int): Ignore
-        -- Simplified
-        BULLISH (int): Rising
-        BEARISH (int): Falling
+        REVERSION (int): Mean-reversion signal; prediction strength fell below the lower band (exit an open position, or enter one otherwise).
+        MOMENTUM (int): Momentum signal; prediction strength exceeded the upper band (enter or extend a position in the predicted direction).
+        HOLD (int): Prediction strength within the tolerance band; maintain the current position.
+        NOISE (int): Prediction confidence below the model threshold; ignore.
+        BULLISH (int): Simple-mode signal; rising price predicted (BUY direction).
+        BEARISH (int): Simple-mode signal; falling price predicted (SELL direction).
     """
     REVERSION=0
     MOMENTUM=1
@@ -141,18 +145,22 @@ class _OrderProxy:
 
     @property
     def id(self) -> int:
+        """Readable accessor for wire field ``i``."""
         return self.i
 
     @property
     def side(self) -> int:
+        """Readable accessor for wire field ``s``."""
         return self.s
 
     @property
     def price(self) -> float:
+        """Readable accessor for wire field ``p``."""
         return self.p
 
     @property
     def quantity(self) -> float:
+        """Readable accessor for wire field ``q``."""
         return self.q
 
 class UnifiedAccount:
@@ -168,10 +176,26 @@ class UnifiedAccount:
         self._raw    = raw
         self._is_dict = isinstance(raw, dict)
 
+    @property
+    def agent_id(self) -> int | None:
+        """The uid this account belongs to.
+
+        Exchange-mode account dicts are built without 'i'/'b' (engines/exchange.py _normalize), so
+        this is None there rather than invented. Returned as None, not 0, because uid 0 is a real
+        miner and a fabricated zero would be indistinguishable from it.
+        """
+        return self._raw.get('i') if self._is_dict else getattr(self._raw, 'agent_id', None)
+
+    @property
+    def book_id(self) -> int | None:
+        """The netuid this account trades on. None on the exchange path, for the same reason."""
+        return self._raw.get('b') if self._is_dict else getattr(self._raw, 'book_id', None)
+
     # ── Balance ───────────────────────────────────────────────────────────────
 
     @property
     def base_balance(self) -> _BalanceProxy:
+        """Base-currency balance, uniform across simulation and exchange account shapes."""
         if self._is_dict:
             bb = self._raw.get('bb')
             free = bb.get('f', 0.0) if isinstance(bb, dict) else self._raw.get('BASE', 0.0)
@@ -180,6 +204,7 @@ class UnifiedAccount:
 
     @property
     def quote_balance(self) -> _BalanceProxy:
+        """Quote-currency balance, uniform across simulation and exchange account shapes."""
         if self._is_dict:
             qb = self._raw.get('qb')
             free = qb.get('f', 0.0) if isinstance(qb, dict) else self._raw.get('QUOTE', 0.0)
@@ -190,24 +215,29 @@ class UnifiedAccount:
 
     @property
     def base_loan(self) -> float:
+        """Outstanding base-currency loan, 0.0 when the account carries none."""
         return self._raw.get('bl', 0.0) if self._is_dict else self._raw.base_loan
 
     @property
     def quote_loan(self) -> float:
+        """Outstanding quote-currency loan, 0.0 when the account carries none."""
         return self._raw.get('ql', 0.0) if self._is_dict else self._raw.quote_loan
 
     @property
     def base_collateral(self) -> float:
+        """Base-currency collateral held against loans, 0.0 when none."""
         return self._raw.get('bc', 0.0) if self._is_dict else self._raw.base_collateral
 
     @property
     def quote_collateral(self) -> float:
+        """Quote-currency collateral held against loans, 0.0 when none."""
         return self._raw.get('qc', 0.0) if self._is_dict else self._raw.quote_collateral
 
     # ── Orders / loans ────────────────────────────────────────────────────────
 
     @property
     def orders(self) -> list:
+        """The account's open orders on this book, as published on the state update."""
         if self._is_dict:
             raw_orders = self._raw.get('o', [])
             return [_OrderProxy(o) for o in raw_orders if isinstance(o, dict)]
@@ -215,12 +245,14 @@ class UnifiedAccount:
 
     @property
     def loans(self) -> dict:
+        """The account's open loans keyed by id; empty when none."""
         return {} if self._is_dict else self._raw.loans
 
     # ── Fees ──────────────────────────────────────────────────────────────────
 
     @property
     def fees(self) -> _FeesProxy:
+        """The account's current fee rates, uniform across both account shapes."""
         if self._is_dict:
             f = self._raw.get('f', {})
             if isinstance(f, dict):
@@ -230,9 +262,52 @@ class UnifiedAccount:
 
     @property
     def traded_volume(self) -> float:
+        """Volume this account has traded, as the validator computed it.
+
+        The dict branch reads 'v', the key every producer writes; 'tv' is accepted as a fallback. The
+        object branch delegates to the model's own `traded_volume` property.
+        """
         if self._is_dict:
-            return self._raw.get('tv', 0.0)
-        return getattr(self._raw, 'traded_volume', 0.0)
+            _v = self._raw.get('v')
+            if _v is None:
+                _v = self._raw.get('tv')
+            return _v
+        return getattr(self._raw, 'traded_volume', None)
+
+    @property
+    def v(self) -> float | None:
+        """Short alias, matching the field name on the Account model."""
+        return self.traded_volume
+
+    @property
+    def delegate_stakes(self) -> dict[str, float]:
+        """This account's alpha on this book, per delegate hotkey. Empty means NOT REPORTED.
+
+        THE POINT: base_balance.free is a SUM across delegates, and a pool SELL draws on ONE of them, so
+        an order sized from the total is refused INSUFFICIENT_FUNDS on an account that visibly holds
+
+        Both branches, for the reason traded_volume records above: the dict branch is the exchange path
+        and the object branch is simulation, and an accessor that handles only one of them is how a field
+        reaches half the miners.
+        """
+        if self._is_dict:
+            return self._raw.get('ds') or {}
+        return getattr(self._raw, 'delegate_stakes', None) or {}
+
+    @property
+    def ds(self) -> dict[str, float]:
+        """Short alias, matching the field name on the Account model."""
+        return self.delegate_stakes
+
+    @property
+    def sellable_alpha(self) -> float:
+        """The most alpha ONE order can sell here: the largest single delegate's stake.
+
+        Returns 0.0 when the breakdown was not reported. A caller must read that as UNKNOWN and fall back
+        to base_balance.free (the pre-existing contract), not as "nothing to sell".
+        """
+        _ds = self.delegate_stakes
+        return max(_ds.values()) if _ds else 0.0
 
     @property
     def raw(self):
@@ -272,7 +347,27 @@ class UnifiedAgentResponse:
         expiryPeriod=None,
         leverage: float = 0.0,
         settlement_option=LoanSettlementOption.NONE,
+        # SL/TP ARE SUPPORTED BY BOTH ENGINES; only this wrapper omitted them, which made them
+        # unreachable through the unified API. PlaceLimitOrderInstruction declares stop_loss/take_profit
+        # in BOTH taos/im/protocol/instructions.py and .../exchange/instructions.py, so an agent calling
+        # limit_order(..., stop_loss=...) got "TypeError: unexpected keyword argument 'stop_loss'" and
+        # lost the whole response -- 19 times in one dwell for OrderOptionAgent, whose purpose is to
+        # exercise exactly these order options.
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
+        """Queue a limit order on this response.
+
+        Args:
+            book_id: Book to place on.
+            direction: BUY or SELL.
+            quantity: Order size, in ``currency`` units.
+            price: Limit price.
+            delay (int): Engine-side ordering key within the batch.
+
+        Additional execution flags (time in force, STP, post-only, SL/TP, currency, leverage) are accepted as
+        keyword arguments and forwarded onto the instruction.
+        """
         if self._exchange_mode:
             from taos.im.protocol.exchange.instructions import PlaceLimitOrderInstruction
             self.instructions.append(PlaceLimitOrderInstruction(
@@ -281,6 +376,7 @@ class UnifiedAgentResponse:
                 quantity=quantity, price=price, clientOrderId=clientOrderId,
                 stp=stp, postOnly=postOnly, timeInForce=timeInForce,
                 expiryPeriod=expiryPeriod, settleFlag=settlement_option,
+                stop_loss=stop_loss, take_profit=take_profit,
                 # leverage silently dropped — exchange does not support margin
             ))
         else:
@@ -291,6 +387,7 @@ class UnifiedAgentResponse:
                 clientOrderId=clientOrderId, stp=stp, postOnly=postOnly,
                 timeInForce=timeInForce, expiryPeriod=expiryPeriod,
                 leverage=leverage, settleFlag=settlement_option,
+                stop_loss=stop_loss, take_profit=take_profit,
             ))
 
     def market_order(
@@ -308,6 +405,16 @@ class UnifiedAgentResponse:
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> None:
+        """Queue a market order on this response.
+
+        Args:
+            book_id: Book to place on.
+            direction: BUY or SELL.
+            quantity: Order size, in ``currency`` units.
+            delay (int): Engine-side ordering key within the batch.
+
+        Additional execution flags are accepted as keyword arguments and forwarded onto the instruction.
+        """
         if self._exchange_mode:
             from taos.im.protocol.exchange.instructions import PlaceMarketOrderInstruction
             self.instructions.append(PlaceMarketOrderInstruction(
@@ -333,10 +440,26 @@ class UnifiedAgentResponse:
 
     def cancel_order(self, book_id, order_id, quantity=None, delay: int = 0) -> None:
         # quantity=None → full cancel; a value → partial cancel of that many BASE units.
+        """Queue a cancellation of one order.
+
+        Args:
+            book_id: Book the order rests on.
+            order_id: The order to cancel.
+            quantity: Partial-cancel volume; None cancels the full remainder.
+            delay (int): Engine-side ordering key within the batch.
+        """
         self.cancel_orders(book_id, [order_id], volume=quantity, delay=delay)
 
     def cancel_orders(self, book_id, order_ids, volume=None, delay: int = 0) -> None:
         # volume applies to every order id (None = full cancel); pass a list to vary per order.
+        """Queue cancellations for several orders on one book.
+
+        Args:
+            book_id: Book the orders rest on.
+            order_ids: The orders to cancel.
+            volume: Partial-cancel volume applied to each; None cancels full remainders.
+            delay (int): Engine-side ordering key within the batch.
+        """
         vols = volume if isinstance(volume, (list, tuple)) else [volume] * len(order_ids)
         if self._exchange_mode:
             from taos.im.protocol.exchange.instructions import (
@@ -355,16 +478,69 @@ class UnifiedAgentResponse:
             ))
 
     def close_position(self, book_id, order_id, quantity=None, delay: int = 0) -> None:
+        """Queue a position close.
+
+        Args:
+            book_id: Book the position is on.
+            order_id: The position order to close.
+            quantity: Partial-close size; None closes it fully.
+            delay (int): Engine-side ordering key within the batch.
+
+        Simulation only. The exchange has no position-close instruction, and this call is IGNORED
+        there with a warning rather than translated: to flatten a position on the exchange, place
+        the opposite-side order yourself.
+        """
         if self._exchange_mode:
-            bt.logging.warning("close_position is not supported in exchange mode — ignored")
+            bt.logging.warning("close_position is not supported in exchange mode; the call was ignored. Place the opposite-side order instead.")
             return
         from taos.im.protocol.instructions import ClosePositionsInstruction, ClosePositionInstruction
         self.instructions.append(ClosePositionsInstruction(
             agentId=self.agent_id, delay=delay, bookId=book_id,
-            positions=[ClosePositionInstruction(orderId=order_id, volume=quantity)],
+            # The field is `closes`; there is no `positions` field, and passing one is a pydantic
+            # "Field required" raised inside the miner's own agent at runtime.
+            closes=[ClosePositionInstruction(orderId=order_id, volume=quantity)],
         ))
 
+    def close_positions(self, book_id, order_ids, delay: int = 0) -> None:
+        """Plural form of close_position, mirroring FinanceAgentResponse.close_positions.
+
+        MISSING UNTIL 2026-08-09, which mattered: the shipped example agents cannot be migrated onto
+        this mode-aware response until it covers every builder they call, and OrderOptionAgent calls
+        this one. A partial surface means "swap the constructor" breaks that agent at runtime, in
+        exchange mode only, where it is hardest to notice.
+
+        Args:
+            book_id: Book the positions are on.
+            order_ids: The position orders to close.
+            delay (int): Engine-side ordering key within the batch.
+        """
+        if self._exchange_mode:
+            bt.logging.warning("close_positions is not supported in exchange mode - ignored")
+            return
+        from taos.im.protocol.instructions import ClosePositionsInstruction, ClosePositionInstruction
+        self.instructions.append(ClosePositionsInstruction(
+            agentId=self.agent_id, delay=delay, bookId=book_id,
+            # FIELD IS `closes`, NOT `positions` (taos/im/protocol/instructions.py:249). Passing the
+            # wrong name is a pydantic "Field required" at RUNTIME only, so it survived review and
+            # surfaced as an agent failure: OrderOptionAgent lost the whole update each time it closed.
+            closes=[ClosePositionInstruction(orderId=oid, volume=None) for oid in order_ids],
+        ))
+
+    def model_copy(self, *args, **kwargs) -> "UnifiedAgentResponse":
+        """Agents treat the response like a pydantic model in places; this is not one.
+
+        OrderOptionAgent calls response.model_copy(). Returning self keeps that working rather than
+        raising AttributeError deep inside an agent, and copying is meaningless here because the
+        instruction list is built up in place and finalize() produces the real model.
+        """
+        return self
+
     def add_instruction(self, instruction) -> None:
+        """Append an already-built instruction to this response.
+
+        Args:
+            instruction: The instruction to send this step.
+        """
         self.instructions.append(instruction)
 
     def finalize(self) -> FinanceAgentResponse | ExchangeAgentResponse:
@@ -378,10 +554,17 @@ class UnifiedAgentResponse:
 
 
 # Base class for agents operating in intelligent market simulations
-class FinanceSimulationAgent(SimulationAgent):
+class FinanceAgentBase(SimulationAgent):
     # Populated each tick from the (decompressed) state in update(). Declared here
     # so subclasses see a concrete type instead of the synapse field's wire union
     # (MarketSimulationConfig | str | ExchangeConfig | dict | None).
+    """Base class for dual-mode trading agents.
+
+    One subclass serves both mechanisms: ``handle`` routes a simulation or exchange state update to the same
+    strategy code, accounts and notices arrive in one uniform shape, and the notice handlers (``onTrade``,
+    ``onOrderAccepted``, ``onOrderCancelled``, ...) fire identically in either mode. Known until 2026-08-18 as
+    ``FinanceSimulationAgent``, which remains an alias.
+    """
     simulation_config: MarketSimulationConfig
     # Per-tick event notices for this agent. Events are dispatched by their string
     # `.type` tag (match/case), which the type system cannot correlate with the
@@ -399,6 +582,11 @@ class FinanceSimulationAgent(SimulationAgent):
         Returns:
             None
         """
+        # Agents launched without --agent.params get config=None; default to an
+        # empty Namespace so getattr(config, ...) defaults apply and setting
+        # config.lazy_load below doesn't raise.
+        if config is None:
+            config = argparse.Namespace()
         self.history = []
         # State snapshots kept for handlers that read self.history (e.g. last
         # bid/ask). 0 keeps none — set it on agents that never read history to
@@ -439,7 +627,7 @@ class FinanceSimulationAgent(SimulationAgent):
                 k, _, v = pair.partition("=")
                 k = k.strip()
                 if k:
-                    out[k] = FinanceSimulationAgent._coerce_live_value(v.strip())
+                    out[k] = FinanceAgentBase._coerce_live_value(v.strip())
         return out
 
     def _parse_live_config_body(self, body: str) -> dict:
@@ -527,6 +715,14 @@ class FinanceSimulationAgent(SimulationAgent):
         return None
 
     def handle(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
+        """Route a state update to this agent and return its response.
+
+        Args:
+            state: The block's state update, simulation or exchange.
+
+        Returns:
+            The response type matching the update's mechanism.
+        """
         self._apply_pending_live_config()
         return super().handle(state)
 
@@ -540,7 +736,34 @@ class FinanceSimulationAgent(SimulationAgent):
         return notification
     
     def simulation_output_dir(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
-        simulation_output_dir = os.path.join(self.output_dir, state.dendrite.hotkey, state.config.simulation_id)
+        # simulation_id is OPTIONAL on the model (`simulation_id : str | None = None`), so joining it
+        # unguarded raises TypeError: join() argument must be str ... not 'NoneType' and takes the
+        # agent's whole respond() with it. Measured on v54: ArbitrageAgent raised this every state
+        # update, logged it ~every 2.5s, and the acceptance stage recorded it as the agent seeing no
+        # updates at all -- a crash in a path shared by every GenTRX agent, reported as silence.
+        #
+        # A missing id is a real gap (it is what keeps one run's data out of another's directory), so
+        # this does not paper over it: it names the state type and the netuid in the label, and warns
+        # once, so the next occurrence identifies its own source instead of needing this trace again.
+        """The output directory this update's simulation writes to.
+
+        Args:
+            state: The update naming the simulation.
+
+        Returns:
+            str: The directory path.
+        """
+        sim_id = getattr(state.config, "simulation_id", None)
+        if not sim_id:
+            sim_id = f"unidentified-{type(state).__name__}-netuid{getattr(state, 'netuid', 'NA')}"
+            if not getattr(self, "_warned_missing_simulation_id", False):
+                self._warned_missing_simulation_id = True
+                bt.logging.warning(
+                    f"state.config.simulation_id is empty on {type(state).__name__}; "
+                    f"writing agent output under '{sim_id}'. Data from separate runs will share this "
+                    f"directory until the sender populates simulation_id."
+                )
+        simulation_output_dir = os.path.join(self.output_dir, state.dendrite.hotkey, sim_id)
         os.makedirs(simulation_output_dir, exist_ok=True)
         return simulation_output_dir
     
@@ -683,7 +906,12 @@ class FinanceSimulationAgent(SimulationAgent):
         
     
     def log_order_event(self, event : LimitOrderPlacementEvent | MarketOrderPlacementEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
-        """Log LimitOrderPlacementEvent or MarketOrderPlacementEvent to CSV."""
+        """Log LimitOrderPlacementEvent or MarketOrderPlacementEvent to CSV.
+
+        Args:
+            event: The placement event to log.
+            state: The state update it arrived on.
+        """
         orders_log_file = os.path.join(self.simulation_output_dir(state), 'orders.csv')
         file_exists = os.path.exists(orders_log_file)
         with open(orders_log_file, mode='a', newline='') as f:
@@ -710,7 +938,12 @@ class FinanceSimulationAgent(SimulationAgent):
             ])
 
     def log_cancellation_event(self, event : OrderCancellationEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
-        """Log OrderCancellationEvent to CSV."""
+        """Log OrderCancellationEvent to CSV.
+
+        Args:
+            event: The cancellation event to log.
+            state: The state update it arrived on.
+        """
         cancellations_log_file = os.path.join(self.simulation_output_dir(state), 'cancellations.csv')
         file_exists = os.path.exists(cancellations_log_file)
         with open(cancellations_log_file, mode='a', newline='') as f:
@@ -729,7 +962,12 @@ class FinanceSimulationAgent(SimulationAgent):
             ])
 
     def log_trade_event(self, event : TradeEvent, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
-        """Log TradeEvent to CSV."""
+        """Log TradeEvent to CSV.
+
+        Args:
+            event: The trade event to log.
+            state: The state update it arrived on.
+        """
         trades_log_file = os.path.join(self.simulation_output_dir(state), 'trades.csv')
         file_exists = os.path.exists(trades_log_file)
         with open(trades_log_file, mode='a', newline='') as f:
@@ -1049,12 +1287,12 @@ class FinanceSimulationAgent(SimulationAgent):
 # Unified base class (simulation + exchange)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FinanceAgent(FinanceSimulationAgent):
+class FinanceAgent(FinanceAgentBase):
     """
     Unified base class for agents that must operate in both simulation and
     exchange modes without modification.
 
-    Extends FinanceSimulationAgent so all simulation event hooks, history,
+    Extends FinanceAgentBase so all simulation event hooks, history,
     and debug logging are preserved in simulation mode.  In exchange mode the
     update() path is minimal (no event processing) and self.accounts is
     populated with UnifiedAccount wrappers keyed by netuid.
@@ -1074,6 +1312,23 @@ class FinanceAgent(FinanceSimulationAgent):
         self._pools: dict = {}
         super().__init__(uid, config, log_dir)
 
+    @property
+    def exchange_mode(self) -> bool:
+        """True while serving an ExchangeStateUpdate, False for a simulation one.
+
+        THE SUPPORTED WAY FOR AN AGENT TO ASK. Most logic needs no mode branch at all -- the account and
+        book surfaces are the same objects in both -- but a few parameters genuinely differ, and leverage
+        is the one that bites: exchange mode runs with maxLeverage=0, so a leveraged order is REFUSED at
+        placement rather than quietly executed unleveraged. An example agent that asks for leverage
+        unconditionally therefore works in simulation and has every order rejected on the exchange.
+
+        Reads the REQUEST-scoped value first. One agent instance serves both validators concurrently, so
+        the instance attribute alone can report the other request's mode; `self._exchange_mode` is the
+        fallback for code paths outside a request.
+        """
+        _req = _REQUEST_EXCHANGE_MODE.get()
+        return bool(self._exchange_mode if _req is None else _req)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def handle(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate) -> FinanceAgentResponse | ExchangeAgentResponse:
@@ -1088,6 +1343,8 @@ class FinanceAgent(FinanceSimulationAgent):
         """
         self._apply_pending_live_config()
         exchange_mode = isinstance(state, ExchangeStateUpdate)
+        # Bind the mode for THIS request only; see _REQUEST_EXCHANGE_MODE at the top of the module.
+        _mode_token = _REQUEST_EXCHANGE_MODE.set(exchange_mode)
         if exchange_mode:
             header = (
                 "\n" + '-' * 50 + "\n"
@@ -1101,11 +1358,20 @@ class FinanceAgent(FinanceSimulationAgent):
         else:
             response = self.respond_simulation(state)
         self.report(state, response)
-        if isinstance(response, UnifiedAgentResponse):
-            return response.finalize()
-        return response
+        try:
+            if isinstance(response, UnifiedAgentResponse):
+                return response.finalize()
+            return response
+        finally:
+            _REQUEST_EXCHANGE_MODE.reset(_mode_token)
 
     def report(self, state: MarketSimulationStateUpdate | ExchangeStateUpdate, response: FinanceAgentResponse | ExchangeAgentResponse) -> None:
+        """Log a one-block summary of state and the response this agent produced.
+
+        Args:
+            state: The block's state update.
+            response: The response about to be returned.
+        """
         exchange_mode = isinstance(state, ExchangeStateUpdate)
         label = 'EXCHANGE' if exchange_mode else 'SIMULATION'
         update_text = '-' * 50 + "\n"
@@ -1134,19 +1400,69 @@ class FinanceAgent(FinanceSimulationAgent):
         Called for ExchangeStateUpdate requests.
 
         Override in subclasses to handle exchange state.  Default delegates to
-        respond() for backward compatibility with agents that implement the
-        single-method API.
+        respond_simulation(), which itself falls back to respond() -- so a miner's
+        existing agent runs unchanged on the exchange whichever of the two
+        single-method APIs it was written against.
+
+        An agent may implement any one of respond(), respond_simulation() or respond_exchange(); all
+        three shapes route here, because respond_simulation()'s own default is respond(). Delegating to
+        respond() directly would return None for an agent that only implements respond_simulation(),
+        and handle() passes that to report().
         """
-        return self.respond(state)
+        return self.respond_simulation(state)
+
+    def _sltp_kwargs(self, direction) -> dict:
+        """stop_loss/take_profit/sltp_std kwargs for an order in `direction`.
+
+        Reads sl_pct, tp_pct and sltp_std_pct off self, which a subclass sets in initialize(); returns
+        {} when neither sl_pct nor tp_pct is configured. Sign convention is relative to entry: for a BUY
+        the stop sits below and the target above, and the reverse for a SELL.
+        """
+        sl_pct = getattr(self, 'sl_pct', None)
+        tp_pct = getattr(self, 'tp_pct', None)
+        sltp_std_pct = getattr(self, 'sltp_std_pct', None)
+        if sl_pct is None and tp_pct is None:
+            return {}
+        sign = 1 if int(direction) == 0 else -1      # 0 == BUY on the wire, in both modes
+        kwargs = {}
+        if sl_pct is not None:
+            kwargs['stop_loss'] = -sign * sl_pct / 100
+        if tp_pct is not None:
+            kwargs['take_profit'] = sign * tp_pct / 100
+        if sltp_std_pct is not None:
+            kwargs['sltp_std'] = sltp_std_pct / 100
+        return kwargs
 
     def update(self, state) -> None:
+        """Refresh the agent's cached view (accounts, events, books) from a state update."""
         if isinstance(state, ExchangeStateUpdate):
             # Minimal exchange-mode setup — no simulation event processing
             self.simulation_config = cast(MarketSimulationConfig, state.config)
             raw = (state.accounts or {}).get(self.uid, {})
             self.accounts = {bid: UnifiedAccount(a) for bid, a in raw.items()}
-            self.events   = list((state.notices or {}).get(self.uid, []))
+            # parse_notices keys by int uid on both paths, so one lookup is enough. The warning stays:
+            # notices present for other uids but none for this one is worth seeing, and it is the signal
+            # that caught the stringified-key mismatch when the two paths disagreed.
+            _nt = state.notices or {}
+            _mine = _nt.get(self.uid, [])
+            self.events = list(_mine)
+            # PAIRED WITH NOTICEWIRE on the validator side. A refusal notice has been proven built,
+            # routed, merged and synapse-valid, and this list still comes up empty, so the two ends must
+            # be comparable: what was packed for this uid versus what arrived.
+            if _mine:
+                import bittensor as _bt2
+                from collections import Counter as _C
+                _bt2.logging.info(
+                    f"NOTICEWIRE uid={self.uid} received "
+                    f"{dict(_C(str(getattr(n, 'y', None) or getattr(n, 'type', None) or '?') for n in _mine))}")
+            if _nt and not _mine:
+                import bittensor as _bt
+                _bt.logging.warning(
+                    f"NOTICEKEYS uid={self.uid!r} ({type(self.uid).__name__}) found no notices; "
+                    f"keys present: {[ (k, type(k).__name__) for k in list(_nt)[:5] ]}"
+                )
             self._exchange_mode = True
+            self._dispatch_notice_handlers(state)
             # Cache pools so empty-book fallback works even when state.pools is
             # None (pools can be lost during bt.Synapse JSON serialisation).
             # Prefer state.pools; fall back to 'price' embedded in each account.
@@ -1171,6 +1487,65 @@ class FinanceAgent(FinanceSimulationAgent):
             self.accounts = {bid: UnifiedAccount(a) for bid, a in self.accounts.items()}
             self._exchange_mode = False
 
+    def _dispatch_notice_handlers(self, state) -> None:
+        """Fire the documented per-notice handlers for exchange-mode notices.
+
+        agents/README presents onStart, onOrderAccepted, onOrderRejected, onOrderCancelled,
+        onOrderCancellationFailed, onPositionClosed, onPositionCloseFailed, onTrade and onEnd as the way
+        a miner consumes notices, and says nothing about a mode. The simulation path dispatches all of
+        them; the exchange path set self.events and dispatched none, so a ported agent that handles
+        onTrade ran on the exchange and was never told about its fills. No error, no warning -- the
+        handler simply never called, which is the one failure a miner cannot debug from the outside.
+
+        The types and signatures deliberately mirror the simulation path, including onTrade taking the
+        validator hotkey as its second argument: an exchange calling it with one would raise on the
+        argument count inside the response builder, which is worse than not calling it.
+
+        ONE MINER'S BUGGY HANDLER COSTS THAT HANDLER, NOT THE RESPONSE. An exception here used to
+        propagate out of the response builder and lose the agent's whole response for the tick -- the
+        SimpleRegressorAgent failure. Each dispatch is isolated and logged.
+
+        onStart and onEnd are dispatched only if such an event actually arrives. An exchange does not
+        start or end, and firing them off every update would make an agent that initialises in onStart
+        re-initialise on every tick.
+        """
+        ended = None
+        for event in self.events or []:
+            etype = getattr(event, "type", None)
+            try:
+                match etype:
+                    case "EVENT_SIMULATION_START" | "ESS":
+                        self.onStart(event)
+                    case "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "RDPOL" | "RDPOM":
+                        self.onOrderAccepted(event)
+                    case "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "ERDPOL" | "ERDPOM":
+                        self.onOrderRejected(event)
+                    case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "RDCO":
+                        for cancellation in (getattr(event, "cancellations", None) or []):
+                            self.onOrderCancelled(cancellation)
+                    case "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERDCO":
+                        for cancellation in (getattr(event, "cancellations", None) or []):
+                            self.onOrderCancellationFailed(cancellation)
+                    case "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "RDCP":
+                        for close in (getattr(event, "closes", None) or []):
+                            self.onPositionClosed(close)
+                    case "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "ERDCP":
+                        for close in (getattr(event, "closes", None) or []):
+                            self.onPositionCloseFailed(close)
+                    case "EVENT_TRADE" | "ET":
+                        self.onTrade(event, getattr(getattr(state, "dendrite", None), "hotkey", None))
+                    case "EVENT_SIMULATION_END" | "ESE":
+                        ended = event
+                    case _:
+                        pass
+            except Exception:
+                bt.logging.exception(f"notice handler for {etype} raised; continuing with the rest")
+        if ended is not None:
+            try:
+                self.onEnd(ended)
+            except Exception:
+                bt.logging.exception("onEnd raised")
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def make_response(self, exchange_mode: "bool | None" = None) -> UnifiedAgentResponse:
@@ -1182,10 +1557,26 @@ class FinanceAgent(FinanceSimulationAgent):
         """
         return UnifiedAgentResponse(
             agent_id=self.uid,
-            exchange_mode=self._exchange_mode if exchange_mode is None else exchange_mode,
+            # Precedence: explicit argument, then the REQUEST-scoped value, then the legacy instance
+            # attribute. The instance attribute is shared across concurrent requests from both
+            # validators, so relying on it alone let a simulation request build an exchange response.
+            exchange_mode=(
+                exchange_mode if exchange_mode is not None
+                else (_REQUEST_EXCHANGE_MODE.get() if _REQUEST_EXCHANGE_MODE.get() is not None
+                      else self._exchange_mode)
+            ),
             delegate=getattr(self, 'delegate', ''),
         )
 
+
+
+# Backward-compatible alias. `FinanceAgentBase` was named `FinanceSimulationAgent` until 2026-08-18, which
+# read as "the simulation-mode class" when it is in fact the mode-agnostic base: its body has no mode
+# branch at all and every mention of the exchange state in it is a type annotation. The mode dispatch lives
+# in `FinanceAgent` below it. Miner agents in the wild subclass the old name, so it stays exported and
+# pointing at the same object -- `issubclass(FinanceAgent, FinanceSimulationAgent)` therefore still holds,
+# which is what the composer's own validation asserts.
+FinanceSimulationAgent = FinanceAgentBase
 
 
 from taos.im.utils.history import history, batch_history
@@ -1566,9 +1957,9 @@ class StateHistoryManager:
             self.last_snapshot = {}
             self.history = {}
 
-# GenTRXAgent extends FinanceSimulationAgent with distributed training.
+# GenTRXAgent extends FinanceAgentBase with distributed training.
 # Import is deferred to end of file to avoid the circular-import that would
-# result from gentrx.py importing FinanceSimulationAgent from this module.
+# result from gentrx.py importing FinanceAgentBase from this module.
 try:
     from taos.im.agents.gentrx import GenTRXAgent  # noqa: F401
 except ImportError:

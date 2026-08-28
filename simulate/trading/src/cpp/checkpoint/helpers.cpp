@@ -69,6 +69,27 @@ namespace taosim::checkpoint
 
 //-------------------------------------------------------------------------
 
+void restoreSignalCounters(MultiBookExchangeAgent* exchange, const msgpack::object& section)
+{
+    if (exchange == nullptr) return;
+    if (section.type != msgpack::type::MAP) {
+        throw CheckpointError{"checkpoint: signals section is not a map"};
+    }
+    auto& signalsMap = exchange->signals();
+    for (uint32_t i = 0; i < section.via.map.size; ++i) {
+        BookId bookId{};
+        section.via.map.ptr[i].key.convert(bookId);
+        const auto it = signalsMap.find(bookId);
+        if (it == signalsMap.end() || !it->second) continue;
+        // Plain integer into the EXISTING object. Never a convert of the object or of the map.
+        uint64_t counter{};
+        section.via.map.ptr[i].val.convert(counter);
+        it->second->eventCounter = counter;
+    }
+}
+
+//-------------------------------------------------------------------------
+
 CheckpointToken postProcessToken(const CheckpointToken& token)
 {
     if (s_specialTokens.contains(token)) {
@@ -272,18 +293,7 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
     };
 
     auto setupSignals = [&](const msgpack::object& o) {
-        if (o.type != msgpack::type::MAP) {
-            throw taosim::checkpoint::CheckpointError{std::to_string(blockIdx)};
-        }
-        auto& signalsMap = simu.exchange()->signals();
-        for (uint32_t i = 0; i < o.via.map.size; ++i) {
-            BookId bookId;
-            o.via.map.ptr[i].key.convert(bookId);
-            const auto it = signalsMap.find(bookId);
-            if (it != signalsMap.end() && it->second) {
-                o.via.map.ptr[i].val.convert(*it->second);
-            }
-        }
+        restoreSignalCounters(simu.exchange(), o);
     };
 
     for (const auto& [k, val] : o.via.map) {
@@ -335,6 +345,12 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
         }
         else if (key == "localTradeByOrderSubs") {
             val.convert(simu.exchange()->localTradeByOrderSubs());
+        }
+        else if (key == "localOwnTradeSubs") {
+            val.convert(simu.exchange()->localOwnTradeSubs());
+        }
+        else if (key == "bookTradeStats") {
+            val.convert(simu.exchange()->bookTradeStats());
         }
         else if (key == "sltpContainer") {
             // Restore the per-book trigger state in place; the container's

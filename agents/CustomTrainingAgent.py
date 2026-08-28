@@ -49,6 +49,7 @@ class CustomTrainingAgent(GenTRXAgent):
         # Opt-in guard: training is a no-op unless the operator explicitly
         # passes gtx_training_enabled=true in --agent.params.  Remove these
         # two lines if you always want training enabled.
+        """Set up strategy state and register with the training server when configured."""
         if not hasattr(self.config, "gtx_training_enabled"):
             self.config.gtx_training_enabled = False
         if not hasattr(self.config, "gtx_collect_data"):
@@ -65,6 +66,7 @@ class CustomTrainingAgent(GenTRXAgent):
     def respond(self, state):
         # MUST call super() first: runs data collection, inference, and
         # queues training if an assignment arrived this tick.
+        """Produce this block's response from the custom-trained model's signal."""
         response = super().respond(state)
 
         # Add your order-placement logic here, modifying `response`.
@@ -103,6 +105,18 @@ class CustomTrainingAgent(GenTRXAgent):
           - Normalise differently: change rel_price or volume encoding
           - Add extra columns:     they will be ignored by OrderDataset but are
                                    preserved in the parquet file for offline use
+
+        Args:
+            book_id: Book the event is on.
+            ts: Event timestamp.
+            order_type: BID, ASK or CANCEL.
+            price_ticks: Price expressed in ticks.
+            qty: Event quantity.
+            snap: The book snapshot at the event.
+            session_open_mid: Session-open mid price for normalisation.
+
+        Returns:
+            dict | None: The row to buffer, or None to drop the event.
         """
         # --- Drop any event type you don't want recorded, e.g.: ----------
         # if order_type == CANCEL:
@@ -157,6 +171,13 @@ class CustomTrainingAgent(GenTRXAgent):
           - Train only on specific books (assignment["books"] lists them)
           - Skip very small files that would produce degenerate batches
           - Prefer locally-collected files over S3-fetched ones
+
+        Args:
+            parquet_files: The downloaded training files.
+            assignment: The training assignment being served.
+
+        Returns:
+            list: The files to train on; empty skips the window.
         """
         # assignment keys: round, books, ts_start, ts_end, validator_uid, data, …
         # Use them to drive filtering logic, e.g.:
@@ -209,6 +230,11 @@ class CustomTrainingAgent(GenTRXAgent):
           - Filter or reweight pages in select_training_files().
           - Keep _submit_gradient() as the publish surface — the validator reads
             that exact S3 path.
+
+        Args:
+            parquet_files: The files selected for this window.
+            train_model: A deep copy of the model; safe to mutate.
+            assignment: The training assignment being served.
         """
         from GenTRX.src.dataloader import OrderDataset, InterleaveSampler
         from GenTRX.src.distributed import train_incremental

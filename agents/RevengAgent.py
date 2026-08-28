@@ -1018,6 +1018,15 @@ class RevengAgent(GenTRXAgent):
         """
 
         def build_trade(event: TradeEvent, prev_volume: float) -> MyTrade:
+            """Build the strategy's trade record from a trade event.
+
+            Args:
+                event (TradeEvent): The fill event.
+                prev_volume (float): Volume already attributed to this order.
+
+            Returns:
+                MyTrade: The strategy-side record.
+            """
             taker = event.takerAgentId == self.uid
             side = event.side if taker else int(abs(event.side - 1))
             fee = event.takerFee if taker else event.makerFee
@@ -1038,7 +1047,15 @@ class RevengAgent(GenTRXAgent):
         if event.takerAgentId == event.makerAgentId:
             return  # Self-trade — ignore
 
-        buf = self.buffers[validator][book_id]
+        # A trade notice can arrive before this validator's first state update. The buffers are
+        # created in the state-update path (initialise_book), keyed by the validator hotkey, and the
+        # ordering between a notice and a state update is not guaranteed.
+        #
+        # Skip the trade rather than inventing a buffer: without the state update there is no
+        # timestamp to seed one from, and the next state update creates it properly.
+        buf = self.buffers.get(validator, {}).get(book_id)
+        if buf is None:
+            return
         trade = build_trade(event, buf.traded_volume)
         buf.returns.append(trade)
 
