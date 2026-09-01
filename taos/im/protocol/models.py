@@ -2545,6 +2545,8 @@ class LazyLevels(Sequence):
         self._parsed = {}
 
     def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self._raw_levels)))]
         if i not in self._parsed:
             self._parsed[i] = LazyLevel(self._raw_levels[i])
         return self._parsed[i]
