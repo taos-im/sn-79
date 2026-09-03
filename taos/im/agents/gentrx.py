@@ -2294,7 +2294,7 @@ def _cfg_bool(config: Any, key: str, default: bool) -> bool:
         return default
     if isinstance(val, bool):
         return val
-    if isinstance(val, int):
+    if isinstance(val, (int, float)):
         return bool(val)
     # FLOATS ARRIVE HERE ROUTINELY, because ParseKwargs (taos/common/config/__init__.py) calls float()
     # on every --agent.params value it can. So `gtx_enabled=0` reaches this as 0.0, which is NOT an int,
