@@ -54,6 +54,17 @@ public:
     void clearOrderRejects() noexcept { m_orderRejects.clear(); }
     void addOrderReject(OrderReject reject) { m_orderRejects.push_back(std::move(reject)); }
 
+    // DIRECT DELIVERY, for a notice raised from inside order matching.
+    //
+    // dispatchMessage QUEUES at the current simulation timestamp, and the exchange-service batch
+    // handler never drains that queue after matching -- so a message raised from deep inside
+    // Book::preventSelfTrade is dispatched and NEVER delivered: it produces no proxy receipt at all,
+    // while cancel responses raised at batch boundaries arrive normally. EVENT_TRADE already sidesteps this
+    // the same way, through tradeSignal() rather than the queue.
+    //
+    // Same buffer the queued path feeds, so the notice is packed and cleared exactly like any other.
+    void pushNotice(Message::Ptr msg) { m_messages.push_back(std::move(msg)); }
+
     virtual void receiveMessage(Message::Ptr msg) override;
     virtual void configure(const pugi::xml_node& node) override;
 

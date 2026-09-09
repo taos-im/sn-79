@@ -36,7 +36,7 @@ class _BtLoggingHandler(logging.Handler):
         # DO NOT FEED bt.logging BACK INTO ITSELF. bt.logging writes THROUGH stdlib logging, so a
         # handler on the root logger receives bittensor's own records and forwards them to bt.logging
         # again, which re-emits them, each pass adding another prefix. Observed immediately after this
-        # bridge was installed on 2026-08-09:
+        # bridge was installed:
         #     INFO | [bittensor] [bittensor] [bittensor] [bittensor] [bittensor]
         # which also buried this module's own install announcement, so the check that was supposed to
         # confirm the bridge was live reported it absent.

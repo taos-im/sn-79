@@ -11,7 +11,7 @@ that fail without saying so:
   matches `case _: pass`. No handler, no error, no log line.
 
 Together they mean an exchange miner could receive every notice and run no code at all, which is what it
-did until 2026-08-19. Every other test in this area asserts on a notice's fields; this one asserts on the
+once did. Every other test in this area asserts on a notice's fields; this one asserts on the
 consequence, starting from the bytes the engine actually sends.
 """
 

@@ -8,7 +8,7 @@
  * numbers. Two properties of the generic path made that impossible:
  *
  *   1. rao is 1e-9, so an on-chain amount needs NINE decimal places. double2decimal truncates at
- *      kDefaultDecimalPlaces = 8, which cannot hold one. Measured on real settlements: a settled
+ *      kDefaultDecimalPlaces = 8, which cannot hold one. Taken from real settlements: a settled
  *      0.999496465 alpha was recorded as 0.99949646, and 0.999496453 as 0.99949645.
  *
  *   2. The amount arrives as `rao / 1e9` computed in Python, and that double can sit just BELOW the
@@ -57,7 +57,7 @@ taosim::decimal_t ratio(int64_t num, int64_t den)
 
 //-------------------------------------------------------------------------
 
-// The three amounts measured on real settlements, whose ninth digit the old path discarded.
+// The three amounts taken from real settlements, whose ninth digit the old path discarded.
 TEST(ChainAmountPrecision, NinthDecimalDigitSurvives)
 {
     const int64_t cases[] = {

@@ -97,6 +97,15 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         if self.query_process.poll() is not None:
             self.pagerduty_alert("Failed to restart query service")
             return responses
+    # RELEASE ONLY WHAT THIS CALL ACQUIRED. asyncio.Lock has no owner, so release() from a coroutine
+    # that never acquired it frees the lock a DIFFERENT in-flight forward() is holding. This try opens
+    # ~60 lines before the acquire below, and forward() is re-entrant across that span because the
+    # reward-catchup loop awaits inside it: an early return (observe) or any exception before the
+    # acquire reached the unconditional release in the finally and stole a live holder's lock. That
+    # surfaces as `RuntimeError: Lock is not acquired` raised by the VICTIM right after a successful
+    # query, and the raising finally then replaces whatever exception actually occurred, destroying the
+    # real fault.
+    _lock_acquired = False
     try:
         session_start = time.time()
         bt.logging.debug(f"Session configured ({time.time() - session_start:.4f}s)")
@@ -161,6 +170,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         # use the same IPC request queue / notify pipe AND the same miner
         # network — they must never overlap. Released in the finally below.
         await self.miner_net_lock.acquire()
+        _lock_acquired = True
         self.querying = True
         query_start = time.time()
         try:
@@ -333,7 +343,10 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         return responses
     finally:
         self.querying = False
-        self.miner_net_lock.release()
+        # NOT `if self.miner_net_lock.locked()`: that is true whenever ANYONE holds it, which
+        # reproduces the cross-release this guard exists to prevent.
+        if _lock_acquired:
+            self.miner_net_lock.release()
         bt.logging.debug("Query flag cleared")
 
 
@@ -377,6 +390,10 @@ async def deliver_gentrx(self: Validator, deliveries: list) -> None:
                     'ts_end': synapse.ts_end,
                     'data': synapse.data,
                     'data_source': synapse.data_source,
+                    # The aggregator's shard. This dict is a hand-listed flattening of the synapse for the
+                    # query service, and query.py rebuilds a synapse FROM it -- so a field missing here is
+                    # silently dropped between two objects that both declare it.
+                    'bucket_prefix': synapse.bucket_prefix,
                     'data_endpoint': synapse.data_endpoint,
                     'data_bucket': synapse.data_bucket,
                     'data_access_key': synapse.data_access_key,

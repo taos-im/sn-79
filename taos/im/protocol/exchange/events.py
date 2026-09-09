@@ -442,10 +442,9 @@ class TradeEvent(ExchangeEvent):
 from typing import Optional
 from taos.im.protocol.models import EventHistory
 
-# ONE AgentEventHistory, NOT TWO. This module used to define its own copy, identical to the one in
-# taos/im/protocol/events.py down to the base class it imports from there. Two classes of the same name
-# meant `from taos.im.protocol.agents import *` followed by `from taos.im.protocol.exchange import *`
-# silently decided which one an agent got, by import order. While one copy tolerated dict-shaped notices
+# ONE AgentEventHistory, NOT TWO. This module imports it rather than defining its own copy. Two
+# classes of the same name would let `from taos.im.protocol.agents import *` followed by
+# `from taos.im.protocol.exchange import *` silently decide which one an agent got, by import order. While one copy tolerated dict-shaped notices
 # and the other did not, that choice was the difference between an agent working and losing its whole
 # response on every exchange tick. Notices now parse to models on both paths so neither copy needs a
 # shim, and re-exporting the canonical class removes the ambiguity rather than leaving two that merely
@@ -501,9 +500,8 @@ def parse_notices(raw):
                     built = None
                 if built is not None:
                     break
-            # NEVER DROP A NOTICE. An earlier version skipped anything the local dispatcher did not
-            # recognise, on the reasoning that consumers select by type so an unparsed notice is
-            # unreadable anyway. That was wrong twice over: it is perfectly readable as a dict, and this
+            # NEVER DROP A NOTICE. Skipping anything the local dispatcher does not recognise is wrong
+            # twice over: an unparsed notice is perfectly readable as a dict, and this
             # tree's dispatcher does not cover every code that reaches it -- the exchange one has no
             # ClosePositionsEvent, so RDCP was discarded and an SL/TP trigger's close notice never
             # reached the miner. The other tree is tried second, and a code neither knows is passed

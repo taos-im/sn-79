@@ -83,6 +83,25 @@ if __name__ != "__mp_main__":
     except ImportError:
         _exchange_notices = None
 
+    def warn_exchange_notices_missing(holder) -> bool:
+        """One loud line, once per process, when EXCHANGE mode runs without the notice-delivery companion.
+
+        A checkout without the companion degrades to a no-op by design (the carve keeps mechanism
+        private), but it used to degrade silently: an exchange validator on such a tree delivers
+        placement acks while surfacing no fills or refusals, which reads as a miner-side bug and cost
+        hours to trace. The message names the consequence, never the mechanism."""
+        if getattr(holder, '_warned_exchange_notices_missing', False):
+            return False
+        holder._warned_exchange_notices_missing = True
+        bt.logging.warning(
+            "The exchange-notice companion module is NOT present in this checkout: fills, refusal and "
+            "cancellation results will NOT be surfaced to exchange miners, while placement acks still "
+            "flow, so miners see orders accepted but never their fills. A public tree degrades this "
+            "way by design; an operated exchange validator must run from a tree that carries the "
+            "companion."
+        )
+        return True
+
     async def _push_fill_notifications(trade_events: list, url: str) -> None:
         """Fire-and-forget: push fill notifications directly to the data service
         immediately after on-chain execution, bypassing the heavy ingest pipeline."""
@@ -490,6 +509,11 @@ if __name__ != "__mp_main__":
                 '--cpu-cores', ','.join(map(str, core_allocation['reporting'])),
                 '--ipc-prefix', self._reporting_ipc_prefix,
             ]
+            # The reporting service parses its OWN argv: scoring flags do not reach it unless
+            # forwarded here. Without this the per-book de-beta gauges are silently dead in the
+            # child no matter what the validator was started with (found live).
+            if bool(getattr(getattr(self.config.scoring, 'debeta', None), 'publish_book_gauges', False)):
+                cmd.append('--scoring.debeta.publish_book_gauges')
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
 
@@ -694,11 +718,12 @@ if __name__ != "__mp_main__":
             burn_ratio = getattr(self.config.neuron, 'burn_ratio', 0.0) or 0.0
             tolerance = 1e-6
 
-            trading_sum = kappa_w + pnl_w
+            debeta_w = float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0) or 0.0)
+            trading_sum = kappa_w + pnl_w + debeta_w
             if abs(trading_sum - 1.0) > tolerance:
                 error_msg = (
                     f"Trading-pool weights must sum to 1.0, got "
-                    f"kappa={kappa_w:.6f} + pnl={pnl_w:.6f} = {trading_sum:.6f}."
+                    f"kappa={kappa_w:.6f} + pnl={pnl_w:.6f} + debeta={debeta_w:.6f} = {trading_sum:.6f}."
                 )
                 bt.logging.error(error_msg)
                 raise ValueError(error_msg)
@@ -1686,6 +1711,7 @@ if __name__ != "__mp_main__":
                                 ts_end=assignment.get("ts_end", 0),
                                 data=assignment.get("data", []),
                                 data_source=assignment.get("data_source", "s3"),
+                                bucket_prefix=assignment.get("bucket_prefix", ""),
                                 data_endpoint=assignment.get("data_endpoint", ""),
                                 data_bucket=assignment.get("data_bucket", ""),
                                 data_access_key=assignment.get("data_access_key", ""),
@@ -1994,6 +2020,12 @@ if __name__ != "__mp_main__":
 
             data = {
                 'metagraph_data': metagraph_data,
+                # Per-book de-beta accumulators for the opt-in book gauges: the reporting child has
+                # no access to validator state, so absent these keys its gauge block reads None
+                # forever and evicts every series.
+                'debeta_capture_buy_sums': getattr(self, 'capture_buy_sums', {}) or {},
+                'debeta_capture_sell_sums': getattr(self, 'capture_sell_sums', {}) or {},
+                'debeta_alphas_by_book': getattr(self, 'debeta_alphas_by_book', {}) or {},
                 'simulation': self.simulation.model_dump(),
                 'last_state': minimal_state,
                 'simulation_timestamp': self.simulation_timestamp,
@@ -2069,6 +2101,15 @@ if __name__ != "__mp_main__":
                         'activity_decay_rate': self.config.scoring.activity.decay_rate,
                         'activity_capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
                         'activity_max_volume': self.config.scoring.activity.capital_turnover_cap * self.simulation.miner_wealth,
+                        # De-beta (P8): the whitelist above predates it, so none of these reached the
+                        # neuron_info labels and the dashboards' Scoring Config table could not show
+                        # the parameters that will actually drive emissions under 0.6.1.
+                        'debeta_weight': float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0)),
+                        'debeta_w_make': getattr(getattr(self.config.scoring, 'debeta', None), 'w_make', 0.0),
+                        'debeta_floor_scale': getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.0),
+                        'debeta_p11_strength': getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0),
+                        'debeta_min_books': getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 0),
+                        'debeta_centered_window': getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 0),
                     }
                 }
             }
@@ -2368,6 +2409,19 @@ if __name__ != "__mp_main__":
                                 adopted = None
                             if adopted is None and _shadow.initialized:
                                 bt.logging.warning("[SCORING-PROC] child scoring unavailable — in-process fallback")
+                                # Self-heal beyond parity: a child that is alive+initialized but
+                                # never delivers (wedged apply loop, stale INIT base_ts after a
+                                # sim-restart race) costs the full timeout + an in-process compute
+                                # EVERY boundary and never recovers on its own. Two consecutive
+                                # misses cannot be one slow compute; re-INIT with a fresh snapshot.
+                                self._scoring_proc_consec_unavail = getattr(self, '_scoring_proc_consec_unavail', 0) + 1
+                                if self._scoring_proc_consec_unavail >= 2:
+                                    bt.logging.warning(
+                                        f"[SCORING-PROC] {self._scoring_proc_consec_unavail} consecutive misses — re-INIT self-heal")
+                                    _shadow.request_reinit()
+                                    self._scoring_proc_consec_unavail = 0
+                            elif adopted is not None:
+                                self._scoring_proc_consec_unavail = 0
 
                         self._scoring_proc_n += 1
                         _verify_every = max(1, int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "10")))
@@ -2956,7 +3010,7 @@ if __name__ != "__mp_main__":
                     # with a default raises nothing, and .get() on a defaultdict does not invoke
                     # default_factory, so no entry was created to hint at the miss. Every writer uses
                     # the nested shape (trade.py, persistence.py, both engines) and report.py consumes
-                    # it nested. Measured working: volume_sums[171][5] = 1383.308 reaching the
+                    # it nested. Verified working: the nested lookup reaches the
                     # state dict and the wire.
                     state.accounts[uid][book_id]['v'] = self.volume_sums.get(uid, {}).get(book_id, 0.0)
             bt.logging.info(f"Volumes added to state ({time.time()-start:.4f}s).")
@@ -3012,7 +3066,18 @@ if __name__ != "__mp_main__":
             # extract + pack runs on `GenTRX-pack` worker thread, the
             # HTTP POST on `GenTRX-tx` worker thread. Neither sits on
             # the validator's hot path.
-            if self._gentrx is not None:
+            # SIMULATION ONLY HERE. The simulator has already matched by the time this state
+            # arrives, so book['e'] is populated and this is the right moment to push.
+            #
+            # EXCHANGE MUST NOT PUSH HERE. Nothing has matched yet: orders go to the LOB and settle
+            # in self.engine.execute(state, miner_responses) further down, and the authoritative 't'
+            # events are only then injected into state.books[nid]['e'] from the reconciliation's
+            # executed_fills. Pushing here handed the exchange aggregator books with EMPTY event
+            # lists on every tick -- measured with both agents trading:
+            # "ingest: 8 tick(s), 80 book-slot(s), 0 event(s)". No events means no rows, no parquet
+            # page, one book in /data-status, and the val split then consumed that one book so every
+            # round was skipped. The exchange mechanism could never train.
+            if self._gentrx is not None and getattr(self.engine, "mode", None) != "exchange":
                 try:
                     self._gentrx.push_state(state)
                 except Exception as _gex:
@@ -3037,6 +3102,8 @@ if __name__ != "__mp_main__":
                     # silent -- which is how acknowledgements went missing for every miner while fills
                     # kept flowing and every surface still looked healthy.
                     _exchange_notices.merge_all(self.engine, state, self.config)
+                else:
+                    warn_exchange_notices_missing(self)
 
 
             # Forward state synapse to miners and collect responses
@@ -3195,6 +3262,15 @@ if __name__ != "__mp_main__":
                             _existing.append(_notice)
                 except Exception:
                     pass
+
+                # EXCHANGE: push to GenTRX now, with the settled fills present in book['e'].
+                # See the simulation-only push earlier in this function for why it cannot go there.
+                if self._gentrx is not None and getattr(self.engine, "mode", None) == "exchange":
+                    try:
+                        self._gentrx.push_state(state)
+                    except Exception as _gex:
+                        bt.logging.warning(f"[GTX] push_state error (exchange): {_gex}")
+
                 # Push post-execution state to MVTRX data service on every block
                 # Build open-order detail from LOB account state (state.accounts[uid][nid]['o'])
                 # which is populated by the C++ engine's packAccounts() on every block.
@@ -3864,7 +3940,7 @@ if __name__ == "__main__":
         The validator's engine, chain and reconcile modules log through
         logging.getLogger(__name__): 242 call sites across 8 modules. bittensor installs
         its own logging stack and those records reach none of it, so every one of those
-        diagnostics was discarded. Measured on this box: build_reconciliation logs
+        diagnostics was discarded. Observed: build_reconciliation logs
         unconditionally at INFO on each reconciliation cycle, yet across three hours and
         ten settled trades it appeared zero times in the pm2 logs.
 
@@ -3950,6 +4026,12 @@ if __name__ == "__main__":
     _bridge_stdlib_logging_to_bittensor()
     bt.logging.info("Initializing validator...")
     app = FastAPI()
+
+    # STATE-INGEST ROUTES ARE LOCAL-ONLY. /orderbook and /account accept simulator state and notices,
+    # so only the simulator on this host may reach them. Miners are unaffected (the validator queries
+    # them outbound), and only these two paths are restricted, so /metrics and /sltp are untouched.
+    from taos.im.validator.net_guard import install_state_ingest_guard
+    install_state_ingest_guard(app, log=bt.logging.warning)
     validator = Validator()
     try:
         app.include_router(validator.router)

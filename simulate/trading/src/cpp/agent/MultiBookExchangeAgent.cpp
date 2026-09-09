@@ -993,7 +993,7 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr&  ms
         simulation()->m_messageQueue.queue().underlying()
             | views::filter([&](const auto& prioMsgWithId) {
                 const auto distributedPayload =
-                    std::static_pointer_cast<DistributedAgentResponsePayload>(
+                    std::dynamic_pointer_cast<DistributedAgentResponsePayload>(
                         prioMsgWithId.pmsg.msg->payload);
                 return !(distributedPayload && resetAgentIds.contains(distributedPayload->agentId));
             })

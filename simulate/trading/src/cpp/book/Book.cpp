@@ -84,8 +84,8 @@ void Book::sampleBandRef(Timestamp ts) noexcept
         static_cast<size_t>(std::max<int64_t>(1, window / interval));
     bool pushed = false;
     // Catch up whole intervals. During a quiet stretch the prevailing price is re-sampled, so the window
-    // never empties and the band never silently disables itself (a gap longer than the window previously
-    // dropped every trade and reopened an unbounded sweep).
+    // never empties and the band never silently disables itself (without the catch-up, a gap longer than
+    // the window drops every sample and leaves the sweep unbounded).
     while (m_bandSeeded && static_cast<int64_t>(ts - m_bandLastSampleTs) >= interval) {
         m_bandLastSampleTs += interval;
         m_bandSamples.push_back(m_bandLastPrice);
@@ -529,7 +529,7 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         // submission to fill a just-placed marketable order arrives in the SAME event as that order,
         // so the "resting" side was never resting when the taker turned up -- it is the very order the
         // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
-        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        // On one book, a single engine timestamp:
         //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
         //   sweep SELL #149 (1.0x1061.3652@MARKET)
         //   SELF TRADE PREVENTION CANCELED ORDER 148
@@ -550,14 +550,11 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         // batch can carry the LARGER timestamp and silently lose STP protection. Within one
         // instruction the order id is useless: the engine's eager sweep is minted immediately after
         // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
-        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
-        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        // target.
         //
-        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
-        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
-        // batch are separate instructions that share one. Measured 2026-08-14 on the running
-        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
-        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // Timestamp equality does NOT mean "one instruction". A miner's whole batch carries ONE
+        // timestamp, so two orders it sends on the same book in one batch are separate instructions
+        // that share one. Reading those as a single instruction stands STP down between them, which is
         // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
         // because the sweep inherits ctx.delay from the same batch.
         //
@@ -714,7 +711,7 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         // submission to fill a just-placed marketable order arrives in the SAME event as that order,
         // so the "resting" side was never resting when the taker turned up -- it is the very order the
         // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
-        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        // On one book, a single engine timestamp:
         //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
         //   sweep SELL #149 (1.0x1061.3652@MARKET)
         //   SELF TRADE PREVENTION CANCELED ORDER 148
@@ -735,14 +732,11 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         // batch can carry the LARGER timestamp and silently lose STP protection. Within one
         // instruction the order id is useless: the engine's eager sweep is minted immediately after
         // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
-        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
-        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        // target.
         //
-        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
-        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
-        // batch are separate instructions that share one. Measured 2026-08-14 on the running
-        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
-        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // Timestamp equality does NOT mean "one instruction". A miner's whole batch carries ONE
+        // timestamp, so two orders it sends on the same book in one batch are separate instructions
+        // that share one. Reading those as a single instruction stands STP down between them, which is
         // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
         // because the sweep inherits ctx.delay from the same batch.
         //
@@ -842,6 +836,45 @@ taosim::book::TickContainer* Book::preventSelfTrade(
     auto stpFlag = order->stpFlag();
     auto now = m_simulation->currentTimestamp();
 
+    // THE INCOMING SIDE NEEDS THE SAME NOTICE AS THE RESTING SIDE. cancelAndLog below tells the owner
+    // when STP cancels a RESTING order, but the three paths that cancel the INCOMING order only wrote a
+    // log line -- so an order the miner had just placed vanished with its reservation freed and nothing
+    // on its channel to say so. An order can be registered, cancelled and unregistered inside a single
+    // engine timestamp, which leaves the validator no record of it and the miner holding a phantom
+    // resting order whose funds the engine has already released.
+    //
+    // Same shape, same delivery path, same exchange-service gate as the resting-side notice: simulation
+    // miners already see the cancellation as a book event on state.books[id].e, and a notice as well
+    // would fire onOrderCancelled twice there.
+    auto notifyOwnerCancelled = [&](OrderID orderId, AgentId ownerId, taosim::decimal_t volume) {
+        auto* proxy = m_simulation->proxy();
+        // DIAGNOSTIC: say whether the notice is dispatched or dropped at the gate. The resting-side
+        // dispatch has been in place and the miner still saw nothing, so "did it fire" has to be
+        // answered from the engine rather than inferred from the miner's silence.
+        if (proxy == nullptr || !proxy->exchangeServiceMode()) {
+            m_simulation->logDebug(
+                "{} | AGENT #{} BOOK {} : STP CANCEL NOTICE SUPPRESSED for order {} (proxy={} exchangeServiceMode={})",
+                m_simulation->currentTimestamp(), ownerId, m_id, orderId,
+                proxy == nullptr ? "null" : "present",
+                proxy == nullptr ? false : proxy->exchangeServiceMode());
+            return;
+        }
+        m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP CANCEL NOTICE DISPATCHED for order {}",
+            m_simulation->currentTimestamp(), ownerId, m_id, orderId);
+        proxy->pushNotice(Message::create(
+            m_simulation->currentTimestamp(),
+            m_simulation->currentTimestamp(),
+            m_simulation->exchange()->name(),
+            proxy->name(),
+            "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+            MessagePayload::create<DistributedAgentResponsePayload>(
+                ownerId,
+                MessagePayload::create<CancelOrdersResponsePayload>(
+                    std::vector<OrderID>{orderId},
+                    MessagePayload::create<CancelOrdersPayload>(
+                        std::vector{taosim::event::Cancellation{orderId, volume}}, m_id)))));
+    };
+
     auto cancelAndLog = [&](OrderID orderId, std::optional<taosim::decimal_t> volume = {}) {
         if (cancelOrder(orderId, volume)) {
             taosim::event::Cancellation cancellation{orderId, volume};
@@ -862,9 +895,13 @@ taosim::book::TickContainer* Book::preventSelfTrade(
             // Exchange-service mode only: simulation miners see the cancellation as a book event on
             // state.books[id].e, and a notice as well would fire onOrderCancelled twice there.
             if (auto* proxy = m_simulation->proxy(); proxy != nullptr && proxy->exchangeServiceMode()) {
-                m_simulation->dispatchMessage(
+                m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP RESTING CANCEL NOTICE DISPATCHED for order {}",
+                    m_simulation->currentTimestamp(), agentId, m_id, orderId);
+                // DIRECT, NOT QUEUED -- see DistributedProxyAgent::pushNotice. dispatchMessage from
+                // inside matching is never delivered: order 379's notice produced zero proxy receipts.
+                proxy->pushNotice(Message::create(
                     m_simulation->currentTimestamp(),
-                    0,
+                    m_simulation->currentTimestamp(),
                     m_simulation->exchange()->name(),
                     proxy->name(),
                     "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
@@ -873,7 +910,7 @@ taosim::book::TickContainer* Book::preventSelfTrade(
                         MessagePayload::create<CancelOrdersResponsePayload>(
                             std::vector<OrderID>{orderId},
                             MessagePayload::create<CancelOrdersPayload>(
-                                std::vector{taosim::event::Cancellation{orderId, volume}}, m_id))));
+                                std::vector{taosim::event::Cancellation{orderId, volume}}, m_id)))));
             }
             return true;
         } else {
@@ -883,8 +920,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
     };
 
     if (stpFlag == STPFlag::CN || stpFlag == STPFlag::CB) {
-        order->removeVolume(order->volume());
+        const auto _stpCancelledVolume = order->volume();
+        order->removeVolume(_stpCancelledVolume);
         m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+        notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
         if (stpFlag == STPFlag::CN) {
             return nullptr;
         }
@@ -909,8 +948,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
 
     if (stpFlag == STPFlag::DC) {
         if (iop->totalVolume() == order->totalVolume()){
-            order->removeVolume(order->volume());
+            const auto _stpCancelledVolume = order->volume();
+            order->removeVolume(_stpCancelledVolume);
             m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+            notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
             cancelAndLog(iop->id());
             return nullptr;
         } else if (iop->totalVolume() < order->totalVolume()){
@@ -926,8 +967,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
         } else {
             auto volumeToCancel = taosim::util::round(order->totalVolume() / taosim::util::dec1p(iop->leverage()),
                 m_simulation->exchange()->config().parameters().volumeIncrementDecimals);
-            order->removeVolume(order->volume());
+            const auto _stpCancelledVolume = order->volume();
+            order->removeVolume(_stpCancelledVolume);
             m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+            notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
             cancelAndLog(iop->id(), volumeToCancel);
             return nullptr;
         }

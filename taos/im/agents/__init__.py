@@ -180,7 +180,7 @@ class UnifiedAccount:
     def agent_id(self) -> int | None:
         """The uid this account belongs to.
 
-        Exchange-mode account dicts are built without 'i'/'b' (engines/exchange.py _normalize), so
+        Exchange-mode account dicts are built without 'i'/'b' by the engine's normaliser, so
         this is None there rather than invented. Returned as None, not 0, because uid 0 is a real
         miner and a fabricated zero would be indistinguishable from it.
         """
@@ -332,6 +332,18 @@ class UnifiedAgentResponse:
         self._exchange_mode = exchange_mode
         self._delegate      = delegate
         self.instructions   = []
+
+    @property
+    def exchange_mode(self) -> bool:
+        """Which mechanism THIS response is for. Fixed when the response was created.
+
+        READ THIS RATHER THAN THE AGENT'S OWN FLAG when a strategy decision depends on the
+        mechanism. One agent instance serves both validators concurrently, so `self.exchange_mode`
+        on the AGENT describes whichever request most recently ran update() -- it reads as "this
+        agent is in exchange mode", which is not a thing an agent can be. The response is per
+        request and immutable, so a decision taken from it is about the response being built.
+        """
+        return bool(self._exchange_mode)
 
     def limit_order(
         self,
@@ -504,7 +516,7 @@ class UnifiedAgentResponse:
     def close_positions(self, book_id, order_ids, delay: int = 0) -> None:
         """Plural form of close_position, mirroring FinanceAgentResponse.close_positions.
 
-        MISSING UNTIL 2026-08-09, which mattered: the shipped example agents cannot be migrated onto
+        MISSING FOR A TIME, which mattered: the shipped example agents cannot be migrated onto
         this mode-aware response until it covers every builder they call, and OrderOptionAgent calls
         this one. A partial surface means "swap the constructor" breaks that agent at runtime, in
         exchange mode only, where it is hardest to notice.
@@ -562,7 +574,7 @@ class FinanceAgentBase(SimulationAgent):
 
     One subclass serves both mechanisms: ``handle`` routes a simulation or exchange state update to the same
     strategy code, accounts and notices arrive in one uniform shape, and the notice handlers (``onTrade``,
-    ``onOrderAccepted``, ``onOrderCancelled``, ...) fire identically in either mode. Known until 2026-08-18 as
+    ``onOrderAccepted``, ``onOrderCancelled``, ...) fire identically in either mode. Formerly known as
     ``FinanceSimulationAgent``, which remains an alias.
     """
     simulation_config: MarketSimulationConfig
@@ -607,7 +619,7 @@ class FinanceAgentBase(SimulationAgent):
     # (+ optional TAOS_LIVE_CONFIG_TOKEN) into the container. Because Hangar agents
     # expose no inbound port, the agent PULLS: a daemon thread polls the endpoint
     # off the hot path; the next handle() applies any change to self.config and
-    # calls on_config_reload(changed). See runbooks/planning/hangar-live-config.md.
+    # calls on_config_reload(changed).
 
     @staticmethod
     def _coerce_live_value(v):
@@ -738,8 +750,8 @@ class FinanceAgentBase(SimulationAgent):
     def simulation_output_dir(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         # simulation_id is OPTIONAL on the model (`simulation_id : str | None = None`), so joining it
         # unguarded raises TypeError: join() argument must be str ... not 'NoneType' and takes the
-        # agent's whole respond() with it. Measured on v54: ArbitrageAgent raised this every state
-        # update, logged it ~every 2.5s, and the acceptance stage recorded it as the agent seeing no
+        # agent's whole respond() with it. Observed: an agent raised this on every state
+        # update and logged it roughly every 2.5s, which reads downstream as the agent seeing no
         # updates at all -- a crash in a path shared by every GenTRX agent, reported as silence.
         #
         # A missing id is a real gap (it is what keeps one run's data out of another's directory), so
@@ -1487,6 +1499,28 @@ class FinanceAgent(FinanceAgentBase):
             self.accounts = {bid: UnifiedAccount(a) for bid, a in self.accounts.items()}
             self._exchange_mode = False
 
+    def _notice_log_line(self, event, etype: str) -> str:
+        """One log line for an exchange notice, worded as the simulation path words it.
+
+        A trade gets the same AGGRESSIVE/PASSIVE sentence `update()` builds, so an
+        operator reading the two halves sees one format rather than two."""
+        book = getattr(event, "bookId", None)
+        prefix = f"BOOK {book} : " if book is not None else ""
+        if etype in ("EVENT_TRADE", "ET"):
+            role = "taker" if self.uid == getattr(event, "takerAgentId", None) else "maker"
+            own = event.takerOrderId if role == "taker" else event.makerOrderId
+            other = event.makerOrderId if role == "taker" else event.takerOrderId
+            own_agent = event.takerAgentId if role == "taker" else event.makerAgentId
+            other_agent = event.makerAgentId if role == "taker" else event.takerAgentId
+            return (
+                f"{prefix}{'BUY ' if event.side == 0 else 'SELL'} TRADE #{event.tradeId} : "
+                f"YOUR {'AGGRESSIVE' if role == 'taker' else 'PASSIVE'} ORDER #{own} (AGENT {own_agent}) "
+                f"MATCHED AGAINST #{other} (AGENT {other_agent}) "
+                f"FOR {event.quantity}@{event.price} "
+                f"AT {duration_from_timestamp(event.timestamp)} (T={event.timestamp})"
+            )
+        return f"{prefix}{event}"
+
     def _dispatch_notice_handlers(self, state) -> None:
         """Fire the documented per-notice handlers for exchange-mode notices.
 
@@ -1510,6 +1544,7 @@ class FinanceAgent(FinanceAgentBase):
         re-initialise on every tick.
         """
         ended = None
+        logged: list[str] = []
         for event in self.events or []:
             etype = getattr(event, "type", None)
             try:
@@ -1540,6 +1575,29 @@ class FinanceAgent(FinanceAgentBase):
                         pass
             except Exception:
                 bt.logging.exception(f"notice handler for {etype} raised; continuing with the rest")
+            # EVERY notice is logged, exactly as the simulation path logs its events.
+            # Firing the handlers and printing nothing makes an exchange agent's events
+            # invisible: the validator reports notices packed and delivered while the
+            # agent's log shows only instructions. The
+            # simulation half logs the same events via update()'s update_text, and the
+            # two halves must not disagree about what an operator can see.
+            try:
+                logged.append(self._notice_log_line(event, etype))
+            except Exception as _log_exc:
+                # The event's __str__ is what can fail here, so the fallback must not call it
+                # again: an event built by model_construct may be missing a field its __str__
+                # reads. repr() renders only the fields that are set, and is guarded anyway,
+                # because a log line must not cost a miner the rest of its notices.
+                try:
+                    _detail = repr(event)
+                except Exception:
+                    _detail = f"<{type(event).__name__} that cannot be rendered>"
+                logged.append(f"{etype} : {_detail}  (log line unavailable: {_log_exc!r})")
+        if logged:
+            rule = "-" * 50
+            bt.logging.info(
+                ".\n" + rule + "\nEXCHANGE EVENTS\n" + rule + "\n" + "\n".join(logged) + "\n" + rule
+            )
         if ended is not None:
             try:
                 self.onEnd(ended)
@@ -1570,12 +1628,12 @@ class FinanceAgent(FinanceAgentBase):
 
 
 
-# Backward-compatible alias. `FinanceAgentBase` was named `FinanceSimulationAgent` until 2026-08-18, which
+# Backward-compatible alias. `FinanceAgentBase` was formerly named `FinanceSimulationAgent`, which
 # read as "the simulation-mode class" when it is in fact the mode-agnostic base: its body has no mode
 # branch at all and every mention of the exchange state in it is a type annotation. The mode dispatch lives
 # in `FinanceAgent` below it. Miner agents in the wild subclass the old name, so it stays exported and
 # pointing at the same object -- `issubclass(FinanceAgent, FinanceSimulationAgent)` therefore still holds,
-# which is what the composer's own validation asserts.
+# which is what composed-agent validation asserts.
 FinanceSimulationAgent = FinanceAgentBase
 
 

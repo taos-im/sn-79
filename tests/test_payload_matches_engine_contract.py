@@ -134,7 +134,7 @@ def test_conditional_fields_appear_once_set():
 def test_exchange_api_offers_no_leverage_to_miners():
     """Exchange mode has no way to REFUSE leverage on a market order, so it must not offer it.
 
-    Confirmed 2026-08-07 by whole-path trace: in exchange mode both order types go through
+    Confirmed by whole-path trace: in exchange mode both order types go through
     Exchange::handle*Instruction -> pool.update(), but only a LIMIT order is forwarded on to the LOB,
     where OrderPlacementValidator returns INVALID_LEVERAGE. A MARKET order is executed as an AMM pool
     swap and returns a signal directly, so validateMarketOrderPlacement never runs on it and the

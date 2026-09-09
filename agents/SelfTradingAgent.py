@@ -91,6 +91,14 @@ class SelfTradingAgent(GenTRXAgent):
 if __name__ == "__main__":
     """
     Example command for local standalone testing execution using Proxy:
-    python SelfTradingAgent.py --port 8888 --agent_id 0 --params min_quantity=0.1 max_quantity=1.0
+    python SelfTradingAgent.py --port 8888 --agent_id 0 --params min_quantity=0.25 max_quantity=1.0
+
+    NOTE min_quantity: the engine refuses a BASE-currency order whose volume is under
+    the exchange's `minOrderSize` -- 0.25 alpha in simulation_0.xml -- BEFORE it looks at
+    direction, so a smaller draw is rejected outright with MINIMUM_ORDER_SIZE_VIOLATION
+    and never reaches the book. 0.1 put the bottom of the sampling range below that floor,
+    so a fraction of orders failed for a reason nothing in the log explains. Check the
+    floor for your config: the exchange logs it at startup as
+    "Exchange order floors: minOrderSize=<N> alpha".
     """
     launch(SelfTradingAgent)

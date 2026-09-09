@@ -552,6 +552,13 @@ class SimulationEngine(MarketEngine):
         v.start_time = time.time()
         v.simulation_timestamp = timestamp
         v.start_timestamp = v.simulation_timestamp
+        # A scoring-service INIT built AFTER this shift must stamp the NEW clock. When a validator
+        # restore and a sim restart race the first INIT, its base_ts carries the OLD clock; the child
+        # then discards every new-clock frame as pre-snapshot replay (applied=0), and each boundary
+        # costs main the full child timeout plus an in-process compute, which is the
+        # "Waiting for rewarding to catch up" backlog.
+        if getattr(v, '_shadow_applied_ts', None) is not None:
+            v._shadow_applied_ts = new_simulation_timestamp
         v.last_state_time = None
         v.step_rates = []
         if event.logDir != v.simulation.logDir:
@@ -740,6 +747,15 @@ class SimulationEngine(MarketEngine):
                         for log_file in log_path.iterdir():
                             if log_file.is_file() and log_file.suffix == '.log':
                                 log_period = log_file.name.split('.')[1]
+                                # A NAME THAT DOES NOT CARRY A PERIOD IS SKIPPED, NOT FATAL.
+                                # int('') below raised ValueError on any .log whose second
+                                # dot-segment has no '-', and the exception escaped the whole
+                                # loop: 'PD: Failure during output compression : invalid
+                                # literal for int() with base 10'. That
+                                # aborts the compression AND the disk cleanup below it, which
+                                # is what keeps run/logs from filling the disk.
+                                if '-' not in log_period:
+                                    continue
                                 if len(log_period) == 13:
                                     log_end = (int(log_period.split('-')[1][:2]) * 3600 + int(log_period.split('-')[1][2:4]) * 60 + int(log_period.split('-')[1][4:])) * 1_000_000_000
                                 else:
@@ -1162,14 +1178,13 @@ class SimulationEngine(MarketEngine):
         """Flag UID for reset, zero its score.
 
         `old_coldkey` is accepted and unused here. The validator calls every engine the same way
-        (taos/im/neurons/validator.py:1365 passes uid AND old_coldkey, because the exchange engine needs
-        it to retire the departed miner's settlement-proxy wallet), and this signature took only uid. Every
+        (the shared call passes uid AND old_coldkey, because another engine needs the coldkey to
+        retire departed-miner state), and this signature took only uid. Every
         deregistration on the simulation mechanism therefore raised
         `TypeError: handle_deregistration() takes 2 positional arguments` out of the resync, which failed
         `_sync_and_check` whole: the departed miner was never flagged for reset, its score never zeroed,
         and `self.hotkeys` never updated from the metagraph, so the same deregistration re-raised on every
-        subsequent resync and the slot's new occupant inherited the old standing indefinitely. Measured
-        live on 2026-08-05 by the acceptance suite's deregistration stage.
+        subsequent resync and the slot's new occupant inherited the old standing indefinitely.
 
         Simulation has no proxy wallet to retire, so the parameter is deliberately ignored rather than
         removed from the shared signature: one call site, one shape.

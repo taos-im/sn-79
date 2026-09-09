@@ -9,7 +9,7 @@ raised
     TypeError: join() argument must be str, bytes, or os.PathLike object, not 'NoneType'
 
 inside respond(), which the miner framework CATCHES -- so the process stayed up, logged a bare ERROR
-with an empty message, and the acceptance stage recorded "no simulation update observed in 90s" for an
+with an empty message, and downstream monitoring recorded "no simulation update observed in 90s" for an
 agent that was receiving updates and dying on every one of them.
 
 That is the shape worth guarding: a crash in a caught path is indistinguishable from silence. The

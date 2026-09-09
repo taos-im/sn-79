@@ -204,10 +204,32 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.enabled",
         action="store_true",
-        help="Enable the combined de-beta trading score (P8): balanced two-sided spread capture "
-             "(making) + drift-stripped directional skill (kappa-of-alpha), rank-combined by w_make. "
-             "Full-replace of the kappa+pnl trading score (Option A). Default OFF: when off the "
-             "legacy kappa+pnl path is used unchanged.",
+        help="DEPRECATED and ignored since scoring.debeta.weight became the only dial (weight 0 == the old disabled, plus the decomposition stays published). Parsed so existing launch lines do not crash; removed in 0.6.2",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.weight",
+        type=float,
+        default=0.0,
+        help="The de-beta component's share of the FLAT trading score: trading = kappa.weight*kappa + "
+             "pnl.weight*pnl + debeta.weight*debeta, the three weights validated to sum to 1 at init. "
+             "Default 0.0: legacy emissions with the de-beta decomposition always computed and published "
+             "(permanent rehearsal visibility). (0, 0, 1) is the characterized full replacement; a "
+             "component is computed only when its own weight is nonzero, so that rung also ends the "
+             "kappa-3 compute. Migration curve (front-loaded reallocation, no floor-zeroing "
+             "below ~0.5): step 0.1 -> 0.25 -> 0.5 -> 1.0, scaling kappa/pnl down proportionally, each "
+             "step reversible",
+    )
+    parser.add_argument(
+        "--scoring.debeta.publish_book_gauges",
+        action="store_true",
+        help="Publish the PER-BOOK de-beta gauges (debeta_capture_buy/sell, debeta_book_making, "
+             "debeta_alpha) for dashboard drill-down. Default OFF because the cardinality is "
+             "uid x book: on a 259-uid 128-book board each gauge is ~33k series, so the four add "
+             "~133k series and roughly 24MB to every /metrics scrape that already runs 154MB. The "
+             "per-UID de-beta gauges are always published and are what a miner needs to read their "
+             "score; these answer WHICH book, and are worth the cost only while debugging.",
         default=False,
     )
 
@@ -251,10 +273,10 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.p11_strength",
         type=float,
         help="P11 counterparty-diversity discount strength on the making leg: making *= "
-             "(1 - strength*max(0,excess_concentration)). 0 disables (default). 1.0 fully removes a "
+             "(1 - strength*max(0,excess_concentration)). 0 disables. 1.0, the default, fully removes a "
              "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
              "sacrificial-feeder hole in the making metric.",
-        default=0.0,
+        default=1.0,
     )
 
     parser.add_argument(

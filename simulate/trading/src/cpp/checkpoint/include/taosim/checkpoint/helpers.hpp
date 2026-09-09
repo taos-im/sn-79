@@ -33,9 +33,7 @@ namespace taosim::checkpoint
 // ONE implementation, because two was the defect. The exchange-service apply path used
 // `ev.convert(exch->signals())`, msgpack's default convert for
 // std::map<BookId, std::unique_ptr<ExchangeSignals>>, which CREATES new objects and destroys the
-// originals, severing every logger and event-backlog feed connected at configure time. That exact bug was
-// found and fixed on 2026-05-12 (971786f9, "preserve L3EventLogger connections") in the OTHER apply path
-// and survived here for three months, because nobody knew there were two.
+// originals, severing every logger and event-backlog feed connected at configure time.
 //
 // This removes the bug class rather than the bug: the section is converted into plain integers and
 // assigned to the existing objects, so no code path deserialises an ExchangeSignals at all. The on-disk

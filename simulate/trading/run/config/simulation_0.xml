@@ -8,7 +8,7 @@
         <MultiBookExchangeAgent name="EXCHANGE" remoteAgentCount="264" gracePeriod="600000000000"
             priceDecimals="2" volumeDecimals="4" baseDecimals="4" quoteDecimals="10"
             maxLeverage="4" maxLoan="10000" maintenanceMargin="0.10" maxOpenOrders="100"
-            initialPrice="300.0" minOrderSize="0.25">
+            initialPrice="300.0" minOrderSize="0.25" maxPriceBand="0.10">
 		    <FeePolicy type="dynamic" historySlots="300"
                 makerFee="0.000" takerFee="0.00023" maxMakerRate="0.015" maxTakerRate="0.015"
                 targetMTR="0.4" shapeMakerFee="2" shapeMakerRebate="2"/>

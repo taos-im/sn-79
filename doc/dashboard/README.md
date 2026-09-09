@@ -72,7 +72,7 @@ The first config table displays the parameters that govern how miners are scored
 
 - **Max 24H Vol** - Cap on rolling 24-hour traded volume used by activity calculation; volumes above this don't earn additional activity.
 
-- **Max Instructions / Book** - Maximum number of order instructions an agent may submit per book per scoring step; submissions above the cap are rejected.
+- **Max Instr / Book** - Maximum number of order instructions an agent may submit per book per scoring step; submissions above the cap are rejected.
 
 - **GenTRX Share** - Fraction of overall scoring weight allocated to GenTRX (the training side of incentive).  The remainder is the trading-side weight.  Same value surfaced as **Pool Share** on the [GenTRX Page](#gentrx-page).
 
@@ -80,15 +80,35 @@ The first config table displays the parameters that govern how miners are scored
 
 - **Kappa3 Weight** - Relative weight of the Kappa3 Score component inside the trading-side Trading Score.  PnL Score Weight + Kappa3 Weight = 1 on the trading side.
 
-- **Kappa3 Assessment Window** - Length of the rolling window (in simulation time) over which Kappa3 is computed.
+- **Kappa3 Window** - Length of the rolling window (in simulation time) over which Kappa3 is computed.
 
-- **Min PnL Observations** - Minimum number of realized PnL observations required for an agent to be eligible for a PnL Score; under this count the agent's PnL Score is suppressed.
+- **Min PnL Obs** - Minimum number of realized PnL observations required for an agent to be eligible for a PnL Score; under this count the agent's PnL Score is suppressed.
 
 - **Activity Impact** - Strength with which the activity factor scales the Kappa3 Score (higher = more reward concentrated on high-volume traders).
 
 - **Activity Decay Rate** - Exponential decay applied to the activity factor when an agent's rolling round-trip volume falls below the target; controls how quickly inactivity is penalised.
 
 - **Scoring Interval** - How often (in simulation time) the validator runs a full scoring + weight-update cycle.
+
+- **PnL Assessment Window** - Rolling window over which realized PnL is evaluated for the PnL Score.
+
+- **Activity Assessment Window** - Rolling window of round-trip volume used by the activity factor.
+
+- **Activity Decay Grace** - Grace period after the last qualifying activity before activity decay begins.
+
+The **De-beta (0.6.1)** parameters follow.  De-beta scores miners as `w_make x rank(making) + (1 - w_make) x rank(skill)`; the decomposition is always computed and published, and enters the trading score only by the blend weight:
+
+- **De-beta Weight** - The ONLY de-beta dial: `trading = (1 - weight) x legacy + weight x de-beta`.  Default 0.0: emissions stay legacy while the full decomposition is visible (permanent rehearsal).  1.0 is full replacement (and the only value at which the Kappa3 computation is skipped); intermediate values step the migration and allow instant rollback.
+
+- **De-beta Making Weight** - `w_make`: the making leg's share of the combined score; the skill leg takes the remainder.
+
+- **De-beta Skill Floor Scale** - Scale on the median-|alpha| floor below which a book does not count toward the skill leg.
+
+- **De-beta CP Discount** - Strength of the counterparty-concentration discount applied to the making leg (1.0 = full strength).
+
+- **De-beta Min Books** - Minimum qualifying books for a miner to receive a de-beta score.
+
+- **De-beta Mid Window** - Half-window, in trades, of the centered mid used as the spread-capture reference.
 
 ### Simulation Config
 
@@ -225,7 +245,11 @@ The Agents table provides summary performance information for all miners in the 
 
 - **Pos** - Ranking position of the agent based on final score.  Sorted ascending by default.
 
-- **Agent** - Unique identifier for the agent (equal to miner UID).  Clicking on the agent ID redirects to the Agent details page for that UID.
+- **UID** - Unique identifier for the agent (the miner UID).  Clicking it opens the Agent page for that UID, carrying the row's run and wallet context.
+
+- **CK** - The agent's coldkey, truncated to its first characters; the full key shows on hover.
+
+- **Axon** - The agent's registered axon as `ip:port`, truncated to the IP; the full value shows on hover.
 
 - **24H Vol** - The agent's total trading volume in QUOTE asset over the last 24 simulation hours for whichever book they traded in the least.
 
@@ -242,6 +266,18 @@ The Agents table provides summary performance information for all miners in the 
 - **Kappa3 Score** - Activity-weighted median normalized realized Kappa3 ratio with outlier penalty applied, for the latest assessment window.
 
 - **Trading Score** - The agent's *standing*: an age-annealed EMA of the trading-side score (Kappa3 Score blended with PnL Score).  This smoothed track record, not the latest-window value, is what drives rank - so a high live Median Kappa3 raises it only gradually (at a rate bounded by the EMA half-life) rather than immediately, and it climbs while skill is sustained.  This is the trading half of incentive; the GenTRX half is below.
+
+- **Scored Books** - Before de-beta is enabled: books carrying a Kappa3 value, which includes penalized inactive books, so idle miners show a constant count.  Once de-beta applies: the number of books whose |alpha| clears the skill floor.
+
+- **De-beta Eligible** - Whether the miner passes the de-beta coverage guard and receives a de-beta score this cycle.
+
+- **CP Factor** - Counterparty-diversity factor on the making leg: 1.0 means diverse flow; lower means the making is fed by few counterparties and is discounted accordingly.
+
+- **Making Rank** - Rank in [0,1] of balanced two-sided spread capture (per book `2*min(buy, sell)` versus the centered mid, after the CP discount).
+
+- **Skill Rank** - Rank in [0,1] of floored Kappa over drift-stripped per-book alpha.
+
+- **De-beta Score** - `w_make x Making Rank + (1 - w_make) x Skill Rank`.  Enters the trading-side score by the configured De-beta Weight (1.0 = full replacement); the de-beta columns are always live; they affect emissions only in proportion to the weight.
 
 - **GenTRX Score** - The miner's EMA-smoothed GenTRX training reward, mirrored from the [GenTRX Page](#gentrx-page).  The final Score blends this with the Trading Score by the configured GenTRX Pool Share.
 
@@ -260,6 +296,10 @@ The Agents table provides summary performance information for all miners in the 
 - **QUOTE Loan** - Quantity of QUOTE borrowed by the agent via leveraged orders.
 
 - **QUOTE Collat.** - Collateral posted in QUOTE for borrowing.
+
+### De-beta Scoring (0.6.1)
+
+An appended section showing the de-beta decomposition per miner: a table of score, leg ranks, CP factor and coverage, and a timeseries of every miner's de-beta score.  Both read from gauges the validator publishes only on cycles where de-beta actually applied, so they are intentionally empty while de-beta is disabled or warming; the Agents table columns above (which read 0 in that state) are the always-on view.
 
 ### Incentives Plot
 
@@ -373,6 +413,14 @@ The Agents table at the Book page displays statistics for agents calculated spec
 - **QUOTE Collat.** - Collateral posted in QUOTE asset for borrowing on this book.
 
 
+When the validator runs with `--scoring.debeta.publish_book_gauges` (off by default: it adds a large per-uid-per-book series count), four per-book de-beta columns appear:
+
+- **Capture Buy / Capture Sell** - The agent's spread capture on each side of this book versus the centered mid; genuine two-sided making shows both nonzero.
+
+- **Book Making** - `2*min(Capture Buy, Capture Sell)` on this book, before the counterparty discount.
+
+- **Alpha** - This book's drift-stripped mark-to-market residual feeding the skill leg; it counts only when |alpha| clears the skill floor.
+
 ### Dynamic Fee Rates Plot
 
 ![alt text](book_fee_rates.png)
@@ -467,6 +515,26 @@ This plot illustrates the average volumes over all selected validators which wer
 ![alt text](agent_realized_pnl.png)
 
 This plot illustrates the realized PnL achieved by the agent in the most recent Sharpe assessment window over time.  Realized PnL is calculated from round tripped trades, using the price difference and fees/rebates to calculate the profit or loss realized through trading activity.
+
+### De-beta Scoring (0.6.1)
+
+An appended row of panels decomposing the agent's de-beta score, populated on cycles where de-beta applied:
+
+- **De-beta Score** - The combined `w_make x rank(making) + (1 - w_make) x rank(skill)`; blended into the trading score by the configured weight (1.0 = full replacement).
+
+- **Making vs Skill rank** - The two legs, rank-normalized to [0,1] across scored miners; they recombine exactly to the score.
+
+- **Making raw** - Balanced two-sided spread capture summed over books, after the counterparty discount.
+
+- **Skill raw** - Floored Kappa over drift-stripped per-book alpha.
+
+- **P11 counterparty factor** - The making discount for concentrated counterparties (1.0 = diverse flow).
+
+- **Scored books / scorable** - Skill-leg coverage and the coverage-guard flag.
+
+- **Scoring parameters** - The `w_make` and skill-floor values the validator applied that cycle.
+
+Once de-beta runs at weight 1.0, the Kappa3 plots below stop moving by design: the validator skips the Kappa3 computation only when de-beta fully replaces the trading score; at any partial weight both are computed and shown.
 
 ### Kappa3 Plots
 

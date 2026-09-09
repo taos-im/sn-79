@@ -61,6 +61,21 @@ class GenTRXAssignment(bt.Synapse):
     data: list[str] = []        # S3 keys for training parquets
     data_source: str = "s3"     # "s3" or "local"
 
+    # THE SHARD THE ISSUING AGGREGATOR READS, e.g. "gentrx/localnet/exchange/".
+    #
+    # One axon serves both mechanisms, and the agent's own mechanism flag flips on every state update,
+    # so a shard derived from it oscillates and a gradient lands wherever the last tick left it. The
+    # aggregator that issued this assignment is the only party that knows where it will look for the
+    # result, so it says so here.
+    #
+    # DELIBERATELY NOT IN required_hash_fields. Adding a field there changes body_hash for everyone and
+    # breaks verification for every miner still on the previous definition -- the whole point of a
+    # default-empty field is that old miners ignore it and new miners fall back to their own
+    # derivation. The bucket and credentials stay signed, so the worst a tampered value can do is make
+    # a miner file its OWN gradient under the wrong prefix (griefing, self-inflicted), not redirect
+    # training to an attacker's bucket. Miners must still sanity-check the value before adopting it.
+    bucket_prefix: str = ""
+
     # Validator's data bucket 
     # Enables per-validator data buckets access without chain commitments.
     data_endpoint: str = ""

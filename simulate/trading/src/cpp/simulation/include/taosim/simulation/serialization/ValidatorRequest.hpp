@@ -95,11 +95,9 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 o.pack(exchange->clearingManager().feePolicy()->makerTakerRatio(book->id(), 0));
 
                 // THE RATES THE ENGINE ACTUALLY APPLIES, alongside the ratio they derive from.
-                // The platform used to recompute these in Python from a curve of its own, and not one
-                // parameter matched: target 0.50 against the engine's 0.4, max 0.0075 against 0.015,
-                // base rates 0.0001/0.0003 against 0.000/0.00023, and no equivalent of getRates'
-                // zero-MTR early return. So every rate the platform displayed was a plausible number
-                // the venue had never charged. Same 'fs'/'mk'/'tk' shape a trade's fees already use.
+                // Sent rather than recomputed downstream: a consumer deriving these from a
+                // curve of its own has no way to match the engine's parameters or getRates' zero-MTR
+                // early return, and would display plausible rates the venue never charged. Same 'fs'/'mk'/'tk' shape a trade's fees already use.
                 o.pack("fs"s);
                 {
                     const auto rates = exchange->clearingManager().feePolicy()->getRates(book->id(), 0);

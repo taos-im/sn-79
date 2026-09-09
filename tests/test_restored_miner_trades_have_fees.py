@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """A restored miner trade must carry the fee fields its consumers read as attributes.
 
-Measured live at 13:11, 13:36, 13:40 and 13:47 on 2026-08-04, all AFTER the validator restart that
+Seen repeatedly in live running, all AFTER the validator restart that
 landed the ET-notice fix:
 
     ERROR | ALERT: Unable to publish metrics : 'TradeEvent' object has no attribute 'Tf'
@@ -75,7 +75,7 @@ def test_an_empty_buffer_is_not_an_error():
 def test_a_restored_miner_trade_with_a_synthetic_id_is_also_dropped():
     """The id must be validated here too, not only in sanitize_recent_trades.
 
-    Found by the first-occurrence stack capture at 13:56:54 on 2026-08-04, FOUR MINUTES after the
+    Found by a first-occurrence stack capture minutes after the
     sanitiser had already dropped 24 fee-less entries: validator.py:1894 _prepare_reporting_data was
     still serialising a `recent_miner_trades` entry whose `i` was a string.
 

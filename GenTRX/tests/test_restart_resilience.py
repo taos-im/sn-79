@@ -16,7 +16,7 @@ def _make_aggregator(tmp_path, validator_store=None):
 
     # `no_startup_cleanup=False` re-enables the wipe path — the whole
     # point of this file is to exercise sim-id-mismatch wipe behaviour.
-    # The constructor default flipped to True (op-safety) in ea26b8d3,
+    # The constructor default is True (op-safety),
     # which would otherwise suppress the very code paths under test.
     return GradientAggregator(
         checkpoint_path=str(tmp_path / "ckpt.pt"),

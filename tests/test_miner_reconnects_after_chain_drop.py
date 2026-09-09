@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """A local-node restart must not permanently wedge the miner.
 
-THE DEFECT (found 2026-08-13). The miner run() loop wrapped its `while` in one try/except whose handler
+THE DEFECT. The miner run() loop wrapped its `while` in one try/except whose handler
 sat OUTSIDE the loop. When the local subtensor node restarted, the next self.sync() raised (dead
 websocket in check_registered/update_block); the exception escaped the loop, run() returned, and the run
 thread died. The process stayed alive, so pm2 reported the miner 'online' while it had stopped syncing

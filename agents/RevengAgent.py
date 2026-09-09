@@ -261,8 +261,8 @@ class DiscordNotifier:
 
         Example output (inside the block)::
 
-            ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #9 |    2.00 @    313.29
-            ▼ SELL | 2026-02-27 12:00:45 | SimBook #41 |    8.25 @    142.78
+            ▲ BUY  | YYYY-MM-DD 12:00:43 | SimBook  #9 |    2.00 @    313.29
+            ▼ SELL | YYYY-MM-DD 12:00:45 | SimBook #41 |    8.25 @    142.78
 
         Symbol convention:
             ▲  up arrow   = BUY
@@ -1906,10 +1906,10 @@ class RevengAgent(GenTRXAgent):
         bt.logging.info("🧪 DISCORD TEST COMPLETE")
         bt.logging.info("="*80)
         bt.logging.info("Check Discord for 1 batched message with 4 one-liner notifications:")
-        bt.logging.info("  ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #X |    2.00 @    313.29")
-        bt.logging.info("  ▼ SELL | 2026-02-27 12:00:45 | SimBook  #X |    2.00 @    313.29")
-        bt.logging.info("  ▼ SELL | 2026-02-27 12:00:47 | SimBook  #X |    2.00 @    313.29")
-        bt.logging.info("  ▲ BUY  | 2026-02-27 12:00:49 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▲ BUY  | YYYY-MM-DD 12:00:43 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▼ SELL | YYYY-MM-DD 12:00:45 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▼ SELL | YYYY-MM-DD 12:00:47 | SimBook  #X |    2.00 @    313.29")
+        bt.logging.info("  ▲ BUY  | YYYY-MM-DD 12:00:49 | SimBook  #X |    2.00 @    313.29")
         bt.logging.info("(Emergency trades do not send notifications)")
         bt.logging.info("(All 4 trades sent in a single batched message)")
         bt.logging.info("="*80 + "\n")
@@ -1945,8 +1945,8 @@ if __name__ == "__main__":
 
     Notification format (monospace code block, columns aligned)::
 
-        ▲ BUY  | 2026-02-27 12:00:43 | SimBook  #9 |    2.00 @    313.29
-        ▼ SELL | 2026-02-27 12:00:45 | SimBook #41 |    8.25 @    142.78
+        ▲ BUY  | YYYY-MM-DD 12:00:43 | SimBook  #9 |    2.00 @    313.29
+        ▼ SELL | YYYY-MM-DD 12:00:45 | SimBook #41 |    8.25 @    142.78
 
     Notes:
         Trades are batched per ``respond()`` call and sent in a single message.

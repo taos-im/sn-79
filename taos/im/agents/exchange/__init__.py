@@ -6,10 +6,10 @@
 through respond_simulation() to respond(), so an agent written against any one of the three methods runs
 unchanged on the exchange. `_sltp_kwargs` lives there too.
 
-FinanceExchangeAgent is kept as an alias so existing agents keep importing it. It used to be a subclass
-carrying an ABSTRACT respond_exchange, which shadowed the chaining in FinanceAgent: a subclass that
-implemented only respond() or respond_simulation() got the stub's None, and handle() passed that to
-report(), raising AttributeError on .instructions. Aliasing removes the shadow.
+FinanceExchangeAgent is kept as an alias so existing agents keep importing it. An ALIAS rather than a
+subclass: a subclass carrying an abstract respond_exchange shadows the chaining in FinanceAgent, so one
+implementing only respond() or respond_simulation() gets the stub's None and handle() passes that to
+report(), raising AttributeError on .instructions.
 """
 
 from taos.im.agents import FinanceAgent

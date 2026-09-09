@@ -40,7 +40,7 @@ void unpackFeePolicy(const auto& o, taosim::matching::FeePolicy& feePolicy)
     if (!typeOpt) {
         // Legacy checkpoints packed stateless/unknown policies as nil (no "type"). A
         // stateless policy has nothing to restore, so treat a missing type as a no-op
-        // rather than fatal — this is what previously reset the whole exchange.
+        // rather than fatal, which would otherwise reset the whole exchange.
         return;
     }
     auto type = *typeOpt;

@@ -758,6 +758,10 @@ class GenTRXService:
                 "ts_end": shared_end,
                 "data": data_keys,
                 "data_source": "s3",
+                # The shard OUR aggregator reads, straight from its /data-status. A miner that adopts this
+                # files its gradient where the round will look for it, instead of guessing from a per-tick
+                # mechanism flag that oscillates when one axon serves both mechanisms.
+                "bucket_prefix": data_status.get("bucket_prefix", ""),
                 "data_endpoint": data_endpoint,
                 "data_bucket": data_bucket,
                 "data_access_key": data_access,

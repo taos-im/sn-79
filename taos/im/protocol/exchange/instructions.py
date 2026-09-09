@@ -3,7 +3,7 @@
 """
 Classes representing instructions that may be submitted by miner agents in a intelligent market simulation are defined here.
 """
-from pydantic import PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field, ConfigDict
+from pydantic import field_validator, PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field, ConfigDict
 from typing import Literal, Annotated
 from taos.im.protocol.simulator import *
 from taos.common.protocol import AgentInstruction, BaseModel
@@ -72,8 +72,25 @@ class PlaceOrderInstruction(ExchangeAgentInstruction):
     quantity: PositiveFloat = Field(alias="volume")
     clientOrderId: UInt32 | None
     delegate: str
-    stp: Literal[STP.NO_STP, STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH,
+    stp: Literal[STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH,
                  STP.DECREASE_CANCEL] = Field(default=STP.CANCEL_OLDEST, alias="stpFlag")
+
+    @field_validator("stp", mode="before")
+    @classmethod
+    def _force_self_trade_prevention(cls, v):
+        """Coerce NO_STP to CANCEL_OLDEST. Self-trade prevention is not a miner's to disable.
+
+        Coerced rather than rejected so one disallowed flag does not invalidate the whole batch. Runs
+        before validation so it sees the wire value in any form: the enum member, the bare integer, or
+        the "stpFlag" alias a re-validated order arrives under.
+        """
+        try:
+            if int(v) == int(STP.NO_STP):
+                return STP.CANCEL_OLDEST
+        except (TypeError, ValueError):
+            pass
+        return v
+
     currency: Literal[OrderCurrency.ALPHA, OrderCurrency.TAO] = OrderCurrency.ALPHA
     leverage: NonNegativeFloat = 0.0
     settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | NonNegativeInt = LoanSettlementOption.NONE

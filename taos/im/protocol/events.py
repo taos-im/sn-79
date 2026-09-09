@@ -24,6 +24,22 @@ def abbreviate(type_name : str):
         str: Concatenated initials, e.g. 'ET'.
     """
     return ''.join([s[0] for s in type_name.split('_')])
+def _close_reason_str(raw):
+    """The engine's integer close reason as the string the miner-facing contract uses.
+
+    1 is SL and 2 is TP; anything else is an ordinary trade. None rather than 0, so `if notice['cr']`
+    reads correctly.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw.upper() if raw.upper() in ("SL", "TP") else None
+    try:
+        return {1: "SL", 2: "TP"}.get(int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 class FinanceEvent(SimulationEvent):
     """
     Base class for representing market events occurring in the simulation.
@@ -51,6 +67,8 @@ class FinanceEvent(SimulationEvent):
             case "EVENT_TRADE":
                 return TradeEvent.from_json(json)
             case "ET":
+                # Normalised here rather than in a field_validator: model_construct skips validation.
+                json['cr'] = _close_reason_str(json.get('cr'))
                 return TradeEvent.model_construct(**json)
             case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS":
                 return OrderCancellationsEvent.from_json(json)
@@ -517,6 +535,15 @@ class TradeEvent(FinanceEvent):
     s : int = Field(alias="side")
     p : float = Field(alias="price")
     q : float = Field(alias="quantity")
+    # 'SL' or 'TP' on an SL/TP close, None on an ordinary trade. The engine sends an integer and the
+    # exchange path sends the string; normalised to the string in FinanceEvent.from_json so a miner
+    # can write one check that holds on both mechanisms.
+    cr : str | None = Field(alias="closeReason", default=None)
+    
+    @property
+    def closeReason(self) -> str | None:
+        """Readable accessor for wire field ``cr``: 'SL', 'TP', or None for an ordinary trade."""
+        return self.cr
     
     @property
     def bookId(self) -> int | None:
@@ -837,10 +864,9 @@ def parse_notices(raw):
                     built = None
                 if built is not None:
                     break
-            # NEVER DROP A NOTICE. An earlier version skipped anything the local dispatcher did not
-            # recognise, on the reasoning that consumers select by type so an unparsed notice is
-            # unreadable anyway. That was wrong twice over: it is perfectly readable as a dict, and this
-            # tree's dispatcher does not cover every code that reaches it -- the exchange one has no
+            # NEVER DROP A NOTICE. Skipping anything the local dispatcher does not recognise is wrong
+            # twice over: an unparsed notice is perfectly readable as a dict, and this tree's dispatcher
+            # does not cover every code that reaches it -- the exchange one has no
             # ClosePositionsEvent, so RDCP was discarded and an SL/TP trigger's close notice never
             # reached the miner. The other tree is tried second, and a code neither knows is passed
             # through unchanged and reported, because losing a miner's notice is worse than a mixed shape.

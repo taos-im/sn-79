@@ -89,8 +89,8 @@ public:
         // the sampling-dependence that dividing by elapsed time exists to remove: a long
         // quiet interval contributes a near-zero ratio with full weight and drags the
         // estimate down, so the answer depends on the observer's cadence rather than on the
-        // market. Measured on a 0.4 trades/s book, the average-of-ratios form read 9.7e-09
-        // against a true 6.7e-08 — low by ~7x. This form is an exponentially weighted
+        // market. On a 0.4 trades/s book the average-of-ratios form reads 9.7e-09
+        // against a true 6.7e-08, low by roughly 7x. This form is an exponentially weighted
         // ratio-of-sums and degrades to plain realized variance as the halflife grows.
         const double w = std::exp(-std::numbers::ln2 * dt / m_halflifeSeconds);
         m_weightedSq = w * m_weightedSq + sumSq;

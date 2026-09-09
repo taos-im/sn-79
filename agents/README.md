@@ -224,7 +224,7 @@ Decimal('0.006799999999999999621136392846665330580435693264007568359375')
 
 That is below `0.0068`, so truncation to four places yields **`0.0067`**, a whole tick lower than you
 intended. Your order rests one tick away, and the quote reserved against it is smaller in proportion.
-Measured on a real order: a 3,335,926.3957 buy reserved 22,350.71 TAO rather than the 22,684.30 the
+On a real order, a 3,335,926.3957 buy reserved 22,350.71 TAO rather than the 22,684.30 the
 price implied, a 1.5% difference caused entirely by the last decimal place.
 
 Nothing rejects the order and nothing warns you. It rests at a legal price, just not the one you
@@ -397,7 +397,7 @@ resolve in both trees. `OrderCurrency.BASE` and `OrderCurrency.ALPHA` are the sa
 and `TAO`, so an agent can import the enum from either tree and use either spelling. Passing the integer
 value works too, and is identical on both.
 
-This was not always true: until 2026-08-20 the simulation tree had only `BASE`/`QUOTE` and the exchange
+This was not always true: earlier releases gave the simulation tree only `BASE`/`QUOTE` and the exchange
 tree only `ALPHA`/`TAO`, so a dual-mode agent raised `AttributeError` on whichever tree it had not been
 written against. If you are reading older agent code that carefully imports from one tree, that is why.
 

@@ -15,7 +15,29 @@ import bittensor as bt
 from taos.im.utils.streams import *
 
 _current_log_dir = None
+# mtime of the handoff file when we last read it. The signal is an OPTIMISATION, not the contract:
+# see check_log_dir_change.
+_log_dir_mtime = None
 _log_dir_changed = False
+
+
+def _ensure_log_dir(path: str) -> None:
+    """Create the directory a seed/external CSV is about to be appended to.
+
+    The run directory can be absent for two ordinary reasons: it lives under /tmp on some deployments
+    and is cleared by systemd, or this service learned of it before the simulator created it. Neither
+    is exceptional, but `open(..., 'a')` raises FileNotFoundError for both, and record_seed is called
+    per trade - so an absent directory produces several "Exception in seed handling: [Errno 2]" lines a
+    SECOND for as long as it persists, with every seed in between silently lost.
+
+    Creating it is the correct repair once the path itself is trustworthy, which the mtime refresh in
+    check_log_dir_change now makes it: a stale path is corrected within one seed rather than written
+    to forever.
+    """
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError as ex:
+        bt.logging.warning(f"Could not create log directory for {path}: {ex}")
 
 def _handle_sigusr1(signum, frame):
     """Signal handler for log directory updates."""
@@ -85,19 +107,37 @@ def seed(config):
     
     def check_log_dir_change():
         """Check if log directory has changed via signal or environment."""
-        global _current_log_dir, _log_dir_changed
+        global _current_log_dir, _log_dir_changed, _log_dir_mtime
         nonlocal seed_filename, seed_file, seed_count, last_seed, pending_seed_data
         nonlocal external_filename, external_file, sampled_external_filename
         nonlocal sampled_external_file, external_count, last_external, pending_external_data
         nonlocal sampled_external_count
-        
-        if not _log_dir_changed and _current_log_dir:
+
+        # STAT THE FILE; DO NOT TRUST THE SIGNAL TO ARRIVE. Refreshing only on SIGUSR1 latches after
+        # the first successful read, because the flag below clears only when the directory did NOT
+        # change. The signal is delivered to
+        # `v.seed_process`, a handle that goes stale the moment this service outlives the validator
+        # that spawned it: the validator then writes the file, finds its handle dead, logs "cannot
+        # notify" and returns, while this process keeps writing to a directory from a previous run.
+        # The handoff file can hold the correct run directory the whole time while this service keeps
+        # writing to a directory that no longer exists, several errors a second. An mtime check is one
+        # stat per seed and makes a lost signal cost latency, not correctness.
+        log_dir_file = os.environ.get('TAOS_VALIDATOR_LOG_DIR_FILE', '/tmp/validator_log_dir.txt')
+        try:
+            _mtime = os.stat(log_dir_file).st_mtime
+        except OSError:
+            _mtime = None
+        if not _log_dir_changed and _current_log_dir and _mtime == _log_dir_mtime:
             return
+        _log_dir_mtime = _mtime
         new_log_dir = None
-        log_dir_file = '/tmp/validator_log_dir.txt'
-        if os.path.exists(log_dir_file):
-            with open(log_dir_file, 'r') as f:
-                new_log_dir = f.read().strip()
+        if _mtime is not None:
+            try:
+                with open(log_dir_file, 'r') as f:
+                    new_log_dir = f.read().strip() or None
+            except OSError as _ex:
+                bt.logging.warning(f"Could not read log dir handoff {log_dir_file}: {_ex}")
+                return
         
         if new_log_dir != _current_log_dir:
             bt.logging.info(f"Log directory changed: {_current_log_dir} -> {new_log_dir}")
@@ -135,8 +175,9 @@ def seed(config):
             external_count = 0
             sampled_external_count = 0
             pending_external_data = ''
-        else:            
-            _log_dir_changed = False
+        # Cleared on BOTH paths: clearing it only here leaves a run that DID change directory re-reading
+        # the file on every seed thereafter.
+        _log_dir_changed = False
     
     def on_coinbase_trade(trade: dict):
         """Handle one Coinbase trade message and record it as seed flow.
@@ -205,6 +246,7 @@ def seed(config):
                             with open(seed_filename) as f:
                                 for _line in f:
                                     seed_count += 1
+                        _ensure_log_dir(seed_filename)
                         seed_file = open(seed_filename, 'a')
                         seed_file.write(pending_seed_data)
                         pending_seed_data = ''
@@ -249,6 +291,7 @@ def seed(config):
                             with open(external_filename) as f:
                                 for _line in f:
                                     external_count += 1
+                        _ensure_log_dir(external_filename)
                         external_file = open(external_filename, 'a')
                         external_file.write(pending_external_data)
                         pending_external_data = ''
@@ -258,6 +301,7 @@ def seed(config):
                             with open(sampled_external_filename) as f:
                                 for _line in f:
                                     sampled_external_count += 1
+                        _ensure_log_dir(sampled_external_filename)
                         sampled_external_file = open(sampled_external_filename, 'a')
                     external_count += 1
                     external_file.write(f"{external_count},{trade['price']},{trade['time']}\n")
@@ -444,6 +488,7 @@ def seed_thread(self) -> None:
                                         with open(self.seed_filename) as f:
                                             for _line in f:
                                                 self.seed_count += 1
+                                    _ensure_log_dir(self.seed_filename)
                                     self.seed_file = open(self.seed_filename,'a')
                                     self.seed_file.write(self.pending_seed_data)
                                     self.pending_seed_data = ''
@@ -473,6 +518,7 @@ def seed_thread(self) -> None:
                                         with open(self.external_filename) as f:
                                             for _line in f:
                                                 self.external_count += 1
+                                    _ensure_log_dir(self.external_filename)
                                     self.external_file = open(self.external_filename,'a')
                                     self.external_file.write(self.pending_external_data)
                                     self.pending_external_data = ''
@@ -482,6 +528,7 @@ def seed_thread(self) -> None:
                                         with open(self.sampled_external_filename) as f:
                                             for _line in f:
                                                 self.sampled_external_count += 1
+                                    _ensure_log_dir(self.sampled_external_filename)
                                     self.sampled_external_file = open(self.sampled_external_filename,'a')
                                 self.external_count += 1
                                 self.external_file.write(f"{self.external_count},{trade['price']},{trade['time']}\n")

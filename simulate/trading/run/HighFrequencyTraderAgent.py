@@ -66,8 +66,6 @@ class HighFrequencyTraderAgent:
         self.wealthFrac = 1
         # minimum feed latency
         self.minMFLatency = int(params['minMFLatency'])
-        # Not used now, previously for cancellation
-        # self.maxD  =int(params['maxD'])        
         # Order placement latency
         self.minOPLatency = int(params['minOPLatency'])
         self.maxOPLatency = int(params['maxOPLatency'])

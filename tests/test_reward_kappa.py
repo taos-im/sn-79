@@ -179,3 +179,39 @@ def test_kappa3_lookback_excludes_old_observations():
     k_wide["lookback"] = 10800_000_000_000
     out_wide = kappa_3(1, series, **k_wide)
     assert out_wide is not None and out_wide["books"][0] is not None
+
+
+def test_calculate_kappa_score_present_uid_with_no_books_is_zero():
+    """A uid present in kappa_values but holding NO books must score 0.0, not crash.
+
+    Distinct from test_calculate_kappa_score_unknown_uid_is_zero: the uid IS known, so the
+    orchestrator does not early-exit, but normalized_kappas is empty, so total_books is 0,
+    max_inactive_books is int(ratio*0)==0, and 0 <= 0 takes the "ignore inactive books"
+    branch with an EMPTY books_with_scores -> data == np.array([]). np.percentile then
+    raises IndexError, and guarding only the penalty would leave np.median([]) == nan to
+    propagate into the weights. Observed on a live exchange-mode validator: repeated
+    "Rewarding failed: index -1 is out of bounds for axis 0 with size 0".
+    """
+    uid = 3
+    score = calculate_kappa_score(
+        uid=uid,
+        kappa_values={uid: {"books": {}}},
+        activity_factors={uid: {}},
+        pnl_factors={uid: {}},
+        roundtrip_volumes={uid: {}},
+        realized_pnl_history={uid: {}},
+        config={
+            "interval": 5_000_000_000,
+            "max_inactive_books_ratio": 0.375,
+            "kappa": {"normalization_min": 0.0, "normalization_max": 2.0,
+                      "lookback": 10800_000_000_000, "pnl": {"impact": 0.5}},
+            "activity": {"capital_turnover_cap": 10.0,
+                         "trade_volume_sampling_interval": 600_000_000_000,
+                         "decay_grace_period": 600_000_000_000, "impact": 0.33,
+                         "decay_rate": 1.0},
+        },
+        simulation_config={"miner_wealth": 1000.0, "publish_interval": 5_000_000_000,
+                           "volumeDecimals": 2},
+        simulation_timestamp=50_000 * 1_000_000_000,
+    )
+    assert score == 0.0

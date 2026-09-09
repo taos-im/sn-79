@@ -12,11 +12,12 @@ Offline-validated on mainnet-sim L3. Two properties are deliberate and load-bear
   floor before it counts, and skill is assessed across books rather than from a single one. Consistency
   at negligible size is not skill.
 
-WIRED AND DEFAULT-OFF. trade.py accumulates per-uid/book buy/sell capture and the inventory
-mark-to-market path; persistence.py and report.py carry the sums across restarts and snapshots;
-reward.py computes the scores and substitutes them for the trading score ONLY when
---scoring.debeta.enabled is set, which defaults to false. Nothing about live scoring changes until
-an operator turns it on.
+ALWAYS COMPUTED, WEIGHTED IN BY ONE DIAL. trade.py accumulates per-uid/book buy/sell capture and
+the inventory mark-to-market path unconditionally; persistence.py and report.py carry the sums
+across restarts and snapshots; reward.py computes the scores every cycle and blends them into the
+trading score by --scoring.debeta.weight (default 0.0: legacy emissions with the decomposition
+fully published; 1.0: full replacement). The old --scoring.debeta.enabled boolean is deprecated
+and ignored.
 """
 import statistics
 from bisect import bisect_left, insort
@@ -183,47 +184,128 @@ def _uid(x):
     return -1 if x is None else int(x)
 
 
+def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts):
+    """Book one fill's capture against `mid`: buyer gets (mid-price)*q, seller the negation
+    (zero-sum per fill under ANY mid, so a degraded mid can shift capture between counterparties
+    but never mint it)."""
+    buy_cap = (mid - float(t["p"])) * float(t["q"])
+    ma = t.get("Ma", -1)
+    ta = t.get("Ta", -1)
+    buyer, seller = (ta, ma) if int(t["s"]) == 0 else (ma, ta)
+    if buyer is not None and buyer >= 0:
+        buy_sums[buyer][book_id] = buy_sums[buyer].get(book_id, 0.0) + buy_cap
+        if buy_hist is not None:
+            _hadd2(buy_hist, buyer, book_id, ts, buy_cap)
+    if seller is not None and seller >= 0:
+        sell_sums[seller][book_id] = sell_sums[seller].get(book_id, 0.0) - buy_cap
+        if sell_hist is not None:
+            _hadd2(sell_hist, seller, book_id, ts, -buy_cap)
+
+
+CAPTURE_FLUSH_NS = 60_000_000_000  # force-finalize a pending fill after 60 sim-s without W forward prints
+
+
+def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
+                    now_ns, flush_ns, force=False):
+    """Finalize every pending fill whose forward window is complete (W prints arrived after it),
+    stale (older than flush_ns of sim time, so a quiet book cannot hold capture hostage), or
+    force-flushed. The window truncates only at genuine stream edges, never at batch edges."""
+    prices, pend = st["prices"], st["pend"]
+    base, n = st["base"], st["n"]
+    while pend:
+        idx, arrive_ns, t = pend[0]
+        if not (force or n - 1 >= idx + W
+                or (now_ns is not None and arrive_ns is not None and now_ns - arrive_ns >= flush_ns)):
+            break
+        lo = max(0, idx - W) - base
+        hi = min(n, idx + W + 1) - base
+        window = prices[lo:hi]
+        _attribute_capture(buy_sums, sell_sums, book_id, t, sum(window) / len(window),
+                           buy_hist, sell_hist, ts)
+        pend.pop(0)
+    new_base = max(base, (pend[0][0] if pend else n) - W)
+    if new_base > base:
+        del prices[:new_base - base]
+        st["base"] = new_base
+
+
 def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
-                            buy_hist=None, sell_hist=None, ts=None):
+                            buy_hist=None, sell_hist=None, ts=None,
+                            mid_state=None, flush_ns=CAPTURE_FLUSH_NS):
     """Accumulate per-uid two-sided spread capture for ONE book's ordered trade batch into
     buy_sums / sell_sums ({uid: {book: cap}}), in place. Each `trade` is dict-like with keys
     p (price), q (quantity), s (side), Ma (maker uid), Ta (taker uid). side==0 => taker buys /
     maker sells; side==1 => maker buys / taker sells. buyer captures (mid-price)*q, seller
-    (price-mid)*q, vs a non-lagging centered mid over this batch. Self-trades (Ma==Ta) are excluded
-    (first-line wash guard; cross-uid rings are netted at score time by coldkey cluster).
+    (price-mid)*q, vs a non-lagging centered mid. Self-trades (Ma==Ta) earn nothing but their
+    prints still shape the mid (first-line wash guard; cross-uid rings are netted by P11).
 
-    When buy_hist/sell_hist ({uid:{book:{ts:incr}}}) + ts are given, the per-batch increments are also
+    mid_state=None (offline callers passing a whole run as one batch): the centered mid is computed
+    over THIS batch, truncating at its edges. At live print density that truncation is the rule,
+    not the exception (on a live board: median 4 prints per state update,
+    90.9% of batches degrade to the plain batch mean, 12.8% of prints see a full window), so live
+    callers pass mid_state ({book: st}) to carry the print window ACROSS batches: each fill is held
+    (bounded: at most W pending fills and 2W+1 prices per book) until W forward prints arrive, then
+    booked against its full centered window at the finalizing call's ts. A fill with no W forward
+    prints inside flush_ns of sim time finalizes with a truncated forward side, so the lag is
+    bounded and a quiet book still settles. Batch shape then cannot move capture: only the print
+    stream itself can.
 
-    Args:
-        buy_sums: ``{uid: {book: capture}}`` buyer-side sums, accumulated in place.
-        sell_sums: ``{uid: {book: capture}}`` seller-side sums, accumulated in place.
-        book_id: The book this batch belongs to.
-        trades: Ordered trade batch, each dict-like with ``p``, ``q``, ``s``, ``Ma``, ``Ta``.
-        W: Optional windowing context ``(buy_hist, sell_hist, ts)``; None for offline callers.
-    recorded at ts so the sums can be windowed (pruned/shifted). Offline callers pass none (full-run)."""
-    prices = [float(t["p"]) for t in trades]
-    mids = centered_mid(prices, W)
-    for t, mid in zip(trades, mids):
-        ma = t.get("Ma", -1)
-        ta = t.get("Ta", -1)
-        if ma == ta:
-            continue
-        buy_cap = (mid - float(t["p"])) * float(t["q"])
-        buyer, seller = (ta, ma) if int(t["s"]) == 0 else (ma, ta)
-        if buyer is not None and buyer >= 0:
-            buy_sums[buyer][book_id] = buy_sums[buyer].get(book_id, 0.0) + buy_cap
-            if buy_hist is not None:
-                _hadd2(buy_hist, buyer, book_id, ts, buy_cap)
-        if seller is not None and seller >= 0:
-            sell_sums[seller][book_id] = sell_sums[seller].get(book_id, 0.0) - buy_cap
-            if sell_hist is not None:
-                _hadd2(sell_hist, seller, book_id, ts, -buy_cap)
+    When buy_hist/sell_hist ({uid:{book:{ts:incr}}}) + ts are given, increments are also recorded
+    at ts so the sums can be windowed (pruned/shifted)."""
+    if mid_state is None:
+        prices = [float(t["p"]) for t in trades]
+        mids = centered_mid(prices, W)
+        for t, mid in zip(trades, mids):
+            if t.get("Ma", -1) == t.get("Ta", -1):
+                continue
+            _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts)
+        return
+    st = mid_state.setdefault(book_id, {"prices": [], "pend": [], "base": 0, "n": 0})
+    for t in trades:
+        st["prices"].append(float(t["p"]))
+        if t.get("Ma", -1) != t.get("Ta", -1):
+            st["pend"].append((st["n"], ts, t))
+        st["n"] += 1
+    _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, ts, flush_ns)
+
+
+def flush_capture_state(mid_state, buy_sums, sell_sums, W, *,
+                        buy_hist=None, sell_hist=None, ts=None,
+                        flush_ns=CAPTURE_FLUSH_NS, force=False):
+    """Finalize stale pending fills on EVERY book (books with no new trades never reach
+    accumulate_book_capture, so the live loop calls this each cycle; force=True drains everything,
+    for offline end-of-run and the sim-boundary re-base)."""
+    for book_id, st in mid_state.items():
+        _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
+                        ts, flush_ns, force=force)
 
 
 def balanced_reward(caps):
     """{agent: [buy_cap, sell_cap]} -> {agent: 2*min(buy_cap, sell_cap)} clamped at 0. The MAKING
     (liquidity) component: genuine two-sided spread capture; a one-sided accumulator/drift-rider -> ~0."""
     return {a: max(0.0, 2.0 * min(bc, sc)) for a, (bc, sc) in caps.items()}
+
+
+def balanced_reward_per_book(capture_buy_sums, capture_sell_sums, uids):
+    """Two-sided capture summed PER BOOK: sum_b 2*min(buy_b, sell_b), clamped at 0.
+
+    Two-sidedness must hold on each book separately: capture is a fill-level quantity, so summing
+    the sides before taking the minimum does not measure it. Strictly tighter than balanced_reward,
+    since min is subadditive and the clamp is on the total, so this can only lower a score.
+    """
+    out = {}
+    for u in uids:
+        cb = capture_buy_sums.get(u) or {}
+        cs = capture_sell_sums.get(u) or {}
+        tot = 0.0
+        for b in set(cb) | set(cs):
+            # The clamp belongs on the total, not here. Capture is (mid - p) * q and is genuinely
+            # negative on 43% of per-book values, so clamping inside the loop would drop a miner's
+            # loss-making books instead of counting them, breaking the subadditivity the docstring
+            # relies on.
+            tot += 2.0 * min(cb.get(b, 0.0), cs.get(b, 0.0))
+        out[u] = max(0.0, tot)
+    return out
 
 
 # Making resistance is ECONOMIC and identity-neutral: on the exchange, capital is really committed and
@@ -262,10 +344,17 @@ def kappa_floored(book_alphas, floor):
 
 
 def _rank01(vals):
+    """Ties share their block's MINIMUM rank: equal raw values must map to equal ranks (uid order
+    must never decide emissions; 88% of miners share making_raw==0.0 on a live board), and a
+    zero-making mass earns zero relative making credit rather than a positional lottery."""
     order = sorted(range(len(vals)), key=lambda i: vals[i])
     rank = [0.0] * len(vals)
-    for pos, i in enumerate(order):
-        rank[i] = pos / max(len(vals) - 1, 1)
+    denom = max(len(vals) - 1, 1)
+    pos = 0
+    for k, i in enumerate(order):
+        if k and vals[i] != vals[order[k - 1]]:
+            pos = k
+        rank[i] = pos / denom
     return rank
 
 
@@ -320,7 +409,13 @@ def et_book_batches(notices, seen_tids, ts):
                 continue
             seen_tids[tid] = ts
             by_book.setdefault(int(n["b"]), []).append(
-                {"p": n["p"], "q": n["q"], "s": n["s"], "Ma": n.get("Ma"), "Ta": n.get("Ta"), "i": tid}
+                # Mf/Tf carried through so making and skill CAN be measured net of fees. The
+                # accumulators ignore unknown keys, so adding them changes no score by itself; the
+                # dynamic fee policy is live and material (maker fees observed inverting from
+                # -0.332% on ordinary fills to +0.626% on sweep fills), and legacy FIFO PnL counts
+                # fees while de-beta does not, so replacing kappa+PnL silently drops them.
+                {"p": n["p"], "q": n["q"], "s": n["s"], "Ma": n.get("Ma"), "Ta": n.get("Ta"),
+                 "i": tid, "Mf": n.get("Mf"), "Tf": n.get("Tf")}
             )
     for b in by_book:
         by_book[b].sort(key=lambda e: (e["i"] is None, e["i"] if e["i"] is not None else 0))
@@ -371,15 +466,33 @@ def p11_discount(own, cp, uids, strength, topk=2):
     feeder cannot rank-buy a top making slot it did not earn from the diverse market."""
     if strength <= 0:
         return own
+    # O(total entries), not O(makers x total entries): build the GLOBAL taker aggregate once and
+    # derive each maker's leave-one-out by subtraction. Numerically identical to the per-maker
+    # rebuild (asserted in tests); the naive form cost 609ms of a 629ms scoring cycle at 251 uids.
+    g = {}
+    g_tot = 0.0
+    for cps in cp.values():
+        for t, v in cps.items():
+            g[t] = g.get(t, 0.0) + v
+            g_tot += v
     out = {}
     for u in uids:
-        ec = max(0.0, counterparty_ec(cp, u, topk))
+        my = cp.get(u, {})
+        tot = sum(my.values())
+        if tot <= 0:
+            out[u] = own.get(u, 0.0)
+            continue
+        other_tot = (g_tot - tot) or 1.0
+        top = sorted(my, key=lambda t: my[t], reverse=True)[:topk]
+        my_share = sum(my[t] for t in top) / tot
+        mkt_share = sum((g.get(t, 0.0) - my.get(t, 0.0)) for t in top) / other_tot
+        ec = max(0.0, my_share - mkt_share)
         out[u] = own.get(u, 0.0) * max(0.0, 1.0 - strength * ec)
     return out
 
 
 def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor=0.0, w_make=0.65,
-                  cp=None, p11_strength=0.0):
+                  cp=None, p11_strength=0.0, detail=None):
     """Full per-uid de-beta score. making = per-uid two-sided spread capture, combined by RANK. Rank
     rather than magnitude-proportional, because proportional combining re-concentrates reward on the
     largest flow; and per-uid rather than netted across linked accounts, because grouping by identity is
@@ -404,16 +517,39 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
         dict: ``{uid: combined score}``.
     cp: {maker_uid: {taker_uid: vol}}. Returns {uid: combined_score in [0,1]}."""
     uids = sorted(set(capture_buy_sums) | set(capture_sell_sums) | set(book_alphas_by_uid))
+    if detail is not None:
+        # Cleared BEFORE the empty-input return, not after: callers reuse one dict across cycles,
+        # so an early return that skipped the clear would republish the previous cycle's legs.
+        detail.clear()
     if not uids:
         return {}
-    caps = {u: [sum(capture_buy_sums.get(u, {}).values()), sum(capture_sell_sums.get(u, {}).values())]
-            for u in uids}
-    own = balanced_reward(caps)
+    # Two-sidedness is required per book, not across global sums, and is deliberately not
+    # configurable. Rollback lives one level up at scoring.debeta.enabled.
+    own = balanced_reward_per_book(capture_buy_sums, capture_sell_sums, uids)
+    pre_p11 = dict(own)
     if cp is not None and p11_strength > 0:
         own = p11_discount(own, cp, uids, p11_strength)
     making = [own.get(u, 0.0) for u in uids]
     skill = [kappa_floored(book_alphas_by_uid.get(u, []), floor) for u in uids]
     comb = combined_reward(making, skill, w_make)
+    if detail is not None:
+        # The SAME numbers the score was built from, not a recomputation: the dashboards publish
+        # these and a recomputation could disagree with what was emitted. Ranks come from the same
+        # _rank01 combined_reward uses, so making_rank*w + skill_rank*(1-w) reproduces the score.
+        rm, rs = _rank01(list(making)), _rank01(list(skill))
+        for i, u in enumerate(uids):
+            base = pre_p11.get(u, 0.0)
+            detail[u] = {
+                "making_raw": making[i],          # POST-P11, i.e. what was ranked
+                "making_rank": rm[i],
+                "skill_raw": skill[i],
+                "skill_rank": rs[i],
+                "p11_factor": (making[i] / base) if base else 1.0,
+                # Books whose |alpha| clears the floor: the de-beta coverage count. The kappa leg's
+                # num_scored_books is a penalty-floor artifact (a constant for idle miners) and must
+                # not stand in for this on any surface.
+                "skill_books": sum(1 for a in (book_alphas_by_uid.get(u) or []) if abs(float(a)) >= floor),
+            }
     return {uids[i]: comb[i] for i in range(len(uids))}
 
 
@@ -422,7 +558,7 @@ def combined_reward(making, skill, w_make=0.65):
     comparable scales). w_make is the operator dial. Offline: drift-OPPOSING at every w_make; genuine
     top-skill decile preserved (reward-rank 0.83-0.95); de-concentrates (combined Gini 0.29).
 
-    Making is RANK, NOT magnitude-proportional (decided 2026-08-06): (1) rank de-concentrates best
+    Making is RANK, NOT magnitude-proportional, by decision: (1) rank de-concentrates best
     (combined Gini 0.286 vs 0.62-0.68 for any magnitude leg, since making magnitude is Gini-0.89
     heavy-tailed); (2) rank BOUNDS a wash to top-rank reward (~one top-decile slot) which it cannot
     exceed, whereas magnitude-proportional lets a wash out-burn the field to approach the full making
@@ -617,32 +753,6 @@ def book_alphas_by_book(mtm, invsum, invn, drift):
             by_book[b] = tb - mi * drift.get(b, 0.0)
         out[uid] = by_book
     return out
-
-
-def demean_cross_section(alphas_by_book):
-    """Remove each book's CROSS-SECTIONAL mean alpha, leaving alpha relative to the field on that book.
-
-    WHY THIS EXISTS. alpha = MTM - mean_inventory x book_drift is drift-neutral in AGGREGATE, but the
-    per-book residuals of a directionally-positioned miner stay CONSISTENTLY SIGNED, and kappa scores
-    consistency rather than magnitude. So the strip cancels in the sum and survives in exactly the
-    pattern kappa rewards: measured corr(net-inventory, skill) of +0.284 on real mainnet L3, when the
-    design requires under 0.20. Subtracting the per-book mean removes the component every miner on
-    that book shares, which is the market move itself, and leaves the part that is genuinely yours.
-
-    This is the standard cross-sectional residualisation used to separate a common factor from
-    idiosyncratic return. It also raises the number of scored miners, because a miner who merely kept
-    pace with the field on every book is no longer credited for the field's move.
-
-    Books with a single participant contribute nothing (their mean IS that participant) and are
-    dropped rather than zeroed, since a book you alone traded carries no cross-sectional information.
-    """
-    per_book = {}
-    for uid, by_book in alphas_by_book.items():
-        for b, a in by_book.items():
-            per_book.setdefault(b, []).append(a)
-    means = {b: sum(v) / len(v) for b, v in per_book.items() if len(v) > 1}
-    return {uid: {b: a - means[b] for b, a in by_book.items() if b in means}
-            for uid, by_book in alphas_by_book.items()}
 
 
 def median_abs_floor(book_alphas_by_uid, scale=0.5):

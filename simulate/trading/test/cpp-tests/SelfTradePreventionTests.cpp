@@ -284,8 +284,8 @@ TEST_F(SelfTradePreventionTest, LimitOrderBuyCO)
 // SEPARATE INSTRUCTIONS CAN SHARE A TIMESTAMP, so STP must not key off timestamp equality.
 //
 // Simulation::m_time.current is set per delivered message to instr.delay, a per-batch offset, so a
-// miner's whole batch carries one timestamp. Measured on the running exchange: agent 4 registered
-// 126 orders stamped 12893798, one per book, plus groups of 122 and 118. Today's traffic happens to
+// miner's whole batch carries one timestamp. On a running exchange one agent registers
+// well over a hundred orders under a single timestamp, one per book. Today's traffic happens to
 // place at most one order per book per batch, which is the only reason Book.cpp's
 // `iop->timestamp() != order->timestamp()` guard does not misfire. Two orders on the SAME book in
 // one batch -- a bid and an ask, or two ladder levels -- are separate instructions sharing a

@@ -32,9 +32,10 @@ struct convert<taosim::decimal_t>
             v = taosim::util::unpackDecimal(o.as<taosim::PackedDecimal>());
         }
         // AN INTEGER IS A VALID DECIMAL. Every msgpack encoder emits a whole number as an integer rather
-        // than a float, so a volume of 5 arrives as POSITIVE_INTEGER and used to throw here. The throw
-        // happens while unpacking the INSTRUCTION, so the engine discarded the whole CANCEL_ORDERS batch
-        // and the UI reported an order CANCELLED that was still resting with its TAO held.
+        // than a float, so a volume of 5 arrives as POSITIVE_INTEGER and must not throw here. A
+        // throw happens while unpacking the INSTRUCTION, so the engine would discard the whole
+        // CANCEL_ORDERS batch and the UI would report an order CANCELLED that was still resting
+        // with its TAO held.
         //
         // Converted directly, NOT through double: double2decimal truncates to the price grid, and a double
         // cannot represent integers above 2^53 exactly.

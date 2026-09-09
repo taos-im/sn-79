@@ -175,3 +175,25 @@ def test_simulation_only_events_are_not_synthesised_on_the_exchange():
     assert "onStart" not in fired and "onEnd" not in fired, (
         f"lifecycle handlers fired on an exchange state update that carried no such event: {fired}"
     )
+
+
+def test_an_unrenderable_notice_does_not_cost_the_miner_its_handlers():
+    """A notice that cannot be turned into a log line must still reach its handler.
+
+    The abbreviated wire codes are built with model_construct (FinanceEvent.from_json), which skips
+    validation, so a notice missing a field is an object that raises on ATTRIBUTE ACCESS rather than a
+    ValidationError at parse time. Rendering one is therefore a thing that can fail:
+    OrderPlacementEvent.__str__ reads self.success, whose property returns self.u.
+
+    _dispatch_notice_handlers guards the render, but its fallback was `f"{etype} : {event}"` -- calling
+    the same __str__ that had just raised. The exception escaped the dispatcher, and the miner lost
+    every handler still queued on that update. Handlers fire BEFORE the log line is built, so the only
+    thing that should ever be lost here is the log line itself.
+    """
+    agent = _agent()
+    # No 'u': the placement event's __str__ cannot render, exactly as the parametrised cases above.
+    agent.update(_state(_parsed(4, [_wire("RDPOL"), _wire("ET")])))
+    fired = [name for name, _ in agent._calls]
+    assert "onOrderAccepted" in fired and "onTrade" in fired, (
+        f"an unrenderable notice cost the miner its handlers; handlers that fired: {fired}"
+    )

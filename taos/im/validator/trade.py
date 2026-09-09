@@ -14,6 +14,7 @@ from taos.im.protocol.events import TradeEvent
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.validator.debeta import (
     accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
+    flush_capture_state,
     prune_hist_2level, prune_hist_1level, shift_hist_2level, shift_hist_1level,
 )
 
@@ -51,8 +52,8 @@ class MissingNoticeField(Exception):
 def notice_fee(trade: dict, is_maker: bool) -> float:
     """The fee this agent paid on a trade notice. Raises rather than inventing one.
 
-    `fee = trade['Mf'] if is_maker else trade['Tf']` raised KeyError 28 times live between 09:21 and
-    11:35 on 2026-08-04, because the hand-built ET notice in engines/exchange.py omitted both fee
+    `fee = trade['Mf'] if is_maker else trade['Tf']` raised KeyError repeatedly in live
+    running, because the hand-built exchange notice omitted both fee
     fields while the canonical to_notice_dict() emits them. That exception propagated out of
     _process_uid_notices, so _process_uid_trade_volumes aborted for the whole uid and its trade
     volumes, realized PnL and roundtrip volume were left unupdated for the block.
@@ -237,11 +238,29 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
             if uid_item not in volume_deltas:
                 volume_deltas[uid_item] = {}
 
+            # Settled-fill notices are DELIBERATELY redelivered on every update for
+            # fill_notice_window_seconds (exchange_notices.merge_settled_fills), so the same fill
+            # arrives ~75 times at a 900s window and ~12s updates. Counting each delivery inflated
+            # volume, the maker/taker splits, roundtrip volume and the FIFO realized-PnL history by
+            # that factor. de-beta already guards this with _debeta_seen_tids; this is the same
+            # guard for the volume/PnL consumer. Keyed by (uid, trade id) because ONE trade is
+            # listed in both the maker's and the taker's notices — a global ledger would let the
+            # first uid processed consume it and starve the counterparty of its own side.
+            if not hasattr(self, '_volume_seen_tids'):
+                self._volume_seen_tids = {}
+            _seen_tids = self._volume_seen_tids
+
             for trade in trades:
+                _tid = trade.get('i')
+                if _tid is not None:
+                    _seen_key = (uid_item, _tid)
+                    if _seen_key in _seen_tids:
+                        continue
+                    _seen_tids[_seen_key] = sampled_timestamp
                 # Check the required fields up front so one malformed notice costs that notice and
-                # nothing more. Previously a missing 'Tf' raised out of this whole function, so the
-                # uid lost its trade volumes, realized PnL and roundtrip volume for the block, and the
-                # same absence separately broke metrics publishing in report.py, where the notice is
+                # nothing more. A missing 'Tf' raised out of this whole function costs the
+                # uid its trade volumes, realized PnL and roundtrip volume for the block, and the
+                # same absence separately breaks metrics publishing in report.py, where the notice is
                 # rebuilt with TradeEvent.model_construct and a missing key becomes a missing
                 # ATTRIBUTE. Reported as the producer defect it is, never defaulted: a fabricated zero
                 # fee would understate cost and corrupt PnL wherever fees are real.
@@ -298,7 +317,7 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
                 # Literal so a sim self-match is always cancelled, and in exchange mode
                 # resolve_trade_roles refuses to name the same uid on both sides. This is defence
                 # against that invariant changing, not a fix for a live path. It is cheap and it is
-                # the correct accounting either way. Raised by code review 2026-08-07, which noted the
+                # the correct accounting either way. Raised by code review, which noted the
                 # NO_STP justification in query.py leans on a protection that covers volume only.
                 if trade['Ma'] is not None and trade['Ma'] == trade['Ta']:
                     continue
@@ -506,8 +525,10 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     volume_prune_threshold = timestamp - self.config.scoring.activity.trade_volume_assessment_period
 
     # De-beta (P8) making + drift-strip skill inputs: accumulated over the ordered per-book fill
-    # stream, carried across publish batches. Gated so there is near-zero overhead when disabled.
-    _debeta_on = bool(getattr(getattr(self.config.scoring, 'debeta', None), 'enabled', False))
+    # stream, carried across publish batches. ALWAYS ON since scoring.debeta.weight replaced the
+    # enabled boolean: the decomposition is published at every weight (0 = legacy emissions with
+    # full visibility), so the accumulators can never silently go dark behind a flag.
+    _debeta_on = True
     if _debeta_on:
         # Running SUMS (what the score reads).
         for _name in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum'):
@@ -520,6 +541,12 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 setattr(self, _name, {})  # invn/drift running (per book); pfirst/plast STATE
         if not hasattr(self, 'debeta_mark_state'):
             self.debeta_mark_state = {}  # STATE (M1 rolling settlement-mark window; re-based at boundary, not persisted)
+        if not hasattr(self, 'debeta_capture_mid'):
+            # STATE {book: rolling print window + pending fills}: carries the capture mid ACROSS
+            # state updates (median 4 prints/update live, so a batch-local mid degrades to the batch
+            # mean 91% of the time). Bounded (<= W pending + 2W+1 prices per book); drained at the
+            # sim boundary, not persisted.
+            self.debeta_capture_mid = {}
         _debeta_cfg = getattr(self.config.scoring, 'debeta', None)
         _mark_mode = str(getattr(_debeta_cfg, 'mark_mode', 'last') or 'last')
         _mark_window = int(getattr(_debeta_cfg, 'mark_window', 0) or 0)
@@ -552,7 +579,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 accumulate_book_capture(
                     self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, CAPTURE_W,
                     buy_hist=self.debeta_capbuy_hist, sell_hist=self.debeta_capsell_hist,
-                    ts=sampled_timestamp,
+                    ts=sampled_timestamp, mid_state=self.debeta_capture_mid,
                 )
                 accumulate_book_mtm(
                     self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
@@ -585,21 +612,37 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             ])
             del recent_trades_book[:-25]
 
-    # De-beta live prune (mirror the volume-history prune above): making inputs to the volume-assessment
-    # window, skill inputs to the kappa lookback. Subtracts pruned mass from the running sums so
-    # running == sum(history within window). Retention is thereby bounded identically to kappa/volume.
+    # A book with no fills this update never reaches accumulate_book_capture, so drain its stale
+    # pending capture fills here (bounded lag: a fill waits at most CAPTURE_FLUSH_NS for its
+    # forward window, then finalizes truncated).
+    if _debeta_on and getattr(self, 'debeta_capture_mid', None):
+        flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
+                            CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
+                            sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp)
+
+    # De-beta live prune. BOTH legs share ONE window, the kappa lookback. Pruning making on the
+    # 24h volume-assessment window, each leg inheriting the retention of the legacy leg it
+    # replaced, splits them; de-beta replaces both, so that split is an artifact of implementation. It also
+    # pointed the wrong way: making alignment against two-sidedness falls monotonically as the
+    # window lengthens (measured 23 windows, all sliding positions: +0.175 at 2h to +0.067 at 24h),
+    # because over a long window a directional miner accumulates offsetting flow across time and
+    # presents as balanced. Subtracts pruned mass from the running sums so
+    # running == sum(history within window).
     if _debeta_on and should_prune:
-        _skill_prune_threshold = timestamp - self.config.scoring.kappa.lookback
-        prune_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, volume_prune_threshold)
-        prune_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, volume_prune_threshold)
-        prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, volume_prune_threshold)
-        prune_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, _skill_prune_threshold)
-        prune_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, _skill_prune_threshold)
-        prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _skill_prune_threshold)
-        prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _skill_prune_threshold)
-        if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the skill window
+        _debeta_prune_threshold = timestamp - self.config.scoring.kappa.lookback
+        prune_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, _debeta_prune_threshold)
+        prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _debeta_prune_threshold)
+        prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _debeta_prune_threshold)
+        if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the same window
             self._debeta_seen_tids = {k: v for k, v in self._debeta_seen_tids.items()
-                                      if v >= _skill_prune_threshold}
+                                      if v >= _debeta_prune_threshold}
+        if hasattr(self, '_volume_seen_tids'):  # same, for the volume/PnL dedup ledger
+            self._volume_seen_tids = {k: v for k, v in self._volume_seen_tids.items()
+                                      if v >= volume_prune_threshold}
 
     volume_deltas = {}
     realized_pnl_updates = {}
@@ -913,13 +956,21 @@ def shift_simulation_histories(
     # De-beta transition (only present when enabled): shift+prune the additive histories onto the new
     # clock so the assessment window spans the boundary continuously (identical to the volume/kappa
     # histories), then re-base the reconstructed-inventory + last-price STATE so the boundary price jump
-    # (openB-closeA) never enters the dp/drift accumulator. Making histories -> volume-assessment window;
-    # skill histories -> kappa lookback. Shared verbatim with the shadow. See SCORING_PATH_ARCHITECTURE.md §7.
+    # (openB-closeA) never enters the dp/drift accumulator. BOTH legs use the kappa lookback, matching
+    # the live prune: see the retention note there for why making no longer uses the 24h window.
+    # Shared verbatim with the shadow. See SCORING_PATH_ARCHITECTURE.md §7.
     if getattr(self, 'debeta_capbuy_hist', None) is not None:
         _log("Shifting de-beta histories...")
-        shift_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, old_ts, new_ts, new_volume_threshold)
-        shift_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, old_ts, new_ts, new_volume_threshold)
-        shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_volume_threshold)
+        # Drain pending capture fills at the OLD clock first (their increments then shift with the
+        # histories); the mid window must never span the boundary price jump, so the stream resets.
+        if getattr(self, 'debeta_capture_mid', None):
+            flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
+                                CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
+                                sell_hist=self.debeta_capsell_hist, ts=old_ts, force=True)
+            self.debeta_capture_mid = {}
+        shift_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_invn_hist, self.debeta_invn, old_ts, new_ts, new_threshold)

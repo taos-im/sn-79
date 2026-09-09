@@ -319,6 +319,8 @@ class GradientAggregator:
             str(validator_uid) if validator_uid not in (None, "") else "0"
         )
         self._bucket_prefix: str = bucket_prefix
+        # Kept beside the prefix so an assignment can name the shard in words as well as in the key.
+        self._mode: str = (bucket_prefix.rstrip("/").rsplit("/", 1)[-1] if bucket_prefix else "")
         # Resolve all filesystem paths to absolute at construction time.
         # If the operator passes a relative --checkpoint, the audit log
         # and any derived paths would otherwise depend on the launching
@@ -669,10 +671,21 @@ class GradientAggregator:
         # Local staging file for in-progress parquet buffer: persisted
         # periodically so a restart can continue filling the current window
         # rather than starting a fresh 5-min accumulation.
-        self._pending_staging_path: Path = (
-            self.checkpoint_path.parent / "pending_rows.msgpack"
+        # SCOPED BY MODE, not just by directory. checkpoint_path is .resolve()d above, so two
+        # aggregators whose --checkpoint paths differ only by a symlink collapse to the SAME parent.
+        # That happened: the exchange server restored the simulation's buffer ("Restored pending
+        # buffer: 128 books, 165419 rows"), exchange rows were written into simulation books, and the
+        # exchange mechanism never accumulated a page of its own. A directory split alone could not
+        # prevent it; the filename must carry the mode. Empty mode keeps the legacy name so an older
+        # invocation does not orphan an existing buffer.
+        self._pending_staging_path: Path = self.checkpoint_path.parent / (
+            f"pending_rows.{self._mode}.msgpack" if self._mode else "pending_rows.msgpack"
         )
         self._last_pending_save_ts: float = 0.0
+        self._ingest_ticks: int = 0
+        self._ingest_books: int = 0
+        self._ingest_events: int = 0
+        self._last_ingest_log: float = 0.0
 
         # S3 data cache: downloaded parquets are cached locally to avoid
         # re-downloading every aggregation cycle. Key: S3 key → local path.
@@ -978,6 +991,15 @@ class GradientAggregator:
             "ts_start": 0,
             "ts_end": 0,
             "data": [],
+            # THE SHARD THIS AGGREGATOR READS. A miner answers exactly one aggregator, and this is the
+            # prefix its gradient must land under -- the gather path looks for
+            # f"{self._bucket_prefix}gradients/{uid}/{round:08d}.grad" and nowhere else. Sending it
+            # removes the miner's need to guess. A shard derived from the miner's own per-tick
+            # trading mechanism is unrelated to which aggregator issued the work, so on a
+            # dual-mechanism stack the gradient lands on the other shard and the round closes empty
+            # while the miner logs a successful upload.
+            "bucket_prefix": self._bucket_prefix,
+            "mode": self._mode,
             "data_source": "s3" if self.validator_store else "local",
             "data_endpoint": self.validator_store.endpoint_url
             if self.validator_store
@@ -2269,19 +2291,51 @@ class GradientAggregator:
                 # fall back to the interval-start comparison.
                 if self._max_timestamp_ns > 0:
                     _cap = self._max_pending_rows_per_book
+                    # A ROBUST CLOCK, NOT THE MAXIMUM.
+                    #
+                    # "Has the sim advanced past this book" used self._max_timestamp_ns, which is a
+                    # MAX over every book -- so one book with a bad timestamp defines the clock for
+                    # all of them. Book 70 held 1530540000000000 (425 sim-hours,
+                    # exchange-scale) while the other 128 sat at ~2.45e12 (0.68h). Every one of them
+                    # was then 1,528,085s "behind" a 300s interval, so every book tail-flushed on
+                    # every loop -- pages of 1-3 sim-seconds and ~217 rows against train_seq_len=512,
+                    # which reads downstream as "no trainable pages" and no gradient, on a stack where
+                    # nothing was actually wrong with training.
+                    #
+                    # The median cannot be moved by a single outlier, so one poisoned book can no
+                    # longer stall the other 128. The outlier is reported rather than silently
+                    # tolerated: it is a real symptom (here, exchange-scale time in a simulation
+                    # aggregator) and hiding it would trade one silent failure for another.
+                    _lasts = sorted(v for v in self._last_ts.values() if v > 0)
+                    if _lasts:
+                        _clock = _lasts[len(_lasts) // 2]
+                        _hi = _lasts[-1]
+                        if (_hi - _clock) >= self._parquet_interval_ns and not getattr(
+                            self, "_clock_outlier_warned", False
+                        ):
+                            self._clock_outlier_warned = True
+                            _who = [b for b, v in self._last_ts.items() if v == _hi]
+                            logger.warning(
+                                "book clock outlier: book(s) %s at ts=%d are %.0fs ahead of the "
+                                "median book (%d). Using the median as the sim clock so one book "
+                                "cannot stall the rest; investigate the source of that timestamp.",
+                                _who, _hi, (_hi - _clock) / 1e9, _clock,
+                            )
+                    else:
+                        _clock = self._max_timestamp_ns
                     for _bid in list(self._pending_rows):
                         if not self._pending_rows[_bid]:
                             continue
                         if _cap:
                             _last = self._last_ts.get(_bid, 0)
                             if _last > 0 and (
-                                self._max_timestamp_ns - _last
+                                _clock - _last
                             ) >= self._parquet_interval_ns:
                                 self._flush_book_parquet(_bid)
                         else:
                             _start = self._pending_interval_start.get(_bid, 0)
                             if _start > 0 and (
-                                self._max_timestamp_ns - _start
+                                _clock - _start
                             ) >= self._parquet_interval_ns:
                                 self._flush_book_parquet(_bid)
 
@@ -2410,9 +2464,28 @@ class GradientAggregator:
                             elapsed_s = time.time() - min(delivered_times)
                             remaining_s = max(0.0, round_s - elapsed_s)
                             timing_suffix = f"; ~{remaining_s:.0f}s until round closes"
+                        # RETAINED PAYLOAD, once per round. Cheap: len() on bytes already in memory,
+                        # over at most a few dozen assignments. Reported as MB because the design
+                        # budget (two rounds, ~290MB) and the failure (11.5GB) are both MB-scale.
+                        try:
+                            _held_n = 0
+                            _held_b = 0
+                            for _src in (self._assignments, self._prev_round_assignments):
+                                for _a in list(_src.values()):
+                                    _gd = _a.get("_gradient_data")
+                                    if _gd is not None:
+                                        _held_n += 1
+                                        _held_b += len(_gd)
+                            _held = (f"; retained {_held_n} gradient(s) "
+                                     f"{_held_b / 1048576:.0f}MB across "
+                                     f"{len(self._assignments)}+{len(self._prev_round_assignments)} assignments")
+                        except Exception as _e:
+                            # SAY WHY IT FAILED. A bare swallow here hid the reason for two rounds and
+                            # made a working instrument look like a no-op.
+                            _held = f"; retained=UNAVAILABLE ({type(_e).__name__}: {_e})"
                         logger.info(
                             f"[GTX] round={self._agg_round}: {gradient_in}/{delivered} gradients in "
-                            f"({delivered}/{total} delivered){timing_suffix}"
+                            f"({delivered}/{total} delivered){timing_suffix}{_held}"
                         )
                     else:
                         # Waiting for validator to push round (data may still be accumulating)
@@ -3093,7 +3166,7 @@ class GradientAggregator:
             # raw ranges instead would collide those distinct loaders onto one
             # cached baseline → a miner scored as baseline_A − loss_after_B
             # across mismatched held-out data. Key on fwd_ranges so the cache
-            # entry always matches the loader it was measured on.
+            # entry always matches the loader it was computed against.
             fwd_ranges = self._forward_val_ranges(miner_ranges)
             held_loader = self._build_val_loader_for_ranges(
                 fwd_ranges, tokenizer, device,
@@ -3669,9 +3742,9 @@ class GradientAggregator:
                 logger.warning("  post-apply model param stats failed: %s", exc)
 
             # Both aggregator and siblings evaluate the applied delta against
-            # the val set. Previously this was gated on `is_aggregator` and
-            # the else branch fell back to `new_loss = best_loss`, but for
-            # siblings the candidates loop above is also gated on
+            # the val set. Gating this on `is_aggregator` and falling
+            # back to `new_loss = best_loss` does not work for siblings: for
+            # them the candidates loop above is also gated on
             # `is_aggregator` — so `best_loss` stays at its initial
             # `float("inf")` and the rollback check always fires. Run the
             # eval unconditionally so siblings get a real `new_loss` for the
@@ -4507,6 +4580,24 @@ class GradientAggregator:
 
         tick_ts = int(tick.get("ts", 0) or 0)
 
+        # INGEST COUNTER. There was no way to tell a tick that carried nothing from a tick that was
+        # never sent: /data-status only reports books that already have PARQUETS, so an aggregator
+        # receiving a steady stream of event-free ticks looked identical to one receiving nothing at
+        # all, for as long as you cared to watch. That ambiguity hid the exchange mechanism producing
+        # zero training rows across several hour-long runs. Cheap counters, logged once a minute.
+        self._ingest_ticks += 1
+        _bk = tick.get("books") or {}
+        self._ingest_books += len(_bk)
+        self._ingest_events += sum(len((_b or {}).get("events") or []) for _b in _bk.values())
+        _now_log = time.time()
+        if _now_log - self._last_ingest_log >= 60.0:
+            self._last_ingest_log = _now_log
+            logger.info(
+                "[GTX] ingest: %d tick(s), %d book-slot(s), %d event(s), last tick_ts=%d",
+                self._ingest_ticks, self._ingest_books, self._ingest_events, tick_ts,
+            )
+            self._ingest_ticks = self._ingest_books = self._ingest_events = 0
+
         # Drop exact retry duplicates (sim_ts == last_seen). Strictly stale
         # arrivals (sim_ts < last_seen) are legitimate reorder-buffer drains
         # and must still process. The sim-swap path below handles sim_id changes.
@@ -4571,6 +4662,15 @@ class GradientAggregator:
             else:
                 transition = False
             if self._sim_id is None and transition and self._no_startup_cleanup:
+                # KEEPING THE BUCKET IS NOT THE SAME AS KEEPING THE CLOCK.
+                #
+                # --no-startup-cleanup says "do not wipe stored data/", which is about the BUCKET. The
+                # in-memory tick buffers belong to the PREVIOUS sim's clock and are meaningless against
+                # the new one: interval_start sat at 907s from the old epoch while
+                # the live sim was at 687s, so `clock - interval_start` was NEGATIVE and no book could
+                # flush until the sim ran another ~520 seconds -- past the end of the acceptance window.
+                # Reset them regardless; stored data is untouched either way.
+                self._reset_sim_buffers()
                 logger.warning(
                     "sim_id transition on restart (restored=%s, bucket=%s → live=%s) "
                     "but --no-startup-cleanup set: keeping existing data/, NOT wiping. "
@@ -5170,6 +5270,11 @@ def create_gradient_router(
             "version": aggregator._version,
             "round": aggregator._agg_round,
             "books": books,
+            # THE SHARD THIS AGGREGATOR READS. The validator stamps it on every assignment it creates,
+            # so a miner learns where its gradient must land instead of deriving it from a per-tick
+            # mechanism flag -- which oscillates whenever one axon serves both mechanisms, filing
+            # gradients on whichever shard the last tick happened to name.
+            "bucket_prefix": aggregator._bucket_prefix,
         }
 
     @router.post("/round")
@@ -5621,8 +5726,12 @@ if __name__ == "__main__":
         choices=["simulation", "exchange"],
         help="Training mode shard for bucket keys (default: simulation). "
         "All keys live under gentrx/<network>/<mode>/. "
-        "'exchange' reserves the prefix for future exchange-data training; "
-        "no working data path today — operators should leave this at 'simulation'.",
+        "All keys live under gentrx/<network>/<mode>/, so the two modes are separate "
+        "shards of the same store and never mix. BOTH MODES ARE SUPPORTED: mode selects "
+        "the prefix and nothing else branches on it, so an aggregator and the validators "
+        "pushing to it need only agree on the value. Run ONE SERVER PER MODE when both "
+        "mechanisms are active, so a gradient is attributable to the mechanism that "
+        "produced it.",
     )
     parser.add_argument(
         "--network",

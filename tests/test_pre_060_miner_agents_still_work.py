@@ -39,7 +39,7 @@ def test_the_old_name_is_the_same_class_not_a_copy():
     """An alias, not a duplicate.
 
     A second class object would make `issubclass(FinanceAgent, FinanceSimulationAgent)` false and break
-    the composer's own validation, which asserts exactly that.
+    composed-agent validation, which asserts exactly that.
     """
     from taos.im.agents import FinanceAgentBase, FinanceAgent, FinanceSimulationAgent
 

@@ -358,10 +358,10 @@ class BaseMinerNeuron(BaseNeuron):
         bt.logging.info(f"Miner starting at block {self.block} with UID {self.uid}")
 
         # This loop maintains the miner's operations until intentionally stopped. A dropped chain
-        # connection (e.g. the local node restarting) must NOT terminate the loop: previously a single
-        # sync() exception escaped to the outer handler, run() returned, and the miner wedged silently —
-        # the process stayed alive so pm2 reported it 'online' while the axon served a stale/unreachable
-        # state and nothing resynced. Now each iteration is guarded: on failure rebuild the subtensor +
+        # connection (e.g. the local node restarting) must NOT terminate the loop: a single sync()
+        # exception escaping to the outer handler returns from run() and wedges the miner silently,
+        # with the process still alive so pm2 reports it 'online' while the axon serves a stale or
+        # unreachable state and nothing resyncs. Each iteration is guarded: on failure rebuild the subtensor +
         # metagraph in place, and only exit (for a clean pm2 restart) if the chain stays unreachable
         # across many consecutive attempts.
         consecutive_sync_failures = 0
