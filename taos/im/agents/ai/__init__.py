@@ -41,10 +41,10 @@ class FinanceSimulationAIAgent(GenTRXAgent):
         """
         # DELEGATE TO THE UNIFIED HANDLE; DO NOT REIMPLEMENT IT.
         #
-        # This method used to do update -> train -> respond -> report itself, never calling
-        # super().handle(). That bypassed FinanceAgent.handle entirely, which is where exchange-mode
-        # detection, the respond_simulation/respond_exchange dispatch and UnifiedAgentResponse.finalize()
-        # live -- so every AI agent was SIMULATION-ONLY by construction and could not answer an exchange
+        # It delegates to super().handle() rather than doing update -> train -> respond -> report
+        # itself. FinanceAgent.handle is where exchange-mode detection, the
+        # respond_simulation/respond_exchange dispatch and UnifiedAgentResponse.finalize() live, so
+        # bypassing it makes an AI agent SIMULATION-ONLY by construction, unable to answer an exchange
         # update at all. It also skipped the SIMULATION/EXCHANGE INSTRUCTIONS logging the acceptance
         # suite reads, so an AI agent looked silent even when it worked.
         #

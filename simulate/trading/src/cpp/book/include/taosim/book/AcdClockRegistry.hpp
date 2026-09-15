@@ -45,11 +45,11 @@ struct AcdClockStats
 // Per-book registry of ACD chains, keyed by the agent class base name of the group that
 // shares one token-passed clock.
 //
-// WHY THIS EXISTS SEPARATELY. This state used to live inside the MagneticField process,
-// which made every agent with an ACD clock depend on the Ising herding field — including
-// StylizedTrader, which reads no magnetism at all and only needed somewhere shared to
-// keep its own timers. A trader wanting zero herding still could not run without the
-// herding process, and the deref sites on the decision path were unchecked.
+// WHY THIS EXISTS SEPARATELY. Holding this state inside the MagneticField process would
+// make every agent with an ACD clock depend on the Ising herding field, including
+// StylizedTrader, which reads no magnetism at all and only needs somewhere shared to keep
+// its own timers. A trader wanting zero herding could then not run without the herding
+// process at all.
 //
 // It is deliberately NOT a member of BookTradeStats, despite living next to it on the
 // exchange and being reached the same way. BookTradeStats is copied by value into every

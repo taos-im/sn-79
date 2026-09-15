@@ -24,6 +24,37 @@ def abbreviate(type_name : str):
         str: Concatenated initials, e.g. 'ET'.
     """
     return ''.join([s[0] for s in type_name.split('_')])
+def _close_reason_str(raw):
+    """The engine's integer close reason as the string the miner-facing contract uses.
+
+    1 is SL and 2 is TP; anything else is an ordinary trade. None rather than 0, so `if notice['cr']`
+    reads correctly.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw.upper() if raw.upper() in ("SL", "TP") else None
+    try:
+        return {1: "SL", 2: "TP"}.get(int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def trade_event_from_wire(json: dict) -> "TradeEvent":
+    """A TradeEvent from an engine notice or a stored dump WITHOUT validation, close reason normalised.
+
+    model_construct skips validators, so every site that builds a TradeEvent from raw wire or stored
+    data has to normalise `cr` itself: the engine packs it as 0 / 1 / 2, the model declares
+    `str | None`. The validator's recent_miner_trades copies were built bare, kept the integer, and
+    tripped the serializer on every state save (PYDANTIC-SER-WARN, Expected `str`, got int 0); files
+    saved that way carry the integer too, so the restore path takes the same door. The caller's dict
+    is left untouched.
+    """
+    if "cr" in json:
+        json = {**json, "cr": _close_reason_str(json.get("cr"))}
+    return TradeEvent.model_construct(**json)
+
+
 class FinanceEvent(SimulationEvent):
     """
     Base class for representing market events occurring in the simulation.
@@ -51,7 +82,9 @@ class FinanceEvent(SimulationEvent):
             case "EVENT_TRADE":
                 return TradeEvent.from_json(json)
             case "ET":
-                return TradeEvent.model_construct(**json)
+                # Normalised in trade_event_from_wire rather than in a field_validator: model_construct
+                # skips validation.
+                return trade_event_from_wire(json)
             case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS":
                 return OrderCancellationsEvent.from_json(json)
             # model_construct skips validation, which is what the abbreviated wire form wants for
@@ -517,6 +550,15 @@ class TradeEvent(FinanceEvent):
     s : int = Field(alias="side")
     p : float = Field(alias="price")
     q : float = Field(alias="quantity")
+    # 'SL' or 'TP' on an SL/TP close, None on an ordinary trade. The engine sends an integer and the
+    # exchange path sends the string; normalised to the string in FinanceEvent.from_json so a miner
+    # can write one check that holds on both mechanisms.
+    cr : str | None = Field(alias="closeReason", default=None)
+    
+    @property
+    def closeReason(self) -> str | None:
+        """Readable accessor for wire field ``cr``: 'SL', 'TP', or None for an ordinary trade."""
+        return self.cr
     
     @property
     def bookId(self) -> int | None:
@@ -837,10 +879,9 @@ def parse_notices(raw):
                     built = None
                 if built is not None:
                     break
-            # NEVER DROP A NOTICE. An earlier version skipped anything the local dispatcher did not
-            # recognise, on the reasoning that consumers select by type so an unparsed notice is
-            # unreadable anyway. That was wrong twice over: it is perfectly readable as a dict, and this
-            # tree's dispatcher does not cover every code that reaches it -- the exchange one has no
+            # NEVER DROP A NOTICE. Skipping anything the local dispatcher does not recognise is wrong
+            # twice over: an unparsed notice is perfectly readable as a dict, and this tree's dispatcher
+            # does not cover every code that reaches it -- the exchange one has no
             # ClosePositionsEvent, so RDCP was discarded and an SL/TP trigger's close notice never
             # reached the miner. The other tree is tried second, and a code neither knows is passed
             # through unchanged and reported, because losing a miner's notice is worse than a mixed shape.

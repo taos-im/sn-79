@@ -4,7 +4,7 @@
 
 A subnet with ``SubtokenEnabled = False`` rejects every stake extrinsic, so an order there can
 never settle however healthy its pool looks. On the seeded localnet netuid 90 holds 81k alpha in
-its pool with staking switched off, and netuid 86 likewise. Measured consequence: a stake returns
+its pool with staking switched off, and netuid 86 likewise. Consequence: a stake returns
 
     Subtensor returned `SubtokenDisabled(Module)` error. This means: `SubToken disabled now`
 

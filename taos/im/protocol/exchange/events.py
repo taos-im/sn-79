@@ -8,7 +8,7 @@ from pydantic import Field
 from typing import Literal
 from taos.im.protocol.simulator import *
 from taos.common.protocol import SimulationEvent
-from taos.im.utils import duration_from_timestamp
+from taos.im.utils import format_timestamp
 from taos.im.protocol.exchange.models import LoanSettlementOption, OrderCurrency
 
 
@@ -40,7 +40,10 @@ class ExchangeEvent(SimulationEvent):
             case "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET":
                 return MarketOrderPlacementEvent.from_json(json)
             case "RDPOM" | "ERDPOM":
-                json['r'] = OrderCurrency(json['r'])
+                # A refusal built from the instruction may carry no currency; the quantity of a miner's
+                # market order is in alpha unless it said otherwise, so that is the reading when the
+                # field is absent rather than dropping the whole notice as unrecognised.
+                json['r'] = OrderCurrency(json['r']) if json.get('r') is not None else OrderCurrency.ALPHA
                 return MarketOrderPlacementEvent.model_construct(**json)
             case "EVENT_TRADE":
                 return TradeEvent.from_json(json)
@@ -57,6 +60,19 @@ class ExchangeEvent(SimulationEvent):
                 _ev.c = [OrderCancellationEvent.model_construct(**_i) if isinstance(_i, dict) else _i
                          for _i in (_ev.c or [])]
                 return _ev
+
+def _placement_verdict(event) -> str:
+    """The first word of a placement notice: what became of the order.
+
+    A refusal that names an order id is not a failed placement. The engine accepted and numbered the
+    order, and it was then not settled on chain (the proxy could not pay the fee, the swap returned
+    nothing within the slippage, the chain was unreachable), so the order was restored and nothing
+    filled. "FAILED TO PLACE ... #19" would contradict the "PLACED ... #19" the miner already saw.
+    """
+    if getattr(event, 'success', False):
+        return 'PLACED'
+    return 'NOT FILLED' if getattr(event, 'orderId', None) else 'FAILED TO PLACE'
+
 
 class OrderPlacementEvent(ExchangeEvent):
     """
@@ -162,7 +178,7 @@ class LimitOrderPlacementEvent(OrderPlacementEvent):
             )
         
     def __str__(self):
-        return f"{'PLACED' if self.success else 'FAILED TO PLACE'} {'BUY ' if self.side == 0 else 'SELL'} LIMIT ORDER{' #'+str(self.orderId) if self.orderId else ''}{' ('+str(self.clientOrderId)+')' if self.clientOrderId else ''} FOR {self.quantity}@{self.price} AT {duration_from_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
+        return f"{_placement_verdict(self)} {'BUY ' if self.side == 0 else 'SELL'} LIMIT ORDER{' #'+str(self.orderId) if self.orderId else ''}{' ('+str(self.clientOrderId)+')' if self.clientOrderId else ''} FOR {self.quantity}@{self.price} AT {format_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
         
 class MarketOrderPlacementEvent(OrderPlacementEvent):
     """
@@ -207,7 +223,7 @@ class MarketOrderPlacementEvent(OrderPlacementEvent):
             )
         
     def __str__(self):
-        return f"{'PLACED' if self.success else 'FAILED TO PLACE'} {'BUY ' if self.side == 0 else 'SELL'} MARKET ORDER{' #'+str(self.orderId) if self.orderId else ''}{' ('+str(self.clientOrderId)+')' if self.clientOrderId else ''} FOR {self.quantity}{'' if self.currency==OrderCurrency.ALPHA else ' TAO'} AT {duration_from_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
+        return f"{_placement_verdict(self)} {'BUY ' if self.side == 0 else 'SELL'} MARKET ORDER{' #'+str(self.orderId) if self.orderId else ''}{' ('+str(self.clientOrderId)+')' if self.clientOrderId else ''} FOR {self.quantity}{'' if self.currency==OrderCurrency.ALPHA else ' TAO'} AT {format_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
         
 class OrderCancellationEvent(BaseModel):
     """
@@ -260,7 +276,7 @@ class OrderCancellationEvent(BaseModel):
         return self.m
 
     def __str__(self):
-        return f"{'CANCELLED' if self.success else 'FAILED TO CANCEL'} ORDER #{self.orderId}{' FOR ' + str(self.quantity) if self.quantity else ''} AT {duration_from_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
+        return f"{'CANCELLED' if self.success else 'FAILED TO CANCEL'} ORDER #{self.orderId}{' FOR ' + str(self.quantity) if self.quantity else ''} AT {format_timestamp(self.timestamp)} (T={self.timestamp}){' : ' + self.message if not self.success else ''}"
         
 class OrderCancellationsEvent(ExchangeEvent):
     """
@@ -436,16 +452,28 @@ class TradeEvent(ExchangeEvent):
         )
     
     def __str__(self):
-        return f"{'BUY ' if self.side == 0 else 'SELL'} TRADE #{self.tradeId} : AGGRESSIVE ORDER #{self.takerOrderId} (AGENT {self.takerAgentId}) MATCHED AGAINST #{self.makerOrderId} (AGENT {self.makerAgentId}) FOR {self.quantity}@{self.price} AT {duration_from_timestamp(self.timestamp)} (T={self.timestamp})"
+        # No maker agent means the pool provided the liquidity (settlement is always against the pool,
+        # and the exchange's own sweep is the pool taking the resting side), so name it rather than
+        # printing order #0 of agent None. An order id of 0 is "not known", never an order.
+        maker_agent = self.makerAgentId
+        if maker_agent is None or (isinstance(maker_agent, int) and maker_agent < 0):
+            against = "POOL"
+        else:
+            against = f"{'#' + str(self.makerOrderId) + ' ' if self.makerOrderId else ''}(AGENT {maker_agent})"
+        return (
+            f"{'BUY ' if self.side == 0 else 'SELL'} TRADE #{self.tradeId} : AGGRESSIVE ORDER"
+            f"{' #' + str(self.takerOrderId) if self.takerOrderId else ''} (AGENT {self.takerAgentId}) "
+            f"MATCHED AGAINST {against} FOR {self.quantity}@{self.price} "
+            f"AT {format_timestamp(self.timestamp)} (T={self.timestamp})"
+        )
     
 
 from typing import Optional
 from taos.im.protocol.models import EventHistory
 
-# ONE AgentEventHistory, NOT TWO. This module used to define its own copy, identical to the one in
-# taos/im/protocol/events.py down to the base class it imports from there. Two classes of the same name
-# meant `from taos.im.protocol.agents import *` followed by `from taos.im.protocol.exchange import *`
-# silently decided which one an agent got, by import order. While one copy tolerated dict-shaped notices
+# ONE AgentEventHistory, NOT TWO. This module imports it rather than defining its own copy. Two
+# classes of the same name would let `from taos.im.protocol.agents import *` followed by
+# `from taos.im.protocol.exchange import *` silently decide which one an agent got, by import order. While one copy tolerated dict-shaped notices
 # and the other did not, that choice was the difference between an agent working and losing its whole
 # response on every exchange tick. Notices now parse to models on both paths so neither copy needs a
 # shim, and re-exporting the canonical class removes the ambiguity rather than leaving two that merely
@@ -501,9 +529,8 @@ def parse_notices(raw):
                     built = None
                 if built is not None:
                     break
-            # NEVER DROP A NOTICE. An earlier version skipped anything the local dispatcher did not
-            # recognise, on the reasoning that consumers select by type so an unparsed notice is
-            # unreadable anyway. That was wrong twice over: it is perfectly readable as a dict, and this
+            # NEVER DROP A NOTICE. Skipping anything the local dispatcher does not recognise is wrong
+            # twice over: an unparsed notice is perfectly readable as a dict, and this
             # tree's dispatcher does not cover every code that reaches it -- the exchange one has no
             # ClosePositionsEvent, so RDCP was discarded and an SL/TP trigger's close notice never
             # reached the miner. The other tree is tried second, and a code neither knows is passed

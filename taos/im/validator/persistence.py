@@ -24,7 +24,7 @@ import bittensor as bt
 from taos.im.utils.save import save_state_worker
 from taos.im.protocol.models import TradeInfo
 from taos.im.validator.debeta import sum_hist_2level, sum_hist_1level
-from taos.im.protocol.events import TradeEvent
+from taos.im.protocol.events import TradeEvent, trade_event_from_wire
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -127,6 +127,26 @@ def _snap_hist2(h):
     return {k: dict(tsd) for k, tsd in (h or {}).items()}
 
 
+_DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist")
+_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist")
+
+
+def build_debeta_state(self) -> dict:
+    """The de-beta block of the validator-state file: the TIMESTAMPED HISTORIES (making window + skill
+    window) plus the reconstruction STATE (per-book inventory + last price). The running sums are rebuilt
+    from the histories on load, so running == sum(history within window) holds by construction.
+
+    One function for both writers. Main's save and the scoring child's save offload (scoring_shadow
+    .child_save_validator_state, the file that is actually written while the cutover service runs) each
+    spelled their own block, and the child's had none of these keys: every restart with the shadow on
+    started the 24-hour making window from zero. Duck-typed: `self` is the Validator or the ShadowState."""
+    out = {name: _snap_hist3(getattr(self, name, {})) for name in _DEBETA_HIST3}
+    out.update({name: _snap_hist2(getattr(self, name, {})) for name in _DEBETA_HIST2})
+    out["debeta_inv"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv', {}) or {}).items()}
+    out["debeta_plast"] = dict(getattr(self, 'debeta_plast', {}) or {})
+    return out
+
+
 def build_validator_state(
     self: Validator,
     inventory_snapshot,
@@ -177,26 +197,16 @@ def build_validator_state(
         "taker_volume_sums": volume_sums_snapshots['taker_volume_sums'],
         "self_volume_sums": volume_sums_snapshots['self_volume_sums'],
         "roundtrip_volume_sums": volume_sums_snapshots['roundtrip_volume_sums'],
-        # De-beta (P8/E5/P11) fill-stream accumulators, windowed exactly like trade_volumes. Persist the
-        # TIMESTAMPED HISTORIES (making window + skill window) + the reconstruction STATE (per-book
-        # inventory + last price); the running sums are rebuilt from the histories on load, so
-        # running == sum(history within window) holds by construction. Only populated when de-beta is
-        # enabled; empty/absent otherwise.
-        "debeta_capbuy_hist": _snap_hist3(getattr(self, 'debeta_capbuy_hist', {})),
-        "debeta_capsell_hist": _snap_hist3(getattr(self, 'debeta_capsell_hist', {})),
-        "debeta_mtm_hist": _snap_hist3(getattr(self, 'debeta_mtm_hist', {})),
-        "debeta_invsum_hist": _snap_hist3(getattr(self, 'debeta_invsum_hist', {})),
-        "debeta_cp_hist": _snap_hist3(getattr(self, 'debeta_cp_hist', {})),
-        "debeta_invn_hist": _snap_hist2(getattr(self, 'debeta_invn_hist', {})),
-        "debeta_drift_hist": _snap_hist2(getattr(self, 'debeta_drift_hist', {})),
-        "debeta_inv": {b: dict(u) for b, u in getattr(self, 'debeta_inv', {}).items()},
-        "debeta_plast": dict(getattr(self, 'debeta_plast', {})),
+        # De-beta (P8/E5/P11) fill-stream accumulators, windowed exactly like trade_volumes. Shared with
+        # the scoring child's save offload so the two writers cannot drift (see build_debeta_state).
+        **build_debeta_state(self),
         # Persist the rolling request/timeout accumulators so a restart doesn't
         # reset them and force a fresh ~100-request (~12 min) blackout before the
         # miner_gauges requests/timeouts/call_time series reappear in Grafana.
         # Per-uid dict + call_time list are copied to tolerate concurrent
         # update_stats() mutation on the main loop (no await between here).
         "miner_stats": snapshot_miner_stats(self),
+        "miner_presence": snapshot_miner_presence(self),
     }
 
 
@@ -215,6 +225,46 @@ def snapshot_miner_stats(self: Validator):
     }
 
 
+def snapshot_miner_presence(self: Validator):
+    """Serialize the per-miner query-outcome windows the de-beta presence gate reads (forward.update_stats
+    keeps them as bounded deques of HTTP-200 outcomes). Persisted so a restart does not presume every
+    miner present until the window refills: during that refill a miner that went dark before the restart
+    is scored on its in-window fills as if it were still answering."""
+    out = {}
+    for uid, outcomes in dict(getattr(self, "miner_presence", {}) or {}).items():
+        try:
+            out[int(uid)] = [1 if o else 0 for o in list(outcomes)]
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def restore_miner_presence(self: Validator, loaded, window: int) -> int:
+    """Rebuild the presence deques from a saved snapshot; returns the number of uids restored. The deque
+    keeps the last `window` outcomes, so a saved window longer than the configured one is trimmed from the
+    left, and a shorter one stays partial (present until full, as a fresh validator treats it)."""
+    from collections import deque
+    if not isinstance(loaded, dict):
+        return 0
+    presence = getattr(self, "miner_presence", None)
+    if not isinstance(presence, dict):
+        presence = self.miner_presence = {}
+    n = max(int(window or 50), 1)
+    restored = 0
+    for uid_key, outcomes in loaded.items():
+        try:
+            uid = int(uid_key)
+        except (TypeError, ValueError):
+            continue
+        if uid < 0 or uid >= self.effective_max_uids:
+            continue
+        if not isinstance(outcomes, (list, tuple)):
+            continue
+        presence[uid] = deque((bool(o) for o in outcomes), maxlen=n)
+        restored += 1
+    return restored
+
+
 def build_save_light_fields(self: Validator) -> dict:
     """The main-only fields of the validator save file, shipped to the scoring
     service when it writes the file from its replica (save offload). Cheap
@@ -231,6 +281,7 @@ def build_save_light_fields(self: Validator) -> dict:
         "trading_score_ema_ts": getattr(self, '_trading_score_ema_ts', None),
         "trading_score_ema_n": dict(getattr(self, '_trading_score_ema_n', {}) or {}),
         "miner_stats": snapshot_miner_stats(self),
+        "miner_presence": snapshot_miner_presence(self),
     }
 
 
@@ -1447,6 +1498,12 @@ def _load_validator_state(self):
                     }
                     _restored += 1
                 bt.logging.info(f"Restored miner_stats for {_restored} UIDs")
+            _loaded_presence = validator_state.get("miner_presence", {})
+            if _loaded_presence:
+                _dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+                _window = int(getattr(_dcfg, 'presence_window', None) or 50)
+                _n = restore_miner_presence(self, _loaded_presence, _window)
+                bt.logging.info(f"Restored miner_presence windows for {_n} UIDs")
 
             loaded_scores = validator_state["scores"]
             self.scores = torch.zeros(self.effective_max_uids, dtype=torch.float32, device=self.device)
@@ -1757,7 +1814,8 @@ def load_state(self: Validator) -> None:
                         for book_id, trades in uid_miner_trades.items():
                             _c, _n = sanitize_miner_trades(trades)
                             _mt_dropped[0] += _n
-                            _mt_clean[book_id] = [[TradeEvent.model_construct(**t), r] for t, r in _c]
+                            # Files saved before the close-reason fix carry the engine's integer `cr`.
+                            _mt_clean[book_id] = [[trade_event_from_wire(t), r] for t, r in _c]
                         self.recent_miner_trades[uid] = {
                             book_id: v
                             for book_id, v in _mt_clean.items()

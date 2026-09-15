@@ -335,7 +335,6 @@ class QueryService:
                     if synapse.compressed:
                         bt.logging.warning(f"Failed to decompress response for {uid}!")
                         continue
-                
                 if not synapse.response:
                     bt.logging.debug(f"UID {uid} failed to respond: {synapse.dendrite.status_message}")
                     continue
@@ -364,7 +363,16 @@ class QueryService:
 
                         if volume_cap > 0 and miner_volumes[instruction.bookId] >= volume_cap and instruction.type != "CANCEL_ORDERS":
                             if not volume_cap_logged:
-                                bt.logging.info(f"Agent {uid} hit volume cap on one or more books")
+                                # SAY WHAT THE CAP AND THE VOLUME ACTUALLY ARE. "hit volume cap on one
+                                # or more books" names neither the book, the accumulated volume, nor
+                                # the limit -- so an agent silently restricted for the rest of the run
+                                # looks identical to one that simply is not trading. This is the line
+                                # that was firing, unread, while every simulation instruction from the
+                                # acceptance miner was being dropped here.
+                                bt.logging.info(
+                                    f"Agent {uid} hit volume cap: book={instruction.bookId} "
+                                    f"volume={miner_volumes[instruction.bookId]:,.2f} >= cap={volume_cap:,.2f} "
+                                    f"(capital_turnover_cap x miner_wealth); instruction DROPPED")
                                 volume_cap_logged = True
                             continue
 

@@ -80,12 +80,17 @@ Training params:
     gtx_gradient_dir      (str):   Where to save gradients. Default: <gtx_output_dir>/gradients/
     gtx_aggregator_uid    (int):   UID of the canonical-checkpoint aggregator. Default: 0.
     gtx_mode              (str):   Training mode shard for bucket keys ("simulation"
-                                   or "exchange"). Default: "simulation". Combined
-                                   with the subtensor network ("finney" → mainnet,
-                                   else testnet) to form the bucket prefix
-                                   gentrx/<network>/<mode>/. Leave at "simulation"
-                                   unless instructed otherwise; "exchange" is
-                                   reserved for future exchange-data training.
+                                   or "exchange"). Combined with the subtensor
+                                   network ("finney" → mainnet, else testnet) to
+                                   form the bucket prefix gentrx/<network>/<mode>/.
+                                   BOTH MODES ARE SUPPORTED; dual-mechanism training
+                                   is intended. Leave EMPTY unless you mean to PIN
+                                   the shard: the agent otherwise adopts the shard
+                                   its aggregator states in each assignment, which
+                                   is the only value that can be right, since the
+                                   gradient must land where that aggregator looks.
+                                   Setting this overrides that adoption and is an
+                                   operator instruction, not a hint.
     gtx_network           (str):   Explicit network shard: "mainnet" or "testnet". Leave
                                    empty to auto-detect from the connected subtensor
                                    (finney + standard wss endpoints → mainnet, else testnet).
@@ -156,6 +161,42 @@ except ImportError as _exc:
 # ---------------------------------------------------------------------------
 
 
+def group_assignments_by_shard(assignments):
+    """Group queued assignments by the aggregator shard they came from.
+
+    The merge in _maybe_train concatenates `data` and `books` across every queued assignment and
+    trains ONE window on the result. That is correct for several validators serving the SAME
+    mechanism, which is what it was written for. Under dual-mechanism SN79 the two validators serve
+    DIFFERENT shards, and each assignment's data keys live under its own bucket_prefix -- so the
+    merge trains a single model on both shards' data and publishes it to whichever shard was learned
+    last. Observed with both mechanisms live: "assignments: 2 validator(s), round=5237
+    ... data=5 files total", two shard lines in the same tick, one gradient.
+    """
+    groups: dict[str, list[dict]] = {}
+    for a in assignments or []:
+        groups.setdefault(a.get("bucket_prefix") or "", []).append(a)
+    return groups
+
+
+def pick_shard_group(groups, last_shard=None):
+    """Choose one shard's assignments to train now; return (chosen, requeue).
+
+    Requeues rather than drops the others, so the second mechanism is delayed by a tick instead of
+    losing its round. Selection avoids repeating `last_shard` when another shard is waiting, so a
+    fast mechanism cannot starve a slow one -- the exchange side produces far fewer rounds than the
+    simulation and would otherwise always lose.
+    """
+    if not groups:
+        return [], []
+    keys = sorted(groups)
+    if last_shard is not None and len(keys) > 1 and last_shard in keys:
+        keys = [k for k in keys if k != last_shard] + [last_shard]
+    chosen_key = keys[0]
+    chosen = groups[chosen_key]
+    requeue = [a for k in keys[1:] for a in groups[k]]
+    return chosen, requeue
+
+
 @dataclass
 class BookBuffer:
     """All mutable state for one book (one market realization)."""
@@ -210,6 +251,14 @@ class _GenTRXState:
     model = None
     store = None
 
+    def __init__(self) -> None:
+        # Mutable safe defaults. Scalars can be class attributes; containers cannot,
+        # or every agent in a process shares one. initialize() overwrites these, so an
+        # enabled agent is unaffected -- this only stops a BARE state object (the
+        # gtx_enabled=false path, where initialize() returns early) from raising
+        # AttributeError inside the miner's synapse handler and killing the request.
+        self.pending_assignments = []
+
     # ---- Data collection config (gtx_* params) ----
     output_dir: Path
     flush_interval_ns: int
@@ -253,6 +302,9 @@ class _GenTRXState:
     vol_scale: int | None
 
     # ---- Training queue / thread ----
+    # A LIST default cannot live at class level -- every instance would share one
+    # object. Set per instance in __init__ below instead, so the safe-defaults
+    # contract this class documents holds for the mutable fields too.
     pending_assignments: list[dict]
     training_thread: threading.Thread | None
     training_in_progress: bool
@@ -268,6 +320,10 @@ class _GenTRXState:
     s3_cache_dir: Path | None
     s3_cached_files: dict[str, Path]
     bucket_prefix: str
+    # The shard the aggregator issuing this miner's work is reading, learned from its assignments.
+    # Distinct from bucket_prefix, which is what this agent is currently writing to: they differ for
+    # exactly as long as it takes the next assignment to arrive and be adopted.
+    agg_bucket_prefix: str
 
     # ---- Training logger + retry backoff ----
     tlog: logging.Logger
@@ -283,11 +339,11 @@ class _GenTRXState:
 
     # ---- Co-base signal cache ----
     # When a composed agent extends both ComposedAgentBase AND GenTRXAgent, the
-    # composer's engines.gentrx in_process module reads the latest per-book
+    # composed agent's in-process GenTRX engine reads the latest per-book
     # signal via :meth:`GenTRXAgent.gentrx_signal`. The cache is populated each
     # tick by ``_execute_signal`` regardless of co-base status (the standalone
     # path also places orders; the co-base path only reads the cache and lets
-    # the composer's weapons module decide what to do).
+    # the composed agent's execution module decide what to do).
     last_signals: dict[int, float]
 
 # ---------------------------------------------------------------------------
@@ -324,8 +380,8 @@ class GenTRXAgent(FinanceAgent):
         # A caller that wants GenTRX genuinely off had no way to say so. This is that way. Every gtx_*
         # feature flag is forced off and setup is skipped, so the agent behaves as a pure trader: the
         # event hooks below all short-circuit on collect_data/training_enabled/inference_enabled.
-        # GenTRX IS OPT-IN: with no gtx_* settings at all, it must not initialise. (Operator decision,
-        # 2026-08-09.) Defaulting `enabled` to True meant every agent inheriting GenTRXAgent paid the
+        # GenTRX IS OPT-IN: with no gtx_* settings at all, it must not initialise (operator
+        # decision). Defaulting `enabled` to True meant every agent inheriting GenTRXAgent paid the
         # full setup cost -- bucket prefix, S3 stores, checkpoint resolution -- whether or not anyone
         # asked for it, which is what put 563s to >944s between process start and the axon serving.
         #
@@ -482,6 +538,7 @@ class GenTRXAgent(FinanceAgent):
         g.discovered_aggregator_store = None
         g.discovered_aggregator_uid = int(getattr(self.config, "gtx_aggregator_uid", 0))
         g.bucket_prefix = ""  # populated by _ensure_gentrx_inited() on first respond()
+        g.agg_bucket_prefix = ""  # populated by _learn_aggregator_shard() when work arrives
         g.gentrx_inited = False
         g.last_signals = {}  # book_id → last signal float; read by composer co-base
 
@@ -597,14 +654,28 @@ class GenTRXAgent(FinanceAgent):
         # first, before any other field is touched.
         if not getattr(g, "enabled", True):
             return
-        if g.gentrx_inited:
-            return
-        g.gentrx_inited = True
-
         from GenTRX.src.gradient_store import gentrx_prefix, network_from_config
 
-        # gtx_mode override: explicit param wins, else derive from actual run mode.
+        # THE SHARD IS RE-DERIVED EVERY TICK, NOT LOCKED ON THE FIRST ONE.
+        #
+        # NOT computed once behind the gentrx_inited guard below from `_exchange_mode`, a flag that
+        # flips per update because one agent instance serves both validators: whichever mechanism ticks
+        # first would own the bucket shard for the whole process lifetime and the other mechanism's
+        # gradients would be filed under it. With
+        # the simulation aggregator stopped and an exchange-mode aggregator the only one running, the
+        # miner still locked to gentrx/localnet/simulation/ because the simulation validator was still
+        # querying it. Round 5072's gradient went to the simulation shard while the exchange
+        # aggregator logged "0/10 gradients in" for that same round.
+        #
+        # SOURCE OF TRUTH IS THE AGGREGATOR, NOT THE TRADING MECHANISM. A miner answers exactly one
+        # aggregator (`gtx_training_url`), and its gradient has to land where that aggregator looks:
+        # f"{bucket_prefix}gradients/{uid}/{round:08d}.grad". `_exchange_mode` describes which market
+        # this tick came from, which is a different question and not the one the shard answers -- so
+        # re-deriving from it per tick would only trade a stuck shard for an oscillating one. The
+        # aggregator now states its prefix in every assignment, and that is what is adopted here.
+        # The per-tick flag remains the last resort, for a miner with no aggregator configured.
         _explicit_mode = str(getattr(self.config, "gtx_mode", "") or "")
+        _agg_prefix = str(getattr(g, "agg_bucket_prefix", "") or "")
         _mode = _explicit_mode or ("exchange" if self._exchange_mode else "simulation")
 
         # gtx_network operator override → env var; network_from_subtensor
@@ -625,7 +696,35 @@ class GenTRXAgent(FinanceAgent):
         _network = network_from_config(
             getattr(self.config, "subtensor", None), netuid=_netuid
         )
-        g.bucket_prefix = gentrx_prefix(_network, _mode)
+        # An explicit gtx_mode is an operator instruction and outranks the aggregator; otherwise the
+        # aggregator's own prefix wins, because it is the only party that can be wrong about where it
+        # will look.
+        if _agg_prefix and not _explicit_mode:
+            _new_prefix = _agg_prefix
+            _mode = _agg_prefix.rstrip("/").rsplit("/", 1)[-1] or _mode
+        else:
+            _new_prefix = gentrx_prefix(_network, _mode)
+
+        if g.gentrx_inited:
+            # RE-POINT AND RETURN. Everything below this is one-time and expensive (store
+            # construction, on-chain aggregator discovery, an S3 checkpoint scan); the shard itself is
+            # a string on stores that already exist, so a change costs three attribute writes. Same
+            # shape as GenTRX/src/miner_training_service.py, which re-derives on attach_subtensor and
+            # re-points _store/_data_store/_write_store rather than keeping a stale prefix.
+            if _new_prefix != getattr(g, "bucket_prefix", None):
+                _old_prefix = getattr(g, "bucket_prefix", None)
+                g.bucket_prefix = _new_prefix
+                for _st in (g.store, g.data_store, g.write_store):
+                    if _st is not None:
+                        _st.prefix = _new_prefix
+                gtx_log.info(
+                    f"GenTRX bucket prefix changed: {_old_prefix} -> {_new_prefix} "
+                    f"(network={_network}, mode={_mode})"
+                )
+            return
+        g.gentrx_inited = True
+
+        g.bucket_prefix = _new_prefix
         gtx_log.info(
             f"GenTRX bucket prefix: {g.bucket_prefix} "
             f"(network={_network}, mode={_mode})"
@@ -713,6 +812,22 @@ class GenTRXAgent(FinanceAgent):
         the drain at handle() makes it independent of any customized respond.
         """
         response = super().handle(state)
+        # THE SHARD RE-DERIVE IS ANCHORED HERE FOR THE SAME REASON THE TRAINING DRAIN IS.
+        #
+        # _ensure_gentrx_inited() was called only from respond(), and per the note above respond() is
+        # not reliably reached: RandomTakerAgent overrides respond_simulation, and respond_exchange is
+        # FinanceAgent's, so neither path delegates back. The only call that ever ran was the startup
+        # bootstrap, where _exchange_mode is still its default False -- so the bucket shard was fixed
+        # at "simulation" for the process lifetime.
+        #
+        # Simulation passed anyway, by luck: the startup default happened to name the right shard.
+        # Exchange got the wrong one every time, and every training download 404'd against keys that
+        # exist only under gentrx/<network>/exchange/.
+        #
+        # super().handle() has already run update(), so _exchange_mode describes THIS state, and this
+        # runs before _drive_training() below so the drain uses the corrected prefix.
+        if getattr(self, "_gtx", None) is not None and getattr(self._gtx, "enabled", True):
+            self._ensure_gentrx_inited()
         # The presence of _gtx is not the same question as whether GenTRX is ON. A disabled agent
         # (gtx_enabled=false) still HAS the state object, so this drained the training queue on every
         # state update and raised on fields initialize() deliberately never set -- once per query, which
@@ -775,8 +890,8 @@ class GenTRXAgent(FinanceAgent):
 
         if self._gtx.price_scale is None:
             # Exchange mode: ExchangeConfig has volumeDecimals but NO
-            # priceDecimals, so state.config.priceDecimals used to AttributeError
-            # and 500 every ExchangeStateUpdate (blocking training). Mirror the
+            # priceDecimals, so reading state.config.priceDecimals would
+            # AttributeError and 500 every ExchangeStateUpdate, blocking training. Mirror the
             # aggregator's exact rule (gradient_server _process_tick): if EITHER
             # decimal is absent, fall back to BOTH canonical defaults (pd=2,vd=4)
             # so the miner's price/vol scale can never diverge from the
@@ -1436,13 +1551,104 @@ class GenTRXAgent(FinanceAgent):
                     access_key=assignment.get("data_access_key", ""),
                     secret_key=assignment.get("data_secret_key", ""),
                     region=os.environ.get("GENTRX_VALIDATOR_S3_REGION", "auto"),
-                    prefix=self._gtx.bucket_prefix,
+                    # The assignment's OWN shard. Using the agent's current prefix read the exchange
+                    # aggregator's keys out of the simulation prefix and 404'd every file.
+                    prefix=self._shard_of(assignment),
                 )
             except Exception as exc:
                 self._gtx.tlog.warning(f"Failed to build data store from assignment fields: {exc}")
         # env-var store first, then chain-discovered aggregator store (training
         # data lives in the same validator bucket as the checkpoint).
         return self._gtx.data_store or self._gtx.discovered_aggregator_store
+
+    def _shard_of(self, assignment: dict) -> str:
+        """The bucket shard THIS assignment belongs to, independent of what the agent is doing now.
+
+        A miner's own mechanism flag flips on every state update, and training runs on a background
+        thread -- so a job started from an exchange assignment could finish while the agent was mid
+        simulation tick and upload under the wrong prefix. Binding the shard to the assignment removes
+        the race entirely: the work carries its own destination.
+
+        Falls back to the agent's current prefix when the assignment does not name one (an older
+        validator that predates the field), which is the previous behaviour and no worse.
+        """
+        pref = str((assignment or {}).get("bucket_prefix") or "")
+        parts = pref.strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "gentrx" and parts[2] in ("simulation", "exchange"):
+            return pref
+        return str(getattr(self._gtx, "bucket_prefix", "") or "")
+
+    def _write_store_for(self, assignment: dict):
+        """The gradient write-store for this assignment's shard.
+
+        Cached per prefix: a store is a client handle, and rebuilding one per upload would add an S3
+        client construction to every round for no benefit.
+        """
+        prefix = self._shard_of(assignment)
+        base = getattr(self._gtx, "write_store", None)
+        if base is None or not prefix or getattr(base, "prefix", None) == prefix:
+            return base
+        cache = getattr(self._gtx, "_write_store_by_prefix", None)
+        if cache is None:
+            cache = {}
+            self._gtx._write_store_by_prefix = cache
+        hit = cache.get(prefix)
+        if hit is not None:
+            return hit
+        try:
+            import copy
+            clone = copy.copy(base)
+            clone.prefix = prefix
+            cache[prefix] = clone
+            self._gtx.tlog.info(f"gradient write-store bound to assignment shard: {prefix}")
+            return clone
+        except Exception as exc:
+            self._gtx.tlog.warning(f"could not bind write-store to {prefix}: {exc}")
+            return base
+
+    def _learn_aggregator_shard(self, assignment: dict, data_keys: list) -> None:
+        """Record which bucket shard the aggregator that issued this work is reading.
+
+        The miner's gradient has to land where its aggregator looks, and only the aggregator knows
+        that. Two ways it can say so, in order:
+
+        1. `bucket_prefix` on the assignment. Present when the miner polls the aggregator's HTTP
+           endpoint directly, where the aggregator states it outright.
+        2. The prefix embedded in a data key, e.g. `gentrx/localnet/simulation/data/0/6/...`. This is
+           the path for validator-pushed assignments, and it is deliberately derived rather than added
+           as a new synapse field: `data` is already inside GenTRXAssignment.required_hash_fields, so
+           the value is covered by the signed body_hash. A new field would have to join that tuple to
+           get the same MITM protection -- the bucket fields are in it for exactly that reason -- and
+           changing the tuple breaks verification for every miner still on the old definition.
+
+        Leaves the shard alone when neither is available: an assignment with no data produces no
+        gradient, so there is nothing to misfile.
+        """
+        prefix = str(assignment.get("bucket_prefix") or "")
+        # SANITY-CHECK BEFORE ADOPTING. The field is not covered by body_hash (see
+        # GenTRXAssignment.bucket_prefix), so it is validated rather than trusted: it must be the
+        # gentrx/<network>/<mode>/ shape, name a mode this miner understands, and name THIS miner's
+        # network. That leaves a tampered value able to swap simulation for exchange and nothing more
+        # -- and a miner that mis-files its own gradient only harms itself.
+        if prefix:
+            _parts = prefix.strip("/").split("/")
+            _own = str(getattr(self._gtx, "bucket_prefix", "") or "").strip("/").split("/")
+            if (len(_parts) != 3 or _parts[0] != "gentrx"
+                    or _parts[2] not in ("simulation", "exchange")
+                    or (len(_own) == 3 and _parts[1] != _own[1])):
+                self._gtx.tlog.warning(
+                    f"ignoring implausible bucket_prefix from assignment: {prefix!r}"
+                )
+                prefix = ""
+        if not prefix:
+            for key in data_keys or ():
+                parts = str(key).split("/")
+                if len(parts) >= 3 and parts[0] == "gentrx":
+                    prefix = "/".join(parts[:3]) + "/"
+                    break
+        if prefix and prefix != getattr(self._gtx, "agg_bucket_prefix", ""):
+            self._gtx.agg_bucket_prefix = prefix
+            self._gtx.tlog.info(f"aggregator shard learned from assignment: {prefix}")
 
     def _download_assignment_data(self, assignment: dict) -> list[Path]:
         """Download pre-resolved data files from the assignment.
@@ -1455,6 +1661,7 @@ class GenTRXAgent(FinanceAgent):
         """
         data_keys = assignment.get("data", [])
         data_source = assignment.get("data_source", "local")
+        self._learn_aggregator_shard(assignment, data_keys)
 
         if not data_keys:
             return []
@@ -1536,8 +1743,38 @@ class GenTRXAgent(FinanceAgent):
         if not assignments:
             return
 
-        # Keep only the freshest round: the merge is for same-round multi-validator
-        # consolidation, but a backlog accumulating across rounds balloons one window.
+        # ONE SHARD PER TRAINING WINDOW, and the round filter applied WITHIN that shard.
+        #
+        # Both steps below run per shard. Running them across every queued assignment at once is
+        # right for several validators serving ONE mechanism and wrong for two:
+        #
+        #   - the merge concatenated data keys across shards, so a single gradient was trained on
+        #     simulation AND exchange data and published to whichever shard was learned last.
+        #     Observed with both mechanisms live: "2 validator(s), round=5237 ... data=5
+        #     files total", two shard lines in one tick, one gradient uploaded.
+        #   - the round filter takes one max() over a round number each validator counts
+        #     INDEPENDENTLY, so a mechanism a round behind had its whole assignment dropped as stale.
+        #
+        # Grouping first fixes both. The other shard is requeued rather than dropped, and selection
+        # avoids repeating the last shard so the slower mechanism (exchange, far fewer rounds) is
+        # not starved by the faster one.
+        _groups = group_assignments_by_shard(assignments)
+        if len(_groups) > 1:
+            assignments, _requeue = pick_shard_group(
+                _groups, last_shard=getattr(self, "_last_trained_shard", None)
+            )
+            if _requeue:
+                self._gtx.pending_assignments = _requeue + self._gtx.pending_assignments
+                self._gtx.tlog.info(
+                    f"{len(_groups)} shards queued this tick; training "
+                    f"{assignments[0].get('bucket_prefix')!r} now, requeued {len(_requeue)} "
+                    f"assignment(s) for the other shard"
+                )
+        if assignments:
+            self._last_trained_shard = assignments[0].get("bucket_prefix")
+
+        # Keep only the freshest round WITHIN this shard: a backlog across rounds balloons one
+        # window.
         latest_round = max(int(a.get("round", 0) or 0) for a in assignments)
         stale = [a for a in assignments if int(a.get("round", 0) or 0) != latest_round]
         if stale:
@@ -1799,13 +2036,15 @@ class GenTRXAgent(FinanceAgent):
         comp = compress(delta, top_k_frac=top_k)
         data = serialize(comp)
 
-        if self._gtx.write_store is None:
+        if self._write_store_for(assignment) is None:
             raise RuntimeError(
                 "No S3 store configured. Set GENTRX_S3_* env vars to enable gradient upload."
             )
         round_id = (assignment or {}).get("round", self._gtx.train_window_id)
         try:
-            self._gtx.write_store.put_gradient(miner_uid=self.uid, round_id=round_id, data=data)
+            self._write_store_for(assignment).put_gradient(
+                miner_uid=self.uid, round_id=round_id, data=data
+            )
             self._gtx.tlog.info(f"gradient uploaded to S3 (round={round_id})")
             bt.logging.info(
                 f"[GTX] gradient uploaded (uid={self.uid}, round={round_id}, "
@@ -2246,9 +2485,9 @@ class GenTRXAgent(FinanceAgent):
             "mid_deltas": _t(enc["mid_deltas"]),
         }
 
-    # Co-base order-suppression flag. The composer's codegen sets this to True
+    # Co-base order-suppression flag. Composed-agent codegen sets this to True
     # on the generated ComposedAgent class when engines.gentrx (in_process) is
-    # in the manifest, so the composer's weapons module owns execution and
+    # in the manifest, so the composed agent's execution module owns placement and
     # GenTRX only contributes the signal via :meth:`gentrx_signal`.
     _gtx_signal_only: bool = False
 

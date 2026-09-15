@@ -4,7 +4,7 @@
 Finance agent instruction classes: limit/market order placement, order
 cancellation, position closing, and agent reset for the intelligent markets protocol.
 """
-from pydantic import PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field, ConfigDict
+from pydantic import field_validator, PositiveFloat, NonNegativeInt, PositiveInt, NonNegativeFloat, Field, ConfigDict
 from typing import Literal, Annotated
 from taos.im.protocol.simulator import *
 from taos.common.protocol import AgentInstruction, BaseModel
@@ -82,8 +82,38 @@ class PlaceOrderInstruction(FinanceAgentInstruction):
 
     quantity: PositiveFloat = Field(alias="volume")
     clientOrderId: UInt32 | None
-    stp: Literal[STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH, STP.DECREASE_CANCEL] = Field(
+    # NO_STP BELONGS HERE. It was omitted while the exchange class (protocol/exchange/instructions.py)
+    # lists it and the engine implements it (Book::preventSelfTrade handles NO_STP alongside the other
+    # four), so simulation was the only place a valid enum member was refused.
+    #
+    # The refusal is not a rejected field, it is a lost batch. This Literal is validated when the
+    # VALIDATOR assigns the miner's reply in MarketSimulationStateUpdate.decompress
+    # (protocol/__init__.py:387); the ValidationError there is caught by returning None for the WHOLE
+    # synapse, so every instruction the miner sent in that response is discarded, not just this one.
+    #
+    # The validator logs it as a decompression failure naming the offending field, and reports the
+    # miner as responding with 0 instructions. Nothing is placed, so a caller waiting on a fill waits
+    # for something that can never arrive.
+    stp: Literal[STP.CANCEL_OLDEST, STP.CANCEL_NEWEST, STP.CANCEL_BOTH,
+                 STP.DECREASE_CANCEL] = Field(
         default=STP.CANCEL_OLDEST, alias="stpFlag")
+
+    @field_validator("stp", mode="before")
+    @classmethod
+    def _force_self_trade_prevention(cls, v):
+        """Coerce NO_STP to CANCEL_OLDEST. Self-trade prevention is not a miner's to disable.
+
+        Coerced rather than rejected so one disallowed flag does not invalidate the whole batch. Runs
+        before validation so it sees the wire value in any form: the enum member, the bare integer, or
+        the "stpFlag" alias a re-validated order arrives under.
+        """
+        try:
+            if int(v) == int(STP.NO_STP):
+                return STP.CANCEL_OLDEST
+        except (TypeError, ValueError):
+            pass
+        return v
+
     currency: Literal[OrderCurrency.BASE, OrderCurrency.QUOTE] = OrderCurrency.BASE
     leverage: NonNegativeFloat = 0.0
     settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | NonNegativeInt = LoanSettlementOption.NONE

@@ -6,6 +6,7 @@
 
 #include "Order.hpp"
 #include "Trade.hpp"
+#include "AgentReset.hpp"
 #include "Cancellation.hpp"
 #include "InstructionLogger.hpp"
 
@@ -25,7 +26,8 @@ struct L3LogEvent
         InstructionLogContext,
         OrderWithLogContext,
         TradeWithLogContext,
-        CancellationWithLogContext> item;
+        CancellationWithLogContext,
+        AgentResetLogContext> item;
     uint64_t id;
 };
 

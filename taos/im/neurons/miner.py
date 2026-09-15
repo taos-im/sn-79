@@ -293,11 +293,19 @@ if __name__ != "__mp_main__":
                     f"data={len(synapse.data)} files "
                     f"ts={synapse.ts_start}..{synapse.ts_end} "
                     f"validator_uid={synapse.validator_uid} "
-                    f"source={synapse.data_source}"
+                    f"source={synapse.data_source} "
+                    f"bucket_prefix={getattr(synapse, 'bucket_prefix', None)!r}"
                 )
                 gtx = getattr(self.agent, "_gtx", None)
                 if gtx is None:
                     bt.logging.debug("[GTX] agent has no _gtx — not a GenTRX agent, ignoring assignment")
+                    return synapse
+                # A DISABLED agent has a _gtx object but never ran initialize(), so it has
+                # no configured store, model or drain loop. Queuing an assignment on it
+                # grows a list nobody empties and, before pending_assignments had a safe
+                # default, raised AttributeError right here and failed the synapse.
+                if not getattr(gtx, "gentrx_inited", False):
+                    bt.logging.debug("[GTX] agent is not participating — ignoring assignment")
                     return synapse
                 gtx.pending_assignments.append({
                     "round":         synapse.round,
@@ -307,6 +315,7 @@ if __name__ != "__mp_main__":
                     "ts_end":        synapse.ts_end,
                     "data":          synapse.data,
                     "data_source":   synapse.data_source,
+                        "bucket_prefix": getattr(synapse, "bucket_prefix", ""),
                     "data_endpoint": synapse.data_endpoint,
                     "data_bucket":   synapse.data_bucket,
                     "data_access_key": synapse.data_access_key,

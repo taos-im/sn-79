@@ -124,6 +124,30 @@ void CheckpointManager::saveCheckpoint()
 
 //-------------------------------------------------------------------------
 
+void CheckpointManager::saveCheckpointOnShutdown()
+{
+    // Warm-up has no meaningful state to resume into, and the interval save skips it for the same
+    // reason. The step counter is deliberately NOT touched: this is out-of-band, and advancing it
+    // would shift the phase of every later interval save on a resumed run.
+    if (m_simuMngr->warmingUp()) return;
+
+    fmt::println("Saving checkpoint on shutdown...");
+
+    try {
+        // Never the measured variant: its wall-clock timing is a benchmark of the periodic path and
+        // this one happens once, while a supervisor is already counting down to SIGKILL.
+        saveCheckpointImpl();
+        fmt::println("Shutdown checkpoint saved successfully.");
+    }
+    catch (const std::exception& e) {
+        // Never rethrow: a failed checkpoint must not turn a clean stop into a crash. The next
+        // resume falls back to the last periodic checkpoint, which is the behaviour without this.
+        fmt::println("Error saving shutdown checkpoint: {}", e.what());
+    }
+}
+
+//-------------------------------------------------------------------------
+
 void CheckpointManager::saveCheckpointImpl()
 {
     const auto simuTime = m_simuMngr->simulations().front()->currentTimestamp();

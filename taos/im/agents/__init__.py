@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from typing import cast
+from collections import OrderedDict
 import bittensor as bt
 from threading import Thread, Lock
 from abc import ABC, abstractmethod
@@ -45,7 +46,7 @@ except ImportError:
         ALPHA = None  # only referenced inside the exchange-mode market_order branch
 from taos.im.protocol.events import *
 from taos.im.protocol.models import *
-from taos.im.utils import duration_from_timestamp, timestamp_from_duration
+from taos.im.utils import duration_from_timestamp, timestamp_from_duration, format_timestamp
 
 @dataclass
 class RollingWindow:
@@ -180,7 +181,7 @@ class UnifiedAccount:
     def agent_id(self) -> int | None:
         """The uid this account belongs to.
 
-        Exchange-mode account dicts are built without 'i'/'b' (engines/exchange.py _normalize), so
+        Exchange-mode account dicts are built without 'i'/'b' by the engine's normaliser, so
         this is None there rather than invented. Returned as None, not 0, because uid 0 is a real
         miner and a fabricated zero would be indistinguishable from it.
         """
@@ -332,6 +333,18 @@ class UnifiedAgentResponse:
         self._exchange_mode = exchange_mode
         self._delegate      = delegate
         self.instructions   = []
+
+    @property
+    def exchange_mode(self) -> bool:
+        """Which mechanism THIS response is for. Fixed when the response was created.
+
+        READ THIS RATHER THAN THE AGENT'S OWN FLAG when a strategy decision depends on the
+        mechanism. One agent instance serves both validators concurrently, so `self.exchange_mode`
+        on the AGENT describes whichever request most recently ran update() -- it reads as "this
+        agent is in exchange mode", which is not a thing an agent can be. The response is per
+        request and immutable, so a decision taken from it is about the response being built.
+        """
+        return bool(self._exchange_mode)
 
     def limit_order(
         self,
@@ -504,7 +517,7 @@ class UnifiedAgentResponse:
     def close_positions(self, book_id, order_ids, delay: int = 0) -> None:
         """Plural form of close_position, mirroring FinanceAgentResponse.close_positions.
 
-        MISSING UNTIL 2026-08-09, which mattered: the shipped example agents cannot be migrated onto
+        MISSING FOR A TIME, which mattered: the shipped example agents cannot be migrated onto
         this mode-aware response until it covers every builder they call, and OrderOptionAgent calls
         this one. A partial surface means "swap the constructor" breaks that agent at runtime, in
         exchange mode only, where it is hardest to notice.
@@ -562,7 +575,7 @@ class FinanceAgentBase(SimulationAgent):
 
     One subclass serves both mechanisms: ``handle`` routes a simulation or exchange state update to the same
     strategy code, accounts and notices arrive in one uniform shape, and the notice handlers (``onTrade``,
-    ``onOrderAccepted``, ``onOrderCancelled``, ...) fire identically in either mode. Known until 2026-08-18 as
+    ``onOrderAccepted``, ``onOrderCancelled``, ...) fire identically in either mode. Formerly known as
     ``FinanceSimulationAgent``, which remains an alias.
     """
     simulation_config: MarketSimulationConfig
@@ -607,7 +620,7 @@ class FinanceAgentBase(SimulationAgent):
     # (+ optional TAOS_LIVE_CONFIG_TOKEN) into the container. Because Hangar agents
     # expose no inbound port, the agent PULLS: a daemon thread polls the endpoint
     # off the hot path; the next handle() applies any change to self.config and
-    # calls on_config_reload(changed). See runbooks/planning/hangar-live-config.md.
+    # calls on_config_reload(changed).
 
     @staticmethod
     def _coerce_live_value(v):
@@ -738,8 +751,8 @@ class FinanceAgentBase(SimulationAgent):
     def simulation_output_dir(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         # simulation_id is OPTIONAL on the model (`simulation_id : str | None = None`), so joining it
         # unguarded raises TypeError: join() argument must be str ... not 'NoneType' and takes the
-        # agent's whole respond() with it. Measured on v54: ArbitrageAgent raised this every state
-        # update, logged it ~every 2.5s, and the acceptance stage recorded it as the agent seeing no
+        # agent's whole respond() with it. Observed: an agent raised this on every state
+        # update and logged it roughly every 2.5s, which reads downstream as the agent seeing no
         # updates at all -- a crash in a path shared by every GenTRX agent, reported as silence.
         #
         # A missing id is a real gap (it is what keeps one run's data out of another's directory), so
@@ -1440,27 +1453,14 @@ class FinanceAgent(FinanceAgentBase):
             self.simulation_config = cast(MarketSimulationConfig, state.config)
             raw = (state.accounts or {}).get(self.uid, {})
             self.accounts = {bid: UnifiedAccount(a) for bid, a in raw.items()}
-            # parse_notices keys by int uid on both paths, so one lookup is enough. The warning stays:
-            # notices present for other uids but none for this one is worth seeing, and it is the signal
-            # that caught the stringified-key mismatch when the two paths disagreed.
-            _nt = state.notices or {}
-            _mine = _nt.get(self.uid, [])
+            # parse_notices keys by int uid on both paths, so one lookup is enough.
+            _mine = (state.notices or {}).get(self.uid, [])
+            # A settled fill is re-sent on every update for the validator's redelivery window (900 s by
+            # default, about 75 deliveries at 12 s blocks) so a miner that was unreachable still learns
+            # of it. Handlers and the log must see each fill once, so the repeats stop here. Each notice
+            # that survives is printed by _notice_log_line, which is the record of what arrived.
+            _mine, _ = self._drop_redelivered_fills(_mine)
             self.events = list(_mine)
-            # PAIRED WITH NOTICEWIRE on the validator side. A refusal notice has been proven built,
-            # routed, merged and synapse-valid, and this list still comes up empty, so the two ends must
-            # be comparable: what was packed for this uid versus what arrived.
-            if _mine:
-                import bittensor as _bt2
-                from collections import Counter as _C
-                _bt2.logging.info(
-                    f"NOTICEWIRE uid={self.uid} received "
-                    f"{dict(_C(str(getattr(n, 'y', None) or getattr(n, 'type', None) or '?') for n in _mine))}")
-            if _nt and not _mine:
-                import bittensor as _bt
-                _bt.logging.warning(
-                    f"NOTICEKEYS uid={self.uid!r} ({type(self.uid).__name__}) found no notices; "
-                    f"keys present: {[ (k, type(k).__name__) for k in list(_nt)[:5] ]}"
-                )
             self._exchange_mode = True
             self._dispatch_notice_handlers(state)
             # Cache pools so empty-book fallback works even when state.pools is
@@ -1487,6 +1487,85 @@ class FinanceAgent(FinanceAgentBase):
             self.accounts = {bid: UnifiedAccount(a) for bid, a in self.accounts.items()}
             self._exchange_mode = False
 
+    # How many (book, trade id) keys the redelivery ledger keeps. A busy miner sees a few thousand fills
+    # inside the 15-minute window; anything older than the ledger is also older than the window.
+    _REDELIVERY_LEDGER_CAP = 20_000
+
+    @staticmethod
+    def _notice_field(notice, *names):
+        """First present field among `names`, on a parsed event (attribute) or a raw wire dict (key)."""
+        if isinstance(notice, dict):
+            for name in names:
+                if notice.get(name) is not None:
+                    return notice.get(name)
+            return None
+        for name in names:
+            value = getattr(notice, name, None)
+            if value is not None:
+                return value
+        return None
+
+    def _drop_redelivered_fills(self, notices):
+        """Return (notices without repeated fills, how many repeats were dropped).
+
+        Exchange-mode settled-fill notices are redelivered on every state update for a window, and there
+        is no acknowledgement to stop them, so a reachable miner receives each fill about 75 times. The
+        validator's own consumers already key on the trade id for the same reason; a miner's handlers
+        and log deserve the same. Keyed by (book, trade id), bounded, and only for fills: refusals and
+        acknowledgements are delivered once by construction.
+        """
+        ledger = getattr(self, '_seen_fill_keys', None)
+        if ledger is None:
+            ledger = self._seen_fill_keys = OrderedDict()
+        kept, dropped = [], 0
+        for notice in notices or []:
+            etype = self._notice_field(notice, 'type', 'y')
+            trade_id = self._notice_field(notice, 'tradeId', 'i') if etype in ('ET', 'EVENT_TRADE') else None
+            if trade_id is None:
+                kept.append(notice)
+                continue
+            key = (self._notice_field(notice, 'bookId', 'b'), trade_id)
+            if key in ledger:
+                ledger.move_to_end(key)
+                dropped += 1
+                continue
+            ledger[key] = True
+            while len(ledger) > self._REDELIVERY_LEDGER_CAP:
+                ledger.popitem(last=False)
+            kept.append(notice)
+        return kept, dropped
+
+    def _notice_log_line(self, event, etype: str) -> str:
+        """One log line for an exchange notice, worded as the simulation path words it.
+
+        A trade gets the same AGGRESSIVE/PASSIVE sentence `update()` builds, so an
+        operator reading the two halves sees one format rather than two. Exchange fills settle
+        against the pool unless another agent's order was crossed, so an absent counterparty is
+        named POOL rather than printed as order #0 of agent None, and an order id of 0 means the
+        engine did not number the order, so no number is shown."""
+        book = getattr(event, "bookId", None)
+        prefix = f"BOOK {book} : " if book is not None else ""
+        if etype in ("EVENT_TRADE", "ET"):
+            role = "taker" if self.uid == getattr(event, "takerAgentId", None) else "maker"
+            own = event.takerOrderId if role == "taker" else event.makerOrderId
+            other = event.makerOrderId if role == "taker" else event.takerOrderId
+            own_agent = event.takerAgentId if role == "taker" else event.makerAgentId
+            other_agent = event.makerAgentId if role == "taker" else event.takerAgentId
+            # The exchange's own sweep aggresses as agent -1: that is the pool taking the resting side.
+            if other_agent is None or (isinstance(other_agent, int) and other_agent < 0):
+                against = "POOL"
+            else:
+                against = f"{'#' + str(other) + ' ' if other else ''}(AGENT {other_agent})"
+            return (
+                f"{prefix}{'BUY ' if event.side == 0 else 'SELL'} TRADE #{event.tradeId} : "
+                f"YOUR {'AGGRESSIVE' if role == 'taker' else 'PASSIVE'} ORDER"
+                f"{' #' + str(own) if own else ''} (AGENT {own_agent}) "
+                f"MATCHED AGAINST {against} "
+                f"FOR {event.quantity}@{event.price} "
+                f"AT {format_timestamp(event.timestamp)} (T={event.timestamp})"
+            )
+        return f"{prefix}{event}"
+
     def _dispatch_notice_handlers(self, state) -> None:
         """Fire the documented per-notice handlers for exchange-mode notices.
 
@@ -1510,6 +1589,7 @@ class FinanceAgent(FinanceAgentBase):
         re-initialise on every tick.
         """
         ended = None
+        logged: list[str] = []
         for event in self.events or []:
             etype = getattr(event, "type", None)
             try:
@@ -1540,6 +1620,29 @@ class FinanceAgent(FinanceAgentBase):
                         pass
             except Exception:
                 bt.logging.exception(f"notice handler for {etype} raised; continuing with the rest")
+            # EVERY notice is logged, exactly as the simulation path logs its events.
+            # Firing the handlers and printing nothing makes an exchange agent's events
+            # invisible: the validator reports notices packed and delivered while the
+            # agent's log shows only instructions. The
+            # simulation half logs the same events via update()'s update_text, and the
+            # two halves must not disagree about what an operator can see.
+            try:
+                logged.append(self._notice_log_line(event, etype))
+            except Exception as _log_exc:
+                # The event's __str__ is what can fail here, so the fallback must not call it
+                # again: an event built by model_construct may be missing a field its __str__
+                # reads. repr() renders only the fields that are set, and is guarded anyway,
+                # because a log line must not cost a miner the rest of its notices.
+                try:
+                    _detail = repr(event)
+                except Exception:
+                    _detail = f"<{type(event).__name__} that cannot be rendered>"
+                logged.append(f"{etype} : {_detail}  (log line unavailable: {_log_exc!r})")
+        if logged:
+            rule = "-" * 50
+            bt.logging.info(
+                ".\n" + rule + "\nEXCHANGE EVENTS\n" + rule + "\n" + "\n".join(logged) + "\n" + rule
+            )
         if ended is not None:
             try:
                 self.onEnd(ended)
@@ -1570,12 +1673,12 @@ class FinanceAgent(FinanceAgentBase):
 
 
 
-# Backward-compatible alias. `FinanceAgentBase` was named `FinanceSimulationAgent` until 2026-08-18, which
+# Backward-compatible alias. `FinanceAgentBase` was formerly named `FinanceSimulationAgent`, which
 # read as "the simulation-mode class" when it is in fact the mode-agnostic base: its body has no mode
 # branch at all and every mention of the exchange state in it is a type annotation. The mode dispatch lives
 # in `FinanceAgent` below it. Miner agents in the wild subclass the old name, so it stays exported and
 # pointing at the same object -- `issubclass(FinanceAgent, FinanceSimulationAgent)` therefore still holds,
-# which is what the composer's own validation asserts.
+# which is what composed-agent validation asserts.
 FinanceSimulationAgent = FinanceAgentBase
 
 

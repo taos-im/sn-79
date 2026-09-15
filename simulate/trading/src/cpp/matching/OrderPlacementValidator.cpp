@@ -57,6 +57,43 @@ namespace
 
 //-------------------------------------------------------------------------
 
+// THE PRICE A WALK MAY REACH, which is NOT the figure sweepCap returns for a buy.
+//
+// sweepCap answers "what should this order RESERVE", and for a banded buy the answer is deliberately
+// 0_dec: predict no sweep and reserve the full volume at the limit price, because the band can veto
+// the cheap fills the prediction would otherwise count on. That is correct for reservation and wrong
+// as a price bound, and checkIOC used it as one:
+//
+//     if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+//
+// With a band active that reads `0 < level.price()`, true for every positive price, so the walk broke
+// on the FIRST level, collected nothing, and checkIOC returned false -- refusing EVERY buy IOC with
+// CONTRACT_VIOLATION whatever its price or size. The refusal reads:
+// `BOOK 5 : FAILED TO PLACE BUY LIMIT ORDER FOR 1.0@312.35 : CONTRACT_VIOLATION` against a book with
+// 20.8 alpha resting at 285.5. The sell side was already correct, because sweepCap's sell branch
+// happens to return a real price bound; only buys were affected.
+//
+// So the walk gets its own bound: how far the order may reach, which is its own limit price, capped by
+// the band's own ceiling for a buy and floored by it for a sell. That is exactly the shape the sell
+// side already had.
+//
+// BAND OFF RETURNS THE ORDER'S PRICE, so every band-off result is bit-for-bit unchanged -- the same
+// property sweepCap documents above, and the one the determinism proofs depend on.
+[[nodiscard]] decimal_t matchCap(
+    const book::Book::Ptr& book, decimal_t price, OrderDirection direction) noexcept
+{
+    if (direction == OrderDirection::BUY) {
+        const auto cap = book->bandLimit(true);
+        if (cap == std::numeric_limits<decimal_t>::max()) return price;   // band off
+        return std::min(price, cap);
+    }
+    const auto floor = book->bandLimit(false);
+    if (floor == std::numeric_limits<decimal_t>::min()) return price;    // band off
+    return std::max(price, floor);
+}
+
+//-------------------------------------------------------------------------
+
 }  // namespace
 
 
@@ -707,7 +744,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -720,7 +757,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -739,7 +776,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -752,7 +789,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -769,7 +806,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * feeCoeff, m_params.volumeIncrementDecimals);
@@ -779,7 +816,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume(), m_params.volumeIncrementDecimals);
@@ -800,7 +837,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -814,7 +851,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -833,7 +870,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -847,7 +884,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         auto it = ranges::find_if(
                             activeOrders, [&](auto order) { return order->id() == tick->id(); });
@@ -864,7 +901,7 @@ bool OrderPlacementValidator::checkIOC(
             if (payload->direction == OrderDirection::BUY) {
                 const auto feeCoeff = util::decInv1p(takerFeeRate);
                 for (const auto& level : nonZeroLevelsView(book->sellQueue())) {
-                    if (sweepCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::BUY) < level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * tick->price() * feeCoeff,
@@ -875,7 +912,7 @@ bool OrderPlacementValidator::checkIOC(
                 }
             } else {
                 for (const auto& level : nonZeroLevelsView(book->buyQueue()) | ranges::views::reverse) {
-                    if (sweepCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
+                    if (matchCap(book, payload->price, OrderDirection::SELL) > level.price()) break;
                     for (const auto& tick : level) {
                         const auto tickVolume = util::round(
                             tick->totalVolume() * tick->price(), m_params.quoteIncrementDecimals);

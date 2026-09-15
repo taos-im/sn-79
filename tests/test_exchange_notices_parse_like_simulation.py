@@ -64,7 +64,7 @@ def test_notices_parse_into_event_models_on_both_paths():
 def test_an_unrecognised_notice_is_passed_through_rather_than_dropped():
     """LOSING A MINER'S NOTICE IS WORSE THAN A MIXED SHAPE.
 
-    This test asserted the opposite until 2026-08-18, on the reasoning that consumers select by type so
+    This test once asserted the opposite, on the reasoning that consumers select by type so
     an unparsed notice is unreadable anyway. It is readable -- as a dict, which is how every consumer
     read notices before the parse existed. Dropping cost the exchange path its RDCP close notices,
     because that tree has no ClosePositionsEvent, and s_sltp reported it as a trigger that never fired.
@@ -156,7 +156,7 @@ def test_parsing_a_notice_loses_no_field_the_validator_stamped():
     became a model, and `model_dump()` could not emit what was never kept.
 
     That is the worst shape of this bug: the notice still arrives, still looks complete, and is missing
-    only the field its consumer selects on. Measured 2026-08-18: an SL/TP trigger closed the position
+    only the field its consumer selects on: an SL/TP trigger closed the position
     correctly, the close notice reached the miner without `cr`, and the scenario reported a trigger that
     never fired. `Ma` masked it in testing by happening to be a declared field.
 

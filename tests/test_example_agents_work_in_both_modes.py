@@ -3,7 +3,7 @@
 """A miner's existing agent must run on the exchange without being rewritten.
 
 WHY THIS EXISTS. The public carve ships the exchange wire types and the agent base class so a miner can
-point an existing strategy at the exchange. Two things broke that on 2026-08-17, and both were silent:
+point an existing strategy at the exchange. Two things broke that, and both were silent:
 
   1. FinanceAgent.respond_exchange() delegated to respond(). An agent implementing respond_simulation()
      -- which is what RandomMakerAgent, RandomTakerAgent and RevengAgent demonstrate, so it is the
@@ -129,10 +129,23 @@ def test_examples_stand_down_leverage_on_the_exchange(filename, attrs):
         setattr(agent, k, v)
     agent._exchange_mode = False
 
-    sim = agent.leverage()
+    # LEVERAGE IS DECIDED FROM THE RESPONSE, so the probe must pass one.
+    #
+    # This called agent.leverage() with no argument and described the helper as one that "returns 0.0
+    # when self.exchange_mode". Both are the pre-migration shape. One agent instance serves both
+    # validators concurrently, so a flag on the AGENT describes whichever request last ran update();
+    # the mechanism belongs to the response being built, and all three example agents now take it from
+    # there. The test was left behind, so it failed with
+    # "TypeError: RandomMakerAgent.leverage() missing 1 required positional argument: 'response'"
+    # against agents that were correct.
+    class _Resp:
+        def __init__(self, exchange_mode):
+            self.exchange_mode = exchange_mode
+
+    sim = agent.leverage(_Resp(False))
     token = A._REQUEST_EXCHANGE_MODE.set(True)
     try:
-        exch = agent.leverage()
+        exch = agent.leverage(_Resp(True))
     finally:
         A._REQUEST_EXCHANGE_MODE.reset(token)
 

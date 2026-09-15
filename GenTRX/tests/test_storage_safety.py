@@ -374,7 +374,7 @@ def test_restored_sim_id_mismatch_resets(aggregator):
 
     This exercises the startup-cleanup path specifically (`_sim_id is None`
     at the moment of the mismatched tick). The constructor's
-    `no_startup_cleanup` defaulted to True in ea26b8d3 as an op-safety
+    `no_startup_cleanup` defaults to True as an op-safety
     net, which suppresses this path — flip it off for this test so the
     wipe fires as designed. Runtime rollovers (`test_changed_sim_id_resets`)
     still work with the safe default because they don't take this branch.

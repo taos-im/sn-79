@@ -62,6 +62,9 @@ void Book::recordBandTrade(
     // miner walks the reference by trading with itself at the band edge for the cost of fees only, which
     // removes the sustained-capital cost that is the whole deterrent.
     if (maker == taker) return;
+    m_bandLastTradeTs = ts;
+    m_bandRefusedSinceTrade = false;
+    m_bandFirstRefusalTs = 0;
     m_bandLastPrice = price;
     if (!m_bandSeeded) {
         m_bandSeeded = true;
@@ -84,8 +87,8 @@ void Book::sampleBandRef(Timestamp ts) noexcept
         static_cast<size_t>(std::max<int64_t>(1, window / interval));
     bool pushed = false;
     // Catch up whole intervals. During a quiet stretch the prevailing price is re-sampled, so the window
-    // never empties and the band never silently disables itself (a gap longer than the window previously
-    // dropped every trade and reopened an unbounded sweep).
+    // never empties and the band never silently disables itself (without the catch-up, a gap longer than
+    // the window drops every sample and leaves the sweep unbounded).
     while (m_bandSeeded && static_cast<int64_t>(ts - m_bandLastSampleTs) >= interval) {
         m_bandLastSampleTs += interval;
         m_bandSamples.push_back(m_bandLastPrice);
@@ -111,7 +114,7 @@ taosim::decimal_t Book::bandRef() const noexcept
 
 taosim::decimal_t Book::bandLimit(bool isBuy) const noexcept
 {
-    const double band = m_simulation->exchange()->config().parameters().maxPriceBand;
+    const double band = effectiveBand(m_simulation->currentTimestamp());
     const auto ref = m_bandRefCached;
     if (band <= 0.0 || ref <= 0_dec) {
         return isBuy ? std::numeric_limits<taosim::decimal_t>::max()
@@ -119,6 +122,42 @@ taosim::decimal_t Book::bandLimit(bool isBuy) const noexcept
     }
     const auto bnd = taosim::util::double2decimal(band);
     return isBuy ? ref * taosim::util::dec1p(bnd) : ref * taosim::util::dec1m(bnd);
+}
+
+//-------------------------------------------------------------------------
+
+double Book::effectiveBand(Timestamp ts) const noexcept
+{
+    const auto& params = m_simulation->exchange()->config().parameters();
+    const double band = params.maxPriceBand;
+    if (band <= 0.0 || !m_bandSeeded || params.bandReleaseAfter <= 0 || !m_bandRefusedSinceTrade) {
+        return band;
+    }
+    // Silence is counted from the last print, which travels with the book in the checkpoint. When no print
+    // is known (a checkpoint written before that field existed) it is counted from the first refusal
+    // instead. Never from the sample clock: that clock advances every time an order is processed, so a
+    // book locked across a resume would never accumulate the silence and never release.
+    const Timestamp last = m_bandLastTradeTs != 0 ? m_bandLastTradeTs : m_bandFirstRefusalTs;
+    if (last == 0 || ts <= last) {
+        return band;
+    }
+    const int64_t silent = static_cast<int64_t>(ts - last);
+    if (silent < params.bandReleaseAfter) {
+        return band;
+    }
+    const int64_t step = std::max<int64_t>(params.bandReleaseStep, 1);
+    const int64_t widenings = 1 + (silent - params.bandReleaseAfter) / step;
+    return std::min(params.bandReleaseMax, band * static_cast<double>(1 + widenings));
+}
+
+//-------------------------------------------------------------------------
+
+void Book::noteBandRefusal() noexcept
+{
+    if (!m_bandRefusedSinceTrade) {
+        m_bandRefusedSinceTrade = true;
+        m_bandFirstRefusalTs = m_simulation->currentTimestamp();
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -276,6 +315,31 @@ void Book::placeLimitBuy(const LimitOrder::Ptr& order)
         if (order->volume() > 0_dec) {
             if (order->volume() == volBefore) {
                 // No progress was made — place as passive to avoid infinite recursion
+                // A CROSSING ORDER THAT CANNOT MATCH MUST NOT REST, OR IT WOULD LEAVE THE BOOK CROSSED
+                // PERMANENTLY. Reaching here means the order is marketable but processAgainst* moved none of
+                // it -- in practice because the price band stopped the walk: that loop is bounded by
+                // bandLo/bandHi = bandRef * (1 -/+ maxPriceBand). Resting it at its own crossing price then
+                // puts a bid above the ask ladder (or an ask below the bid ladder), and the book cannot
+                // recover: the band reference is fed ONLY by trades (recordBandTrade is its sole setter), so
+                // with matching blocked no trade prints, sampleBandRef re-samples the frozen price forever,
+                // and the band never releases. A closed loop with no exit.
+                //
+                // Both directions reach it: a bid resting above the ask ladder, or an ask below the bid
+                // ladder. Either leaves the book crossed from that instant on, with every subsequent level
+                // update carrying the inversion, and no path back.
+                //
+                // The band's policy is deliberately NOT changed: no match is permitted that was not permitted
+                // before, and the reference still moves only on trades, which is what PriceBandTests pins
+                // ("NO RATCHET -- the reference must NOT be top-of-book"). This only refuses to CREATE an
+                // illegal state. The order is unregistered on the same path a fully-filled order takes.
+                //
+                // Trade-off: an order that today rests (invisibly crossing the book) is instead dropped. That
+                // is visible where the current behaviour is not, but it IS a behaviour change, and a dedicated
+                // refusal code would be better than reusing unregister.
+                if (m_sellQueue.hasActiveOrders() && order->price() >= bestAsk()) {
+                    unregisterLimitOrder(order);
+                    return;
+                }
                 auto firstLessThan = std::find_if(
                     m_buyQueue.rbegin(),
                     m_buyQueue.rend(),
@@ -330,6 +394,31 @@ void Book::placeLimitSell(const LimitOrder::Ptr& order)
         if (order->volume() > 0_dec) {
             if (order->volume() == volBefore) {
                 // No progress was made — place as passive to avoid infinite recursion
+                // A CROSSING ORDER THAT CANNOT MATCH MUST NOT REST, OR IT WOULD LEAVE THE BOOK CROSSED
+                // PERMANENTLY. Reaching here means the order is marketable but processAgainst* moved none of
+                // it -- in practice because the price band stopped the walk: that loop is bounded by
+                // bandLo/bandHi = bandRef * (1 -/+ maxPriceBand). Resting it at its own crossing price then
+                // puts a bid above the ask ladder (or an ask below the bid ladder), and the book cannot
+                // recover: the band reference is fed ONLY by trades (recordBandTrade is its sole setter), so
+                // with matching blocked no trade prints, sampleBandRef re-samples the frozen price forever,
+                // and the band never releases. A closed loop with no exit.
+                //
+                // Both directions reach it: a bid resting above the ask ladder, or an ask below the bid
+                // ladder. Either leaves the book crossed from that instant on, with every subsequent level
+                // update carrying the inversion, and no path back.
+                //
+                // The band's policy is deliberately NOT changed: no match is permitted that was not permitted
+                // before, and the reference still moves only on trades, which is what PriceBandTests pins
+                // ("NO RATCHET -- the reference must NOT be top-of-book"). This only refuses to CREATE an
+                // illegal state. The order is unregistered on the same path a fully-filled order takes.
+                //
+                // Trade-off: an order that today rests (invisibly crossing the book) is instead dropped. That
+                // is visible where the current behaviour is not, but it IS a behaviour change, and a dedicated
+                // refusal code would be better than reusing unregister.
+                if (m_buyQueue.hasActiveOrders() && order->price() <= bestBid()) {
+                    unregisterLimitOrder(order);
+                    return;
+                }
                 auto firstGreaterThan = std::find_if(
                     m_sellQueue.begin(),
                     m_sellQueue.end(),
@@ -473,6 +562,7 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
     // priced deep through the book, which matches at the far level and prints the same excursion.
     // LULD prohibits any trade outside the band, not merely market-order executions.
     sampleBandRef(m_simulation->currentTimestamp());
+    const auto ownMin = minPrice;
     minPrice = std::max(minPrice, bandLimit(false));
     // BOTH bounds, not just the sweep's adverse side. Enforcing only the floor here left the upside
     // open: a resting bid parked ABOVE ref*(1+band) is hit by a sell-aggressor and prints far outside
@@ -529,7 +619,7 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         // submission to fill a just-placed marketable order arrives in the SAME event as that order,
         // so the "resting" side was never resting when the taker turned up -- it is the very order the
         // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
-        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        // On one book, a single engine timestamp:
         //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
         //   sweep SELL #149 (1.0x1061.3652@MARKET)
         //   SELF TRADE PREVENTION CANCELED ORDER 148
@@ -550,14 +640,11 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         // batch can carry the LARGER timestamp and silently lose STP protection. Within one
         // instruction the order id is useless: the engine's eager sweep is minted immediately after
         // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
-        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
-        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        // target.
         //
-        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
-        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
-        // batch are separate instructions that share one. Measured 2026-08-14 on the running
-        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
-        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // Timestamp equality does NOT mean "one instruction". A miner's whole batch carries ONE
+        // timestamp, so two orders it sends on the same book in one batch are separate instructions
+        // that share one. Reading those as a single instruction stands STP down between them, which is
         // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
         // because the sweep inherits ctx.delay from the same batch.
         //
@@ -649,6 +736,17 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         }
     }
 
+    // A marketable remainder stopped by the band rather than by the order's own floor or an empty side:
+    // the band is refusing prints, which is what the release rule in effectiveBand counts.
+    if (order->volume() > 0_dec) {
+        if (const auto lvl = bestBuyLevel(); lvl && lvl->get().getFirstActiveOrder()) {
+            const auto p = lvl->get().price();
+            if (p >= ownMin && (p < minPrice || p > bandHi)) {
+                noteBandRefusal();
+            }
+        }
+    }
+
     return processedQuote;
 }
 
@@ -661,6 +759,7 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
     // priced deep through the book, which matches at the far level and prints the same excursion.
     // LULD prohibits any trade outside the band, not merely market-order executions.
     sampleBandRef(m_simulation->currentTimestamp());
+    const auto ownMax = maxPrice;
     maxPrice = std::min(maxPrice, bandLimit(true));
     // BOTH bounds - mirror of the buy-queue fix: a resting ask parked BELOW ref*(1-band) lifted by a
     // buy-aggressor printed under the band (measured: 101 prints, every one a buy-aggressor below
@@ -714,7 +813,7 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         // submission to fill a just-placed marketable order arrives in the SAME event as that order,
         // so the "resting" side was never resting when the taker turned up -- it is the very order the
         // sweep exists to fill. Cancelling it is not self-trade prevention, it is destroying the order.
-        // Measured 2026-08-07, book 103, one engine timestamp 12078144:
+        // On one book, a single engine timestamp:
         //   REGISTERED BUY ORDER #148 FOR 1061.3652@0.012
         //   sweep SELL #149 (1.0x1061.3652@MARKET)
         //   SELF TRADE PREVENTION CANCELED ORDER 148
@@ -735,14 +834,11 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         // batch can carry the LARGER timestamp and silently lose STP protection. Within one
         // instruction the order id is useless: the engine's eager sweep is minted immediately after
         // the order it exists to FILL, so the sweep always has the higher id and STP cancels its own
-        // target. Measured 2026-08-07 on s_cancel_partial_fill: "REGISTERED BUY ORDER #487",
-        // "Sending sweep order", "SELF TRADE PREVENTION CANCELED ORDER 487", both stamped 10875958.
+        // target.
         //
-        // Timestamp equality was the original stand-in for "one instruction", and it is WRONG. A
-        // miner's whole batch carries ONE timestamp, so two orders it sends on the same book in one
-        // batch are separate instructions that share one. Measured 2026-08-14 on the running
-        // exchange: agent 4 registered 126 orders stamped 12893798, one per book, plus groups of
-        // 122 and 118. Reading those as a single instruction stands STP down between them, which is
+        // Timestamp equality does NOT mean "one instruction". A miner's whole batch carries ONE
+        // timestamp, so two orders it sends on the same book in one batch are separate instructions
+        // that share one. Reading those as a single instruction stands STP down between them, which is
         // exactly the self-trade this guard exists to prevent, and it is reachable in exchange mode
         // because the sweep inherits ctx.delay from the same batch.
         //
@@ -831,6 +927,16 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         }
     }
 
+    // Mirror of the buy-queue exit: a remainder the band stopped, not the order's own cap or an empty side.
+    if (order->volume() > 0_dec) {
+        if (const auto lvl = bestSellLevel(); lvl && lvl->get().getFirstActiveOrder()) {
+            const auto p = lvl->get().price();
+            if (p <= ownMax && (p > maxPrice || p < bandLo)) {
+                noteBandRefusal();
+            }
+        }
+    }
+
     return processedQuote;
 }
 
@@ -841,6 +947,47 @@ taosim::book::TickContainer* Book::preventSelfTrade(
 {
     auto stpFlag = order->stpFlag();
     auto now = m_simulation->currentTimestamp();
+
+    // THE INCOMING SIDE NEEDS THE SAME NOTICE AS THE RESTING SIDE. cancelAndLog below tells the owner
+    // when STP cancels a RESTING order, but the three paths that cancel the INCOMING order only wrote a
+    // log line -- so an order the miner had just placed vanished with its reservation freed and nothing
+    // on its channel to say so. An order can be registered, cancelled and unregistered inside a single
+    // engine timestamp, which leaves the validator no record of it and the miner holding a phantom
+    // resting order whose funds the engine has already released.
+    //
+    // BOTH MECHANISMS, not exchange-service only. This notice was gated on exchangeServiceMode() on the
+    // belief that a simulation miner sees the cancellation as a book event on state.books[id].e. It does
+    // not: the published books carry {bids, asks, r} and nothing else, and the validator builds a
+    // miner's notices from the proxy's messages alone, so in simulation an STP cancel reached the miner
+    // through no channel at all: the order is narrated as cancelled, no RDCO is emitted, and the
+    // owner's cancellation handler is never invoked. Miner-initiated cancels already deliver their
+    // RESPONSE_DISTRIBUTED_CANCEL_ORDERS through the same buffer in both modes, so there is nothing to
+    // fire twice. The only reason not to dispatch is having no proxy to dispatch through.
+    auto notifyOwnerCancelled = [&](OrderID orderId, AgentId ownerId, taosim::decimal_t volume) {
+        auto* proxy = m_simulation->proxy();
+        // DIAGNOSTIC: say whether the notice is dispatched or dropped. "Did it fire" has to be answered
+        // from the engine rather than inferred from the miner's silence.
+        if (proxy == nullptr) {
+            m_simulation->logDebug(
+                "{} | AGENT #{} BOOK {} : STP CANCEL NOTICE SUPPRESSED for order {} (no proxy)",
+                m_simulation->currentTimestamp(), ownerId, m_id, orderId);
+            return;
+        }
+        m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP CANCEL NOTICE DISPATCHED for order {}",
+            m_simulation->currentTimestamp(), ownerId, m_id, orderId);
+        proxy->pushNotice(Message::create(
+            m_simulation->currentTimestamp(),
+            m_simulation->currentTimestamp(),
+            m_simulation->exchange()->name(),
+            proxy->name(),
+            "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+            MessagePayload::create<DistributedAgentResponsePayload>(
+                ownerId,
+                MessagePayload::create<CancelOrdersResponsePayload>(
+                    std::vector<OrderID>{orderId},
+                    MessagePayload::create<CancelOrdersPayload>(
+                        std::vector{taosim::event::Cancellation{orderId, volume}}, m_id)))));
+    };
 
     auto cancelAndLog = [&](OrderID orderId, std::optional<taosim::decimal_t> volume = {}) {
         if (cancelOrder(orderId, volume)) {
@@ -859,12 +1006,20 @@ taosim::book::TickContainer* Book::preventSelfTrade(
             // carried this cancellation, so the miner's order vanished silently -- an STP cancel has no
             // instruction behind it, hence no response path. Dispatch the same response shape a miner
             // cancel gets, addressed to the owner, delivered through the proxy like every other notice.
-            // Exchange-service mode only: simulation miners see the cancellation as a book event on
-            // state.books[id].e, and a notice as well would fire onOrderCancelled twice there.
-            if (auto* proxy = m_simulation->proxy(); proxy != nullptr && proxy->exchangeServiceMode()) {
-                m_simulation->dispatchMessage(
+            // In BOTH mechanisms: see notifyOwnerCancelled above for why the exchange-service gate that
+            // used to sit here was wrong, and why nothing fires twice without it.
+            auto* proxy = m_simulation->proxy();
+            if (proxy == nullptr) {
+                m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP RESTING CANCEL NOTICE SUPPRESSED for order {} (no proxy)",
+                    m_simulation->currentTimestamp(), agentId, m_id, orderId);
+            } else {
+                m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP RESTING CANCEL NOTICE DISPATCHED for order {}",
+                    m_simulation->currentTimestamp(), agentId, m_id, orderId);
+                // DIRECT, NOT QUEUED -- see DistributedProxyAgent::pushNotice. dispatchMessage from
+                // inside matching is never delivered: order 379's notice produced zero proxy receipts.
+                proxy->pushNotice(Message::create(
                     m_simulation->currentTimestamp(),
-                    0,
+                    m_simulation->currentTimestamp(),
                     m_simulation->exchange()->name(),
                     proxy->name(),
                     "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
@@ -873,7 +1028,7 @@ taosim::book::TickContainer* Book::preventSelfTrade(
                         MessagePayload::create<CancelOrdersResponsePayload>(
                             std::vector<OrderID>{orderId},
                             MessagePayload::create<CancelOrdersPayload>(
-                                std::vector{taosim::event::Cancellation{orderId, volume}}, m_id))));
+                                std::vector{taosim::event::Cancellation{orderId, volume}}, m_id)))));
             }
             return true;
         } else {
@@ -883,8 +1038,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
     };
 
     if (stpFlag == STPFlag::CN || stpFlag == STPFlag::CB) {
-        order->removeVolume(order->volume());
+        const auto _stpCancelledVolume = order->volume();
+        order->removeVolume(_stpCancelledVolume);
         m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+        notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
         if (stpFlag == STPFlag::CN) {
             return nullptr;
         }
@@ -909,8 +1066,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
 
     if (stpFlag == STPFlag::DC) {
         if (iop->totalVolume() == order->totalVolume()){
-            order->removeVolume(order->volume());
+            const auto _stpCancelledVolume = order->volume();
+            order->removeVolume(_stpCancelledVolume);
             m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+            notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
             cancelAndLog(iop->id());
             return nullptr;
         } else if (iop->totalVolume() < order->totalVolume()){
@@ -926,8 +1085,10 @@ taosim::book::TickContainer* Book::preventSelfTrade(
         } else {
             auto volumeToCancel = taosim::util::round(order->totalVolume() / taosim::util::dec1p(iop->leverage()),
                 m_simulation->exchange()->config().parameters().volumeIncrementDecimals);
-            order->removeVolume(order->volume());
+            const auto _stpCancelledVolume = order->volume();
+            order->removeVolume(_stpCancelledVolume);
             m_simulation->logDebug("{} | AGENT #{} BOOK {} : SELF TRADE PREVENTION CANCELED ORDER {}", now, agentId, m_id, order->id());
+            notifyOwnerCancelled(order->id(), agentId, _stpCancelledVolume);  // STP fires only when both sides are the same agent, so agentId IS this order's owner -- the same recipient cancelAndLog uses for the resting side.
             cancelAndLog(iop->id(), volumeToCancel);
             return nullptr;
         }

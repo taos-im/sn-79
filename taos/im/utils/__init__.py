@@ -1,6 +1,34 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 import re
+import time
+
+# Below this a nanosecond value is a simulation clock (a run is days long, this is three years); at or
+# above it the value is a wall-clock instant, which is what the exchange path stamps on every event.
+EPOCH_NS_FLOOR = 10**17
+
+
+def is_wall_clock_ns(timestamp) -> bool:
+    """Whether a nanosecond timestamp is an epoch instant rather than a simulation duration."""
+    try:
+        return int(timestamp) >= EPOCH_NS_FLOOR
+    except (TypeError, ValueError):
+        return False
+
+
+def format_timestamp(timestamp: int) -> str:
+    """Render a nanosecond timestamp for a log line.
+
+    A simulation clock reads as a duration (``1d 02:03:04.000000000``); a wall-clock instant, which is
+    what exchange-mode events carry, reads as a UTC datetime with the nanoseconds kept
+    (``YYYY-MM-DD 09:37:48.804743621``). Rendering an epoch instant as a duration gave ``20706d ...``.
+    """
+    ts = int(timestamp)
+    if not is_wall_clock_ns(ts):
+        return duration_from_timestamp(ts)
+    seconds, nanoseconds = divmod(ts, 1_000_000_000)
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(seconds)) + f'.{nanoseconds:09d}'
+
 
 def duration_from_timestamp(timestamp : int) -> str:
     """Render a nanosecond timestamp as a human-readable duration.

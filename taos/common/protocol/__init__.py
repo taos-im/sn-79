@@ -119,9 +119,9 @@ class SimulationEvent(BaseModel):
     declares -- `cr` (the SL/TP close reason), `xo` (the external-order UUID the data service keys on),
     `seq`. With pydantic's default `extra='ignore'` those are dropped the moment a wire dict becomes a
     model, and `model_dump()` cannot emit what was never kept: the notice arrives looking complete and
-    is silently missing the one field its consumer selects on. Measured 2026-08-18, once notices began
-    parsing into models on both paths: an SL/TP trigger closed the position correctly and the close
-    notice reached the miner with `cr` gone, so the scenario reported a trigger that never fired.
+    is silently missing the one field its consumer selects on: an SL/TP trigger closes the position
+    correctly and the close notice reaches the miner with `cr` gone, so it reads as a trigger that
+    never fired.
     """
     model_config = ConfigDict(populate_by_name=True, validate_by_name=True, validate_by_alias=True,
                               extra="allow")

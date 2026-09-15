@@ -11,14 +11,14 @@
 
 agent_params() {
   case "$1" in
-    RandomTakerAgent)   echo "min_quantity=0.1 max_quantity=1.0 expiry_period=200 max_fee_rate=0.01 min_leverage=0.0 max_leverage=0.0 gtx_training_enabled=true gtx_collect_data=true" ;;
-    RandomMakerAgent)   echo "min_quantity=0.1 max_quantity=1.0 expiry_period=200 max_fee_rate=0.01 min_leverage=0.0 max_leverage=0.0" ;;
-    ImbalanceAgent)     echo "imbalance_depth=5 history_retention_mins=1 expiry_period=200 parallel_history_workers=1 gtx_training_enabled=true gtx_collect_data=true" ;;
+    RandomTakerAgent)   echo "min_quantity=0.1 max_quantity=1.0 expiry_period=120000000000 max_fee_rate=0.01 min_leverage=0.0 max_leverage=0.0 gtx_training_enabled=true gtx_collect_data=true" ;;
+    RandomMakerAgent)   echo "min_quantity=0.1 max_quantity=1.0 expiry_period=120000000000 max_fee_rate=0.01 min_leverage=0.0 max_leverage=0.0" ;;
+    ImbalanceAgent)     echo "imbalance_depth=5 history_retention_mins=1 expiry_period=120000000000 parallel_history_workers=1 gtx_training_enabled=true gtx_collect_data=true" ;;
     OrderOptionAgent)   echo "min_quantity=0.1 max_quantity=1.0 gtx_training_enabled=true gtx_collect_data=true" ;;
     SelfTradingAgent)   echo "min_quantity=0.1 max_quantity=1.0" ;;
-    FuturesAgent)       echo "quantity=0.5 expiry_period=200 sampling_period=1000000000" ;;
+    FuturesAgent)       echo "quantity=0.5 expiry_period=120000000000 sampling_period=60" ;;
     SLTPAgent)          echo "quantity=0.5" ;;
-    SimpleRegressorAgent) echo "model=PassiveAggressiveRegressor quantity=0.5 signal_threshold=0.0025 model_threshold=0.5 expiry_period=200" ;;
+    SimpleRegressorAgent) echo "model=PassiveAggressiveRegressor quantity=0.5 signal_threshold=0.0025 model_threshold=0.5 expiry_period=120000000000" ;;
     MovingHurstAgent)   echo "gtx_training_enabled=true gtx_collect_data=true" ;;
     DevAgent)           echo "gtx_training_enabled=true gtx_collect_data=true" ;;
     RevengAgent)        echo "gtx_training_enabled=true gtx_collect_data=true" ;;

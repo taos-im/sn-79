@@ -121,7 +121,7 @@ def test_single_gradient_aggregate_survives_direct_reshape_path():
     returns the input UNCHANGED — where `vals.numel() != shape.numel()`.
     The PR-4 direct-reshape path (`vals.reshape(shape)`) crashed on this
     case with `shape '[3, 288]' is invalid for input of size 43` (seen on
-    testnet aggregation loop 2026-07-02).
+    testnet aggregation loop).
 
     The fix: numel-check gates the fast path; single-gradient falls back
     to `decompress()`, which allocates zeros(numel) + scatter and handles

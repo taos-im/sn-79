@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """An instruction re-validated from its own wire form must not lose fields.
 
-THE DEFECT (found 2026-08-06, root-caused after two wrong attempts). `payload()` serialises three fields
+THE DEFECT (root-caused after two wrong attempts). `payload()` serialises three fields
 under names the model does not answer to:
 
     wire "volume"       <- field quantity
@@ -10,7 +10,7 @@ under names the model does not answer to:
     wire "allowPartial" <- field allow_partial   (exchange limit order only)
 
 Pydantic ignores unknown keys without raising, so anything that re-validates an instruction from its own
-serialised form silently drops them and applies the field DEFAULT instead. Measured on a live stack:
+serialised form silently drops them and applies the field DEFAULT instead. On a live stack:
 
     598 of 598 forwarded orders reached the engine with "stpFlag":"CO", whatever the miner asked for.
 

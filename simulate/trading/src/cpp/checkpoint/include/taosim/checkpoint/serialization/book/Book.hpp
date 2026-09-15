@@ -48,6 +48,33 @@ struct convert<taosim::book::Book>
             else if (key == "orderToClientInfo") {
                 val.convert(v.orderToClientInfo());
             }
+            // THE BAND TRAVELS WITH THE BOOK. Absent here, a resumed book is unbounded until its
+            // first print, and that print then becomes the reference. Keys are read individually so
+            // a checkpoint written before this change still loads: the missing keys simply leave the
+            // defaults, which is the old behaviour rather than a parse failure.
+            else if (key == "bandSamples") {
+                val.convert(v.bandSamples());
+            }
+            else if (key == "bandLastPrice") {
+                val.convert(v.bandLastPrice());
+            }
+            else if (key == "bandRefCached") {
+                val.convert(v.bandRefCached());
+            }
+            else if (key == "bandLastSampleTs") {
+                val.convert(v.bandLastSampleTs());
+            }
+            else if (key == "bandSeeded") {
+                val.convert(v.bandSeeded());
+            }
+            // The release rule counts silence from the last print; without it a book locked across a resume
+            // would count from nothing and never widen.
+            else if (key == "bandLastTradeTs") {
+                val.convert(v.bandLastTradeTs());
+            }
+            else if (key == "bandRefusedSinceTrade") {
+                val.convert(v.bandRefusedSinceTrade());
+            }
         }
 
         return o;
@@ -60,7 +87,7 @@ struct pack<taosim::book::Book>
     template<typename Stream>
     msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o, const taosim::book::Book& v) const
     {
-        o.pack_map(5);
+        o.pack_map(12);
 
         o.pack("buyQueue");
         o.pack(v.buyQueue());
@@ -76,6 +103,25 @@ struct pack<taosim::book::Book>
 
         o.pack("orderToClientInfo");
         o.pack(v.orderToClientInfo());
+
+        o.pack("bandSamples");
+        o.pack(v.bandSamples());
+
+        o.pack("bandLastPrice");
+        o.pack(v.bandLastPrice());
+
+        o.pack("bandRefCached");
+        o.pack(v.bandRefCached());
+
+        o.pack("bandLastSampleTs");
+        o.pack(v.bandLastSampleTs());
+
+        o.pack("bandSeeded");
+        o.pack(v.bandSeeded());
+        o.pack("bandLastTradeTs");
+        o.pack(v.bandLastTradeTs());
+        o.pack("bandRefusedSinceTrade");
+        o.pack(v.bandRefusedSinceTrade());
 
         return o;
     }

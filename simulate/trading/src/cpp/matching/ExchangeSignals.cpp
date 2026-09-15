@@ -50,6 +50,9 @@ ExchangeSignals::ExchangeSignals() noexcept
     cancelLog.connect([this](CancellationWithLogContext item) {
         L3({.item = item, .id = eventCounter++});
     });
+    resetLog.connect([this](AgentResetLogContext item) {
+        L3({.item = item, .id = eventCounter++});
+    });
 }
 
 //-------------------------------------------------------------------------

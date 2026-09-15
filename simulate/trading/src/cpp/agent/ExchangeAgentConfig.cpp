@@ -173,6 +173,30 @@ void ExchangeAgentConfig::setPriceBand(pugi::xml_node node)
         }
         m_parameters.bandRefWindow = value;
     }
+    if (pugi::xml_attribute attr = node.attribute("bandReleaseAfter"); !attr.empty()) {
+        const int64_t value = attr.as_llong();
+        if (value < 0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'bandReleaseAfter' should be >= 0 (sim ns, 0 disables), was {}", value)};
+        }
+        m_parameters.bandReleaseAfter = value;
+    }
+    if (pugi::xml_attribute attr = node.attribute("bandReleaseStep"); !attr.empty()) {
+        const int64_t value = attr.as_llong();
+        if (value <= 0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'bandReleaseStep' should be > 0 (sim ns), was {}", value)};
+        }
+        m_parameters.bandReleaseStep = value;
+    }
+    if (pugi::xml_attribute attr = node.attribute("bandReleaseMax"); !attr.empty()) {
+        const double value = attr.as_double();
+        if (value <= 0.0 || value > 1.0 || value < m_parameters.maxPriceBand) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'bandReleaseMax' should be in (0,1] and at least maxPriceBand, was {}", value)};
+        }
+        m_parameters.bandReleaseMax = value;
+    }
 }
 
 }  // namespace taosim::config

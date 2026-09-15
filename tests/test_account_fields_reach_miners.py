@@ -1,12 +1,12 @@
 """Every field the Account model declares must survive to the miner.
 
-FOUR SEPARATE DEFECTS OF THIS SHAPE IN ONE NIGHT (2026-08-07/08). Each was a hand-maintained field
+FOUR SEPARATE DEFECTS OF THIS SHAPE IN ONE NIGHT. Each was a hand-maintained field
 list that drifted from its schema, and every one failed silently because the missing field had a
 benign default:
 
   1. PlaceMarketOrderInstruction.payload() omitted leverage and settleFlag; msgpack ignores unknown
      keys and defaults absent ones, so the engine used its struct defaults.
-  2. The exchange engine's account dicts (engines/exchange.py _normalize) had no 'v' key at all.
+  2. The exchange engine's account dicts had no 'v' key at all.
   3. MarketSimulationStateUpdate's from_json path constructed Account with 7 of 12 kwargs, so
      base_loan, quote_loan, base_collateral, quote_collateral and traded_volume all defaulted --
      a miner carrying a margin loan read zero for it.

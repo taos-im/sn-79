@@ -90,10 +90,11 @@ def test_debeta_scores_ranks_maker_over_drift_rider():
     for u in range(8):
         # makers 0..3: balanced two-sided capture + consistent positive alpha
         if u < 4:
+            # distinct sizes and shapes: identical makers tie, and ties share the block minimum
             for b in range(6):
-                buy[u][b] = 3.0
-                sell[u][b] = 3.0
-            alphas[u] = [1.0, 1.2, 0.9, 1.1, 1.0, 1.05]
+                buy[u][b] = 3.0 + 0.5 * u
+                sell[u][b] = 3.0 + 0.5 * u
+            alphas[u] = [1.0, 1.2, 0.9, 1.1, 1.0, 1.05 + 0.03 * u]
         else:
             # drift-riders 4..7: one-sided capture (buy only), inconsistent/zero alpha
             for b in range(6):
@@ -149,7 +150,10 @@ def test_debeta_scores_p11_demotes_feeder_maker():
     without = debeta_scores(buy, sell, alphas, floor=0.0, w_make=1.0)
     with_p11 = debeta_scores(buy, sell, alphas, floor=0.0, w_make=1.0, cp=cp, p11_strength=1.0)
     assert without[1] > max(without[mk] for mk in range(10, 16)), without  # top without P11
-    assert with_p11[1] < min(with_p11[mk] for mk in range(10, 16)), with_p11  # bottom with P11
+    # bottom with P11: its making is discounted to exactly 0, so it ranks with the zero makers, below
+    # every genuine maker but the smallest, which the positives rule also places at 0
+    assert with_p11[1] == 0.0, with_p11
+    assert sorted(with_p11[mk] for mk in range(10, 16))[1] > 0.0, with_p11
 
 
 def _fake_validator(enabled, w_make=0.30, min_books=4):
@@ -243,9 +247,10 @@ def test_debeta_dereg_reset_clears_reused_uid():
 def test_compute_debeta_scores_gate():
     from taos.im.validator.reward import compute_debeta_scores
 
-    # Disabled -> empty (legacy path).
-    assert compute_debeta_scores(_fake_validator(enabled=False)) == {}
-    # Enabled + warm -> map that ranks the two-sided maker above the one-sided rider.
+    # The enabled boolean is DEPRECATED AND IGNORED (weight is the only dial): the decomposition
+    # computes and publishes regardless, so enabled=False must NOT suppress it.
+    assert compute_debeta_scores(_fake_validator(enabled=False, min_books=1))
+    # Warm -> map that ranks the two-sided maker above the one-sided rider.
     scores = compute_debeta_scores(_fake_validator(enabled=True, min_books=1))
     assert scores, scores
     assert scores.get(1, 0.0) > scores.get(2, 0.0), scores

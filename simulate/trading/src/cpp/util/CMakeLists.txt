@@ -1,4 +1,5 @@
 add_library(util STATIC
+    AgentReset.cpp
     Cancellation.cpp
     ClosePosition.cpp
     GBMValuationModel.hpp

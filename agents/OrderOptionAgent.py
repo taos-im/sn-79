@@ -52,13 +52,18 @@ class OrderOptionAgent(GenTRXAgent):
         """
         return round(random.uniform(self.min_quantity,self.max_quantity),self.simulation_config.volumeDecimals)
 
-    def leverage(self):
+    def leverage(self, response):
         """
         Leverage to request, which is mode-dependent: exchange mode runs with maxLeverage=0 and REFUSES a
         leveraged order at placement rather than executing it unleveraged, so this agent's demonstration
         of the leverage parameter has to stand down there. Simulation keeps the 1.0 it always used.
         """
-        return 0.0 if self.exchange_mode else 1.0
+        # TAKEN FROM THE RESPONSE, NOT FROM THE AGENT. One agent instance serves both
+        # validators concurrently, so a flag on the AGENT describes whichever request last
+        # ran update(): it reads as "this agent is in exchange mode", which is not a thing an
+        # agent can be. The mechanism is a property of the response being built, so the
+        # decision is taken from the response passed in.
+        return 0.0 if response.exchange_mode else 1.0
 
     def respond(self, state : MarketSimulationStateUpdate) -> FinanceAgentResponse:
         """
@@ -220,7 +225,7 @@ class OrderOptionAgent(GenTRXAgent):
                 bt.logging.info(f"BOOK {book_id} ROUND {self.round} : BASE : {self.accounts[book_id].base_balance.total} [LOAN {self.accounts[book_id].base_loan} | COLLAT {self.accounts[book_id].base_collateral}]")
                 match self.round:
                     case 0:
-                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage())
+                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage(response))
                     case 1:
                         loans = list(self.accounts[book_id].loans.values())
                         if len(loans) > 0:
@@ -230,7 +235,7 @@ class OrderOptionAgent(GenTRXAgent):
                         else:
                             bt.logging.warning(f"No loans for close position on book {book_id}!")
                     case 2:
-                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage())
+                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage(response))
                     case 3:
                         loans = list(self.accounts[book_id].loans.values())
                         if len(loans) > 0:
@@ -240,21 +245,21 @@ class OrderOptionAgent(GenTRXAgent):
                         else:
                             bt.logging.warning(f"No loans for close position on book {book_id}!")
                     case 4:
-                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage())
-                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage())
+                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage(response))
+                        response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, leverage=self.leverage(response))
                     case 5:
                         for order_id, loan in self.accounts[book_id].loans.items():
                             bt.logging.info(f"CLOSING POSITION FOR ORDER #{order_id} | {loan}")
                         response.close_positions(book_id=book_id, order_ids=[order_id for order_id in self.accounts[book_id].loans])
                     case 6:
-                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage())
-                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage())
+                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage(response))
+                        response.market_order(book_id=book_id, direction=OrderDirection.SELL, quantity=0.01, leverage=self.leverage(response))
                     case 7:
                         for order_id, loan in self.accounts[book_id].loans.items():
                             bt.logging.info(f"CLOSING POSITION FOR ORDER #{order_id} | {loan}")
                         response.close_positions(book_id=book_id, order_ids=[order_id for order_id in self.accounts[book_id].loans])
                     case 8:
-                        response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, price=ask*0.99, leverage=self.leverage(), clientOrderId=1000 + book_id)
+                        response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=0.01, price=ask*0.99, leverage=self.leverage(response), clientOrderId=1000 + book_id)
         
         if self.response:
             self.response.instructions.extend(response.instructions)
@@ -288,7 +293,7 @@ class OrderOptionAgent(GenTRXAgent):
                     if not self.response:
                         self.response = self.make_response()  # mode-aware: emits exchange or simulation instructions
                     self.response.close_position(book_id=event.bookId, order_id=order_id)
-                    self.response.limit_order(book_id=event.bookId, direction=OrderDirection.SELL, quantity=0.01, price=self.history[-1].books[event.bookId].bids[0].price+0.01, leverage=self.leverage(), clientOrderId=2000 + event.bookId)
+                    self.response.limit_order(book_id=event.bookId, direction=OrderDirection.SELL, quantity=0.01, price=self.history[-1].books[event.bookId].bids[0].price+0.01, leverage=self.leverage(self.response), clientOrderId=2000 + event.bookId)
                     bt.logging.info(f"CLOSING POSITION FOR BUY LIMIT ORDER #{order_id} | {loan}")
         if event.clientOrderId == 2000 + event.bookId:            
             for order_id, loan in self.accounts[event.bookId].loans.items():
@@ -302,7 +307,15 @@ class OrderOptionAgent(GenTRXAgent):
 if __name__ == "__main__":
     """
     Example command for local standalone testing execution using Proxy:
-    python OrderOptionAgent.py --port 8888 --agent_id 0 --params min_quantity=0.1 max_quantity=1.0 PO=1 GTT=1 IOC=1 FOK=1 QUOTE=1 MARGIN=1 SLTP=1
+    python OrderOptionAgent.py --port 8888 --agent_id 0 --params min_quantity=0.25 max_quantity=1.0 PO=1 GTT=1 IOC=1 FOK=1 QUOTE=1 MARGIN=1 SLTP=1
+
+    NOTE min_quantity: the engine refuses a BASE-currency order whose volume is under
+    the exchange's `minOrderSize` -- 0.25 alpha in simulation_0.xml -- BEFORE it looks at
+    direction, so a smaller draw is rejected outright with MINIMUM_ORDER_SIZE_VIOLATION
+    and never reaches the book. 0.1 put the bottom of the sampling range below that floor,
+    so a fraction of orders failed for a reason nothing in the log explains. Check the
+    floor for your config: the exchange logs it at startup as
+    "Exchange order floors: minOrderSize=<N> alpha".
 
     SLTP test runs 4 rounds per book:
       Round 0: BUY market, SL=-2%, TP=+5%

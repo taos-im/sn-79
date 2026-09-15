@@ -34,6 +34,73 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SHADOW_PARITY_NS = int(os.environ.get("SHADOW_PARITY_NS", "10000000000"))
+# Parity self-heal storm breaker. This many re-INITs inside this window means the child cannot be
+# brought into parity at all (a structure missing from the snapshot, a dropped tee) and every further
+# re-INIT only stalls main for the snapshot: the service suspends itself and main scores in-process
+# until the validator restarts. 0 disables. A storm of re-INITs inside the window, none of which
+# holds parity, is the signature this breaker exists for.
+SHADOW_REINIT_STORM_N = int(os.environ.get("SHADOW_REINIT_STORM_N", "3"))
+SHADOW_REINIT_STORM_S = float(os.environ.get("SHADOW_REINIT_STORM_S", "900"))
+# Cutover VERIFY (main recomputes every SCORING_PROC_VERIFY_EVERY-th boundary and cross-checks the
+# child) is a second full get_rewards under the reward lock. A due check runs only while at most
+# MAX_PENDING reward tasks are queued (the running one included); otherwise it is deferred to the
+# next boundary, and after FORCE_AFTER deferrals it runs regardless so a permanently busy box still
+# verifies. Unthrottled, a VERIFY holds the reward lock long enough for the queue to cross the
+# query-blocking threshold, and miners go unqueried while it does.
+SCORING_PROC_VERIFY_MAX_PENDING = int(os.environ.get("SCORING_PROC_VERIFY_MAX_PENDING", "2"))
+SCORING_PROC_VERIFY_FORCE_AFTER = int(os.environ.get("SCORING_PROC_VERIFY_FORCE_AFTER", "3"))
+
+
+def scoring_proc_verify_decision(pending_reward_tasks: int, deferrals: int) -> tuple:
+    """Whether a due VERIFY runs at this boundary. Returns (run, deferrals_after)."""
+    if pending_reward_tasks <= SCORING_PROC_VERIFY_MAX_PENDING or deferrals >= SCORING_PROC_VERIFY_FORCE_AFTER:
+        return True, 0
+    return False, deferrals + 1
+
+
+class VerifyScheduler:
+    """When main runs the in-process VERIFY of the cutover child, one decision per scoring boundary.
+
+    A check falls due every `every` boundaries. A due check runs when the reward queue is short
+    (scoring_proc_verify_decision); otherwise the WHOLE due period is skipped and counted, and after
+    enough skipped periods the next due check runs regardless. The period is consumed either way: the
+    first cut carried the due flag to the next boundary, where the queue is the same size because the
+    adoption wait alone queues three rounds, so the check merely slid three boundaries and ran at the
+    old cadence (testnet: deferred at boundaries 10, 11, 12, ran at 13). Skipping the
+    period gives one VERIFY per (force_after + 1) * every boundaries on a busy box and every `every`
+    on an idle one.
+    """
+
+    def __init__(self, every: int):
+        self.every = max(1, int(every))
+        self.deferrals = 0
+        self.last = None  # "ran", "deferred" or None when the boundary was not due
+
+    @property
+    def skips_before_force(self) -> int:
+        """How many more due periods may be skipped before one runs regardless of the queue."""
+        return max(0, SCORING_PROC_VERIFY_FORCE_AFTER - self.deferrals)
+
+    def boundary(self, n: int, pending_reward_tasks: int) -> bool:
+        """`n` is the running count of cutover boundaries; returns whether VERIFY runs at this one."""
+        self.last = None
+        if n % self.every != 0:
+            return False
+        run, self.deferrals = scoring_proc_verify_decision(pending_reward_tasks, self.deferrals)
+        self.last = "ran" if run else "deferred"
+        return run
+
+# De-beta fill-stream accumulators (trade.update_trade_volumes). Running sums keyed {uid: {book: x}}
+# (debeta_inv is {book: {uid: x}}) as two-level float defaultdicts; the rest plain dicts: the
+# reconstruction state, the capture-mid print windows, the P11 counterparty sums and the
+# timestamped histories every sum is pruned from.
+_DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv"]
+_DEBETA_PLAIN = [
+    "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
+    "debeta_capture_mid", "debeta_cp",
+    "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
+    "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
+]
 
 _STRUCT_NAMES = [
     "trade_volumes", "volume_sums", "maker_volume_sums", "taker_volume_sums",
@@ -44,6 +111,15 @@ _STRUCT_NAMES = [
     # Shadow-reward inputs: mutated in place by score_uids each interval, so
     # once initialized the child's own scoring keeps them in lockstep with main.
     "kappa_values", "activity_factors", "pnl_factors",
+    # The de-beta accumulators. Until 0.6.1 the snapshot stopped at the kappa structures, so every
+    # INIT (and every parity re-INIT) restarted the child's making and skill windows from zero while
+    # main's kept going; in cutover mode the child's are the ones that score, so frequent re-INITs
+    # leave the legs computed over a tiny slice of fills.
+    *_DEBETA_DD2,
+    *_DEBETA_PLAIN,
+    # Redelivery dedup ledgers (exchange mode): a child with an empty ledger counts every redelivered
+    # fill again.
+    "_debeta_seen_tids", "_volume_seen_tids",
 ]
 
 
@@ -138,6 +214,11 @@ def _rebuild_structs(parts: dict) -> dict:
             }
     out["open_positions"] = pos
 
+    for name in _DEBETA_DD2:
+        out[name] = dd_float_2(parts.get(name, {}))
+    for name in _DEBETA_PLAIN + ["_debeta_seen_tids", "_volume_seen_tids"]:
+        out[name] = parts.get(name, {})
+
     for name in ("trade_volumes", "inventory_history", "initial_balances",
                  "recent_trades", "recent_miner_trades",
                  "kappa_values", "activity_factors", "pnl_factors"):
@@ -173,6 +254,11 @@ def compute_parity_components(s) -> dict:
         "pnl_book": h(sum_books(s.agent_pnl_by_book)),
         "vol": h(sum_books(s.volume_sums)),
         "rt": h(sum_books(s.roundtrip_volume_sums)),
+        # The de-beta legs' inputs: a child scoring on accumulators main does not share must show here,
+        # not only in the scores it publishes.
+        "debeta_cap": h(sum_books(getattr(s, "capture_buy_sums", {}) or {})
+                        + sum_books(getattr(s, "capture_sell_sums", {}) or {})),
+        "debeta_mtm": h(sum_books(getattr(s, "debeta_mtm", {}) or {})),
         "prune": h(getattr(s, "_last_prune_timestamp", None)),
     }
 
@@ -224,7 +310,8 @@ class ShadowState:
 
 def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
                  gentrx_scores=None, gentrx_ema=None,
-                 trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> dict:
+                 trading_ema=None, trading_ema_n=None, trading_ema_ts=None,
+                 absent=None) -> dict:
     """Run the SAME scoring main runs (score_uids + Pareto distribute) on the
     shadow's structures. Mutates kappa/activity/pnl factors in place exactly as
     main's reward does, keeping the shadow in lockstep.
@@ -253,6 +340,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
                                           compute_debeta_scores, distribute_rewards, score_uids)
 
     shadow.deregistered_uids = list(deregs)
+    # The presence gate's absent set is main-side knowledge (query outcomes), shipped with the inputs.
+    shadow.debeta_absent = (set(int(u) for u in absent) if absent is not None else None)
     all_uids = list(range(shadow.effective_max_uids))
     _ema = dict(gentrx_ema or {})
     validator_data = {
@@ -274,6 +363,13 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         # (with the config duck also lacking scoring.debeta) silently pinned cutover scoring to the
         # legacy path. The shadow owns the same fill-stream accumulators via the trade.py update path.
         'debeta_scores': compute_debeta_scores(shadow),
+        # Read AFTER the line above, which stashes them on the shadow (dict literals evaluate in source
+        # order). Main adopts this child's kappa_values for publishing in cutover mode, and the per-uid
+        # publisher reads the decomposition from these keys: without them every rank, raw leg, CP
+        # factor, w_make and floor is None on the wire and num_scored_books reads 0 for every miner.
+        'debeta_detail': getattr(shadow, 'debeta_detail', {}) or {},
+        'debeta_floor': getattr(shadow, 'debeta_floor', None),
+        'debeta_w_make': getattr(shadow, 'debeta_w_make', None),
     }
     trading_scores, gentrx_scores_out = score_uids(validator_data)
     # Track-record EMA: same pre-round state main ships (parity contract with
@@ -323,7 +419,7 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
     are the proof the heavy subtrees match main's. Returns bytes written."""
     import msgpack
     from taos.im.validator.persistence import (
-        _SAVE_STREAM_DEPTH, _stream_pack,
+        _SAVE_STREAM_DEPTH, _stream_pack, build_debeta_state,
         snapshot_inventory_history, snapshot_realized_pnl_history,
         snapshot_volume_sums, snapshot_trade_volumes,
         snapshot_roundtrip_volumes, snapshot_open_positions,
@@ -353,7 +449,11 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
         "taker_volume_sums": vols["taker_volume_sums"],
         "self_volume_sums": vols["self_volume_sums"],
         "roundtrip_volume_sums": vols["roundtrip_volume_sums"],
+        # Same block, same function as main's build_validator_state: this file is what a restart loads,
+        # and without it the de-beta windows restarted from zero on every restart with the shadow on.
+        **build_debeta_state(shadow),
         "miner_stats": light["miner_stats"],
+        "miner_presence": light.get("miner_presence", {}),
     }
     packer = msgpack.Packer(use_bin_type=True)
     tmp = f"{path}.tmp.shadow"
@@ -489,11 +589,11 @@ def _shadow_child_main(sock, cores, parity_ns):
                     pass
 
         def _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
-                            t_ema=None, t_ema_n=None, t_ema_ts=None):
+                            t_ema=None, t_ema_n=None, t_ema_ts=None, absent=None):
             t0 = time.time()
             try:
                 result = shadow_score(shadow, sim_ts, deregs, gtx_scores, gtx_ema,
-                                      t_ema, t_ema_n, t_ema_ts)
+                                      t_ema, t_ema_n, t_ema_ts, absent=absent)
                 _send_frame(sock, ("scores", (s_ts, result, time.time() - t0)))
             except Exception as e:
                 import traceback
@@ -630,11 +730,12 @@ def _shadow_child_main(sock, cores, parity_ns):
                 t_ema = payload[5] if len(payload) > 5 else None
                 t_ema_n = payload[6] if len(payload) > 6 else None
                 t_ema_ts = payload[7] if len(payload) > 7 else None
+                absent = payload[8] if len(payload) > 8 else None
                 if shadow is not None and awaiting_score_at is not None and awaiting_score_at[0] == s_ts:
                     # inputs arrived after the boundary was applied — score now
                     awaiting_score_at = None
                     _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
-                                    t_ema, t_ema_n, t_ema_ts)
+                                    t_ema, t_ema_n, t_ema_ts, absent)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -643,7 +744,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                             side_buffer.append((ts, raw))
                 else:
                     pending_score_inputs[s_ts] = (sim_ts, deregs, gtx_scores, gtx_ema,
-                                                  t_ema, t_ema_n, t_ema_ts)
+                                                  t_ema, t_ema_n, t_ema_ts, absent)
                     while len(pending_score_inputs) > 4:
                         pending_score_inputs.pop(next(iter(pending_score_inputs)))
             elif kind == "score_at":
@@ -653,6 +754,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                 t_ema = payload[5] if len(payload) > 5 else None
                 t_ema_n = payload[6] if len(payload) > 6 else None
                 t_ema_ts = payload[7] if len(payload) > 7 else None
+                absent = payload[8] if len(payload) > 8 else None
                 if shadow is None or awaiting_score_at is None or awaiting_score_at[0] != s_ts:
                     print(f"[SHADOW] unexpected score_at ts={s_ts} (awaiting={awaiting_score_at}) — ignored", flush=True)
                     if shadow is not None:
@@ -660,7 +762,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                 else:
                     awaiting_score_at = None
                     _score_and_send(s_ts, sim_ts, deregs, gentrx_scores, gentrx_ema,
-                                    t_ema, t_ema_n, t_ema_ts)
+                                    t_ema, t_ema_n, t_ema_ts, absent)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -678,6 +780,28 @@ def _shadow_child_main(sock, cores, parity_ns):
             sock.close()
         except Exception:
             pass
+
+
+class _ReinitStorm:
+    """Sliding-window counter behind the storm breaker: `hit(now)` records a re-INIT and answers whether
+    `n` of them now sit inside `window` seconds. n <= 0 disables."""
+
+    def __init__(self, n: int, window: float):
+        self.n = int(n)
+        self.window = float(window)
+        self._times = deque()
+
+    @property
+    def count(self) -> int:
+        return len(self._times)
+
+    def hit(self, now: float) -> bool:
+        if self.n <= 0:
+            return False
+        self._times.append(now)
+        while self._times and now - self._times[0] > self.window:
+            self._times.popleft()
+        return len(self._times) >= self.n
 
 
 class ScoringShadow:
@@ -719,6 +843,12 @@ class ScoringShadow:
         self.score_matches = 0
         self.score_mismatches = 0
         self._consecutive_mismatches = 0
+        self.reinits = 0
+        # Set by the storm breaker: every main-facing method is then inert (no tee, no INIT, no scores,
+        # no save offload) and main scores and saves in-process until the validator restarts.
+        self.cutover_suspended = False
+        self._storm = _ReinitStorm(SHADOW_REINIT_STORM_N, SHADOW_REINIT_STORM_S)
+        self._last_drop_log = 0.0
 
     def start(self) -> None:
         """Start the shadow process and its feed."""
@@ -752,13 +882,31 @@ class ScoringShadow:
             raw: One round's raw state bytes.
             timestamp: The round timestamp.
         block or bloat the main process for the shadow's sake)."""
-        if not self.is_alive():
+        if self.cutover_suspended or not self.is_alive():
             return
         with self._pending_lock:
             if self._pending >= 8:
                 self._dropped += 1
-                return
-            self._pending += 1
+                dropped = self._dropped
+                now = time.time()
+                log_it = now - self._last_drop_log >= 30.0
+                if log_it:
+                    self._last_drop_log = now
+            else:
+                self._pending += 1
+                dropped = 0
+                log_it = False
+        if dropped:
+            # A dropped round is a guaranteed parity MISMATCH and re-INIT downstream; until 0.6.1 the
+            # only trace was the dropped= counter on a MATCH line, which a diverging child never prints.
+            if log_it:
+                import bittensor as bt
+                bt.logging.warning(
+                    f"[SHADOW] tee dropped frame ts={timestamp}: the child is not draining "
+                    f"({self._pending} sends pending, {dropped} dropped so far). Its replica now lacks "
+                    f"this round; expect a parity MISMATCH and a re-INIT."
+                )
+            return
 
         def _send():
             try:
@@ -805,7 +953,7 @@ class ScoringShadow:
 
     def tee_score_inputs(self, timestamp: int, sim_ts: int, deregs: list,
                          gentrx_scores=None, gentrx_ema=None,
-                         trading_ema=None, trading_ema_n=None, trading_ema_ts=None) -> None:
+                         trading_ema=None, trading_ema_n=None, trading_ema_ts=None, absent=None) -> None:
         """Eager scoring: ship the boundary round's scoring inputs at TEE time,
         so the child computes during the seconds main's _reward spends queued
         behind _reward_lock — request_scores then collects a (usually) finished
@@ -831,6 +979,7 @@ class ScoringShadow:
             'trading_ema': dict(trading_ema or {}),
             'trading_ema_n': dict(trading_ema_n or {}),
             'trading_ema_ts': trading_ema_ts,
+            'absent': (sorted(int(u) for u in absent) if absent is not None else None),
         }
         self._stash(self._eager_inputs, timestamp, pin, 4)
 
@@ -840,7 +989,7 @@ class ScoringShadow:
                     "score_inputs",
                     (timestamp, sim_ts, pin['deregistered_uids'],
                      pin['gentrx_scores'], pin['gentrx_ema'],
-                     pin['trading_ema'], pin['trading_ema_n'], pin['trading_ema_ts']),
+                     pin['trading_ema'], pin['trading_ema_n'], pin['trading_ema_ts'], pin['absent']),
                 ))
             except Exception:
                 pass
@@ -855,7 +1004,8 @@ class ScoringShadow:
     def request_scores(self, timestamp: int, sim_ts: int, deregs: list,
                        gentrx_scores=None, gentrx_ema=None, timeout: float = 45.0,
                        eager: bool = False,
-                       trading_ema=None, trading_ema_n=None, trading_ema_ts=None):
+                       trading_ema=None, trading_ema_n=None, trading_ema_ts=None,
+                       absent=None):
         """Cutover mode: collect this boundary's full scoring result, blocking
         until it arrives (call via run_in_executor — the wait is GIL-free).
         eager=True means the inputs were already shipped at tee time (the child
@@ -880,6 +1030,8 @@ class ScoringShadow:
             The child's full scoring result.
         """
         import concurrent.futures
+        if self.cutover_suspended:
+            return None
         ready = self._score_results.pop(timestamp, None)
         if ready is not None:
             return ready
@@ -902,7 +1054,8 @@ class ScoringShadow:
                         "score_at",
                         (timestamp, sim_ts, list(deregs),
                          dict(gentrx_scores or {}), dict(gentrx_ema or {}),
-                         dict(trading_ema or {}), dict(trading_ema_n or {}), trading_ema_ts),
+                         dict(trading_ema or {}), dict(trading_ema_n or {}), trading_ema_ts,
+                         (sorted(int(u) for u in absent) if absent is not None else None)),
                     ))
                 except Exception:
                     pass
@@ -947,9 +1100,17 @@ class ScoringShadow:
 
     def request_reinit(self) -> None:
         """Self-heal: drop the child's state and re-run INIT on the next round
-        (triggered automatically after consecutive parity mismatches)."""
+        (triggered automatically after consecutive parity mismatches). Counted
+        by the storm breaker: SHADOW_REINIT_STORM_N of these inside
+        SHADOW_REINIT_STORM_S seconds suspend the service instead."""
         import bittensor as bt
-        bt.logging.warning("[SHADOW] requesting re-INIT (parity self-heal)")
+        if self.cutover_suspended:
+            return
+        self.reinits += 1
+        if self._storm.hit(time.monotonic()):
+            self.suspend(f"{self._storm.count} re-INITs within {self._storm.window:.0f}s")
+            return
+        bt.logging.warning(f"[SHADOW] requesting re-INIT (parity self-heal, #{self.reinits})")
         self.initialized = False
         self._ring.clear()
         self._score_ring.clear()
@@ -964,10 +1125,61 @@ class ScoringShadow:
 
         self._executor.submit(_send)
 
+    def suspend(self, reason: str) -> None:
+        """Storm breaker: the parity self-heal is not converging, so stop paying for it. The child
+        drops its state and gets nothing further; every main-facing call becomes a no-op (request_scores
+        and request_save answer None, so main's existing in-process fallbacks take over) until the
+        validator restarts. Pending score waits are released with None so a boundary mid-wait falls
+        back instead of running out its timeout."""
+        import bittensor as bt
+        if self.cutover_suspended:
+            return
+        self.cutover_suspended = True
+        self.initialized = False
+        for ring in (self._ring, self._score_ring, self._pending_child_parity,
+                     self._pending_child_scores, self._eager_inputs, self._score_results):
+            ring.clear()
+        for fut in list(self._score_futures.values()):
+            if not fut.done():
+                fut.set_result(None)
+        self._score_futures.clear()
+        bt.logging.error(
+            f"[SHADOW] {reason}: the parity self-heal is not converging, so the scoring service is "
+            f"suspended and main scores and saves in-process until the validator restarts. Each re-INIT "
+            f"was stalling main for the snapshot without ever restoring parity ({self.mismatches} "
+            f"mismatches, {self.matches} matches, {self._dropped} tee drops). Look for "
+            f"'[SHADOW] tee dropped' lines and for a structure missing from the INIT snapshot."
+        )
+
+        def _send():
+            try:
+                _send_frame(self._sock, ("reinit", None))
+            except Exception:
+                pass
+
+        self._executor.submit(_send)
+
+    def health(self) -> dict:
+        """Counters for the report data and the validator gauges."""
+        return {
+            "alive": int(self.is_alive()),
+            "initialized": int(self.initialized),
+            "cutover_suspended": int(self.cutover_suspended),
+            "parity_matches": int(self.matches),
+            "parity_mismatches": int(self.mismatches),
+            "reinits": int(self.reinits),
+            "tee_dropped": int(self._dropped),
+        }
+
     def send_init(self, validator) -> None:
         """Build + stream the INIT snapshot. MUST be called while the caller
         holds _reward_lock (structures frozen); runs synchronously on the
         shadow executor so it is FIFO-ordered with the tee frames."""
+        if self.cutover_suspended:
+            import concurrent.futures
+            done = concurrent.futures.Future()
+            done.set_result(None)
+            return done
         self.initialized = True
         base_ts = validator._shadow_applied_ts
 
@@ -1004,13 +1216,21 @@ class ScoringShadow:
     def _compare_parity(self, ts: int, mine, theirs, applied=None, apply_s=None) -> None:
         import bittensor as bt
         mine_comps, mine_vec = mine if isinstance(mine, tuple) else (mine, None)
-        theirs_comps, theirs_vec = theirs if isinstance(theirs, tuple) else (theirs, None)
+        if isinstance(theirs, tuple):
+            # (comps, vec) or (comps, vec, applied): the child's applied-round count rides along so a
+            # MISMATCH line says how many rounds its replica had absorbed since INIT.
+            theirs_comps = theirs[0]
+            theirs_vec = theirs[1] if len(theirs) > 1 else None
+            if applied is None and len(theirs) > 2:
+                applied = theirs[2]
+        else:
+            theirs_comps, theirs_vec = theirs, None
         mine, theirs = mine_comps, theirs_comps
         if mine == theirs:
             self.matches += 1
             bt.logging.info(
                 f"[SHADOW-PARITY] ts={ts} MATCH ({self.matches} ok / {self.mismatches} bad, "
-                f"dropped={self._dropped})"
+                f"applied={applied}, dropped={self._dropped})"
             )
         else:
             self.mismatches += 1
@@ -1023,6 +1243,7 @@ class ScoringShadow:
                 )
                 bt.logging.error(
                     f"[SHADOW-PARITY] ts={ts} MISMATCH diverged_structures={_diff} "
+                    f"(applied={applied}, dropped={self._dropped}, reinits={self.reinits}) "
                     f"(main={ {k: mine.get(k) for k in _diff} } shadow={ {k: theirs.get(k) for k in _diff} })"
                 )
                 if 'n_pnl' in _diff and mine_vec is not None and theirs_vec is not None:
@@ -1074,6 +1295,8 @@ class ScoringShadow:
             timestamp (int): Step timestamp the digest belongs to.
             digest (str): The main scorer's digest.
         """
+        if self.cutover_suspended:
+            return
         theirs = self._pending_child_parity.pop(timestamp, None)
         if theirs is not None:
             self._compare_parity(timestamp, digest, theirs)
@@ -1127,9 +1350,9 @@ class ScoringShadow:
                         # Child computed ahead of main (normal: it applies on tee,
                         # main applies seconds later behind _reward_lock) — stash
                         # and let record_main_digest complete the comparison.
-                        self._stash(self._pending_child_parity, ts, (comps, vec), 32)
+                        self._stash(self._pending_child_parity, ts, (comps, vec, applied), 32)
                     else:
-                        self._compare_parity(ts, mine, (comps, vec))
+                        self._compare_parity(ts, mine, (comps, vec, applied))
                 elif kind == "scores":
                     ts, result, score_s = payload
                     fut = self._score_futures.pop(ts, None)
@@ -1225,6 +1448,13 @@ def _config_duck(config):
                 centered_window=_num(getattr(_d, 'centered_window', None), 15, int),
                 min_books=_num(getattr(_d, 'min_books', None), 4, int),
                 p11_strength=_num(getattr(_d, 'p11_strength', None), 0.0, float),
+                making_floor_scale=_num(getattr(_d, 'making_floor_scale', None), 0.0, float),
+                skill_rank_scope=str(_d_scope if (_d_scope := getattr(_d, 'skill_rank_scope', None)) is not None
+                                     else 'positives'),
+                making_rank_scope=str(_d_mscope if (_d_mscope := getattr(_d, 'making_rank_scope', None)) is not None
+                                      else 'positives'),
+                presence_gate=_num(getattr(_d, 'presence_gate', None), 1, int),
+                presence_window=_num(getattr(_d, 'presence_window', None), 50, int),
                 mark_mode=str(_d_mark if (_d_mark := getattr(_d, 'mark_mode', None)) is not None
                               else 'last'),
                 mark_window=_num(getattr(_d, 'mark_window', None), 200, int),

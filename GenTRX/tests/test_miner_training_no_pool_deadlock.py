@@ -3,7 +3,7 @@
 """
 Miner training pipeline — pool-shutdown must not deadlock on stuck downloads.
 
-Regression for the observed live bug (2026-07-02): benchmark miner on a
+Regression for the observed live bug: benchmark miner on a
 remote R2-backed deployment received 27 assignments over ~2 hours but
 never produced a training log line. Root cause:
 `_download_and_train_background` used `with ThreadPoolExecutor(...) as pool:`.

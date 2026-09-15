@@ -60,9 +60,9 @@ struct convert<taosim::agent::StylizedTraderAgent>
                 v.topLevel() = val.as<T>();
             }
             else if (key == "lastMid") {
-                // Was "priceHist", a full ring buffer of which only the last element was
-                // ever read. Checkpoints written before this change carry the old key and
-                // will not restore this field; the agent reseeds it on the first L1.
+                // Only the last element of a full ring buffer is ever read, so this stores
+                // just that. Checkpoints carrying the older "priceHist" key will not restore
+                // this field; the agent reseeds it on the first L1.
                 using T = std::remove_cvref_t<decltype(v.lastMid())>;
                 v.lastMid() = val.as<T>();
             }

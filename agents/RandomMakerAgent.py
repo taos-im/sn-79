@@ -34,7 +34,7 @@ class RandomMakerAgent(GenTRXAgent):
         """
         return round(random.uniform(self.min_quantity, self.max_quantity), getattr(self.simulation_config, 'volumeDecimals', 8))
 
-    def leverage(self):
+    def leverage(self, response):
         """
         Obtains a random leverage value for order placement within the bounds defined by the agent strategy parameters.
         """
@@ -42,7 +42,12 @@ class RandomMakerAgent(GenTRXAgent):
         # than executed unleveraged. Returning 0 here rather than at each call site also fixes the
         # `quantity() * (1 + leverage())` sizing below, which would otherwise inflate an order the
         # exchange will not accept. Simulation behaviour is unchanged.
-        if self.exchange_mode:
+        # TAKEN FROM THE RESPONSE, NOT FROM THE AGENT. One agent instance serves both
+        # validators concurrently, so a flag on the AGENT describes whichever request last
+        # ran update(): it reads as "this agent is in exchange mode", which is not a thing an
+        # agent can be. The mechanism is a property of the response being built, so the
+        # decision is taken from the response passed in.
+        if response.exchange_mode:
             return 0.0
         return round(random.uniform(self.min_leverage, self.max_leverage), 2)
 
@@ -104,13 +109,13 @@ class RandomMakerAgent(GenTRXAgent):
                 bt.logging.info(f"BOOK {book_id} | BASE : {self.accounts[book_id].base_balance.total} [LOAN {self.accounts[book_id].base_loan} | COLLAT {self.accounts[book_id].base_collateral}]")
                 # BUY side
                 # Obtain a random leverage value if there is no open margin position on sell side
-                leverage   = self.leverage() if self.accounts[book_id].base_loan == 0 else 0.0
+                leverage   = self.leverage(response) if self.accounts[book_id].base_loan == 0 else 0.0
                 # If an open opposite margin position exists, repay the corresponding loans in order
                 # from oldest to newest by setting LoanSettlementOption.FIFO
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].base_loan == 0 else LoanSettlementOption.FIFO
                 # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity   = round(self.quantity() * (1 + self.leverage()), volume_decimals)
+                quantity   = round(self.quantity() * (1 + self.leverage(response)), volume_decimals)
                 # If the agent can afford to place the buy order
                 if self.accounts[book_id].quote_balance.free >= quantity * bidprice:
                     response.limit_order(
@@ -129,13 +134,13 @@ class RandomMakerAgent(GenTRXAgent):
                     bt.logging.error(f"CANNOT SUBMIT BUY ORDER FOR {str(round(1+leverage,2))+'x' if leverage > 0 else ''}{quantity}@{bidprice} : Insufficient quote balance!")
                 # SELL side
                 # Obtain a random leverage value if there is no open margin position on buy side
-                leverage   = self.leverage() if self.accounts[book_id].quote_loan == 0 else 0.0
+                leverage   = self.leverage(response) if self.accounts[book_id].quote_loan == 0 else 0.0
                 # If an open opposite margin position exists, repay the corresponding loans in order
                 # from oldest to newest by setting LoanSettlementOption.FIFO
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].quote_loan == 0 else LoanSettlementOption.FIFO
                 # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity   = round(self.quantity() * (1 + self.leverage()), volume_decimals)
+                quantity   = round(self.quantity() * (1 + self.leverage(response)), volume_decimals)
                 # If the agent can afford to place the sell order
                 if self.accounts[book_id].base_balance.free >= quantity:
                     response.limit_order(
@@ -159,6 +164,14 @@ class RandomMakerAgent(GenTRXAgent):
 if __name__ == "__main__":
     """
     Example command for local standalone testing execution using Proxy:
-    python RandomMakerAgent.py --port 8888 --agent_id 0 --params min_quantity=0.1 max_quantity=1.0 min_leverage=0.0 max_leverage=1.0 expiry_period=200000000000 max_fee_rate=0.002
+    python RandomMakerAgent.py --port 8888 --agent_id 0 --params min_quantity=0.25 max_quantity=1.0 min_leverage=0.0 max_leverage=1.0 expiry_period=200000000000 max_fee_rate=0.002
+
+    NOTE min_quantity: the engine refuses a BASE-currency order whose volume is under
+    the exchange's `minOrderSize` -- 0.25 alpha in simulation_0.xml -- BEFORE it looks at
+    direction, so a smaller draw is rejected outright with MINIMUM_ORDER_SIZE_VIOLATION
+    and never reaches the book. 0.1 put the bottom of the sampling range below that floor,
+    so a fraction of orders failed for a reason nothing in the log explains. Check the
+    floor for your config: the exchange logs it at startup as
+    "Exchange order floors: minOrderSize=<N> alpha".
     """
     launch(RandomMakerAgent)

@@ -15,6 +15,7 @@
 #include <boost/asio.hpp>
 #include <pugixml.hpp>
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -35,6 +36,27 @@ struct SimulationBlockInfo
     uint32_t count;
     uint32_t dimension;
 };
+
+//-------------------------------------------------------------------------
+
+// A STOP REQUEST IS PROCESS-WIDE, BECAUSE A SIGNAL IS.
+//
+// Installed with std::signal in SimulationManager.cpp. What used to sit there was
+//
+//     boost::asio::signal_set{mngr->m_io, SIGINT, SIGTERM}.async_wait(...)
+//
+// which could never fire, for two independent reasons: the signal_set is a TEMPORARY, destroyed at
+// the end of the statement and cancelling its own pending wait; and m_io is never run -- its only
+// two uses in the whole translation unit are those two constructions, and m_io.run() appears
+// nowhere. So nothing here has ever handled SIGINT or SIGTERM, and the process died on the default
+// disposition. That, rather than a handler that merely forgot to checkpoint, is why taosim has never
+// written one on an intended stop.
+//
+// requestStop() only RECORDS the request. The barrier completion in runSimulations() is the one
+// point at which every block has arrived and none has resumed, so it is the only place a checkpoint
+// is consistent, and the only place allowed to act on it.
+void requestStop() noexcept;
+[[nodiscard]] bool stopRequested() noexcept;
 
 //-------------------------------------------------------------------------
 
@@ -60,6 +82,8 @@ public:
 
     [[nodiscard]] bool online() const noexcept;
     [[nodiscard]] bool warmingUp() const noexcept;
+
+
 
     static std::unique_ptr<SimulationManager> fromConfig(const fs::path& configPath, const fs::path& baseDir);
     static std::unique_ptr<SimulationManager> fromCheckpoint(const checkpoint::CheckpointToken& ckptToken);
@@ -99,6 +123,12 @@ private:
     taosim::net::NetworkingInfo m_netInfo;
     std::string m_bookStateEndpoint, m_generalMsgEndpoint;
     UnsyncSignal<void()> m_stepSignal;
+    // Written ONLY inside the barrier completion and read ONLY after the barrier releases, so a
+    // plain bool is correct: the completion happens-before every waiting block resumes. It exists
+    // so the checkpoint and the decision to leave are the SAME observation -- sampling the request
+    // separately in each block could let it flip after the completion had declined to checkpoint,
+    // and the run would then exit without one.
+    bool m_leaving{false};
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorReqMessageQueue;
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorResMessageQueue;
     bool m_useMessagePack{};

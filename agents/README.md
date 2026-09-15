@@ -125,7 +125,9 @@ class MyTradingAgent(FinanceAgent):
 
 Note of course that these notices are part of the state update, and so all events occurring in the previous interval will be processed in sequence when the state is received (i.e. before your `respond` method is called).
 
-These handlers fire in **both** simulation and exchange mode, so an agent that consumes notices this way needs no change when it moves to the exchange. Two mode differences are worth knowing: `onStart` and `onEnd` fire only where a simulation actually starts and ends, since an exchange does neither; and an exception raised inside your own handler is logged and skipped rather than aborting the rest of your notices, so one faulty handler costs you that handler and not your whole response.
+These handlers fire in **both** simulation and exchange mode, so an agent that consumes notices this way needs no change when it moves to the exchange. Three mode differences are worth knowing: `onStart` and `onEnd` fire only where a simulation actually starts and ends, since an exchange does neither; an exception raised inside your own handler is logged and skipped rather than aborting the rest of your notices, so one faulty handler costs you that handler and not your whole response; and an exchange fill is announced only once it has settled on chain, then re-sent by the validator on every state update for a while so a miner that was unreachable still learns of it, with the agent base dropping the repeats by trade id so `onTrade` fires once per fill. On an exchange fill `takerOrderId` (or `makerOrderId` when your order rested) is the id your `onOrderAccepted` notice carried, and a fill against the liquidity pool has no maker agent: `makerAgentId` is `None` and `makerOrderId` is 0, which the event log prints as `MATCHED AGAINST POOL`.
+
+Two more exchange-only notices concern settlement. Your order settles on chain through a **settlement proxy wallet** the validator holds for your coldkey, and that proxy pays the chain fee. A proxy that cannot pay to settle (below the validator's `neuron.proxy_min_balance_tao`, 0.003 TAO by default) has every placement refused before it reaches the exchange, in any batch: `onOrderRejected` fires with a `FAILED TO PLACE` notice typed as the order you sent, whose message names the proxy address, its balance and the requirement; cancels still pass, and placements flow again once the proxy is funded. An order the exchange accepted that then settles nothing (the proxy could not pay the fee after all, the chain was unreachable, the swap returned nothing within the slippage tolerance) is restored with no fill and reported through `onOrderRejected` as well, under the same `orderId` your `onOrderAccepted` notice carried; the event log prints it as `NOT FILLED ... ORDER #id ... : not settled: <reason>` so it is not mistaken for a refused placement.
 
 ## Running in both simulation and exchange mode
 
@@ -224,7 +226,7 @@ Decimal('0.006799999999999999621136392846665330580435693264007568359375')
 
 That is below `0.0068`, so truncation to four places yields **`0.0067`**, a whole tick lower than you
 intended. Your order rests one tick away, and the quote reserved against it is smaller in proportion.
-Measured on a real order: a 3,335,926.3957 buy reserved 22,350.71 TAO rather than the 22,684.30 the
+On a real order, a 3,335,926.3957 buy reserved 22,350.71 TAO rather than the 22,684.30 the
 price implied, a 1.5% difference caused entirely by the last decimal place.
 
 Nothing rejects the order and nothing warns you. It rests at a legal price, just not the one you
@@ -397,7 +399,7 @@ resolve in both trees. `OrderCurrency.BASE` and `OrderCurrency.ALPHA` are the sa
 and `TAO`, so an agent can import the enum from either tree and use either spelling. Passing the integer
 value works too, and is identical on both.
 
-This was not always true: until 2026-08-20 the simulation tree had only `BASE`/`QUOTE` and the exchange
+This was not always true: earlier releases gave the simulation tree only `BASE`/`QUOTE` and the exchange
 tree only `ALPHA`/`TAO`, so a dual-mode agent raised `AttributeError` on whichever tree it had not been
 written against. If you are reading older agent code that carefully imports from one tree, that is why.
 

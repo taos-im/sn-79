@@ -124,7 +124,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
                     # reconstruction path in this file, used by the well-tested simulation flow) passes
                     # all twelve, which is why the same data is correct there and wrong here.
                     #
-                    # Found 2026-08-08 chasing traded_volume: the validator holds the real number
+                    # Found while chasing traded_volume: the validator holds the real number
                     # (measured 1383.308 for uid 171 book 5) and the miner received None. None rather
                     # than 0.0 was the tell -- a working assignment of an empty volume sends 0.0, so
                     # None meant the object was constructed without the field. Four earlier fixes
@@ -132,7 +132,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
                     #
                     # The engine serialises baseLoan/quoteLoan/baseCollateral/quoteCollateral in each
                     # holdings entry (accounting Balances::jsonSerialize), so these are real values,
-                    # not invented defaults. A miner carrying a margin loan previously saw zero.
+                    # not invented defaults, which matters for a miner carrying a margin loan.
                     accounts[agentId][book_id] = Account(
                         agent_id=account['agentId'],book_id=book_id,
                         base_loan=balances.get('baseLoan', 0.0),

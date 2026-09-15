@@ -29,7 +29,8 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from taos.im.validator.debeta import book_alphas_from_drift, median_abs_floor, debeta_scores
+from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_from_drift, median_abs_floor,
+                                      debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
 
@@ -95,6 +96,8 @@ def _aggregate_roundtrip_volumes(uid, roundtrip_volumes, book_ids, lookback_thre
 
 def _outlier_penalty(data):
     """STEP 8 helper: 1.5×IQR left-tail outlier penalty. Pure extraction."""
+    if len(data) == 0:
+        return 0.0
     q1, q3 = np.percentile(data, [25, 75])
     iqr = q3 - q1
 
@@ -457,6 +460,18 @@ def calculate_kappa_score(
             f"Ignoring {max_inactive_books}, penalizing {excess_inactive} as 0.0"
         )
     
+    # A uid with no books at all leaves data empty: total_books==0 makes max_inactive_books
+    # 0, so the branch above ignores zero inactive books and keeps an empty books_with_scores.
+    # np.percentile raises on that, and guarding only the penalty would leave np.median([])
+    # as nan to propagate into the weights, which is worse than the raise.
+    if len(data) == 0:
+        uid_kappa['activity_weighted_normalized_median'] = 0.0
+        uid_kappa['penalty'] = 0.0
+        uid_kappa['score'] = 0.0
+        uid_kappa['num_scored_books'] = 0
+        uid_kappa['scorable'] = False
+        return 0.0
+
     # ===== STEP 8: CALCULATE OUTLIER PENALTY =====
     # Use the 1.5×IQR rule to detect left-hand outliers in the activity-weighted Kappas
     # Outliers indicate books where the miner performed significantly worse than their median
@@ -694,6 +709,28 @@ def _gentrx_rank_normalize(gentrx_scores: Dict) -> Dict[int, float]:
     return result
 
 
+def kappa_stub(skipped: bool = False) -> Dict:
+    """A kappa_values entry for a uid whose kappa-3 was not computed this cycle, in the full reporting shape.
+
+    kappa_values doubles as the per-uid reporting carrier, and the report reads it by key. The two stubs
+    this replaces were {'books': {}} (a uid kappa-3 could not score while the de-beta weight is nonzero) and
+    {'books': {}, 'books_weighted': {}, 'skipped': True} (kappa weight 0): both truthy, neither with a
+    median, so report.py's kappa_values['median'] raised and the report worker died every cycle, from
+    the first cycle after a fresh registration onwards.
+    Same keys as the zeroed slot in trade.py and the init default in validator.py.
+    """
+    stub = {
+        'books': {}, 'books_weighted': {},
+        'total': None, 'average': None, 'median': None,
+        'normalized_average': 0.0, 'normalized_median': 0.0, 'normalized_total': 0.0,
+        'activity_weighted_normalized_median': 0.0,
+        'penalty': 0.0, 'score': 0.0,
+    }
+    if skipped:
+        stub['skipped'] = True
+    return stub
+
+
 def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     """
     Computes the per-UID trading and gentrx scores for the two-pool allocation.
@@ -736,13 +773,26 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     simulation_config = validator_data['simulation_config']
     simulation_timestamp = validator_data['simulation_timestamp']
 
+    # De-beta full-replace: when STEP 4b will overwrite the trading score this cycle, the kappa and
+    # PnL components are dead computation (score_uids already skipped the kappa-3 batch under the
+    # same condition), so both report 0.0 rather than a value that was never going to be used.
+    debeta_cfg = config.get('debeta', {}) or {}
+    debeta_map = validator_data.get('debeta_scores') or {}
+    # FLAT composition: trading = kappa.weight*kappa + pnl.weight*pnl + debeta.weight*debeta, the
+    # three weights validated to sum to 1 at init. A component is computed iff its weight is
+    # nonzero; de-beta is always computed (cheap, and the decomposition must stay visible).
+    # An empty de-beta map (warming/exception) renormalizes onto the legacy components.
+    _debeta_replace = bool(debeta_map)
+    _debeta_weight = max(0.0, min(1.0, float(debeta_cfg.get('weight', 0.0))))
+    _kappa_dead = float(config['kappa'].get('weight', 0.0)) <= 0.0
+
     # ===== STEP 1: CALCULATE KAPPA SCORE COMPONENT =====
     # This calculates risk-adjusted returns with activity and P&L weighting
     # The Kappa score already includes:
     # - Per-book activity factors (volume-based participation weighting)
     # - Per-book P&L factors (profitability-based quality weighting)
     # - Outlier penalty (consistency enforcement)
-    kappa_score = calculate_kappa_score(
+    kappa_score = 0.0 if _kappa_dead else calculate_kappa_score(
         uid=uid,
         kappa_values=kappa_values,
         activity_factors=activity_factors,
@@ -753,7 +803,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         simulation_config=simulation_config,
         simulation_timestamp=simulation_timestamp
     )
-    
+
     # ===== STEP 2: P&L COMPONENT =====
     pnl_config = config.get('pnl', {})
     pnl_score_weight = pnl_config.get('weight', 0.0)
@@ -827,6 +877,11 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
 
     trading_score = (kappa_weight * kappa_score) + (pnl_score_weight * pnl_score)
     trading_score = max(0.0, min(1.0, trading_score))
+    # Warming/exception fallback: with no de-beta map, its weight share renormalizes onto the
+    # legacy components so the score keeps its scale (the EMA standing must not read a config
+    # step or a warmup as a skill change).
+    if not _debeta_replace and _debeta_weight > 0.0 and _debeta_weight < 1.0:
+        trading_score = min(1.0, trading_score / (1.0 - _debeta_weight))
     gentrx_score = max(0.0, min(1.0, gentrx_score))
 
     # ===== STEP 4b: DE-BETA (P8) OPTION A — full-replace of the trading score =====
@@ -834,13 +889,20 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     # the drift-stripped making+skill rank REPLACES the kappa+pnl trading score. The downstream
     # track-record EMA + floor + Pareto pipeline is applied to it unchanged (so the newcomer-warmup
     # seed and de-concentration guards still hold). A uid absent from the map (never traded) -> 0.
-    debeta_cfg = config.get('debeta', {}) or {}
-    debeta_map = validator_data.get('debeta_scores') or {}
     debeta_applied = False
-    if debeta_cfg.get('enabled') and debeta_map:
-        trading_score = max(0.0, min(1.0, float(debeta_map.get(uid, 0.0))))
+    if _debeta_replace:
+        _deb = max(0.0, min(1.0, float(debeta_map.get(uid, 0.0))))
+        # Flat: the legacy terms above already carry their own weights; de-beta adds its share.
+        # (0,0,1) is the characterized full replacement; weight 0 publishes without paying.
+        trading_score = trading_score + _debeta_weight * _deb
         debeta_applied = True
 
+    # A miner kappa-3 could not score (no realized data -> None entry) must still get a reporting
+    # carrier when de-beta applies OR the transition weight is set: warming cycles at a nonzero
+    # rung must publish the dial and the raw trading score for every miner, or the live blend
+    # invariant (and the dashboards) lose exactly the cycles the ladder gates watch.
+    if (debeta_applied or _debeta_weight > 0.0) and not kappa_values.get(uid):
+        kappa_values[uid] = kappa_stub()
     if kappa_values.get(uid):
         uid_kappa = kappa_values[uid]
         uid_kappa['pnl_score'] = pnl_score if pnl_score_weight > 0 else None
@@ -849,6 +911,26 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['pnl_score_weight'] = pnl_score_weight
         uid_kappa['gentrx_simulation_share'] = gentrx_sim_share
         uid_kappa['debeta_score'] = float(debeta_map.get(uid, 0.0)) if debeta_applied else None
+        # The decomposition the dashboards publish. Without these a miner sees kappa moving
+        # while emissions follow a score kappa no longer contributes to.
+        _d = (validator_data.get('debeta_detail') or {}).get(uid) if debeta_applied else None
+        uid_kappa['making_raw'] = _d['making_raw'] if _d else None
+        uid_kappa['making_rank'] = _d['making_rank'] if _d else None
+        uid_kappa['skill_raw'] = _d['skill_raw'] if _d else None
+        uid_kappa['skill_rank'] = _d['skill_rank'] if _d else None
+        uid_kappa['p11_factor'] = _d['p11_factor'] if _d else None
+        uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
+        uid_kappa['debeta_w_make'] = validator_data.get('debeta_w_make') if debeta_applied else None
+        uid_kappa['debeta_floor'] = validator_data.get('debeta_floor') if debeta_applied else None
+        # The weight is the CONFIG dial, meaningful every cycle (warming included): the live blend
+        # invariant needs it to reconstruct the renormalized legacy composition, and a gauge that
+        # vanishes during warmup reads as "de-beta off" on the dashboards.
+        uid_kappa['debeta_weight'] = _debeta_weight
+        if debeta_applied:
+            # Under de-beta these carry DE-BETA coverage, not the kappa leg's (whose count is a
+            # penalty-floor artifact: a constant for idle miners). Map membership = passed coverage.
+            uid_kappa['num_scored_books'] = (_d.get('skill_books', 0) if _d else 0)
+            uid_kappa['scorable'] = uid in debeta_map
         uid_kappa['trading_score'] = trading_score
         uid_kappa['final_score'] = trading_score
 
@@ -882,7 +964,23 @@ def score_uids(validator_data: Dict) -> Tuple[Dict[int, float], Dict[int, float]
     realized_pnl_history = validator_data['realized_pnl_history']
     tau = config['kappa']['tau']
 
-    if config['kappa']['parallel_workers'] == 0:
+    # De-beta full-replace (STEP 4b) makes the kappa-3 result dead computation (~1s/cycle plus a
+    # loky worker pool), so it is skipped whenever the replacement will actually fire. The guard is
+    # the SAME condition as STEP 4b: any de-beta fallback (disabled, warming, exception -> empty
+    # map) restores kappa scoring in the same cycle with nothing to rebuild (kappa_3 recomputes
+    # from realized_pnl_history; the cache is fingerprint-keyed). kappa_values doubles as the
+    # per-uid reporting carrier, so skipped uids get explicit stubs rather than absence (reporting
+    # would drop them) or stale last-cycle values (dashboards would show kappa that was not
+    # computed this cycle).
+    # FLAT weights (validated to sum to 1): a component is computed iff its own weight is nonzero.
+    # kappa.weight 0 makes the batch dead computation in every path, warming fallback included
+    # (renormalization uses the weights as configured, so a zero-weight kappa contributes nothing).
+    # Stub entries keep the reporting carrier.
+    if float(config['kappa'].get('weight', 0.0)) <= 0.0:
+        for uid in uids:
+            kappa_values[uid] = kappa_stub(skipped=True)
+        bt.logging.debug(f"de-beta replace active: kappa-3 computation skipped for {len(uids)} uids")
+    elif config['kappa']['parallel_workers'] == 0:
         cache_updates = {}
         for uid in uids:
             realized_pnl_value = realized_pnl_history.get(uid, {})
@@ -1024,7 +1122,11 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     where the accumulators live) and used by both get_rewards (weights) and the reporting snapshot."""
     dcfg = getattr(getattr(self, 'config', None), 'scoring', None)
     dcfg = getattr(dcfg, 'debeta', None)
-    if not (dcfg and getattr(dcfg, 'enabled', False)):
+    # ALWAYS computed and published (weight replaced the enabled boolean): weight 0 means legacy
+    # emissions with the decomposition visible, never an invisible mechanism. Only a missing config
+    # object (tests, exotic callers) skips.
+    if dcfg is None:
+        self.debeta_detail = {}
         return {}
     try:
         # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
@@ -1033,9 +1135,20 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
             getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
         )
+        # Book identity is discarded by book_alphas_from_drift (it returns a LIST per uid), so
+        # rebuild the keyed form for the per-book dashboard gauges. Same inputs and values; only
+        # the keys survive. Cheap: it is the dict the list was built from.
+        self.debeta_alphas_by_book = book_alphas_by_book(
+            getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
+            getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
+        )
         floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
         p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
         cp = {int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()} if p11_strength > 0 else None
+        # The legs, for the dashboards. Stashed on the validator rather than returned so the
+        # Dict[int, float] contract every caller relies on is unchanged. Cleared on every path
+        # that returns {}, so a fallback cycle cannot publish the previous cycle's decomposition.
+        _detail = {}
         scores = debeta_scores(
             {u: dict(b) for u, b in getattr(self, 'capture_buy_sums', {}).items()},
             {u: dict(b) for u, b in getattr(self, 'capture_sell_sums', {}).items()},
@@ -1044,15 +1157,89 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             w_make=float(dcfg.w_make),
             cp=cp,
             p11_strength=p11_strength,
+            detail=_detail,
+            # getattr with a default: the scoring child's config duck must carry this too (it does),
+            # but an older duck must degrade to no floor, not to an exception fallback.
+            making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
+            skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
+            making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
         )
+        # PRESENCE GATE: a uid whose last presence_window queries all failed is not scorable this
+        # cycle (dropped from the map, so the blend reads 0 and scorable is False); its legs stay in
+        # the detail with present=False and its accumulators keep running. The scoring child gets the
+        # absent set from main with its score inputs (debeta_absent), so both scorers agree.
+        _gate_dial = getattr(dcfg, 'presence_gate', None)
+        _gate = 1 if _gate_dial is None else int(_gate_dial)
+        _absent = set()
+        if _gate:
+            _shipped = getattr(self, 'debeta_absent', None)
+            if _shipped is not None:
+                _absent = {int(u) for u in _shipped}
+            else:
+                _absent = absent_uids(getattr(self, 'miner_presence', {}) or {},
+                                      int(getattr(dcfg, 'presence_window', None) or 50))
+        for _u in list(scores):
+            if _u in _absent:
+                scores.pop(_u)
+        for _u, _dd in _detail.items():
+            _dd['present'] = _u not in _absent
         warm = sum(1 for v in scores.values() if v > 0.0)
         if warm < int(dcfg.min_books):
             bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
-            return {}
+            return _debeta_fallback_map(self, dcfg, "warming")
+        self.debeta_detail = _detail
+        self.debeta_floor = float(floor)
+        self.debeta_w_make = float(dcfg.w_make)
+        self._debeta_last = {
+            'scores': dict(scores), 'detail': dict(_detail), 'floor': float(floor),
+            'w_make': float(dcfg.w_make), 'ts': time.time(),
+        }
         return scores
     except Exception:
         bt.logging.exception("De-beta score computation failed; falling back to legacy scoring")
-        return {}
+        return _debeta_fallback_map(self, dcfg, "exception")
+
+
+# How long a de-beta map may be carried at the (0, 0, 1) rung when the current cycle produced none.
+_DEBETA_CARRY_MAX_S = 600.0
+
+
+def _debeta_fallback_map(self: 'Validator', dcfg, why: str) -> Dict[int, float]:
+    """What score_uid gets when this cycle produced no de-beta map.
+
+    Below weight 1.0 the answer is the empty map: score_uid renormalises the de-beta share onto the
+    legacy components, which is the characterised warming behaviour of every blend rung. At weight
+    1.0 there is nothing to renormalise onto (kappa and pnl carry weight 0 and are not computed), so
+    an empty map scored every miner 0 for the cycle: a warming guard or any exception in the
+    computation zeroed the board (reported by a miner on the 0.6.1 testnet ratchet). At
+    that rung the previous cycle's map is carried instead, for at most _DEBETA_CARRY_MAX_S, with its
+    decomposition, and the carry is logged every time; with nothing to carry the zero cycle is
+    logged as the error it is rather than passing silently.
+    """
+    weight = 0.0
+    try:
+        weight = float(getattr(dcfg, 'weight', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        pass
+    last = getattr(self, '_debeta_last', None) or {}
+    if weight >= 1.0 and last.get('scores'):
+        age = time.time() - float(last.get('ts') or 0.0)
+        if age <= _DEBETA_CARRY_MAX_S:
+            self.debeta_detail = dict(last.get('detail') or {})
+            self.debeta_floor = last.get('floor')
+            self.debeta_w_make = last.get('w_make')
+            bt.logging.warning(
+                f"De-beta {why} at weight {weight:.2f}: carrying the previous map "
+                f"({len(last['scores'])} uids, {age:.0f}s old) so the cycle does not score every miner 0"
+            )
+            return dict(last['scores'])
+    self.debeta_detail = {}
+    if weight >= 1.0:
+        bt.logging.error(
+            f"De-beta {why} at weight {weight:.2f} with no recent map to carry: every trading score is "
+            f"0 this cycle"
+        )
+    return {}
 
 
 def build_scoring_config(self: 'Validator') -> Dict:
@@ -1085,7 +1272,7 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 }
             },
             'debeta': {
-                'enabled': bool(getattr(getattr(self.config.scoring, 'debeta', None), 'enabled', False)),
+                'weight': float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0)),
                 'w_make': float(getattr(getattr(self.config.scoring, 'debeta', None), 'w_make', 0.30)),
                 'centered_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 15)),
                 'floor_scale': float(getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.5)),
@@ -1184,7 +1371,7 @@ def apply_track_record_ema(scores: Dict, all_uids, deregs, ts: int, halflife: in
     Returns:
         The age-annealed scores.
     """
-    # Deregistered/vacant slots (uid in deregs until re-registration — engines/exchange.py
+    # Deregistered/vacant slots (uid in deregs until re-registration: the exchange engine
     # appends on dereg, removes on re-register) are excluded from the EMA entirely: cleared here
     # AND skipped in the update below, so the slot stays empty (no value, k=0) through its
     # vacancy. Otherwise a vacant slot would keep accruing k on neutral scores, and a miner
@@ -1283,6 +1470,11 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         'config': build_scoring_config(self),
         'simulation_config': build_simulation_config_dict(self),
         'debeta_scores': _pin.get('debeta_scores') if 'debeta_scores' in _pin else compute_debeta_scores(self),
+        # Read AFTER the line above, which is what populates them. Stashed on self by
+        # compute_debeta_scores; empty on any fallback path.
+        'debeta_detail': getattr(self, 'debeta_detail', {}) or {},
+        'debeta_floor': getattr(self, 'debeta_floor', None),
+        'debeta_w_make': getattr(self, 'debeta_w_make', None),
         'simulation_timestamp': _pin.get('simulation_timestamp', self.simulation_timestamp),
         'uids': all_uids,
         'deregistered_uids': _pin.get('deregistered_uids', self.deregistered_uids),

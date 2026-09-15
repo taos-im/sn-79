@@ -62,15 +62,24 @@ public:
     [[nodiscard]] auto&& tradeIdCounter(this auto&& self) noexcept { return self.m_tradeIdCounter; }
 
     // Mint a trade id for a fill the books never matched (an AMM/pool swap settled
-    // straight off the reserves).  Those fills used to leave the engine with no id at
-    // all, which forced every downstream consumer to invent one, so a single fill
-    // ended up with a different identity on every surface.  Drawing from the same
+    // straight off the reserves).  Without one, such a fill leaves the engine with no id
+    // at all, every downstream consumer invents its own, and a single fill ends up
+    // with a different identity on every surface.  Drawing from the same
     // counter Book::logTrade uses keeps engine-matched and pool fills in one id space.
     // Returns nullopt when books own private counters (no shared counter configured),
     // since an id from a per-book sequence would collide across books.
     [[nodiscard]] std::optional<TradeID> mintPoolTradeId() noexcept
     {
         return assignTradeId(m_tradeIdCounter);
+    }
+
+    // Order id for an instruction the pool executed. Such an order never enters a book, so nothing
+    // numbered it. Drawn from the shared counter the books use, so pool and book orders are one id
+    // space; nullopt when books own private counters, for the same reason as mintPoolTradeId.
+    [[nodiscard]] std::optional<OrderID> mintPoolOrderId() noexcept
+    {
+        if (!m_orderIdCounter) return std::nullopt;
+        return (*m_orderIdCounter)++;
     }
 
     // Placement details of the LIMIT instruction that caused a pool swap, kept against the

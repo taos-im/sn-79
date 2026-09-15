@@ -48,6 +48,19 @@ public:
     [[nodiscard]] auto&& orderIdCounter(this auto&& self) noexcept { return self.m_orderIdCounter; }
     [[nodiscard]] auto&& tradeIdCounter(this auto&& self) noexcept { return self.m_tradeIdCounter; }
     [[nodiscard]] auto&& orderToClientInfo(this auto&& self) noexcept { return self.m_order2clientCtx; }
+    // FOR THE CHECKPOINT, which must carry the band with the book.
+    //
+    // A resumed book whose band state was not restored has m_bandRefCached == 0, and bandLimit()
+    // treats a zero reference as "no band at all" -- so the first marketable order after a resume
+    // walks the whole book instead of stopping at the band. The first print then seeds the reference
+    // at that price, and every sane order afterwards is outside the band and refused.
+    [[nodiscard]] auto&& bandSamples(this auto&& self) noexcept { return self.m_bandSamples; }
+    [[nodiscard]] auto&& bandLastPrice(this auto&& self) noexcept { return self.m_bandLastPrice; }
+    [[nodiscard]] auto&& bandRefCached(this auto&& self) noexcept { return self.m_bandRefCached; }
+    [[nodiscard]] auto&& bandLastSampleTs(this auto&& self) noexcept { return self.m_bandLastSampleTs; }
+    [[nodiscard]] auto&& bandSeeded(this auto&& self) noexcept { return self.m_bandSeeded; }
+    [[nodiscard]] auto&& bandLastTradeTs(this auto&& self) noexcept { return self.m_bandLastTradeTs; }
+    [[nodiscard]] auto&& bandRefusedSinceTrade(this auto&& self) noexcept { return self.m_bandRefusedSinceTrade; }
     [[nodiscard]] auto&& orderIdMap(this auto&& self) noexcept { return self.m_orderIdMap; }
     [[nodiscard]] taosim::decimal_t midPrice() const noexcept;
     [[nodiscard]] taosim::decimal_t bestBid() const noexcept;
@@ -93,6 +106,12 @@ public:
     void recordBandTrade(Timestamp ts, taosim::decimal_t price, AgentId maker, AgentId taker) noexcept;
     void sampleBandRef(Timestamp ts) noexcept;
     [[nodiscard]] taosim::decimal_t bandLimit(bool isBuy) const noexcept;
+    // The band in force at ts: maxPriceBand, widened by the release rule while the band has refused a
+    // marketable order and no trade has printed for bandReleaseAfter (see ExchangeAgentConfig).
+    [[nodiscard]] double effectiveBand(Timestamp ts) const noexcept;
+    // Called when a marketable remainder was stopped by the band rather than by its own limit or an
+    // empty side; cleared by the next print that feeds the reference.
+    void noteBandRefusal() noexcept;
 
 private:
     struct TopOfBook
@@ -127,6 +146,9 @@ private:
     taosim::decimal_t m_bandRefCached{};      // median, recomputed only when a sample is pushed
     Timestamp m_bandLastSampleTs{};
     bool m_bandSeeded{false};
+    Timestamp m_bandLastTradeTs{};        // last print that fed the reference (self-trades excluded)
+    bool m_bandRefusedSinceTrade{false};  // a marketable order was stopped by the band since that print
+    Timestamp m_bandFirstRefusalTs{};     // when that first happened; the silence anchor when no print is known
     size_t m_maxDepth;
     size_t m_detailedDepth;
     BookSignals m_signals;

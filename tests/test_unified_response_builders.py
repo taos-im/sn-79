@@ -7,7 +7,7 @@ written by hand, twice over -- once for the simulation instruction set and once 
 wrong or missing field name is not a static error there; it is a ValidationError raised inside an agent
 at runtime, in one mode only, at whichever moment the miner first calls that builder. Two of the seven
 builders shipped with exactly that bug (close_positions with `positions` instead of `closes`, fixed
-2026-08-09; close_position with the same mistake, still present until 2026-08-19 and found only by
+close_position carried the same mistake, and it was found only by
 reading the note left on its sibling).
 
 The pattern is what makes it dangerous: each was noticed as an agent losing an update in production

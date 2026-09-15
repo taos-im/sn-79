@@ -18,7 +18,7 @@ the same operator re-registering on the same box and port, which is the common c
 rare in production. Then the slot changes hands, `handle_deregistration` is never called, the departed
 miner's score and history are never cleared, and the new occupant inherits the standing.
 
-Found 2026-08-05 while building the acceptance suite's deregistration stage. The fix keeps the early return
+Found while exercising deregistration end to end. The fix keeps the early return
 and widens its condition to cover the hotkeys as well, so it still skips a genuinely unchanged resync.
 """
 
