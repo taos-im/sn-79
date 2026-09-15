@@ -358,6 +358,12 @@ def _rank01(vals):
     return rank
 
 
+# Counterparty bucket for takers that are not miners (background agents, external exchange flow, pool
+# fills). It counts in a maker's total flow but is never a "top counterparty": concentration is only
+# ever measured over miner takers, against the whole flow.
+MARKET_FLOW = -1
+
+
 def accumulate_counterparties(cp, book_id, trades, *, cp_hist=None, ts=None):
     """P11 input: accumulate per-MAKER counterparty (taker) volume over ONE book's trade batch, IN
     PLACE (carried across batches). cp: {maker_uid: {taker_uid: vol}}. A maker fed by a dedicated
@@ -370,12 +376,20 @@ def accumulate_counterparties(cp, book_id, trades, *, cp_hist=None, ts=None):
         cp: ``{maker_uid: {taker_uid: vol}}`` counterparty volumes, accumulated in place.
         book_id: The book this batch belongs to.
         trades: Ordered trade batch, each dict-like with ``p``, ``q``, ``s``, ``Ma``, ``Ta``.
-    windowing (making window). Offline callers pass none."""
+    windowing (making window). Offline callers pass none.
+
+    Non-miner takers (simulation background agents, exchange external flow and pool fills, all with a
+    negative or missing id) are kept under the single MARKET_FLOW bucket. They are the diverse market
+    the discount is meant to leave untouched: dropping them judged a maker on its miner slice alone.
+    A maker quoting into the broad market can take almost all of its flow from non-miner
+    counterparties, and judging it on the miner slice alone read that as concentration."""
     for t in trades:
         ma = _uid(t.get("Ma", -1))
         ta = _uid(t.get("Ta", -1))
-        if ma == ta or ma < 0 or ta < 0:
+        if ma < 0 or ma == ta:
             continue
+        if ta < 0:
+            ta = MARKET_FLOW
         q = float(t["q"])
         d = cp.setdefault(ma, {})
         d[ta] = d.get(ta, 0.0) + q
@@ -385,7 +399,7 @@ def accumulate_counterparties(cp, book_id, trades, *, cp_hist=None, ts=None):
 
 def et_book_batches(notices, seen_tids, ts):
     """Regroup exchange ET settled-fill notices into per-book ordered trade batches for de-beta.
-    notices: {uid: [notice, ...]} from state.notices; seen_tids: {trade_id: ts} carried across calls
+    notices: {uid: [notice, ...]} from state.notices; seen_tids: {(book, trade_id): ts} carried across calls
     (mutated) so a fill counted once is never recounted -- neutralizes the maker+taker duplicate listing
     and the deliberate redelivery of settled fills across blocks; ts: current sample ts. Returns
     {book_id: [{p,q,s,Ma,Ta,i}, ...]} ordered by trade id (monotone engine mint order), the shape the
@@ -393,7 +407,7 @@ def et_book_batches(notices, seen_tids, ts):
 
     Args:
         notices: ``{uid: [notice, ...]}`` from ``state.notices``.
-        seen_tids: ``{trade_id: ts}`` carried across calls and mutated, so no fill is recounted.
+        seen_tids: ``{(book, trade_id): ts}`` carried across calls and mutated, so no fill is recounted.
         ts: The current sample timestamp.
 
     Returns:
@@ -405,9 +419,12 @@ def et_book_batches(notices, seen_tids, ts):
             if n.get("y") != "ET":
                 continue
             tid = n.get("i")
-            if tid in seen_tids:
+            # A trade id names a trade within its book: the exchange mints them from one counter
+            # today, but the ledger must not depend on that.
+            seen_key = (int(n["b"]), tid)
+            if seen_key in seen_tids:
                 continue
-            seen_tids[tid] = ts
+            seen_tids[seen_key] = ts
             by_book.setdefault(int(n["b"]), []).append(
                 # Mf/Tf carried through so making and skill CAN be measured net of fees. The
                 # accumulators ignore unknown keys, so adding them changes no score by itself; the
@@ -446,7 +463,8 @@ def counterparty_ec(cp, maker, topk=2):
         for t, v in cps.items():
             other[t] = other.get(t, 0.0) + v
     other_tot = sum(other.values()) or 1.0
-    top = sorted(my, key=lambda t: my[t], reverse=True)[:topk]
+    # Shares are over the WHOLE flow, MARKET_FLOW included; the top-k is drawn from miner takers only.
+    top = sorted((t for t in my if t != MARKET_FLOW), key=lambda t: my[t], reverse=True)[:topk]
     my_share = sum(my[t] for t in top) / tot
     mkt_share = sum(other.get(t, 0.0) for t in top) / other_tot
     return my_share - mkt_share
@@ -483,7 +501,8 @@ def p11_discount(own, cp, uids, strength, topk=2):
             out[u] = own.get(u, 0.0)
             continue
         other_tot = (g_tot - tot) or 1.0
-        top = sorted(my, key=lambda t: my[t], reverse=True)[:topk]
+        # Same rule as counterparty_ec: the market bucket is flow, never a counterparty.
+        top = sorted((t for t in my if t != MARKET_FLOW), key=lambda t: my[t], reverse=True)[:topk]
         my_share = sum(my[t] for t in top) / tot
         mkt_share = sum((g.get(t, 0.0) - my.get(t, 0.0)) for t in top) / other_tot
         ec = max(0.0, my_share - mkt_share)
@@ -491,8 +510,130 @@ def p11_discount(own, cp, uids, strength, topk=2):
     return out
 
 
+SKILL_RANK_SCOPES = ("positives", "whole")
+
+
+PRESENCE_WINDOW_DEFAULT = 50
+
+
+def absent_uids(presence, window=PRESENCE_WINDOW_DEFAULT):
+    """The uids whose last `window` query outcomes hold no successful response.
+
+    `presence` is {uid: outcomes}, each outcome truthy for a valid (HTTP 200) response, kept by
+    forward.update_stats as a bounded deque, or a list when shipped to the scoring child. A uid with
+    fewer than `window` outcomes is present: a fresh validator has not seen enough to judge, so a
+    restart never zeroes the board. One success anywhere in the window makes the uid present again.
+
+    Without the gate a uid that had stopped answering kept earning on the timing of resting fills
+    already inside the window: the skill leg is built from fills, so credit continues to accrue after
+    the agent goes away.
+
+    Args:
+        presence: ``{uid: outcomes}``.
+        window: Number of most recent outcomes that must all be failures.
+    Returns:
+        set: The absent uids.
+    """
+    n = max(int(window or PRESENCE_WINDOW_DEFAULT), 1)
+    out = set()
+    for u, outcomes in (presence or {}).items():
+        seq = list(outcomes)
+        if len(seq) >= n and not any(bool(x) for x in seq[-n:]):
+            out.add(int(u))
+    return out
+
+
+def absent_now(validator):
+    """The absent set from a live validator's presence records and dials, sorted for the wire; None when
+    the gate is off (so the child applies none either)."""
+    dcfg = getattr(getattr(getattr(validator, "config", None), "scoring", None), "debeta", None)
+    gate = getattr(dcfg, "presence_gate", None)
+    if gate is not None and int(gate) == 0:
+        return None
+    window = int(getattr(dcfg, "presence_window", None) or PRESENCE_WINDOW_DEFAULT)
+    return sorted(absent_uids(getattr(validator, "miner_presence", {}) or {}, window))
+
+
+def _rank_positive_leg(values, scope, dial):
+    if scope not in SKILL_RANK_SCOPES:
+        raise ValueError(f"{dial} must be one of {SKILL_RANK_SCOPES}, got {scope!r}")
+    if scope == "whole":
+        return _rank01([max(0.0, float(v)) for v in values])
+    idx = [i for i, v in enumerate(values) if v > 0]
+    out = [0.0] * len(values)
+    if len(idx) == 1:
+        # A lone positive is the best there is: _rank01 of one value is 0, which would pay the only
+        # maker or the only skilled trader nothing on that leg (seen in the warm-up gate).
+        out[idx[0]] = 1.0
+    elif idx:
+        for i, r in zip(idx, _rank01([float(values[i]) for i in idx])):
+            out[i] = r
+    return out
+
+
+def rank_making(making, scope="positives"):
+    """The making leg's rank, the twin of rank_skill. A uid with no two-sided capture ranks 0.
+
+    scope="positives" (default): the positive makings are ranked among themselves, lowest positive 0,
+    highest 1, a lone positive 1. scope="whole": ranked over the whole pool, the rule shipped previously, kept for
+    rollback. Under "whole" the smallest positive making inherits the rank of the entire zero-maker
+    block, and on both networks most of the pool makes nothing, so negligible two-sided capture is
+    materially overpaid. Ranking among positives removes that without disturbing the top of the
+    board.
+
+    Args:
+        making: Per-uid making values (post floor), any order.
+        scope: "positives" or "whole".
+    Returns:
+        list: Ranks in [0, 1], aligned to `making`.
+    """
+    return _rank_positive_leg(making, scope, "making_rank_scope")
+
+
+def rank_skill(skill, scope="positives"):
+    """The skill leg's rank. Non-positive skill always ranks 0 (no directional skill, no credit).
+
+    scope="positives" (default): the positive skills are ranked among themselves, lowest positive 0,
+    highest 1, a lone positive 1. scope="whole": the clamped skills are ranked over the whole pool, the rule shipped previously,
+    kept for rollback. Under "whole" the smallest positive skill inherits the rank of the entire
+    non-positive block, so a negligible skill collects a mid score and near-zero skills square-wave as
+    their sign flips between boards. Ranking among positives removes both effects without disturbing
+    the top of the board.
+
+    Args:
+        skill: Per-uid skill values, any order.
+        scope: "positives" or "whole".
+    Returns:
+        list: Ranks in [0, 1], aligned to `skill`.
+    """
+    return _rank_positive_leg(skill, scope, "skill_rank_scope")
+
+
+def making_magnitude_floor(making, scale=0.5):
+    """Magnitude floor for the MAKING rank, the making-side twin of median_abs_floor: scale times the
+    median of the strictly positive making values across the field. Rank is magnitude-blind, so a
+    two-sided quoter of negligible size ranked beside the field's real makers on testnet:
+    two uids with 34k and 19k of daily maker volume (0.02 per cent of the scored field's) carried
+    making raws of 5.4 and 3.8 against a median of about 200 and ranked 0.77 and 0.68 because only 8
+    of 23 uids made at all. Below the floor a uid's making enters the rank as 0. 0 disables.
+
+    Args:
+        making: Per-uid making values (post-P11), any order.
+        scale: Multiple of the positive-making median.
+    Returns:
+        float: The floor, 0.0 when scale is 0 or nobody made.
+    """
+    if scale <= 0:
+        return 0.0
+    pos = [float(m) for m in making if m > 0]
+    if not pos:
+        return 0.0
+    return float(scale) * statistics.median(pos)
+
+
 def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor=0.0, w_make=0.65,
-                  cp=None, p11_strength=0.0, detail=None):
+                  cp=None, p11_strength=0.0, detail=None, making_floor_scale=0.0,
+                  skill_rank_scope="positives", making_rank_scope="positives"):
     """Full per-uid de-beta score. making = per-uid two-sided spread capture, combined by RANK. Rank
     rather than magnitude-proportional, because proportional combining re-concentrates reward on the
     largest flow; and per-uid rather than netted across linked accounts, because grouping by identity is
@@ -512,6 +653,14 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
         w_make: Weight of the making leg in the combined score.
         cp: Counterparty volumes for the P11 discount, or None.
         p11_strength: P11 discount strength; 0 disables.
+        making_floor_scale: Making magnitude floor as a multiple of the positive-making median
+            (making_magnitude_floor); 0 disables.
+        skill_rank_scope: How the skill leg is ranked, see rank_skill: "positives" (default) ranks the
+            positive skills among themselves, "whole" ranks the clamped skills over the whole pool.
+            Non-positive skill ranks 0 either way.
+        making_rank_scope: How the making leg is ranked, see rank_making: "positives" (default) ranks
+            the positive makings among themselves, "whole" ranks over the whole pool. Zero making
+            ranks 0 either way.
 
     Returns:
         dict: ``{uid: combined score}``.
@@ -531,12 +680,27 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
         own = p11_discount(own, cp, uids, p11_strength)
     making = [own.get(u, 0.0) for u in uids]
     skill = [kappa_floored(book_alphas_by_uid.get(u, []), floor) for u in uids]
-    comb = combined_reward(making, skill, w_make)
+    # What enters the two ranks. SKILL: only positive skill earns skill rank (rank_skill). Before the
+    # Under the earlier clamp, a skill of exactly 0.0 (no book clears the magnitude floor) ranked ABOVE every
+    # negative trader: testnet rung 2, 13 of 23 scored uids negative, 3 exactly 0.0, 4 positive, so the
+    # zero block ranked 0.73 and at w_make 0.30 earned 0.51 of the score for no directional exposure.
+    # The clamp alone then left the smallest positive skill on the step above the whole non-positive
+    # block (see rank_skill), which "positives", the default scope, removes. MAKING below the
+    # magnitude floor enters the rank as 0 for the same reason on the other leg (see
+    # making_magnitude_floor). The raw legs in `detail` are the unclamped, unfloored values, so a
+    # miner can still see what was measured.
+    making_floor = making_magnitude_floor(making, making_floor_scale)
+    making_ranked = [m if m >= making_floor else 0.0 for m in making] if making_floor > 0 else list(making)
+    # Both legs rank their positives among themselves by default: the pool is mostly zero makers on
+    # both networks (see rank_making), so a whole-pool making rank hands the smallest positive maker
+    # the rank of the whole zero block, the making-side twin of the skill cliff.
+    rm = rank_making(making_ranked, making_rank_scope)
+    rs = rank_skill(skill, skill_rank_scope)
+    comb = [w_make * rm[i] + (1.0 - w_make) * rs[i] for i in range(len(uids))]
     if detail is not None:
         # The SAME numbers the score was built from, not a recomputation: the dashboards publish
-        # these and a recomputation could disagree with what was emitted. Ranks come from the same
-        # _rank01 combined_reward uses, so making_rank*w + skill_rank*(1-w) reproduces the score.
-        rm, rs = _rank01(list(making)), _rank01(list(skill))
+        # these and a recomputation could disagree with what was emitted, so
+        # making_rank*w + skill_rank*(1-w) reproduces the score exactly.
         for i, u in enumerate(uids):
             base = pre_p11.get(u, 0.0)
             detail[u] = {

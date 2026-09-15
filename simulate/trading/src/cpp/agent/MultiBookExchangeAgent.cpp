@@ -855,6 +855,7 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr&  ms
             auto& acct = accounts().at(agentId);
             for (auto book : m_books) {
                 const auto activeOrders = acct.activeOrders().at(book->id());
+                uint32_t cancelled = 0;
                 for (Order::Ptr order : activeOrders) {
                     auto limitOrder = std::dynamic_pointer_cast<LimitOrder>(order);
                     if (limitOrder == nullptr) {
@@ -871,7 +872,13 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr&  ms
                             agentId,
                             book->id(),
                             simulation()->currentTimestamp())));
+                    ++cancelled;
                 }
+                m_signals.at(book->id())->resetLog(AgentResetLogContext(
+                    agentId,
+                    book->id(),
+                    simulation()->currentTimestamp(),
+                    cancelled));
             }
         }
         rapidjson::Document json;
@@ -937,6 +944,11 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr&  ms
                     }
                 }
             }
+            m_signals.at(bookId)->resetLog(AgentResetLogContext(
+                agentId,
+                bookId,
+                simulation()->currentTimestamp(),
+                static_cast<uint32_t>(bookCancellations.size())));
             cancellations.push_back(std::move(bookCancellations));
         }
         accounts().reset(agentId);
@@ -1188,11 +1200,20 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(const Message::Ptr
     // would never fire (and would leak in the queue). GTT expiry is instead driven per batch
     // off the block clock by Exchange::expireGTTOrders. Keep the scheduler for the stepped
     // distributed sim, where the message queue is drained by Simulation::step().
+    //
+    // OCCURRENCE AT THE DEADLINE, DELAY ZERO. respondToMessage answers a message with the same latency the
+    // message took to arrive (arrival - occurrence), the symmetric network model. Scheduled as (now,
+    // expiryPeriod) this expiry arrived with a latency of one whole expiry period, so the owner's
+    // RESPONSE_DISTRIBUTED_CANCEL_ORDERS was sent back with that same latency: the order was cancelled
+    // at the deadline and the miner learned of it one expiry period later (the internal simulation checks,
+    // s_gtd: the RDCO for order 103816 arrived, late; order 52474's fell outside a 120 s wall budget
+    // and read as never sent). A message that occurs at the deadline and arrives at the deadline
+    // answers at the deadline.
     if (subPayload->timeInForce == taosim::TimeInForce::GTT && subPayload->expiryPeriod.has_value()
         && !simulation()->proxy()->exchangeServiceMode()) {
         simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            subPayload->expiryPeriod.value(),
+            simulation()->currentTimestamp() + subPayload->expiryPeriod.value(),
+            Timestamp{},
             msg->source,
             name(),
             "DISTRIBUTED_CANCEL_ORDERS",
@@ -1595,10 +1616,11 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(const Message::Ptr&  msg
         MessagePayload::create<PlaceOrderLimitResponsePayload>(order->id(), payload),
         1);
 
+    // Occurrence at the deadline, delay zero: see the distributed placement handler for why.
     if (payload->timeInForce == taosim::TimeInForce::GTT && payload->expiryPeriod.has_value()) {
         simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            payload->expiryPeriod.value(),
+            simulation()->currentTimestamp() + payload->expiryPeriod.value(),
+            Timestamp{},
             msg->source,
             name(),
             "CANCEL_ORDERS",

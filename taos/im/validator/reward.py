@@ -29,7 +29,8 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from taos.im.validator.debeta import book_alphas_by_book, book_alphas_from_drift, median_abs_floor, debeta_scores
+from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_from_drift, median_abs_floor,
+                                      debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
 
@@ -708,6 +709,28 @@ def _gentrx_rank_normalize(gentrx_scores: Dict) -> Dict[int, float]:
     return result
 
 
+def kappa_stub(skipped: bool = False) -> Dict:
+    """A kappa_values entry for a uid whose kappa-3 was not computed this cycle, in the full reporting shape.
+
+    kappa_values doubles as the per-uid reporting carrier, and the report reads it by key. The two stubs
+    this replaces were {'books': {}} (a uid kappa-3 could not score while the de-beta weight is nonzero) and
+    {'books': {}, 'books_weighted': {}, 'skipped': True} (kappa weight 0): both truthy, neither with a
+    median, so report.py's kappa_values['median'] raised and the report worker died every cycle, from
+    the first cycle after a fresh registration onwards.
+    Same keys as the zeroed slot in trade.py and the init default in validator.py.
+    """
+    stub = {
+        'books': {}, 'books_weighted': {},
+        'total': None, 'average': None, 'median': None,
+        'normalized_average': 0.0, 'normalized_median': 0.0, 'normalized_total': 0.0,
+        'activity_weighted_normalized_median': 0.0,
+        'penalty': 0.0, 'score': 0.0,
+    }
+    if skipped:
+        stub['skipped'] = True
+    return stub
+
+
 def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     """
     Computes the per-UID trading and gentrx scores for the two-pool allocation.
@@ -879,7 +902,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     # rung must publish the dial and the raw trading score for every miner, or the live blend
     # invariant (and the dashboards) lose exactly the cycles the ladder gates watch.
     if (debeta_applied or _debeta_weight > 0.0) and not kappa_values.get(uid):
-        kappa_values[uid] = {'books': {}}
+        kappa_values[uid] = kappa_stub()
     if kappa_values.get(uid):
         uid_kappa = kappa_values[uid]
         uid_kappa['pnl_score'] = pnl_score if pnl_score_weight > 0 else None
@@ -896,6 +919,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['skill_raw'] = _d['skill_raw'] if _d else None
         uid_kappa['skill_rank'] = _d['skill_rank'] if _d else None
         uid_kappa['p11_factor'] = _d['p11_factor'] if _d else None
+        uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
         uid_kappa['debeta_w_make'] = validator_data.get('debeta_w_make') if debeta_applied else None
         uid_kappa['debeta_floor'] = validator_data.get('debeta_floor') if debeta_applied else None
         # The weight is the CONFIG dial, meaningful every cycle (warming included): the live blend
@@ -954,7 +978,7 @@ def score_uids(validator_data: Dict) -> Tuple[Dict[int, float], Dict[int, float]
     # Stub entries keep the reporting carrier.
     if float(config['kappa'].get('weight', 0.0)) <= 0.0:
         for uid in uids:
-            kappa_values[uid] = {'books': {}, 'books_weighted': {}, 'skipped': True}
+            kappa_values[uid] = kappa_stub(skipped=True)
         bt.logging.debug(f"de-beta replace active: kappa-3 computation skipped for {len(uids)} uids")
     elif config['kappa']['parallel_workers'] == 0:
         cache_updates = {}
@@ -1134,20 +1158,88 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             cp=cp,
             p11_strength=p11_strength,
             detail=_detail,
+            # getattr with a default: the scoring child's config duck must carry this too (it does),
+            # but an older duck must degrade to no floor, not to an exception fallback.
+            making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
+            skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
+            making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
         )
+        # PRESENCE GATE: a uid whose last presence_window queries all failed is not scorable this
+        # cycle (dropped from the map, so the blend reads 0 and scorable is False); its legs stay in
+        # the detail with present=False and its accumulators keep running. The scoring child gets the
+        # absent set from main with its score inputs (debeta_absent), so both scorers agree.
+        _gate_dial = getattr(dcfg, 'presence_gate', None)
+        _gate = 1 if _gate_dial is None else int(_gate_dial)
+        _absent = set()
+        if _gate:
+            _shipped = getattr(self, 'debeta_absent', None)
+            if _shipped is not None:
+                _absent = {int(u) for u in _shipped}
+            else:
+                _absent = absent_uids(getattr(self, 'miner_presence', {}) or {},
+                                      int(getattr(dcfg, 'presence_window', None) or 50))
+        for _u in list(scores):
+            if _u in _absent:
+                scores.pop(_u)
+        for _u, _dd in _detail.items():
+            _dd['present'] = _u not in _absent
         warm = sum(1 for v in scores.values() if v > 0.0)
         if warm < int(dcfg.min_books):
             bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
-            self.debeta_detail = {}
-            return {}
+            return _debeta_fallback_map(self, dcfg, "warming")
         self.debeta_detail = _detail
         self.debeta_floor = float(floor)
         self.debeta_w_make = float(dcfg.w_make)
+        self._debeta_last = {
+            'scores': dict(scores), 'detail': dict(_detail), 'floor': float(floor),
+            'w_make': float(dcfg.w_make), 'ts': time.time(),
+        }
         return scores
     except Exception:
         bt.logging.exception("De-beta score computation failed; falling back to legacy scoring")
-        self.debeta_detail = {}
-        return {}
+        return _debeta_fallback_map(self, dcfg, "exception")
+
+
+# How long a de-beta map may be carried at the (0, 0, 1) rung when the current cycle produced none.
+_DEBETA_CARRY_MAX_S = 600.0
+
+
+def _debeta_fallback_map(self: 'Validator', dcfg, why: str) -> Dict[int, float]:
+    """What score_uid gets when this cycle produced no de-beta map.
+
+    Below weight 1.0 the answer is the empty map: score_uid renormalises the de-beta share onto the
+    legacy components, which is the characterised warming behaviour of every blend rung. At weight
+    1.0 there is nothing to renormalise onto (kappa and pnl carry weight 0 and are not computed), so
+    an empty map scored every miner 0 for the cycle: a warming guard or any exception in the
+    computation zeroed the board (reported by a miner on the 0.6.1 testnet ratchet). At
+    that rung the previous cycle's map is carried instead, for at most _DEBETA_CARRY_MAX_S, with its
+    decomposition, and the carry is logged every time; with nothing to carry the zero cycle is
+    logged as the error it is rather than passing silently.
+    """
+    weight = 0.0
+    try:
+        weight = float(getattr(dcfg, 'weight', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        pass
+    last = getattr(self, '_debeta_last', None) or {}
+    if weight >= 1.0 and last.get('scores'):
+        age = time.time() - float(last.get('ts') or 0.0)
+        if age <= _DEBETA_CARRY_MAX_S:
+            self.debeta_detail = dict(last.get('detail') or {})
+            self.debeta_floor = last.get('floor')
+            self.debeta_w_make = last.get('w_make')
+            bt.logging.warning(
+                f"De-beta {why} at weight {weight:.2f}: carrying the previous map "
+                f"({len(last['scores'])} uids, {age:.0f}s old) so the cycle does not score every miner 0"
+            )
+            return dict(last['scores'])
+    self.debeta_detail = {}
+    if weight >= 1.0:
+        bt.logging.error(
+            f"De-beta {why} at weight {weight:.2f} with no recent map to carry: every trading score is "
+            f"0 this cycle"
+        )
+    return {}
 
 
 def build_scoring_config(self: 'Validator') -> Dict:

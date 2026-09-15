@@ -86,3 +86,33 @@ def test_dead_worker_returns_none_and_respawns():
         assert w.is_alive() or True  # dying worker dies again immediately; spawn attempted
     finally:
         w.stop()
+
+
+def test_torn_down_pipe_returns_none_without_raising_or_respawning():
+    """stop() clears _conn before the child exits, leaving a live _proc and no pipe.
+
+    Seen in practice: live validator, three lines after "Stopping metagraph sync worker...":
+        ERROR | PD: Failed to sync: 'NoneType' object has no attribute 'send'
+    which came out of resync_metagraph and abandoned the whole resync. None is this method's
+    contract for an unusable worker, so the torn-down pipe must take that path.
+
+    The second assertion is the one that is easy to get wrong: this must NOT respawn. start()
+    unconditionally builds a new Pipe and Process and overwrites self._proc, so respawning here
+    would orphan the child that is still running and resurrect a worker the caller is stopping.
+    """
+    w = MetagraphSyncWorker("ws://x:9944", 79, worker_fn=_echo_worker)
+    w.start()
+    try:
+        assert w.sync(timeout=15.0) is not None       # healthy first, so the race is the variable
+        proc_before = w._proc
+        w._conn = None                                 # exactly what stop() does, before the child dies
+        assert w.is_alive()                            # the window: proc up, pipe gone
+
+        assert w.sync(timeout=5.0) is None             # contract, not AttributeError
+        assert w._proc is proc_before                  # and no second worker was spawned
+    finally:
+        w._conn = None
+        w.stop()
+        if proc_before.is_alive():
+            proc_before.terminate()
+            proc_before.join(timeout=5)

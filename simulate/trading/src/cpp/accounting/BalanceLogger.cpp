@@ -60,6 +60,8 @@ void BalanceLogger::log(L3LogEvent event) const
                 return {item.logContext->bookId, item.trade->timestamp()};
             } else if constexpr (std::same_as<T, CancellationWithLogContext>) {
                 return {item.logContext->bookId, item.logContext->timestamp};
+            } else if constexpr (std::same_as<T, AgentResetLogContext>) {
+                return {item.bookId, item.timestamp};
             } else {
                 static_assert(false, "Unknown L3LogEvent::item type");
             }

@@ -24,6 +24,7 @@ struct ExchangeSignals
     UnsyncSignal<void(OrderWithLogContext)> orderLog;
     UnsyncSignal<void(TradeWithLogContext)> tradeLog;
     UnsyncSignal<void(CancellationWithLogContext)> cancelLog;
+    UnsyncSignal<void(AgentResetLogContext)> resetLog;
     UnsyncSignal<void(taosim::L3LogEvent)> L3;
     UnsyncSignal<void(const FeePolicyWrapper*, taosim::FeeLogEvent)> feeLog;
     // uint64 to match TradeID, which was widened while this was missed. It is the identity of every L3

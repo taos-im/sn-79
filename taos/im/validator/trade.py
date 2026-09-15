@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import bittensor as bt
 
 from taos.im.protocol.models import TradeInfo
-from taos.im.protocol.events import TradeEvent
+from taos.im.protocol.events import TradeEvent, trade_event_from_wire
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.validator.debeta import (
     accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
@@ -243,17 +243,27 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
             # arrives ~75 times at a 900s window and ~12s updates. Counting each delivery inflated
             # volume, the maker/taker splits, roundtrip volume and the FIFO realized-PnL history by
             # that factor. de-beta already guards this with _debeta_seen_tids; this is the same
-            # guard for the volume/PnL consumer. Keyed by (uid, trade id) because ONE trade is
-            # listed in both the maker's and the taker's notices — a global ledger would let the
-            # first uid processed consume it and starve the counterparty of its own side.
+            # guard for the volume/PnL consumer. Keyed by (uid, book, trade id): ONE trade is
+            # listed in both the maker's and the taker's notices, so a global ledger would let the
+            # first uid processed consume it and starve the counterparty of its own side; and a
+            # trade id names a trade only within its book.
+            #
+            # EXCHANGE MODE ONLY. Redelivery is an exchange mechanism; the simulation delivers each
+            # fill once. In the simulation every book mints its own trade ids from 0, so the ids
+            # overlap across all 128 books, and they start again at every simulation roll while a
+            # ledger pruned by timestamp keeps the old ones. Keyed by (uid, trade id) and applied
+            # in both modes, this ledger silently dropped a fill on book B whenever book A had
+            # already used the same id (reported by a miner on the 0.6.1 testnet ratchet, # who estimated 15 to 50 percent of a heavy uid's fills lost from volume, the
+            # maker/taker split, roundtrip volume and the FIFO realized-PnL leg).
+            _dedup_fills = getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
             if not hasattr(self, '_volume_seen_tids'):
                 self._volume_seen_tids = {}
             _seen_tids = self._volume_seen_tids
 
             for trade in trades:
                 _tid = trade.get('i')
-                if _tid is not None:
-                    _seen_key = (uid_item, _tid)
+                if _dedup_fills and _tid is not None:
+                    _seen_key = (uid_item, trade.get('b'), _tid)
                     if _seen_key in _seen_tids:
                         continue
                     _seen_tids[_seen_key] = sampled_timestamp
@@ -276,10 +286,12 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
 
                 # Update recent miner trades
                 recent_miner_trades_uid.setdefault(book_id, [])
+                # trade_event_from_wire, not a bare model_construct: the engine's integer close reason
+                # must become the model's string form here, or the copy trips the serializer on save.
                 if is_maker:
-                    recent_miner_trades_uid[book_id].append([TradeEvent.model_construct(**trade), "maker"])
+                    recent_miner_trades_uid[book_id].append([trade_event_from_wire(trade), "maker"])
                 if is_taker:
-                    recent_miner_trades_uid[book_id].append([TradeEvent.model_construct(**trade), "taker"])
+                    recent_miner_trades_uid[book_id].append([trade_event_from_wire(trade), "taker"])
                 if len(recent_miner_trades_uid[book_id]) > 5:
                     del recent_miner_trades_uid[book_id][:-5]
 

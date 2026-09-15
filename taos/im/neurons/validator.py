@@ -511,9 +511,18 @@ if __name__ != "__mp_main__":
             ]
             # The reporting service parses its OWN argv: scoring flags do not reach it unless
             # forwarded here. Without this the per-book de-beta gauges are silently dead in the
-            # child no matter what the validator was started with (found live).
-            if bool(getattr(getattr(self.config.scoring, 'debeta', None), 'publish_book_gauges', False)):
-                cmd.append('--scoring.debeta.publish_book_gauges')
+            # child no matter what the validator was started with (found live). Forwarded with an
+            # explicit value in BOTH directions: the option defaults on, so an operator's `false`
+            # must reach the child too or parent and child disagree about what is published.
+            _book_gauges = bool(getattr(getattr(self.config.scoring, 'debeta', None), 'publish_book_gauges', True))
+            cmd += ['--scoring.debeta.publish_book_gauges', 'true' if _book_gauges else 'false']
+            # Same reason, and the same class of bug found live on obs-mainnet: the child
+            # gated report() solely on validator_config.observe carried in each payload, so
+            # a single payload arriving with observe=False ran the whole non-observe
+            # reporting path on an observing validator. Forwarding the flag gives the child
+            # its own static answer instead of re-deciding per payload.
+            _observe = bool(getattr(getattr(self.config, 'neuron', None), 'observe', False))
+            cmd += ['--neuron.observe', 'true' if _observe else 'false']
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
 
@@ -848,6 +857,7 @@ if __name__ != "__mp_main__":
             self._shadow_applied_ts = 0
             self._scoring_proc_cutover = False
             self._scoring_proc_n = 0
+            self._scoring_proc_verify_sched = None
             if getattr(self.config, 'engine', 'simulation') != 'exchange' and not self.config.mock:
                 try:
                     from taos.im.validator.scoring_shadow import (
@@ -2026,6 +2036,13 @@ if __name__ != "__mp_main__":
                 'debeta_capture_buy_sums': getattr(self, 'capture_buy_sums', {}) or {},
                 'debeta_capture_sell_sums': getattr(self, 'capture_sell_sums', {}) or {},
                 'debeta_alphas_by_book': getattr(self, 'debeta_alphas_by_book', {}) or {},
+                # Scoring-service health (parity matches/mismatches, re-INITs, tee drops, suspension) for
+                # the validator gauges: a re-INIT storm truncates the de-beta window and used to leave no
+                # mark on any dashboard.
+                'scoring_shadow': (
+                    self._scoring_shadow.health()
+                    if getattr(self, '_scoring_shadow', None) is not None else None
+                ),
                 'simulation': self.simulation.model_dump(),
                 'last_state': minimal_state,
                 'simulation_timestamp': self.simulation_timestamp,
@@ -2348,7 +2365,11 @@ if __name__ != "__mp_main__":
                             # structures frozen) + own parity digest at the same
                             # deterministic timestamps the shadow uses.
                             self._shadow_applied_ts = timestamp
-                            if not _shadow.initialized:
+                            if _shadow.cutover_suspended:
+                                # Storm breaker tripped: no INIT, no digest. Main scores and saves
+                                # in-process until restart (see ScoringShadow.suspend).
+                                pass
+                            elif not _shadow.initialized:
                                 await asyncio.get_event_loop().run_in_executor(
                                     None, lambda: _shadow.send_init(self).result()
                                 )
@@ -2367,7 +2388,7 @@ if __name__ != "__mp_main__":
                         # SCORING_PROC_VERIFY_EVERY-th interval main ALSO computes
                         # and cross-checks (prefer main + re-INIT child on mismatch).
                         adopted = None
-                        if _shadow is not None and self._scoring_proc_cutover:
+                        if _shadow is not None and self._scoring_proc_cutover and not _shadow.cutover_suspended:
                             _eager = _shadow.eager_inputs_for(timestamp)
                             if _eager is not None:
                                 # inputs were shipped at tee time — the child is
@@ -2379,6 +2400,7 @@ if __name__ != "__mp_main__":
                                 _t_ema = _eager.get('trading_ema', {})
                                 _t_ema_n = _eager.get('trading_ema_n', {})
                                 _t_ema_ts = _eager.get('trading_ema_ts')
+                                _absent = _eager.get('absent')
                             else:
                                 _sim_ts = self.simulation_timestamp
                                 _deregs = list(self.deregistered_uids)
@@ -2390,6 +2412,8 @@ if __name__ != "__mp_main__":
                                 _t_ema = dict(getattr(self, '_trading_score_ema', {}) or {})
                                 _t_ema_n = dict(getattr(self, '_trading_score_ema_n', {}) or {})
                                 _t_ema_ts = getattr(self, '_trading_score_ema_ts', None)
+                                from taos.im.validator.debeta import absent_now
+                                _absent = absent_now(self)
                             adopted = await loop.run_in_executor(
                                 None,
                                 lambda: _shadow.request_scores(
@@ -2397,7 +2421,7 @@ if __name__ != "__mp_main__":
                                     timeout=float(os.environ.get("SCORING_PROC_TIMEOUT", "45")),
                                     eager=_eager is not None,
                                     trading_ema=_t_ema, trading_ema_n=_t_ema_n,
-                                    trading_ema_ts=_t_ema_ts,
+                                    trading_ema_ts=_t_ema_ts, absent=_absent,
                                 ),
                             )
                             if adopted is not None and len(adopted['trading']) != self.effective_max_uids:
@@ -2424,8 +2448,28 @@ if __name__ != "__mp_main__":
                                 self._scoring_proc_consec_unavail = 0
 
                         self._scoring_proc_n += 1
-                        _verify_every = max(1, int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "10")))
-                        _verify = adopted is not None and (self._scoring_proc_n % _verify_every == 0)
+                        # The in-process VERIFY is a second full compute under the reward lock (~30 s on
+                        # testnet on top of the ~15 s adoption wait). Rounds queue behind it, pending
+                        # crosses the query-blocking threshold and miners go unqueried for the rest of
+                        # it: one blackout of 25 to 33 s per VERIFY in practice. The scheduler runs a
+                        # due check while the reward queue is short and otherwise skips the whole due
+                        # period, forcing one after enough skips (scoring_shadow.VerifyScheduler).
+                        _verify = False
+                        if adopted is not None:
+                            _sched = self._scoring_proc_verify_sched
+                            if _sched is None:
+                                from taos.im.validator.scoring_shadow import VerifyScheduler
+                                _sched = self._scoring_proc_verify_sched = VerifyScheduler(
+                                    int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "10"))
+                                )
+                            _verify = _sched.boundary(self._scoring_proc_n, self._pending_reward_tasks)
+                            if _sched.last == "deferred":
+                                bt.logging.info(
+                                    f"[SCORING-PROC] VERIFY deferred at ts={timestamp}: "
+                                    f"{self._pending_reward_tasks} reward tasks pending "
+                                    f"(skipped period {_sched.deferrals}; runs regardless after "
+                                    f"{_sched.skips_before_force} more skip(s))"
+                                )
 
                         if adopted is None or _verify:
                             # Verify must compute with EXACTLY the inputs the child
@@ -2537,113 +2581,15 @@ if __name__ != "__mp_main__":
             self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._reward(state)))
 
         def _build_agent_scoring_maps(self) -> dict:
-            """Per-agent scoring maps (scores, kappa, volume, pnl, fees) for the
-            data-service snapshot, computed from the incrementally-maintained
-            accumulators.
+            """Per-agent scoring maps (scores, kappa, de-beta decomposition, volume, pnl, fees) for the
+            data-service snapshot, computed from the incrementally-maintained accumulators.
 
-            Both the simulation and exchange ingest payloads must carry these so the
-            agent_snapshots row (top-level score/volume_24h/pnl_24h and per_book
-            vol/fee/pnl/kappa) is populated identically in both modes — parity of
-            process. The genuine difference is only in what feeds the accumulators:
-            in exchange, update_trade_volumes(state) folds the RECONCILED
-            NormalizedState (reward() → trade.py), so these reflect only on-chain-
-            settled activity, satisfying "snapshots reflect reconciled data".
-
-            Uses the same two-step atomic outer/inner snapshot as
-            _build_sim_push_payload to stay safe against concurrent trade.py mutation
-            from the reward thread (see the note there).
-
-            NOTE: _build_sim_push_payload still inlines an equivalent computation; it
-            should be consolidated onto this helper once the exchange path is verified
-            in production, so the two cannot drift.
+            Both the simulation and exchange ingest payloads carry these so the agent_snapshots row is
+            populated identically in both modes; only what feeds the accumulators differs (the exchange
+            folds the RECONCILED state, so its maps reflect settled activity only). One builder for both
+            paths and for the reporting child: taos.im.validator.ingest_payload.agent_scoring_maps.
             """
-            _vs_outer = dict(getattr(self, "volume_sums", {}))
-            _mvs_outer = dict(getattr(self, "maker_volume_sums", {}))
-            _tvs_outer = dict(getattr(self, "taker_volume_sums", {}))
-            _fs_outer = dict(getattr(self, "fee_sums", {}))
-            _rt_outer = dict(getattr(self, "roundtrip_volume_sums", {}))
-            _af_outer = dict(getattr(self, "activity_factors", {}))
-            _snap_kv = dict(getattr(self, "kappa_values", {}))
-            _snap_scores = list(self.scores) if getattr(self, "scores", None) is not None else None
-            _snap_pnl_book = {u: dict(b) for u, b in dict(getattr(self, "agent_pnl_by_book", {})).items()}
-            _snap_pnl_total = dict(getattr(self, "agent_pnl_total", {}))
-            _snap_vs = {u: dict(b) for u, b in _vs_outer.items()}
-            _snap_mvs = {u: dict(b) for u, b in _mvs_outer.items()}
-            _snap_tvs = {u: dict(b) for u, b in _tvs_outer.items()}
-            _snap_fs = {u: dict(b) for u, b in _fs_outer.items()}
-            _snap_rt = {u: dict(b) for u, b in _rt_outer.items()}
-            _snap_af = {u: dict(b) for u, b in _af_outer.items()}
-
-            def _sv(d):
-                return {
-                    str(uid): sum(float(v) for v in list(bks.values()))
-                    for uid, bks in list(d.items())
-                    if bks
-                }
-
-            _vs = _sv(_snap_vs)
-            _mvs = _sv(_snap_mvs)
-            _tvs = _sv(_snap_tvs)
-            _pnl = {str(uid): round(float(v), 6) for uid, v in _snap_pnl_total.items() if v != 0.0}
-            _sc = _snap_scores
-            _sc_dict = {str(i): float(_sc[i]) for i in range(len(_sc))} if _sc is not None else {}
-            _kappa_raw = {}
-            _kappa_score = {}
-            _kappa_penalty = {}
-            _kappa_books = {}
-            _kappa_books_w = {}
-            for _kuid, _kv in _snap_kv.items():
-                if _kv and isinstance(_kv, dict):
-                    if _kv.get("total") is not None:
-                        _kappa_raw[str(_kuid)] = float(_kv["total"])
-                    if _kv.get("normalized_total") is not None:
-                        _kappa_score[str(_kuid)] = float(_kv["normalized_total"])
-                    if _kv.get("penalty") is not None:
-                        _kappa_penalty[str(_kuid)] = float(_kv["penalty"])
-                    _bks = {str(bid): float(v) for bid, v in (_kv.get("books") or {}).items() if v is not None}
-                    if _bks:
-                        _kappa_books[str(_kuid)] = _bks
-                    _bw = {str(bid): float(v) for bid, v in (_kv.get("books_weighted") or {}).items() if v is not None}
-                    if _bw:
-                        _kappa_books_w[str(_kuid)] = _bw
-            return {
-                "agent_scores": _sc_dict,
-                "agent_kappa": _kappa_raw,
-                "agent_kappa_score": _kappa_score,
-                "agent_kappa_penalty": _kappa_penalty,
-                "agent_kappa_books": _kappa_books,
-                "agent_kappa_books_w": _kappa_books_w,
-                "agent_volume": _vs,
-                "agent_maker_volume": _mvs,
-                "agent_taker_volume": _tvs,
-                "agent_pnl": _pnl,
-                "agent_pnl_book": {
-                    str(uid): {str(bid): round(float(v), 6) for bid, v in bks.items() if v != 0}
-                    for uid, bks in _snap_pnl_book.items()
-                    if bks
-                },
-                "agent_volume_book": {
-                    str(uid): {str(bid): round(float(v), 4) for bid, v in bks.items() if v}
-                    for uid, bks in _snap_vs.items()
-                    if bks
-                },
-                "agent_fee_book": {
-                    str(uid): {str(bid): round(float(v), 6) for bid, v in bks.items() if v != 0}
-                    for uid, bks in _snap_fs.items()
-                    if bks
-                },
-                "agent_roundtrip_volume": {
-                    str(uid): round(float(sum(bks.values())), 4) for uid, bks in _snap_rt.items() if bks
-                },
-                "agent_activity_factor": {
-                    str(uid): round(float(sum(bks.values()) / len(bks)), 4) for uid, bks in _snap_af.items() if bks
-                },
-                "agent_median_kappa": {
-                    str(uid): round(float(kv.get("activity_weighted_normalized_median") or 0), 6)
-                    for uid, kv in _snap_kv.items()
-                    if kv
-                },
-            }
+            return agent_scoring_maps(self)
 
         def _build_sim_push_payload(self, state) -> dict:
             """Build the MVTRX data-service push payload for a simulation state update.
@@ -2803,54 +2749,9 @@ if __name__ != "__mp_main__":
             # `RuntimeError: dictionary changed size during iteration`.
             # Splitting into two atomic steps eliminates that window.
             _vs_outer  = dict(getattr(self, 'volume_sums', {}))
-            _mvs_outer = dict(getattr(self, 'maker_volume_sums', {}))
-            _tvs_outer = dict(getattr(self, 'taker_volume_sums', {}))
-            _fs_outer  = dict(getattr(self, 'fee_sums', {}))
-            _rt_outer  = dict(getattr(self, 'roundtrip_volume_sums', {}))
-            _af_outer  = dict(getattr(self, 'activity_factors', {}))
-            _snap_kv   = dict(getattr(self, 'kappa_values', {}))
-            _snap_scores = list(self.scores) if getattr(self, 'scores', None) is not None else None
-            # MVTRX push agent_pnl / agent_pnl_book: read pre-aggregated running
-            # totals maintained incrementally by trade.py, NOT re-walk of
-            # realized_pnl_history (which cost ~5-7s of Python CPU per push
-            # cycle at N=259 UIDs × T~2000 timestamps × B=128 books).
-            _snap_pnl_book  = {u: dict(b) for u, b in dict(getattr(self, 'agent_pnl_by_book', {})).items()}
-            _snap_pnl_total = dict(getattr(self, 'agent_pnl_total', {}))
             _snap_vs   = {u: dict(b) for u, b in _vs_outer.items()}
-            _snap_mvs  = {u: dict(b) for u, b in _mvs_outer.items()}
-            _snap_tvs  = {u: dict(b) for u, b in _tvs_outer.items()}
-            _snap_fs   = {u: dict(b) for u, b in _fs_outer.items()}
-            _snap_rt   = {u: dict(b) for u, b in _rt_outer.items()}
-            _snap_af   = {u: dict(b) for u, b in _af_outer.items()}
-            def _sv(d):
-                return {str(uid): sum(float(v) for v in list(bks.values()))
-                        for uid, bks in list(d.items()) if bks}
-            _vs  = _sv(_snap_vs)
-            _mvs = _sv(_snap_mvs)
-            _tvs = _sv(_snap_tvs)
-            _pnl = {str(uid): round(float(v), 6) for uid, v in _snap_pnl_total.items() if v != 0.0}
-            _sc  = _snap_scores
-            _sc_dict = ({str(i): float(_sc[i]) for i in range(len(_sc))}
-                        if _sc is not None else {})
-            _kappa_raw   = {}
-            _kappa_score = {}
-            _kappa_penalty = {}
-            _kappa_books = {}
-            _kappa_books_w = {}
-            for _kuid, _kv in _snap_kv.items():
-                if _kv and isinstance(_kv, dict):
-                    if _kv.get('total') is not None:
-                        _kappa_raw[str(_kuid)] = float(_kv['total'])
-                    if _kv.get('normalized_total') is not None:
-                        _kappa_score[str(_kuid)] = float(_kv['normalized_total'])
-                    if _kv.get('penalty') is not None:
-                        _kappa_penalty[str(_kuid)] = float(_kv['penalty'])
-                    _bks = {str(bid): float(v) for bid, v in (_kv.get('books') or {}).items() if v is not None}
-                    if _bks:
-                        _kappa_books[str(_kuid)] = _bks
-                    _bw = {str(bid): float(v) for bid, v in (_kv.get('books_weighted') or {}).items() if v is not None}
-                    if _bw:
-                        _kappa_books_w[str(_kuid)] = _bw
+            # The per-agent scoring maps come from the one shared builder (see _build_agent_scoring_maps).
+            _scoring_maps = self._build_agent_scoring_maps()
             _book_vol: dict = {}
             for _uid_bk, _bk_dict in _snap_vs.items():
                 for _bid, _bvol in _bk_dict.items():
@@ -2899,31 +2800,7 @@ if __name__ != "__mp_main__":
                     "dividends":       _m.dividends.tolist() if hasattr(_m, 'dividends') else [],
                     "last_update":     _m.last_update.tolist() if hasattr(_m, 'last_update') else [],
                 } if _m is not None else {})(getattr(self, 'metagraph', None)),
-                "agent_scores":        _sc_dict,
-                "agent_kappa":         _kappa_raw,
-                "agent_kappa_score":   _kappa_score,
-                "agent_kappa_penalty": _kappa_penalty,
-                "agent_kappa_books":   _kappa_books,
-                "agent_kappa_books_w": _kappa_books_w,
-                "agent_volume":        _vs,
-                "agent_maker_volume":  _mvs,
-                "agent_taker_volume":  _tvs,
-                "agent_pnl":           _pnl,
-                "agent_pnl_book":      {str(uid): {str(bid): round(float(v), 6)
-                                        for bid, v in bks.items() if v != 0}
-                                       for uid, bks in _snap_pnl_book.items() if bks},
-                "agent_volume_book":   {str(uid): {str(bid): round(float(v), 4)
-                                        for bid, v in bks.items() if v}
-                                       for uid, bks in _snap_vs.items() if bks},
-                "agent_fee_book":      {str(uid): {str(bid): round(float(v), 6)
-                                        for bid, v in bks.items() if v != 0}
-                                       for uid, bks in _snap_fs.items() if bks},
-                "agent_roundtrip_volume": {str(uid): round(float(sum(bks.values())), 4)
-                                           for uid, bks in _snap_rt.items() if bks},
-                "agent_activity_factor":   {str(uid): round(float(sum(bks.values()) / len(bks)), 4)
-                                            for uid, bks in _snap_af.items() if bks},
-                "agent_median_kappa":      {str(uid): round(float(kv.get('activity_weighted_normalized_median') or 0), 6)
-                                           for uid, kv in _snap_kv.items() if kv},
+                **_scoring_maps,
                 "fee_policy":              ({"fee_type": self.simulation.fee_policy.fee_type,
                                             **{k: float(v) for k, v in self.simulation.fee_policy.params.items()
                                                if k in ("targetMTR", "makerFee", "takerFee", "maxMakerRate", "maxTakerRate")}}
@@ -3592,6 +3469,14 @@ if __name__ != "__mp_main__":
                             "reconciliation":      {},
                             "agent_open_orders":   _soo,
                             "agent_orders_detail": _sod,
+                            # The scoring maps too. This push carried accounts and no scoring, and
+                            # the service built an agent_snapshots row from it for every uid, so each
+                            # run of this block wrote a whole board of score, volume and PnL zeros
+                            # between real rows (seen on the localnet exchange DB:
+                            # 256 or 257 such rows at 16:06, 16:25, 16:58, 17:31 and 18:04 local, each
+                            # matching a "MVTRX startup push" line). load_state() has already run in
+                            # engine.start(), so these are the restored values, not warm-up zeros.
+                            **self._build_agent_scoring_maps(),
                             "metagraph":           _sm,
                             "validator_uid":       self.uid,
                             "benchmark_agents":    [{"uid": _ba["uid"], "coldkey": _ba.get("coldkey", ""), "hotkey": _ba.get("hotkey", ""), "name": _ba.get("name", "")} for _ba in getattr(self, 'benchmark_agents', [])],
@@ -3670,6 +3555,7 @@ if __name__ != "__mp_main__":
                                     # instead of after _reward finally asks. sim_ts is
                                     # the boundary's own timestamp — deterministic and
                                     # main-defined (verify pins to the same values).
+                                    from taos.im.validator.debeta import absent_now
                                     self._scoring_shadow.tee_score_inputs(
                                         normalized_state.timestamp,
                                         normalized_state.timestamp,
@@ -3680,6 +3566,7 @@ if __name__ != "__mp_main__":
                                         trading_ema=dict(getattr(self, '_trading_score_ema', {}) or {}),
                                         trading_ema_n=dict(getattr(self, '_trading_score_ema_n', {}) or {}),
                                         trading_ema_ts=getattr(self, '_trading_score_ema_ts', None),
+                                        absent=absent_now(self),
                                     )
                             response = await self.handle_state(normalized_state, receive_start)
                     except Exception as ex:
@@ -3861,7 +3748,8 @@ if __name__ != "__mp_main__":
     from taos.im.validator.cleanup import (
         cleanup_ipc, cleanup_executors, cleanup_event_loop, cleanup
     )
-    from taos.im.validator.persistence import (
+    from taos.im.validator.ingest_payload import agent_scoring_maps
+from taos.im.validator.persistence import (
         load_state, build_validator_state,
         snapshot_inventory_history, snapshot_realized_pnl_history,
         snapshot_2_level_dict, snapshot_volume_sums, snapshot_trade_volumes,

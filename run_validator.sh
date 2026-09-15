@@ -274,9 +274,12 @@ if [ "$PRESERVE_SIMULATOR" = "0" ]; then
     cd ../../../simulate/trading/run
     echo "Starting Simulator"
     if [ "$CHECKPOINT" = "0" ]; then
-        pm2 start --no-autorestart --name=simulator "../build/src/cpp/taosim -f config/$SIMULATION_CONFIG.xml"
+        # --kill-timeout: pm2 SIGKILLs 1600ms after the signal by default, long before the engine can
+        # reach a barrier and write its shutdown checkpoint, so an intended stop behaves like a crash
+        # and the next resume rewinds to the last periodic checkpoint.
+        pm2 start --no-autorestart --kill-timeout 60000 --name=simulator "../build/src/cpp/taosim -f config/$SIMULATION_CONFIG.xml"
     else
-        pm2 start --no-autorestart --name=simulator "../build/src/cpp/taosim -c $CHECKPOINT"
+        pm2 start --no-autorestart --kill-timeout 60000 --name=simulator "../build/src/cpp/taosim -c $CHECKPOINT"
     fi
 fi
 pm2 save

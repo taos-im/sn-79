@@ -24,6 +24,8 @@
 
 #include <map>
 #include <memory>
+#include <optional>
+#include <variant>
 #include <vector>
 
 //-------------------------------------------------------------------------
@@ -126,3 +128,34 @@ TEST(L3SignalWiringTest, TwoSubscribersOnOneL3SignalBothReceive)
     EXPECT_EQ(logger, 1);
     ASSERT_EQ(backlog, 1);
 }
+//-------------------------------------------------------------------------
+
+TEST(L3SignalWiringTest, AgentResetRelaysIntoL3AsItsOwnRecordKind)
+{
+    // A reset cancels the agent's resting orders through the book, so L3 already carries one plain
+    // cancellation per order; this record is what says a reset caused them, once per book, and it is the
+    // only trace for an agent that had nothing resting. It rides the same relay as the other kinds and
+    // serialises with the common "g" group, so the logger's canonical book-id rewrite applies to it.
+    ExchangeSignals signals;
+    std::optional<taosim::L3LogEvent> delivered;
+    bs2::scoped_connection feed = signals.L3.connect([&](taosim::L3LogEvent ev) { delivered = ev; });
+    signals.resetLog(AgentResetLogContext{7, 3, 1'234'567, 2});
+    ASSERT_TRUE(delivered.has_value());
+    const auto* reset = std::get_if<AgentResetLogContext>(&delivered->item);
+    ASSERT_NE(reset, nullptr);
+    rapidjson::Document json;
+    reset->L3Serialize(json);
+    ASSERT_TRUE(json.IsObject());
+    ASSERT_TRUE(json.HasMember("r"));
+    ASSERT_TRUE(json.HasMember("g"));
+    EXPECT_EQ(json["r"]["a"].GetInt(), 7);
+    EXPECT_EQ(json["r"]["n"].GetUint(), 2u);
+    EXPECT_EQ(json["g"]["a"].GetInt(), 7);
+    EXPECT_EQ(json["g"]["b"].GetUint(), 3u);
+    EXPECT_EQ(json["g"]["j"].GetUint64(), 1'234'567u);
+    EXPECT_FALSE(json.HasMember("o"));
+    EXPECT_FALSE(json.HasMember("t"));
+    EXPECT_FALSE(json.HasMember("c"));
+}
+
+//-------------------------------------------------------------------------

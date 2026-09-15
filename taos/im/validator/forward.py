@@ -30,6 +30,7 @@ import posix_ipc
 import struct
 import traceback
 import pickle
+from collections import deque
 from typing import List
 
 from taos.im.neurons.validator import Validator
@@ -63,6 +64,18 @@ def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpd
             self.miner_stats[uid]['rejections'] += 1
         elif synapse.dendrite.process_time:
             self.miner_stats[uid]['call_time'].append(synapse.dendrite.process_time)
+        # Presence: the last presence_window outcomes per uid, read by the de-beta presence gate
+        # (debeta.absent_uids). Kept apart from miner_stats, whose window is the publish cadence.
+        ok = not (synapse.is_timeout or synapse.is_failure or synapse.response is None or synapse.is_blacklist)
+        presence = getattr(self, 'miner_presence', None)
+        if presence is None:
+            presence = self.miner_presence = {}
+        outcomes = presence.get(uid)
+        if outcomes is None:
+            dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+            window = int(getattr(dcfg, 'presence_window', None) or 50)
+            outcomes = presence[uid] = deque(maxlen=max(window, 1))
+        outcomes.append(ok)
 
 async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAgentResponse]:
     """
@@ -112,12 +125,6 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
 
         data_start = time.time()
         extended_metagraph = self.get_extended_metagraph()
-        # WHAT ACTUALLY GOES ON THE WIRE, per uid. A refusal notice has been proven built, routed and
-        # merged onto state.notices, and the miner still reports an empty list for its own uid, so the
-        # loss is in this hop and nothing on either side of it says so.
-        _nz = {u: len(v) for u, v in (synapse.notices or {}).items() if v}
-        if _nz:
-            bt.logging.info(f"NOTICEWIRE packing notices for uids {_nz}")
         request_data = {
             'books': synapse.books,
             'accounts': synapse.accounts,

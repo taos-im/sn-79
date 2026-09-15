@@ -33,6 +33,7 @@
 
 #include <barrier>
 #include <latch>
+#include <csignal>
 #include <ranges>
 #include <source_location>
 #include <thread>
@@ -41,6 +42,34 @@
 
 namespace taosim::simulation
 {
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+// ASYNC-SIGNAL-SAFE BY CONSTRUCTION. A handler may call almost nothing, but a lock-free atomic
+// store is explicitly permitted, and std::atomic_bool is lock-free everywhere this builds. The
+// handler does nothing else -- no allocation, no I/O, no locks -- because everything that matters
+// happens later, at the barrier, where the state is consistent.
+std::atomic_bool g_stopRequested{false};
+
+extern "C" void onStopSignal(int) noexcept
+{
+    g_stopRequested.store(true, std::memory_order_release);
+}
+
+}  // namespace
+
+void requestStop() noexcept
+{
+    g_stopRequested.store(true, std::memory_order_release);
+}
+
+bool stopRequested() noexcept
+{
+    return g_stopRequested.load(std::memory_order_acquire);
+}
 
 //-------------------------------------------------------------------------
 
@@ -57,6 +86,14 @@ void SimulationManager::runSimulations()
             }
             publishState();
             m_stepSignal();
+            // THE ONE POINT WHERE A CHECKPOINT IS CONSISTENT. Every block has arrived, none has
+            // resumed, and the periodic checkpoint rides this same signal. Deciding here -- rather
+            // than in each block after the barrier -- makes "write the checkpoint" and "leave" a
+            // single observation of the request.
+            m_leaving = stopRequested();
+            if (m_leaving && m_checkpointManager != nullptr) {
+                m_checkpointManager->saveCheckpointOnShutdown();
+            }
         }};
     std::latch latch{m_blockInfo.count};
 
@@ -66,7 +103,7 @@ void SimulationManager::runSimulations()
         boost::asio::post(
             *m_threadPool,
             [&] {
-                simulation->simulate(barrier);
+                simulation->simulate(barrier, m_leaving);
                 latch.count_down();
             });
     }
@@ -689,11 +726,11 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
         return requestedThreadCount;
     }());
 
-    boost::asio::signal_set{mngr->m_io, SIGINT, SIGTERM}.async_wait(
-        [&](boost::system::error_code, int) {
-            mngr->m_threadPool->stop();
-            mngr->m_io.stop();
-        });
+    // See the note beside requestStop() in the header: the signal_set that stood here was a
+    // temporary on an io_context that is never run, so it could not fire. std::signal is what the
+    // exchange service already uses for the same job (exchange_service/server.cpp), and it works.
+    std::signal(SIGINT, onStopSignal);
+    std::signal(SIGTERM, onStopSignal);
 
     fmt::println(" - Setting up log directory...");
     mngr->setupLogDir(node, baseDir);
@@ -899,11 +936,11 @@ std::unique_ptr<SimulationManager> SimulationManager::fromReplay(const replay::R
         };
     }();
     mngr->m_threadPool = std::make_unique<boost::asio::thread_pool>(mngr->m_blockInfo.count);
-    boost::asio::signal_set{mngr->m_io, SIGINT, SIGTERM}.async_wait(
-        [&](boost::system::error_code, int) {
-            mngr->m_threadPool->stop();
-            mngr->m_io.stop();
-        });
+    // See the note beside requestStop() in the header: the signal_set that stood here was a
+    // temporary on an io_context that is never run, so it could not fire. std::signal is what the
+    // exchange service already uses for the same job (exchange_service/server.cpp), and it works.
+    std::signal(SIGINT, onStopSignal);
+    std::signal(SIGTERM, onStopSignal);
 
     mngr->m_replayManager = std::make_unique<replay::ReplayManager>(
         desc,

@@ -147,7 +147,9 @@ def _snapshot_to_shadow(main):
     """The exact INIT path: plainify -> pickle -> unpickle -> rebuild -> ShadowState."""
     parts = {}
     for name in _STRUCT_NAMES:
-        parts[name] = pickle.loads(pickle.dumps(_plainify(getattr(main, name)), protocol=5))
+        # getattr default as in send_init: structures main has not created yet (the exchange-only dedup
+        # ledger in sim mode, the de-beta accumulators before the first round) ship as empty shells.
+        parts[name] = pickle.loads(pickle.dumps(_plainify(getattr(main, name, {})), protocol=5))
     knobs = {
         "_last_prune_timestamp": main._last_prune_timestamp,
         "step": main.step,
@@ -606,6 +608,7 @@ def _light_fields():
         "trading_score_ema_n": {u: u + 1 for u in range(_UIDS)},
         "miner_stats": {1: {"requests": 3, "timeouts": 0, "failures": 0,
                             "rejections": 0, "call_time": [0.5]}},
+        "miner_presence": {1: [1, 0, 1], 2: [0] * 50},
     }
 
 
@@ -649,7 +652,11 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "deregistered_uids", "trading_score_ema", "trading_score_ema_ts",
         "trading_score_ema_n", "trade_volumes", "roundtrip_volumes",
         "volume_sums", "maker_volume_sums", "taker_volume_sums",
-        "self_volume_sums", "roundtrip_volume_sums", "miner_stats",
+        "self_volume_sums", "roundtrip_volume_sums",
+        "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
+        "debeta_cp_hist", "debeta_invn_hist", "debeta_drift_hist", "debeta_inv", "debeta_plast",
+        "miner_stats",
+        "miner_presence",
     ]
 
     for key in ("step", "simulation_timestamp", "hotkeys", "scores",
@@ -658,6 +665,7 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         assert saved[key] == _mp_norm(light[key])
     assert saved["unnormalized_scores"] == _mp_norm(light["unnormalized_scores"])
     assert saved["miner_stats"] == _mp_norm(light["miner_stats"])
+    assert saved["miner_presence"] == _mp_norm(light["miner_presence"])
 
     vols = p.snapshot_volume_sums(main)
     heavy = {

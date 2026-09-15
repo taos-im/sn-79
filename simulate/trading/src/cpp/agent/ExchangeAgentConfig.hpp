@@ -45,6 +45,16 @@ public:
         double maxPriceBand = 0.0;
         int64_t bandRefWindow = 300'000'000'000;     // 5 minutes of SIM time (m_time.current, never wall clock)
         int64_t bandRefInterval = 1'000'000'000;     // sample the prevailing price once per sim-second
+        // Release of a locked band. The reference moves only on trades, so a book whose last print landed
+        // a band-width from where its agents will trade cannot print again: every marketable order is
+        // refused and the reference re-samples the frozen price forever. While no trade has printed for
+        // bandReleaseAfter AND the band has refused at least one marketable order since the last print, the
+        // effective band widens by maxPriceBand every bandReleaseStep, up to bandReleaseMax; the first print
+        // snaps it back. The reference itself never moves without a trade, so quoting cannot steer it.
+        // bandReleaseAfter <= 0 disables the release.
+        int64_t bandReleaseAfter = 300'000'000'000;  // 5 sim minutes without a print
+        int64_t bandReleaseStep = 30'000'000'000;    // one more band-width every 30 sim seconds
+        double bandReleaseMax = 0.5;                 // the widened band never exceeds this
         // ...
     };
 

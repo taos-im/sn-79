@@ -73,6 +73,15 @@ public:
         return assignTradeId(m_tradeIdCounter);
     }
 
+    // Order id for an instruction the pool executed. Such an order never enters a book, so nothing
+    // numbered it. Drawn from the shared counter the books use, so pool and book orders are one id
+    // space; nullopt when books own private counters, for the same reason as mintPoolTradeId.
+    [[nodiscard]] std::optional<OrderID> mintPoolOrderId() noexcept
+    {
+        if (!m_orderIdCounter) return std::nullopt;
+        return (*m_orderIdCounter)++;
+    }
+
     // Placement details of the LIMIT instruction that caused a pool swap, kept against the
     // trade id minted for it. A swept marketable order never rests in the book, so when the
     // chain reports a PARTIAL fill there is no order event to rebuild its remainder from; this

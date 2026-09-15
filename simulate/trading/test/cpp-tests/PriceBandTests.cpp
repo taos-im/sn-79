@@ -38,11 +38,21 @@ struct BandRef
     double lastPrice{0.0};
     long long lastSampleTs{0};
     bool seeded{false};
+    // Release rule state, mirroring Book::effectiveBand.
+    long long lastTradeTs{0};
+    bool refused{false};
+    long long firstRefusalTs{0};
+    long long releaseAfter{300'000'000'000LL};
+    long long releaseStep{30'000'000'000LL};
+    double releaseMax{0.5};
 
     void trade(long long ts, double price, int maker, int taker)
     {
         if (price <= 0.0) return;
         if (maker == taker) return;               // self-trades excluded (engine STP also prevents these)
+        lastTradeTs = ts;
+        refused = false;
+        firstRefusalTs = 0;
         lastPrice = price;
         if (!seeded) { seeded = true; lastSampleTs = ts; samples.push_back(price); }
         sample(ts);
@@ -65,6 +75,33 @@ struct BandRef
         std::vector<double> t{samples.begin(), samples.end()};
         std::nth_element(t.begin(), t.begin() + t.size() / 2, t.end());
         return t[t.size() / 2];
+    }
+
+    void refuse(long long ts)
+    {
+        if (!refused) { refused = true; firstRefusalTs = ts; }
+    }
+
+    // Mirrors Book::effectiveBand: the band in force at ts. The reference never moves here; only the
+    // width does, and only while the band has refused a marketable order and nothing has printed.
+    double effective(long long ts, double band) const
+    {
+        if (band <= 0.0 || !seeded || releaseAfter <= 0 || !refused) return band;
+        const long long last = lastTradeTs != 0 ? lastTradeTs : firstRefusalTs;
+        if (last == 0 || ts <= last) return band;
+        const long long silent = ts - last;
+        if (silent < releaseAfter) return band;
+        const long long step = std::max<long long>(releaseStep, 1);
+        const long long widenings = 1 + (silent - releaseAfter) / step;
+        return std::min(releaseMax, band * static_cast<double>(1 + widenings));
+    }
+
+    double limitAt(long long ts, bool isBuy, double band) const
+    {
+        const double r = ref();
+        const double b = effective(ts, band);
+        if (b <= 0.0 || r <= 0.0) return isBuy ? 1e300 : -1e300;
+        return isBuy ? r * (1.0 + b) : r * (1.0 - b);
     }
 
     double limit(bool isBuy, double band) const
@@ -240,4 +277,92 @@ TEST(PriceBandTest, TheSellSideIsUnchangedByTheWalkBound)
     for (const double px : {100.0, 271.5, 300.0, 1e5}) {
         EXPECT_DOUBLE_EQ(matchCap(false, px, sellFloor), sweepCap(false, px, sellFloor));
     }
+}
+
+// RELEASE. The reference is fed only by trades, so a book whose last print landed a band-width from where
+// its agents will trade can never print again: every marketable order is refused and the frozen price is
+// re-sampled forever. The release widens the BAND, never moves the REFERENCE: quoting cannot steer it
+// (NO RATCHET still holds), a walk during the spell is bounded by the widened band, and the first print
+// ends the spell.
+
+TEST(PriceBandTest, ALockedBookWidensTheBandWithoutMovingTheReference)
+{
+    auto b = makeRef();
+    for (long long s = 0; s < 300; ++s) b.trade(s * kSec, 300.0, 1, 2);
+    const long long last = 299 * kSec;
+    b.refuse(last + kSec);                                               // a sane order was stopped by the band
+    EXPECT_DOUBLE_EQ(b.limitAt(last + 299 * kSec, true, 0.10), 330.0);  // not yet bandReleaseAfter
+    EXPECT_DOUBLE_EQ(b.limitAt(last + 300 * kSec, true, 0.10), 360.0);  // 0.20 at bandReleaseAfter
+    EXPECT_DOUBLE_EQ(b.limitAt(last + 330 * kSec, true, 0.10), 390.0);  // 0.30 one step later
+    EXPECT_DOUBLE_EQ(b.limitAt(last + 900 * kSec, true, 0.10), 450.0);  // capped at bandReleaseMax
+    EXPECT_DOUBLE_EQ(b.limitAt(last + 900 * kSec, false, 0.10), 150.0);
+    EXPECT_DOUBLE_EQ(b.ref(), 300.0);                                    // the reference has not moved
+}
+
+TEST(PriceBandTest, TheFirstPrintEndsTheWideningSpell)
+{
+    auto b = makeRef();
+    for (long long s = 0; s < 300; ++s) b.trade(s * kSec, 300.0, 1, 2);
+    b.refuse(300 * kSec);
+    const long long t = 299 * kSec + 330 * kSec;
+    EXPECT_DOUBLE_EQ(b.effective(t, 0.10), 0.30);
+    b.trade(t, 350.0, 1, 2);                                             // a print inside the widened band
+    EXPECT_DOUBLE_EQ(b.effective(t + kSec, 0.10), 0.10);                // the configured band, at once
+    // A print after a long quiet re-samples the window at its price (QuietStretchDoesNotDisableTheBand),
+    // so the reference follows the reopening print rather than staying at the frozen one.
+    EXPECT_DOUBLE_EQ(b.ref(), 350.0);
+}
+
+TEST(PriceBandTest, SilenceWithoutRefusalsDoesNotWiden)
+{
+    auto b = makeRef();
+    for (long long s = 0; s < 300; ++s) b.trade(s * kSec, 300.0, 1, 2);
+    EXPECT_DOUBLE_EQ(b.effective(299 * kSec + 3600 * kSec, 0.10), 0.10);  // an hour of quiet, nothing refused
+}
+
+TEST(PriceBandTest, SelfTradesDoNotEndTheWideningSpell)
+{
+    auto b = makeRef();
+    for (long long s = 0; s < 300; ++s) b.trade(s * kSec, 300.0, 1, 2);
+    b.refuse(300 * kSec);
+    const long long t = 299 * kSec + 330 * kSec;
+    b.trade(t, 320.0, 7, 7);                                             // a miner printing against itself
+    EXPECT_DOUBLE_EQ(b.effective(t + kSec, 0.10), 0.30);                // the spell continues
+}
+
+TEST(PriceBandTest, AResumedBookCountsSilenceFromItsLastPrintOrItsFirstRefusal)
+{
+    // The checkpoint carries the last print with the band. A book restored with it counts silence from that
+    // print, so a book locked before the resume releases on schedule after it.
+    auto b = makeRef();
+    b.seeded = true;
+    b.samples.assign(300, 300.0);
+    b.lastPrice = 300.0;
+    b.lastSampleTs = 5000 * kSec;
+    b.lastTradeTs = 4800 * kSec;
+    b.refuse(5000 * kSec);
+    EXPECT_DOUBLE_EQ(b.effective(5001 * kSec, 0.10), 0.10);   // 201 s since the print
+    EXPECT_DOUBLE_EQ(b.effective(5100 * kSec, 0.10), 0.20);   // 300 s since the print
+    // A checkpoint written before the field existed restores no last print; silence then counts from the
+    // first refusal, never from the sample clock, which moves every time an order is processed.
+    auto c = makeRef();
+    c.seeded = true;
+    c.samples.assign(300, 300.0);
+    c.lastPrice = 300.0;
+    c.lastSampleTs = 5000 * kSec;
+    c.lastTradeTs = 0;
+    EXPECT_DOUBLE_EQ(c.effective(9000 * kSec, 0.10), 0.10);   // no refusal yet: nothing to release
+    c.refuse(5000 * kSec);
+    for (long long s = 5001; s <= 5299; ++s) c.sample(s * kSec);  // orders keep arriving and re-sampling
+    EXPECT_DOUBLE_EQ(c.effective(5299 * kSec, 0.10), 0.10);
+    EXPECT_DOUBLE_EQ(c.effective(5300 * kSec, 0.10), 0.20);   // 300 s after the first refusal
+}
+
+TEST(PriceBandTest, ReleaseDisabledLeavesTheBandFixed)
+{
+    auto b = makeRef();
+    b.releaseAfter = 0;
+    for (long long s = 0; s < 300; ++s) b.trade(s * kSec, 300.0, 1, 2);
+    b.refuse(300 * kSec);
+    EXPECT_DOUBLE_EQ(b.effective(299 * kSec + 3600 * kSec, 0.10), 0.10);
 }

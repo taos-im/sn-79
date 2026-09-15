@@ -41,6 +41,12 @@ def _detect_engine_mode() -> str:
     return 'simulation'
 
 
+def _flag(value) -> bool:
+    """Boolean option that can be turned OFF on the command line: `--x`, `--x true` and the default are
+    on, `--x false|0|no|off` is off. A store_true flag with default=True has no off switch."""
+    return str(value).strip().lower() not in ('0', 'false', 'no', 'off')
+
+
 def add_im_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""
     add_validator_args(cls, parser)
@@ -131,6 +137,12 @@ def add_im_validator_args(cls, parser):
         default=0.375,
     )
 
+    # The three trading weights below are the CURRENT LADDER RUNG, set as defaults so a deployment
+    # is a file copy. Final rung of the 0.6.1 de-beta ladder (testnet): (0, 0, 1), the
+    # characterised full replacement. At kappa weight 0 the kappa-3 batch is not computed (its
+    # carrier is a stub) and an empty de-beta cycle carries the previous map rather than scoring the
+    # board 0. Rehearsal rung was (0.79, 0.21, 0.0), rung 1 (0.5925, 0.1575, 0.25), rung 2
+    # (0.395, 0.105, 0.50). They must sum to 1, checked at validator init.
     parser.add_argument(
         "--scoring.kappa.weight",
         type=float,
@@ -214,7 +226,8 @@ def add_im_validator_args(cls, parser):
         default=0.0,
         help="The de-beta component's share of the FLAT trading score: trading = kappa.weight*kappa + "
              "pnl.weight*pnl + debeta.weight*debeta, the three weights validated to sum to 1 at init. "
-             "Default 0.0: legacy emissions with the de-beta decomposition always computed and published "
+             "Default is the current ladder rung (see the kappa.weight comment). At 0.0 emissions are "
+             "legacy with the de-beta decomposition always computed and published "
              "(permanent rehearsal visibility). (0, 0, 1) is the characterized full replacement; a "
              "component is computed only when its own weight is nonzero, so that rung also ends the "
              "kappa-3 compute. Migration curve (front-loaded reallocation, no floor-zeroing "
@@ -223,14 +236,17 @@ def add_im_validator_args(cls, parser):
     )
     parser.add_argument(
         "--scoring.debeta.publish_book_gauges",
-        action="store_true",
+        type=_flag,
+        nargs="?",
+        const=True,
         help="Publish the PER-BOOK de-beta gauges (debeta_capture_buy/sell, debeta_book_making, "
-             "debeta_alpha) for dashboard drill-down. Default OFF because the cardinality is "
-             "uid x book: on a 259-uid 128-book board each gauge is ~33k series, so the four add "
-             "~133k series and roughly 24MB to every /metrics scrape that already runs 154MB. The "
-             "per-UID de-beta gauges are always published and are what a miner needs to read their "
-             "score; these answer WHICH book, and are worth the cost only while debugging.",
-        default=False,
+             "debeta_alpha) for dashboard drill-down. Default ON for the 0.6.1 ladder: the per-UID "
+             "gauges say WHAT a miner scored, these say on WHICH book and WHY (one-sided capture, "
+             "alpha under the floor), which is what the ladder gates are read against. The cost is "
+             "cardinality uid x book: on a 259-uid 128-book board each gauge is ~33k series, so the "
+             "four add ~133k series and roughly 24MB to every /metrics scrape that already runs "
+             "154MB. Pass `false` to turn them off where the scrape body is the binding constraint.",
+        default=True,
     )
 
     parser.add_argument(
@@ -277,6 +293,63 @@ def add_im_validator_args(cls, parser):
              "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
              "sacrificial-feeder hole in the making metric.",
         default=1.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.making_floor_scale",
+        type=float,
+        help="Magnitude floor for the MAKING rank, the making-side twin of floor_scale: a uid's "
+             "two-sided capture must clear making_floor_scale*median(positive making) to enter the "
+             "making rank, otherwise it ranks as 0 (rank is magnitude-blind; a negligible two-sided "
+             "quoter ranked beside the field's real makers on testnet). 0, the default, disables it: "
+             "on an earlier testnet board it moved the combined Gini from 0.64 to 0.74 for the "
+             "removal of four small makers, so it stays off until observed. Skill is always clamped "
+             "at 0 before ranking, so only positive directional skill earns skill rank.",
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.skill_rank_scope",
+        type=str,
+        choices=["positives", "whole"],
+        help="How the skill leg is ranked. 'positives' (default): the positive skills are ranked among "
+             "themselves, lowest positive 0, highest 1, non-positive 0. 'whole': the clamped skills are "
+             "ranked over the whole pool (the earlier rule, kept for rollback), under which the smallest "
+             "positive skill inherits the rank of the whole non-positive block, so a negligible skill "
+             "collects a mid score and near-zero skills square-wave as their sign flips.",
+        default="positives",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.making_rank_scope",
+        type=str,
+        choices=["positives", "whole"],
+        help="How the making leg is ranked, the twin of skill_rank_scope. 'positives' (default): the "
+             "positive makings are ranked among themselves, lowest positive 0, highest 1, zero making 0. "
+             "'whole': ranked over the whole pool (the rule shipped previously, kept for rollback), "
+             "under which the smallest positive making inherits the rank of the whole zero-maker block. "
+             "Most of the pool makes nothing, so negligible two-sided capture is materially overpaid.",
+        default="positives",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.presence_gate",
+        type=int,
+        choices=[0, 1],
+        help="De-beta presence gate. 1 (default): a uid whose last presence_window queries all failed "
+             "(no HTTP 200) is not scorable that cycle; its legs stay published with present 0 and its "
+             "accumulators keep running, so it resumes at full standing when it answers again. 0: off. "
+             "Without it, an agent that has stopped answering keeps earning on the timing of resting "
+             "fills already inside the scoring window.",
+        default=1,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.presence_window",
+        type=int,
+        help="Number of most recent validator queries a uid must have failed in a row to count as absent "
+             "for the presence gate; fewer outcomes than this (fresh restart) count as present.",
+        default=50,
     )
 
     parser.add_argument(
@@ -564,6 +637,51 @@ def add_im_validator_args(cls, parser):
         choices=["simulation", "exchange"],
         help="Validator engine mode: 'simulation' (default) or 'exchange'.",
         default="simulation",
+    )
+
+    parser.add_argument(
+        "--neuron.fill_notice_window_seconds",
+        type=float,
+        default=900.0,
+        help=(
+            "Exchange mode: how long a settled-fill notice is re-sent on every state update, so a miner "
+            "that was unreachable when its fill settled still learns of it. There is no acknowledgement, "
+            "so a reachable miner receives each fill on every update inside the window; the agent base "
+            "drops the repeats by trade id."
+        ),
+    )
+
+    parser.add_argument(
+        "--neuron.fill_notice_max_per_uid",
+        type=int,
+        default=500,
+        help="Exchange mode: cap on parked settled-fill notices per miner inside the redelivery window.",
+    )
+
+    parser.add_argument(
+        "--neuron.proxy_min_balance_tao",
+        type=float,
+        default=0.003,
+        help=(
+            "Exchange mode: the free TAO a miner's settlement proxy wallet must hold for the miner's "
+            "placements to be included in a batch at all. A proxy below it has every placement refused "
+            "with a notice naming the proxy, its balance and this requirement; cancels still pass. The "
+            "default covers one settlement fee (about 0.002) plus the executor's 0.001 reserve. The "
+            "executor still checks the exact fee at settlement, so this is the gate, not the ledger. With "
+            "PROXY_AUTOFUND_TAO set (testbeds) a proxy closes the gate only after the executor reports a "
+            "failed fee pre-flight, since an empty proxy is funded at its first settlement there."
+        ),
+    )
+
+    parser.add_argument(
+        "--neuron.proxy_funding_refresh_seconds",
+        type=float,
+        default=30.0,
+        help=(
+            "Exchange mode: how often the validator re-reads every proxy wallet's free balance for the "
+            "placement gate. A settlement that fails for want of fee balance marks the proxy unfunded "
+            "at once, without waiting for the next read."
+        ),
     )
 
     parser.add_argument(

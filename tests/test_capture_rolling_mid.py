@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """The capture mid must not depend on batch shape. Live batches are one state update per book and
-median 4 prints (measured, board 20260902 window 21), so a batch-local centered mid degrades to the
+median 4 prints (measured over a live board), so a batch-local centered mid degrades to the
 plain batch mean 91% of the time and to the fill's own price on single-print batches: the
 drift-stripping the centered design exists for barely operates, and splitting the same prints into
 more batches changes scores. Reported by a miner on the 0.6.0 tape and confirmed here.

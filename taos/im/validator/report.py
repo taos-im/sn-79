@@ -27,6 +27,7 @@ from taos.im.protocol.events import TradeEvent
 
 from taos.common.utils.prometheus import prometheus
 from taos.im.utils import duration_from_timestamp
+from taos.im.validator.ingest_payload import kappa_maps, debeta_maps, scoring_params
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import GaugeMetricFamily
 from fastapi import FastAPI
@@ -619,6 +620,7 @@ class ReportingService:
                     'current_block', 'uid', 'metagraph_data', 'validator_config']:
             setattr(self, key, data[key])
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
+        self.scoring_shadow_health = data.get('scoring_shadow')
 
         def _int_keyed_books(d):
             """IPC serialization stringifies keys; the book-gauge block indexes by int uid/book."""
@@ -732,7 +734,13 @@ class ReportingService:
             (getattr(getattr(self.config, 'simulation', None), 'data_service_url', '')
              or getattr(getattr(self.config, 'exchange', None), 'data_service_url', ''))
         )
-        is_observe = bool((data.get('validator_config') or {}).get('observe', False))
+        # The process-level flag is the authority: it is set once at launch and cannot
+        # vary, whereas the per-payload value has been observed arriving False on a
+        # single cycle of an observing validator, which ran the entire non-observe
+        # reporting path. The payload is still honoured so an older validator that does
+        # not forward the flag keeps working.
+        _cfg_observe = bool(getattr(getattr(self.config, 'neuron', None), 'observe', False))
+        is_observe = _cfg_observe or bool((data.get('validator_config') or {}).get('observe', False))
 
         asyncio.create_task(_push_to_mvtrx_data_service({
             "mode":           "exchange" if is_exchange else "simulation",
@@ -743,10 +751,14 @@ class ReportingService:
             "accounts":       data['last_state']['accounts'],
             "pools":          data['last_state'].get('pools'),
             "reconciliation": data.get('reconciliation', {}),
-            # per-agent scoring — used by data service to build agent:stats
+            # per-agent scoring — used by data service to build agent:stats. The kappa and de-beta
+            # keys come from the same functions as the validator's own push, so agent_kappa is the
+            # kappa TOTAL here as everywhere (this push used to send the kappa SCORE under that key,
+            # and the two landed in the same agent_snapshots column).
             "agent_scores":          self.scores,
-            "agent_kappa":           {uid: float((kv or {}).get('score', 0.0))
-                                      for uid, kv in self.kappa_values.items()},
+            **kappa_maps(self.kappa_values),
+            **debeta_maps(self.kappa_values),
+            "scoring_params":        scoring_params(self.config, self.kappa_values),
             "agent_volume":          _sum_books(self.volume_sums),
             "agent_maker_volume":    _sum_books(self.maker_volume_sums),
             "agent_roundtrip_volume":_sum_books(self.roundtrip_volume_sums),
@@ -825,6 +837,23 @@ def publish_validator_gauges(self: ReportingService):
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="cpu_usage_percent").set( cpu_usage )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="ram_usage_percent").set( memory_usage )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="disk_usage_percent").set( disk_usage )    
+    _shadow_health = getattr(self, 'scoring_shadow_health', None)
+    if _shadow_health:
+        # Scoring-service health. A parity re-INIT storm (testnet: one every two minutes)
+        # truncates the de-beta window the child scores on and stalls main for every snapshot; these
+        # make it a dashboard fact instead of a log grep.
+        for _gauge, _key in (
+            ("scoring_shadow_parity_matches", "parity_matches"),
+            ("scoring_shadow_parity_mismatches", "parity_mismatches"),
+            ("scoring_shadow_reinits", "reinits"),
+            ("scoring_shadow_tee_dropped", "tee_dropped"),
+            ("scoring_shadow_suspended", "cutover_suspended"),
+            ("scoring_shadow_initialized", "initialized"),
+        ):
+            self.prometheus_validator_gauges.labels(
+                wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                sim_id=self.simulation.simulation_id, validator_gauge_name=_gauge,
+            ).set(float(_shadow_health.get(_key, 0) or 0))
     bt.logging.debug(f"Validator metrics published ({time.time()-start:.4f}s).")
 
 def publish_gentrx_gauges(self: ReportingService) -> None:
@@ -1344,7 +1373,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'min_roundtrip_volume': min_roundtrip_volume,
                 'activity_factor': activity_factor,
                 'pnl_factor': pnl_factor,
-                'kappa': kappa_values['median'] if kappa_values else None,
+                # .get, never []: a stub entry (a uid kappa-3 could not score while the de-beta weight is
+                # nonzero) carried no median, and the KeyError killed the whole report worker every cycle.
+                # Observed at a nonzero rung: validator gauges kept publishing, every miner,
+                # book and simulation gauge froze, and nothing named the report as the cause.
+                'kappa': kappa_values.get('median') if kappa_values else None,
                 'kappa_penalty': kappa_values.get('penalty') if kappa_values else None,
                 'activity_weighted_normalized_median': kappa_values.get('activity_weighted_normalized_median') if kappa_values else None,
                 'kappa_score': kappa_values.get('score') if kappa_values else None,
@@ -1363,6 +1396,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'skill_raw': kappa_values.get('skill_raw') if kappa_values else None,
                 'skill_rank': kappa_values.get('skill_rank') if kappa_values else None,
                 'p11_factor': kappa_values.get('p11_factor') if kappa_values else None,
+                'present': kappa_values.get('present') if kappa_values else None,
                 'debeta_w_make': kappa_values.get('debeta_w_make') if kappa_values else None,
                 'debeta_weight': kappa_values.get('debeta_weight') if kappa_values else None,
                 'debeta_floor': kappa_values.get('debeta_floor') if kappa_values else None,
@@ -1490,34 +1524,49 @@ async def report(self: ReportingService) -> None:
                     get_price('ask',1), get_vol('ask',1), get_price('ask',0), get_vol('ask',0),
                     "books"
                 ))
-            if book['e']:
-                trades = [event for event in book['e'] if event['y'] == 't']
-                if trades:
-                    last_trade = trades[-1]
-                    fp = self.fundamental_price.get(bookId) if self.fundamental_price else None
-                    if fp is not None:
-                        if isinstance(fp, pd.Series):
-                            updates.append((book_gauges,
-                                fp.iloc[-1],
-                                wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
-                        elif fp:
-                            updates.append((book_gauges,
-                                fp,
-                                wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
-                        else:
-                            _remove_and_evict(self._child_cache, book_gauges,
-                                wallet_addr, netuid, simid, bookId, 0, "fundamental_price")
+            # The fundamental price does not depend on this step's trades: it used to sit inside the
+            # trades branch below, so a quiet book had no fundamental_price series after a reporting
+            # restart until its next trade.
+            fp = self.fundamental_price.get(bookId) if self.fundamental_price else None
+            if fp is not None:
+                if isinstance(fp, pd.Series):
+                    updates.append((book_gauges,
+                        fp.iloc[-1],
+                        wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
+                elif fp:
+                    updates.append((book_gauges,
+                        fp,
+                        wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
+                else:
+                    _remove_and_evict(self._child_cache, book_gauges,
+                        wallet_addr, netuid, simid, bookId, 0, "fundamental_price")
 
-                    updates.append((book_gauges, last_trade['p'],
+            trades = [event for event in (book.get('e') or []) if event['y'] == 't']
+            if trades:
+                last_trade = trades[-1]
+                updates.append((book_gauges, last_trade['p'],
+                    wallet_addr, netuid, simid, bookId, 0, "trade_price"))
+                updates.append((book_gauges, sum([trade['q'] for trade in trades]),
+                    wallet_addr, netuid, simid, bookId, 0, "trade_volume"))
+                updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 0]),
+                    wallet_addr, netuid, simid, bookId, 0, "trade_buy_volume"))
+                updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 1]),
+                    wallet_addr, netuid, simid, bookId, 0, "trade_sell_volume"))
+
+                has_new_trades = True
+            else:
+                # No trade on this book this step. The gauges are persistent, so between trades they used
+                # to hold the previous step's values, and after a reporting restart a quiet book had NO
+                # trade_price or trade_volume series at all until it traded again (testnet:
+                # 31 of 128 books blank four minutes after a restart). The last trade price is seeded from
+                # the recent-trades buffer the validator keeps per book, and this step's volume is what
+                # it is, zero.
+                _recent = (getattr(self, 'recent_trades', None) or {}).get(bookId)
+                if _recent:
+                    updates.append((book_gauges, _recent[-1].price,
                         wallet_addr, netuid, simid, bookId, 0, "trade_price"))
-                    updates.append((book_gauges, sum([trade['q'] for trade in trades]),
-                        wallet_addr, netuid, simid, bookId, 0, "trade_volume"))
-                    updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 0]),
-                        wallet_addr, netuid, simid, bookId, 0, "trade_buy_volume"))
-                    updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 1]),
-                        wallet_addr, netuid, simid, bookId, 0, "trade_sell_volume"))
-
-                    has_new_trades = True
+                for _g in ("trade_volume", "trade_buy_volume", "trade_sell_volume"):
+                    updates.append((book_gauges, 0.0, wallet_addr, netuid, simid, bookId, 0, _g))
             if getattr(self.simulation, 'fee_policy', None) and self.simulation.fee_policy.fee_type == 'dynamic':
                 DISMTR = self.last_state.books[bookId].get('r', self.last_state.books[bookId].get('mtr', 0))
                 DISmakerRate = self.last_state.accounts[0][bookId]['f']['m']
@@ -1693,11 +1742,19 @@ async def report(self: ReportingService) -> None:
                 _agent_fee_books = _fee_sums_by_book.get(agentId, _fee_sums_by_book.get(str(agentId), {}))
                 updates.append((agent_gauges, _agent_fee_books.get(bookId, _agent_fee_books.get(str(bookId), 0.0)),
                                 wallet_addr, netuid, simid, bookId, agentId, "net_fee"))
-                updates.append((agent_gauges, daily_volumes[agentId][bookId]['total'], wallet_addr, netuid, simid, bookId, agentId, "daily_volume"))
-                updates.append((agent_gauges, daily_volumes[agentId][bookId]['maker'], wallet_addr, netuid, simid, bookId, agentId, "daily_maker_volume"))
-                updates.append((agent_gauges, daily_volumes[agentId][bookId]['taker'], wallet_addr, netuid, simid, bookId, agentId, "daily_taker_volume"))
-                updates.append((agent_gauges, daily_volumes[agentId][bookId]['self'], wallet_addr, netuid, simid, bookId, agentId, "daily_self_volume"))
-                updates.append((agent_gauges, daily_roundtrip_volumes[agentId][bookId], wallet_addr, netuid, simid, bookId, agentId, "daily_roundtrip_volume"))
+                # daily_volumes is keyed by the accounts snapshot metrics were built
+                # from, but this loop walks the CURRENT last_state.accounts. An agent
+                # present in one and not the other raised KeyError here and aborted
+                # the whole publish, losing every gauge for the cycle rather than one.
+                # 0.0 is the right default and not a papering-over: the builder itself
+                # defaults these to 0.0 when the volume sums have nothing for the pair.
+                # Every other lookup in this block is already defensive this way.
+                _dv = daily_volumes.get(agentId, {}).get(bookId) or {}
+                updates.append((agent_gauges, _dv.get('total', 0.0), wallet_addr, netuid, simid, bookId, agentId, "daily_volume"))
+                updates.append((agent_gauges, _dv.get('maker', 0.0), wallet_addr, netuid, simid, bookId, agentId, "daily_maker_volume"))
+                updates.append((agent_gauges, _dv.get('taker', 0.0), wallet_addr, netuid, simid, bookId, agentId, "daily_taker_volume"))
+                updates.append((agent_gauges, _dv.get('self', 0.0), wallet_addr, netuid, simid, bookId, agentId, "daily_self_volume"))
+                updates.append((agent_gauges, daily_roundtrip_volumes.get(agentId, {}).get(bookId, 0.0), wallet_addr, netuid, simid, bookId, agentId, "daily_roundtrip_volume"))
                 updates.append((agent_gauges, self.activity_factors.get(agentId, {}).get(bookId, 0.0), wallet_addr, netuid, simid, bookId, agentId, "activity_factor"))
                 updates.append((agent_gauges, self.pnl_factors.get(agentId, {}).get(bookId, 1.0), wallet_addr, netuid, simid, bookId, agentId, "pnl_factor"))
                 if kappas:
@@ -1848,41 +1905,49 @@ async def report(self: ReportingService) -> None:
                     updates.append((miner_gauges, m['kappa_penalty'], wallet_addr, netuid, simid, agentId, "kappa_penalty"))
                 if m['kappa_score'] is not None:
                     updates.append((miner_gauges, m['kappa_score'], wallet_addr, netuid, simid, agentId, "kappa_score"))
-                if m['pnl_score'] is not None:
-                    updates.append((miner_gauges, m['pnl_score'], wallet_addr, netuid, simid, agentId, "pnl_score"))
-                if m.get('trading_score') is not None:
-                    # RAW pre-EMA trading score: the quantity the blend invariant checks
-                    # (combined_score above is the EMA standing and would never reconcile).
-                    updates.append((miner_gauges, m['trading_score'], wallet_addr, netuid, simid, agentId, "trading_score"))
-                else:
-                    _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "trading_score")
-                if m['combined_score'] is not None:
-                    updates.append((miner_gauges, m['combined_score'], wallet_addr, netuid, simid, agentId, "combined_score"))
-                else:
-                    _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "combined_score")
-                # DE-BETA decomposition. Emitted when present and EVICTED when absent, so a fallback
-                # cycle (empty debeta map -> legacy kappa+pnl) cannot leave a stale making/skill series
-                # implying de-beta still drives the score.
-                for _k, _g in (('debeta_score', 'debeta_score'),
-                               ('making_raw', 'debeta_making'),
-                               ('making_rank', 'debeta_making_rank'),
-                               ('skill_raw', 'debeta_skill'),
-                               ('skill_rank', 'debeta_skill_rank'),
-                               ('p11_factor', 'debeta_p11_factor'),
-                               ('debeta_weight', 'debeta_weight'),
-                               ('debeta_w_make', 'debeta_w_make'),
-                               ('debeta_floor', 'debeta_skill_floor'),
-                               ('num_scored_books', 'num_scored_books')):
-                    _v = m.get(_k)
-                    if _v is not None:
-                        updates.append((miner_gauges, _v, wallet_addr, netuid, simid, agentId, _g))
-                    else:
-                        _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, _g)
-                # scorable is a warmup flag, not a score: 0 explains a legitimate zero.
-                if m.get('scorable') is not None:
-                    updates.append((miner_gauges, 1.0 if m["scorable"] else 0.0, wallet_addr, netuid, simid, agentId, "scorable"))
             else:
                 _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "kappa")
+            # The blend scores, the de-beta decomposition and the eligibility flag are NOT kappa gauges
+            # and are published for every miner whose carrier holds them. They used to sit inside the
+            # kappa test above: at kappa weight 0 (the final rung) no uid has a kappa, and on the first
+            # cycle of (0, 0, 1), every debeta_*, trading_score,
+            # combined_score and scorable series disappeared for all 257 miners while the score itself
+            # kept moving. The same gate had hidden the decomposition for the scored uids without a
+            # kappa at every earlier rung.
+            if m['pnl_score'] is not None:
+                updates.append((miner_gauges, m['pnl_score'], wallet_addr, netuid, simid, agentId, "pnl_score"))
+            if m.get('trading_score') is not None:
+                # RAW pre-EMA trading score: the quantity the blend invariant checks
+                # (combined_score above is the EMA standing and would never reconcile).
+                updates.append((miner_gauges, m['trading_score'], wallet_addr, netuid, simid, agentId, "trading_score"))
+            else:
+                _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "trading_score")
+            if m['combined_score'] is not None:
+                updates.append((miner_gauges, m['combined_score'], wallet_addr, netuid, simid, agentId, "combined_score"))
+            else:
+                _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "combined_score")
+            # DE-BETA decomposition. Emitted when present and EVICTED when absent, so a fallback
+            # cycle (empty debeta map -> legacy kappa+pnl) cannot leave a stale making/skill series
+            # implying de-beta still drives the score.
+            for _k, _g in (('debeta_score', 'debeta_score'),
+                           ('making_raw', 'debeta_making'),
+                           ('making_rank', 'debeta_making_rank'),
+                           ('skill_raw', 'debeta_skill'),
+                           ('skill_rank', 'debeta_skill_rank'),
+                           ('p11_factor', 'debeta_p11_factor'),
+                           ('present', 'debeta_present'),
+                           ('debeta_weight', 'debeta_weight'),
+                           ('debeta_w_make', 'debeta_w_make'),
+                           ('debeta_floor', 'debeta_skill_floor'),
+                           ('num_scored_books', 'num_scored_books')):
+                _v = m.get(_k)
+                if _v is not None:
+                    updates.append((miner_gauges, _v, wallet_addr, netuid, simid, agentId, _g))
+                else:
+                    _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, _g)
+            # scorable is a warmup flag, not a score: 0 explains a legitimate zero.
+            if m.get('scorable') is not None:
+                updates.append((miner_gauges, 1.0 if m["scorable"] else 0.0, wallet_addr, netuid, simid, agentId, "scorable"))
 
             updates.append((miner_gauges, m['unnormalized_score'], wallet_addr, netuid, simid, agentId, "unnormalized_score"))
             updates.append((miner_gauges, m['score'], wallet_addr, netuid, simid, agentId, "score"))
@@ -1941,10 +2006,16 @@ async def report(self: ReportingService) -> None:
                 average_roundtrip_volume=m['average_roundtrip_volume'],
                 activity_factor=m['activity_factor'],
                 pnl_factor=m['pnl_factor'],
-                kappa=m['kappa'],
-                kappa_penalty=m['kappa_penalty'],
-                kappa_score=m['kappa_score'],
-                pnl_score=m['pnl_score'],
+                # EMPTY labels when the component was not computed, never a stringified None or the stub's
+                # 0.0: Prometheus treats a label with an empty value as absent, so when kappa-3 is skipped
+                # for every miner (kappa weight 0, the final rung) the kappa, penalty and kappa score
+                # columns of the Agents table disappear on their own, and come back by themselves the
+                # cycle kappa is computed again, with no dashboard edit either way. A skipped kappa is
+                # recognised by its missing median; the stub carries penalty and score as 0.0.
+                kappa=("" if m['kappa'] is None else m['kappa']),
+                kappa_penalty=("" if m['kappa'] is None or m['kappa_penalty'] is None else m['kappa_penalty']),
+                kappa_score=("" if m['kappa'] is None or m['kappa_score'] is None else m['kappa_score']),
+                pnl_score=("" if m['pnl_score'] is None else m['pnl_score']),
                 combined_score=m['combined_score'],
                 gentrx_score=m['gentrx_score'],
                 unnormalized_score=m['unnormalized_score'],
@@ -2024,6 +2095,14 @@ if __name__ == '__main__':
     parser.add_argument('--cpu-cores', type=str, default=None)
     parser.add_argument('--ipc-prefix', type=str, default='validator',
                         help='Prefix for POSIX IPC resource names — "validator" for simulation, "exchange" for exchange mode')
+    # This parser is NOT the validator's: an option the validator forwards but this parser does not
+    # declare is dropped by bt.Config, and config.scoring simply does not exist here. The per-book
+    # de-beta gauges were dead in the child for exactly that reason, with the flag forwarded.
+    from taos.im.config import _flag
+    parser.add_argument('--scoring.debeta.publish_book_gauges', type=_flag, nargs='?', const=True, default=True,
+                        help='Publish the per-book de-beta gauges; forwarded by the validator, `false` turns them off')
+    parser.add_argument('--neuron.observe', type=_flag, nargs='?', const=True, default=False,
+                        help='Observe mode; forwarded by the validator so the child does not have to infer it per payload')
 
     config = bt.Config(parser)
     bt.logging(config=config)

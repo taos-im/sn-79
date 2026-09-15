@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from typing import cast
+from collections import OrderedDict
 import bittensor as bt
 from threading import Thread, Lock
 from abc import ABC, abstractmethod
@@ -45,7 +46,7 @@ except ImportError:
         ALPHA = None  # only referenced inside the exchange-mode market_order branch
 from taos.im.protocol.events import *
 from taos.im.protocol.models import *
-from taos.im.utils import duration_from_timestamp, timestamp_from_duration
+from taos.im.utils import duration_from_timestamp, timestamp_from_duration, format_timestamp
 
 @dataclass
 class RollingWindow:
@@ -1452,27 +1453,14 @@ class FinanceAgent(FinanceAgentBase):
             self.simulation_config = cast(MarketSimulationConfig, state.config)
             raw = (state.accounts or {}).get(self.uid, {})
             self.accounts = {bid: UnifiedAccount(a) for bid, a in raw.items()}
-            # parse_notices keys by int uid on both paths, so one lookup is enough. The warning stays:
-            # notices present for other uids but none for this one is worth seeing, and it is the signal
-            # that caught the stringified-key mismatch when the two paths disagreed.
-            _nt = state.notices or {}
-            _mine = _nt.get(self.uid, [])
+            # parse_notices keys by int uid on both paths, so one lookup is enough.
+            _mine = (state.notices or {}).get(self.uid, [])
+            # A settled fill is re-sent on every update for the validator's redelivery window (900 s by
+            # default, about 75 deliveries at 12 s blocks) so a miner that was unreachable still learns
+            # of it. Handlers and the log must see each fill once, so the repeats stop here. Each notice
+            # that survives is printed by _notice_log_line, which is the record of what arrived.
+            _mine, _ = self._drop_redelivered_fills(_mine)
             self.events = list(_mine)
-            # PAIRED WITH NOTICEWIRE on the validator side. A refusal notice has been proven built,
-            # routed, merged and synapse-valid, and this list still comes up empty, so the two ends must
-            # be comparable: what was packed for this uid versus what arrived.
-            if _mine:
-                import bittensor as _bt2
-                from collections import Counter as _C
-                _bt2.logging.info(
-                    f"NOTICEWIRE uid={self.uid} received "
-                    f"{dict(_C(str(getattr(n, 'y', None) or getattr(n, 'type', None) or '?') for n in _mine))}")
-            if _nt and not _mine:
-                import bittensor as _bt
-                _bt.logging.warning(
-                    f"NOTICEKEYS uid={self.uid!r} ({type(self.uid).__name__}) found no notices; "
-                    f"keys present: {[ (k, type(k).__name__) for k in list(_nt)[:5] ]}"
-                )
             self._exchange_mode = True
             self._dispatch_notice_handlers(state)
             # Cache pools so empty-book fallback works even when state.pools is
@@ -1499,11 +1487,62 @@ class FinanceAgent(FinanceAgentBase):
             self.accounts = {bid: UnifiedAccount(a) for bid, a in self.accounts.items()}
             self._exchange_mode = False
 
+    # How many (book, trade id) keys the redelivery ledger keeps. A busy miner sees a few thousand fills
+    # inside the 15-minute window; anything older than the ledger is also older than the window.
+    _REDELIVERY_LEDGER_CAP = 20_000
+
+    @staticmethod
+    def _notice_field(notice, *names):
+        """First present field among `names`, on a parsed event (attribute) or a raw wire dict (key)."""
+        if isinstance(notice, dict):
+            for name in names:
+                if notice.get(name) is not None:
+                    return notice.get(name)
+            return None
+        for name in names:
+            value = getattr(notice, name, None)
+            if value is not None:
+                return value
+        return None
+
+    def _drop_redelivered_fills(self, notices):
+        """Return (notices without repeated fills, how many repeats were dropped).
+
+        Exchange-mode settled-fill notices are redelivered on every state update for a window, and there
+        is no acknowledgement to stop them, so a reachable miner receives each fill about 75 times. The
+        validator's own consumers already key on the trade id for the same reason; a miner's handlers
+        and log deserve the same. Keyed by (book, trade id), bounded, and only for fills: refusals and
+        acknowledgements are delivered once by construction.
+        """
+        ledger = getattr(self, '_seen_fill_keys', None)
+        if ledger is None:
+            ledger = self._seen_fill_keys = OrderedDict()
+        kept, dropped = [], 0
+        for notice in notices or []:
+            etype = self._notice_field(notice, 'type', 'y')
+            trade_id = self._notice_field(notice, 'tradeId', 'i') if etype in ('ET', 'EVENT_TRADE') else None
+            if trade_id is None:
+                kept.append(notice)
+                continue
+            key = (self._notice_field(notice, 'bookId', 'b'), trade_id)
+            if key in ledger:
+                ledger.move_to_end(key)
+                dropped += 1
+                continue
+            ledger[key] = True
+            while len(ledger) > self._REDELIVERY_LEDGER_CAP:
+                ledger.popitem(last=False)
+            kept.append(notice)
+        return kept, dropped
+
     def _notice_log_line(self, event, etype: str) -> str:
         """One log line for an exchange notice, worded as the simulation path words it.
 
         A trade gets the same AGGRESSIVE/PASSIVE sentence `update()` builds, so an
-        operator reading the two halves sees one format rather than two."""
+        operator reading the two halves sees one format rather than two. Exchange fills settle
+        against the pool unless another agent's order was crossed, so an absent counterparty is
+        named POOL rather than printed as order #0 of agent None, and an order id of 0 means the
+        engine did not number the order, so no number is shown."""
         book = getattr(event, "bookId", None)
         prefix = f"BOOK {book} : " if book is not None else ""
         if etype in ("EVENT_TRADE", "ET"):
@@ -1512,12 +1551,18 @@ class FinanceAgent(FinanceAgentBase):
             other = event.makerOrderId if role == "taker" else event.takerOrderId
             own_agent = event.takerAgentId if role == "taker" else event.makerAgentId
             other_agent = event.makerAgentId if role == "taker" else event.takerAgentId
+            # The exchange's own sweep aggresses as agent -1: that is the pool taking the resting side.
+            if other_agent is None or (isinstance(other_agent, int) and other_agent < 0):
+                against = "POOL"
+            else:
+                against = f"{'#' + str(other) + ' ' if other else ''}(AGENT {other_agent})"
             return (
                 f"{prefix}{'BUY ' if event.side == 0 else 'SELL'} TRADE #{event.tradeId} : "
-                f"YOUR {'AGGRESSIVE' if role == 'taker' else 'PASSIVE'} ORDER #{own} (AGENT {own_agent}) "
-                f"MATCHED AGAINST #{other} (AGENT {other_agent}) "
+                f"YOUR {'AGGRESSIVE' if role == 'taker' else 'PASSIVE'} ORDER"
+                f"{' #' + str(own) if own else ''} (AGENT {own_agent}) "
+                f"MATCHED AGAINST {against} "
                 f"FOR {event.quantity}@{event.price} "
-                f"AT {duration_from_timestamp(event.timestamp)} (T={event.timestamp})"
+                f"AT {format_timestamp(event.timestamp)} (T={event.timestamp})"
             )
         return f"{prefix}{event}"
 

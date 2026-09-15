@@ -9,6 +9,7 @@
 #include <bdldfp_decimalutil.h>
 #include <fmt/format.h>
 
+#include <cstring>
 #include <spanstream>
 
 //-------------------------------------------------------------------------
@@ -153,6 +154,12 @@ static inline void trim(std::span<char> span)
 {
     const size_t len = std::strlen(span.data());
     if (len <= 3uz) return;
+    // ONLY A FRACTIONAL PART HAS REDUNDANT TRAILING ZEROS. Decimal128 is unnormalised, so a whole
+    // number can render without a point -- 150000 is stored as 15e4 and streams as "150000" -- and
+    // stripping its zeros changes the value rather than tidying it: an untouched 150000.0 quote
+    // endowment renders as "15", while a 500 base endowment survives only because the length guard
+    // above returns early on three characters.
+    if (std::memchr(span.data(), '.', len) == nullptr) return;
     size_t i = len - 1;
     while (i > 1 && span[i] == '0' && span[i - 1] != '.') {
         --i;

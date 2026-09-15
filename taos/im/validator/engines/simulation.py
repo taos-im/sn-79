@@ -756,10 +756,21 @@ class SimulationEngine(MarketEngine):
                                 # is what keeps run/logs from filling the disk.
                                 if '-' not in log_period:
                                     continue
-                                if len(log_period) == 13:
-                                    log_end = (int(log_period.split('-')[1][:2]) * 3600 + int(log_period.split('-')[1][2:4]) * 60 + int(log_period.split('-')[1][4:])) * 1_000_000_000
-                                else:
-                                    log_end = (int(log_period.split('-')[1][:2]) * 86400 + int(log_period.split('-')[1][2:4]) * 3600 + int(log_period.split('-')[1][4:6]) * 60 + int(log_period.split('-')[1][6:])) * 1_000_000_000
+                                # AND A NAME THAT CARRIES A PERIOD THIS PARSER CANNOT READ IS ALSO SKIPPED, NOT
+                                # FATAL. The guard above only catches names with NO '-' at all. The dominant
+                                # naming on disk is YYYYMMDD-HHMM-HHMM, e.g. 'L2-22.20260903-1400-1500.log',
+                                # whose second dash-segment is FOUR characters, so [6:] is '' and int('') raises
+                                # exactly the ValueError the guard above was written to stop.
+                                # Nearly every .log file on disk carries that naming, so the first one raised
+                                # and aborted compression AND the disk cleanup below it on every call -- which
+                                # is how the log directory grows until the disk fills.
+                                try:
+                                    if len(log_period) == 13:
+                                        log_end = (int(log_period.split('-')[1][:2]) * 3600 + int(log_period.split('-')[1][2:4]) * 60 + int(log_period.split('-')[1][4:])) * 1_000_000_000
+                                    else:
+                                        log_end = (int(log_period.split('-')[1][:2]) * 86400 + int(log_period.split('-')[1][2:4]) * 3600 + int(log_period.split('-')[1][4:6]) * 60 + int(log_period.split('-')[1][6:])) * 1_000_000_000
+                                except (ValueError, IndexError):
+                                    continue
                                 if log_end < v.simulation_timestamp or (start and str(output_dir.resolve()) != v.simulation.logDir):
                                     log_type = log_file.name.split('-')[0]
                                     label = f"{log_type}_{log_period}"

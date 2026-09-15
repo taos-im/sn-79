@@ -87,8 +87,9 @@ public:
         m_messageQueue.push(taosim::message::PrioritizedMessage(std::forward<Args>(args)...));
     }
 
+    // `leaving` is the manager's barrier-aligned stop latch; see SimulationManager::requestStop.
     template<typename Fn>
-    void simulate(std::barrier<Fn>& barrier)
+    void simulate(std::barrier<Fn>& barrier, const bool& leaving)
     {
         if (m_state == taosim::simulation::SimulationState::STOPPED) return;
         else if (m_state == taosim::simulation::SimulationState::INACTIVE) start();
@@ -96,6 +97,11 @@ public:
         while (m_time.current < m_time.start + m_time.duration) {
             step();
             barrier.arrive_and_wait();
+            // AFTER THE BARRIER, NEVER BEFORE. Every block reads the value the completion function
+            // just wrote, so they all leave on the same iteration. A block that broke out early
+            // would strand its siblings in arrive_and_wait for ever: the barrier expects a fixed
+            // number of arrivals and this loop never calls arrive_and_drop.
+            if (leaving) break;
         }
 
         stop();

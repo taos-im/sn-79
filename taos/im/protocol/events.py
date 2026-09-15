@@ -40,6 +40,21 @@ def _close_reason_str(raw):
         return None
 
 
+def trade_event_from_wire(json: dict) -> "TradeEvent":
+    """A TradeEvent from an engine notice or a stored dump WITHOUT validation, close reason normalised.
+
+    model_construct skips validators, so every site that builds a TradeEvent from raw wire or stored
+    data has to normalise `cr` itself: the engine packs it as 0 / 1 / 2, the model declares
+    `str | None`. The validator's recent_miner_trades copies were built bare, kept the integer, and
+    tripped the serializer on every state save (PYDANTIC-SER-WARN, Expected `str`, got int 0); files
+    saved that way carry the integer too, so the restore path takes the same door. The caller's dict
+    is left untouched.
+    """
+    if "cr" in json:
+        json = {**json, "cr": _close_reason_str(json.get("cr"))}
+    return TradeEvent.model_construct(**json)
+
+
 class FinanceEvent(SimulationEvent):
     """
     Base class for representing market events occurring in the simulation.
@@ -67,9 +82,9 @@ class FinanceEvent(SimulationEvent):
             case "EVENT_TRADE":
                 return TradeEvent.from_json(json)
             case "ET":
-                # Normalised here rather than in a field_validator: model_construct skips validation.
-                json['cr'] = _close_reason_str(json.get('cr'))
-                return TradeEvent.model_construct(**json)
+                # Normalised in trade_event_from_wire rather than in a field_validator: model_construct
+                # skips validation.
+                return trade_event_from_wire(json)
             case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS":
                 return OrderCancellationsEvent.from_json(json)
             # model_construct skips validation, which is what the abbreviated wire form wants for

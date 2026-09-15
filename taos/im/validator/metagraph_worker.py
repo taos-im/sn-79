@@ -106,6 +106,19 @@ class MetagraphSyncWorker:
         must fall back to the in-process sync. A dead worker is respawned for
         the next cycle rather than blocking this one on a fresh bt import.
         """
+        # A None _conn means stop() is in progress: it clears the pipe BEFORE the child exits, so
+        # a sync landing in that window finds a live _proc and no pipe and `self._conn.send` raises
+        # AttributeError out of a path this function documents as returning None. It surfaces shortly
+        # after a "Stopping metagraph sync worker" log line as:
+        #     ERROR | PD: Failed to sync: 'NoneType' object has no attribute 'send'
+        # which is then misread downstream as a deregistration handler throwing.
+        #
+        # Returned WITHOUT respawning, and that distinction matters: start() unconditionally builds a
+        # new Pipe and Process and overwrites self._proc, so calling it here would orphan a child
+        # that is still running and resurrect a worker the caller has just asked to stop. The dead
+        # worker case below keeps its respawn, which is what that path is for.
+        if self._conn is None:
+            return None
         if not self.is_alive():
             try:
                 self.start()

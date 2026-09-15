@@ -12,6 +12,9 @@
 #include <gtest/gtest.h>
 
 #include "MultiBookExchangeAgent.hpp"
+#include "taosim/agent/DistributedProxyAgent.hpp"
+#include "taosim/message/MultiBookMessagePayloads.hpp"
+#include <algorithm>
 #include "Order.hpp"
 #include "taosim/message/PayloadFactory.hpp"
 #include "Simulation.hpp"
@@ -705,3 +708,108 @@ TEST_F(SelfTradePreventionTest, SameBatchTimestampStillPrevents)
 //     //-------------------------------------------------------------------------
 
 // }
+
+//-------------------------------------------------------------------------
+// ENGINE-INITIATED CANCELS REACH THE OWNER IN BOTH MECHANISMS.
+//
+// An STP cancel of a
+// miner's order was narrated by the engine and never announced to the miner, because both notice
+// sites in Book::preventSelfTrade were gated on exchangeServiceMode() on the belief that a simulation
+// miner sees the cancellation as a book event. The published books carry no such field, and the
+// validator builds a miner's notices from the proxy's messages alone. A GTT expiry did announce
+// itself, but one expiry period late: scheduled as (now, expiryPeriod), the expiry message arrived
+// with that latency and respondToMessage mirrored it onto the reply.
+//
+// This fixture IS the stepped simulation (MultiAgentFees.xml declares a DistributedProxyAgent with
+// exchangeServiceMode off), so what it sees on the proxy is what a simulation miner is told.
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+::Message::Ptr findCancelNotice(
+    taosim::agent::DistributedProxyAgent* proxy, AgentId owner, OrderID orderId)
+{
+    for (const auto& msg : proxy->messages()) {
+        if (msg->type != "RESPONSE_DISTRIBUTED_CANCEL_ORDERS") continue;
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        if (pld == nullptr || pld->agentId != owner) continue;
+        const auto sub = std::dynamic_pointer_cast<CancelOrdersResponsePayload>(pld->payload);
+        if (sub != nullptr && std::find(sub->orderIds.begin(), sub->orderIds.end(), orderId) != sub->orderIds.end()) {
+            return msg;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST_F(SelfTradePreventionTest, StpRestingCancelIsAnnouncedToTheOwnerInSimulationMode)
+{
+    auto* proxy = simulation->proxy();
+    ASSERT_NE(proxy, nullptr);
+    ASSERT_FALSE(proxy->exchangeServiceMode()) << "the stepped simulation is the mechanism that heard nothing";
+    proxy->clearMessages();
+
+    // The same sequence as LimitOrderBuyCO up to the STP step: agent2 rests a SELL at 301, then buys
+    // through its own price. CANCEL_OLDEST removes the resting SELL.
+    placeLimitOrder(exchange, agent1, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
+    auto [resting, restingEc] = placeLimitOrder(exchange, agent2, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
+    ASSERT_NE(resting, nullptr);
+    const OrderID restingId = resting->id();
+    placeLimitOrder(exchange, agent3, bookId, OrderDirection::SELL, 2_dec, 301_dec, DEC(.5));
+    placeLimitOrder(exchange, agent2, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
+
+    const auto notice = findCancelNotice(proxy, agent2, restingId);
+    ASSERT_NE(notice, nullptr)
+        << "STP cancelled resting order " << restingId << " of agent " << agent2
+        << " and no RESPONSE_DISTRIBUTED_CANCEL_ORDERS naming it reached the proxy";
+}
+
+TEST_F(SelfTradePreventionTest, StpIncomingCancelIsAnnouncedToTheOwnerInSimulationMode)
+{
+    auto* proxy = simulation->proxy();
+    ASSERT_NE(proxy, nullptr);
+    proxy->clearMessages();
+
+    auto [resting, restingEc] = placeLimitOrder(exchange, agent2, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
+    ASSERT_NE(resting, nullptr);
+    // CANCEL_NEWEST: the incoming BUY is the one that goes.
+    auto [incoming, incomingEc] = placeLimitOrder(
+        exchange, agent2, bookId, false, taosim::TimeInForce::GTC, std::nullopt, STPFlag::CN,
+        OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
+    ASSERT_NE(incoming, nullptr);
+
+    ASSERT_NE(findCancelNotice(proxy, agent2, incoming->id()), nullptr)
+        << "STP cancelled the incoming order " << incoming->id() << " and its owner was not told";
+    EXPECT_EQ(findCancelNotice(proxy, agent2, resting->id()), nullptr)
+        << "the resting order survived CANCEL_NEWEST and must not be announced as cancelled";
+}
+
+TEST_F(SelfTradePreventionTest, GttExpiryIsScheduledAtTheDeadlineSoItsAnswerIsNotDelayed)
+{
+    const Timestamp now = simulation->currentTimestamp();
+    const Timestamp expiry = 60'000'000'000;  // 60 s, the s_gtd scenario's period
+    auto& queue = simulation->messageQueue();
+    while (!queue.empty()) queue.pop();
+
+    exchange->receiveMessage(::Message::create(
+        now, now, "agent1", exchange->name(), "PLACE_ORDER_LIMIT",
+        MessagePayload::create<PlaceOrderLimitPayload>(
+            OrderDirection::BUY, 1_dec, 290_dec, DEC(0.), bookId, Currency::BASE, std::nullopt, false,
+            taosim::TimeInForce::GTT, std::optional<Timestamp>{expiry}, STPFlag::CO)));
+
+    ::Message::Ptr cancel;
+    while (!queue.empty()) {
+        auto msg = queue.top();
+        queue.pop();
+        if (msg->type == "CANCEL_ORDERS") { cancel = msg; break; }
+    }
+    ASSERT_NE(cancel, nullptr) << "a GTT placement schedules its own expiry cancel";
+    EXPECT_EQ(cancel->occurrence, now + expiry);
+    // respondToMessage replies with latency (arrival - occurrence). Scheduled as (now, expiry) this
+    // message carried a 60 s latency and the owner's RDCO came back 60 s after the cancel.
+    EXPECT_EQ(cancel->arrival, cancel->occurrence)
+        << "an expiry that arrives later than it occurs is answered that much later again";
+}
+

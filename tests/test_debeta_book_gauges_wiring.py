@@ -16,9 +16,19 @@ REPORT = (DEV / "taos/im/validator/report.py").read_text()
 def test_publish_flag_is_forwarded_to_the_reporting_child():
     spawn = VALIDATOR[VALIDATOR.index("'../validator/report.py'"):]
     spawn = spawn[:spawn.index("subprocess.Popen")]
-    assert "cmd.append('--scoring.debeta.publish_book_gauges')" in spawn, (
-        "report.py parses its own argv: without forwarding, the flag is dead in the child"
+    assert "'--scoring.debeta.publish_book_gauges', 'true' if _book_gauges else 'false'" in spawn, (
+        "report.py parses its own argv: the value must be forwarded in BOTH directions, since the "
+        "option defaults on and an operator's `false` has to reach the child too"
     )
+
+
+def test_reporting_child_declares_the_publish_flag():
+    """Forwarding alone is not enough: bt.Config drops an option the receiving parser never declared,
+    and config.scoring then does not exist in the child. Found live on 0.6.1 testnet: the flag was
+    forwarded and the per-book gauges were still dead."""
+    main = REPORT[REPORT.index("parser = argparse.ArgumentParser()"):]
+    main = main[:main.index("config = bt.Config(parser)")]
+    assert "parser.add_argument('--scoring.debeta.publish_book_gauges'" in main
 
 
 def test_accumulators_ship_in_the_reporting_payload():
