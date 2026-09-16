@@ -104,7 +104,7 @@ def test_empty_map_at_full_replacement_scores_zero_without_resurrecting_kappa(mo
 
 def test_default_weight_is_zero_legacy_scores_with_decomposition():
     """No weight configured = the old 'disabled' emissions, but the decomposition still publishes:
-    there is no boolean any more, and weight defaults to 0.0 (deploy-safe rehearsal)."""
+    there is no boolean any more; weight 0.0 is the rehearsal rung (legacy emissions, decomposition published)."""
     vd = _validator_data(debeta_scores={1: 0.9, 2: 0.9})
     trading, _ = reward.score_uids(vd)
     for uid in (1, 2):

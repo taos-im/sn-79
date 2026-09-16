@@ -147,7 +147,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.kappa.weight",
         type=float,
         help="Weight applied to Kappa evaluation in final score calculation",
-        default=0.79,
+        default=0.5925,
     )
 
     parser.add_argument(
@@ -210,7 +210,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.pnl.weight",
         type=float,
         help="Weight applied to Realized PnL evaluation in final score calculation",
-        default=0.21,
+        default=0.1575,
     )
 
     parser.add_argument(
@@ -223,7 +223,7 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.weight",
         type=float,
-        default=0.0,
+        default=0.25,
         help="The de-beta component's share of the FLAT trading score: trading = kappa.weight*kappa + "
              "pnl.weight*pnl + debeta.weight*debeta, the three weights validated to sum to 1 at init. "
              "Default is the current ladder rung (see the kappa.weight comment). At 0.0 emissions are "

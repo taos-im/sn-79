@@ -4,7 +4,7 @@
 
     trading = kappa.weight * kappa + pnl.weight * pnl + debeta.weight * debeta
 
-debeta.weight defaults to 0.0: deploying is rehearsal by default (legacy emissions, decomposition
+debeta.weight 0.0 is the rehearsal rung (legacy emissions, decomposition
 always computed and published); (0, 0, 1) is the characterized full replacement, and a component
 is computed iff its own weight is nonzero. An empty de-beta map renormalizes onto the legacy
 components so warming never reads as a scale change.

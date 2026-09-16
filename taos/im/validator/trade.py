@@ -1024,7 +1024,7 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     """
     self.kappa_values[uid] = {
         'books': {bookId: None for bookId in book_ids},
-        'books_weighted': {bookId: 0.0 for bookId in book_ids},
+        'books_weighted': {bookId: None for bookId in book_ids},
         'total': None, 'average': None, 'median': None,
         'normalized_average': 0.0, 'normalized_median': 0.0,
         'normalized_total': 0.0,

@@ -41,16 +41,20 @@ def _hadd1(hist, k, ts, val):
 
 def prune_hist_2level(hist, running, threshold):
     """hist {k1:{k2:{ts:val}}}, running {k1:{k2:val}}. Drop ts<threshold, subtract pruned mass from
+    running. Keeps running == sum(kept). A pair whose history empties is removed from both maps: it has
+    no fills inside the window, and a key left behind would carry a running total of a floating-point
+    residue into every pool built from the map (the skill floor's median, kappa's book count), where
+    such residues accumulate until they outnumber the live pairs.
 
     Args:
         hist: ``{k1: {k2: {ts: val}}}`` history, pruned in place.
         running: ``{k1: {k2: val}}`` running totals, reduced by the pruned mass.
         threshold: Timestamps strictly below this are dropped.
-    running. Keeps running == sum(kept)."""
-    for k1, d2 in hist.items():
-        for k2, tsd in d2.items():
-            if not tsd:
-                continue
+    """
+    for k1 in list(hist):
+        d2 = hist[k1]
+        for k2 in list(d2):
+            tsd = d2[k2]
             pruned = 0.0
             keep = {}
             for ts, v in tsd.items():
@@ -62,19 +66,27 @@ def prune_hist_2level(hist, running, threshold):
                 d2[k2] = keep
                 if pruned and k1 in running and k2 in running.get(k1, {}):
                     running[k1][k2] = running[k1][k2] - pruned
+            if not keep:
+                del d2[k2]
+                if k1 in running:
+                    running[k1].pop(k2, None)
+        if not d2:
+            del hist[k1]
+            if k1 in running and not running[k1]:
+                del running[k1]
 
 
 def prune_hist_1level(hist, running, threshold):
-    """hist {k:{ts:val}}, running {k:val}.
+    """hist {k:{ts:val}}, running {k:val}. A key whose history empties is removed from both maps, for
+    the reason given on prune_hist_2level.
 
     Args:
         hist: ``{k: {ts: val}}`` history, pruned in place.
         running: ``{k: val}`` running totals, reduced by the pruned mass.
         threshold: Timestamps strictly below this are dropped.
     """
-    for k, tsd in hist.items():
-        if not tsd:
-            continue
+    for k in list(hist):
+        tsd = hist[k]
         pruned = 0.0
         keep = {}
         for ts, v in tsd.items():
@@ -86,6 +98,9 @@ def prune_hist_1level(hist, running, threshold):
             hist[k] = keep
             if pruned and k in running:
                 running[k] = running[k] - pruned
+        if not keep:
+            del hist[k]
+            running.pop(k, None)
 
 
 def shift_hist_2level(hist, running, old_ts, new_ts, threshold):
@@ -111,6 +126,14 @@ def shift_hist_2level(hist, running, old_ts, new_ts, threshold):
             d2[k2] = newd
             if pruned and k1 in running and k2 in running.get(k1, {}):
                 running[k1][k2] = running[k1][k2] - pruned
+            if not newd:
+                del d2[k2]
+                if k1 in running:
+                    running[k1].pop(k2, None)
+        if not d2:
+            del hist[k1]
+            if k1 in running and not running[k1]:
+                del running[k1]
 
 
 def shift_hist_1level(hist, running, old_ts, new_ts, threshold):
@@ -919,9 +942,37 @@ def book_alphas_by_book(mtm, invsum, invn, drift):
     return out
 
 
+def traded_book_alphas(alphas_by_book, capture_buy_sums, capture_sell_sums):
+    """Keep, per uid, the books on which the uid FILLED inside the window: {uid: {book: alpha}}.
+
+    The mark-to-market and inventory accumulators run for every miner holding a position on a book,
+    on every trade in that book, so a miner that merely holds a static position through the window
+    carries an alpha entry for it, and by the defining invariant that alpha is exactly zero. On a
+    long-running validator those held-not-traded pairs come to be half of all pairs, so a floor taken
+    over every pair collapses to a rounding residue and kappa counts books the miner never traded. The
+    capture maps hold exactly the (uid, book) pairs with fills inside the window (they are pruned on
+    the same clock), so they define the pool for both the floor and the skill leg.
+
+    Args:
+        alphas_by_book: ``{uid: {book: alpha}}`` from book_alphas_by_book.
+        capture_buy_sums: ``{uid: {book: capture}}`` buyer-side capture, windowed.
+        capture_sell_sums: ``{uid: {book: capture}}`` seller-side capture, windowed.
+
+    Returns:
+        dict: ``{uid: {book: alpha}}`` restricted to books with fills; a uid with none keeps an empty map.
+    """
+    out = {}
+    for uid, by_book in alphas_by_book.items():
+        traded = set((capture_buy_sums.get(uid) or {})) | set((capture_sell_sums.get(uid) or {}))
+        out[uid] = {b: a for b, a in by_book.items() if b in traded}
+    return out
+
+
 def median_abs_floor(book_alphas_by_uid, scale=0.5):
-    """E5 magnitude floor for kappa_floored: scale * median(|alpha|) over ALL per-book alphas across
-    all miners. Kappa is magnitude-blind, so a tiny-consistent spammer ranks high without a floor."""
+    """E5 magnitude floor for kappa_floored: scale * median(|alpha|) over the per-book alphas passed
+    in. Kappa is magnitude-blind, so a tiny-consistent spammer ranks high without a floor. The caller
+    passes the pool of (uid, book) pairs with fills inside the window (traded_book_alphas): a held but
+    untraded book has an alpha of exactly zero by the invariant and would drag the median to nothing."""
     mags = [abs(a) for al in book_alphas_by_uid.values() for a in al if a is not None]
     if not mags:
         return 0.0

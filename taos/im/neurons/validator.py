@@ -1107,7 +1107,7 @@ if __name__ != "__mp_main__":
                 self.kappa_values = {
                     uid: {
                         'books': {bookId: None for bookId in _bids},
-                        'books_weighted': {bookId: 0.0 for bookId in _bids},
+                        'books_weighted': {bookId: None for bookId in _bids},
                         'total': None,
                         'average': None,
                         'median': None,
@@ -1580,7 +1580,7 @@ if __name__ != "__mp_main__":
                          else list(range(self.simulation.book_count)))
                 _kappa_default = {
                     'books': {b: None for b in _bids},
-                    'books_weighted': {b: 0.0 for b in _bids},
+                    'books_weighted': {b: None for b in _bids},
                     'total': None, 'average': None, 'median': None,
                     'normalized_average': 0.0, 'normalized_median': 0.0,
                     'normalized_total': 0.0,
@@ -1600,7 +1600,7 @@ if __name__ != "__mp_main__":
                     if _uid not in self.kappa_values:
                         self.kappa_values[_uid] = dict(_kappa_default)
                         self.kappa_values[_uid]['books'] = {b: None for b in _bids}
-                        self.kappa_values[_uid]['books_weighted'] = {b: 0.0 for b in _bids}
+                        self.kappa_values[_uid]['books_weighted'] = {b: None for b in _bids}
                     if _uid not in self.unnormalized_scores:
                         self.unnormalized_scores[_uid] = 0.0
                     if _uid not in self.initial_balances:

@@ -148,3 +148,55 @@ def test_the_making_floor_ships_off_by_default():
 
 def test_the_skill_floor_helper_is_unchanged():
     assert median_abs_floor({1: [1.0, -3.0], 2: [2.0]}, scale=0.5) == pytest.approx(1.0)
+
+
+def test_the_prune_drops_a_pair_once_its_fills_have_aged_out():
+    """A (uid, book) pair whose fills have all left the window used to keep its key with a running
+    total reduced to a floating-point residue. On a long-running validator those pairs come to
+    outnumber the live ones, so the skill floor's median collapsed to a residue and switched itself
+    off. The prune now removes the emptied pair from both maps; live pairs keep running == sum(kept)."""
+    from taos.im.validator.debeta import prune_hist_2level, prune_hist_1level
+    hist = {1: {0: {100: 4.0, 300: 2.0}, 1: {100: 0.7}}, 2: {0: {100: 0.3}}}
+    running = {1: {0: 6.0, 1: 0.7}, 2: {0: 0.3}}
+    prune_hist_2level(hist, running, threshold=250)
+    assert hist == {1: {0: {300: 2.0}}}
+    assert running == {1: {0: pytest.approx(2.0)}}
+    h1 = {0: {100: 5.0}, 1: {100: 1.0, 300: 1.0}}
+    r1 = {0: 5.0, 1: 2.0}
+    prune_hist_1level(h1, r1, threshold=250)
+    assert h1 == {1: {300: 1.0}} and r1 == {1: pytest.approx(1.0)}
+
+
+def test_the_skill_floor_sees_only_pairs_with_fills_in_the_window():
+    """After the prune the floor's pool holds the live pairs alone, so its median is theirs."""
+    from taos.im.validator.debeta import prune_hist_2level, book_alphas_from_drift
+    mtm = {1: {0: 4.0, 1: -6.0, 2: 5.0}, 2: {0: 3.0}}
+    for u in range(10, 20):                       # pairs whose only fills are outside the window
+        mtm[u] = {0: 1e-12, 1: 0.0}
+    invsum = {u: {b: 0.0 for b in books} for u, books in mtm.items()}
+    ts_of = lambda u: 300 if u in (1, 2) else 100
+    mtm_hist = {u: {b: {ts_of(u): v} for b, v in books.items()} for u, books in mtm.items()}
+    inv_hist = {u: {b: {ts_of(u): v} for b, v in books.items()} for u, books in invsum.items()}
+    prune_hist_2level(mtm_hist, mtm, threshold=250)
+    prune_hist_2level(inv_hist, invsum, threshold=250)
+    alphas = book_alphas_from_drift(mtm, invsum, {0: 10, 1: 10, 2: 10}, {0: 0.0, 1: 0.0, 2: 0.0})
+    assert set(alphas) == {1, 2}
+    assert median_abs_floor(alphas, scale=0.5) == pytest.approx(2.25)
+
+
+def test_the_skill_pool_is_the_books_a_uid_filled_inside_the_window():
+    """A miner holding a static position on a book carries an alpha entry for it on every trade, and
+    that alpha is exactly zero by the invariant. On a long-running validator such held-not-traded
+    pairs were half of all pairs, so the floor collapsed to a rounding residue and kappa counted books
+    the miner never traded. The pool is restricted to books with fills inside the window, read from
+    the windowed capture maps."""
+    from taos.im.validator.debeta import traded_book_alphas
+    by_book = {1: {0: 4.0, 1: -6.0, 2: 5.0, 3: 0.0, 4: 0.0}, 2: {0: 3.0, 5: 0.0}, 3: {0: 0.0, 1: 0.0}}
+    cb = {1: {0: 1.0, 2: 1.0}, 2: {0: 1.0}}
+    cs = {1: {1: 1.0}, 2: {}, 3: {}}
+    pool = traded_book_alphas(by_book, cb, cs)
+    assert pool == {1: {0: 4.0, 1: -6.0, 2: 5.0}, 2: {0: 3.0}, 3: {}}
+    alphas = {u: list(b.values()) for u, b in pool.items()}
+    assert median_abs_floor(alphas, scale=0.5) == pytest.approx(2.25)
+    assert median_abs_floor({u: list(b.values()) for u, b in by_book.items()}, scale=0.5) == 0.0
+    assert kappa_floored(alphas[3], 2.25) == 0.0

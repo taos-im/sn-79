@@ -1453,7 +1453,7 @@ def _load_validator_state(self):
     def _default_kappa(bids):
         return {
             'books': {bookId: None for bookId in bids},
-            'books_weighted': {bookId: 0.0 for bookId in bids},
+            'books_weighted': {bookId: None for bookId in bids},
             'total': None, 'average': None, 'median': None,
             'normalized_average': 0.0, 'normalized_median': 0.0,
             'normalized_total': 0.0,
@@ -1611,7 +1611,7 @@ def _load_validator_state(self):
                             }
                             for book_id in book_ids:
                                 if book_id not in kappa['books_weighted']:
-                                    kappa['books_weighted'][book_id] = 0.0
+                                    kappa['books_weighted'][book_id] = None
                         self.kappa_values[uid] = kappa
                     elif uid >= self.effective_max_uids:
                         bt.logging.debug(f"Skipping kappa_values for UID {uid} (exceeds effective_max_uids={self.effective_max_uids})")
@@ -1625,7 +1625,7 @@ def _load_validator_state(self):
                     if uid < self.effective_max_uids and sharpe_data:
                         self.kappa_values[uid] = {
                             'books': sharpe_data.get('books_realized', {bookId: None for bookId in book_ids}),
-                            'books_weighted': sharpe_data.get('books_weighted_realized', {bookId: 0.0 for bookId in book_ids}),
+                            'books_weighted': sharpe_data.get('books_weighted_realized', {bookId: None for bookId in book_ids}),
                             'total': sharpe_data.get('total_realized'),
                             'average': sharpe_data.get('average_realized'),
                             'median': sharpe_data.get('median_realized'),

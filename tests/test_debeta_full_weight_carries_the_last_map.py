@@ -75,7 +75,7 @@ def test_with_nothing_to_carry_the_zero_cycle_is_still_an_error(monkeypatch):
 def test_an_exception_at_full_weight_also_carries(monkeypatch):
     lines = _logged(monkeypatch)
     monkeypatch.setattr(reward.bt.logging, "exception", lambda *a, **k: None)
-    monkeypatch.setattr(reward, "book_alphas_from_drift", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(reward, "book_alphas_by_book", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     v = _validator(1.0)
     v._debeta_last = {"scores": {1: 0.8}, "detail": {}, "floor": 0.1, "w_make": 0.3, "ts": time.time()}
     assert reward.compute_debeta_scores(v) == {1: 0.8}

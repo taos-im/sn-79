@@ -29,7 +29,7 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_from_drift, median_abs_floor,
+from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, median_abs_floor, traded_book_alphas,
                                       debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
@@ -395,9 +395,19 @@ def calculate_kappa_score(
     for book_id in normalized_kappas.keys():
         activity_factor = activity_factors_uid[book_id]
         pnl_factor = pnl_factors_uid[book_id]
-        combined_factor = activity_factor * pnl_factor
-        
         norm_kappa = normalized_kappas[book_id]
+
+        # A factor of exactly 0.0 is the never-observed marker a book keeps until one of its round
+        # trips is seen inside the latest sampling bucket at a scoring tick. A book that carries a
+        # kappa has realized round trips inside the lookback, so it is active by definition; the
+        # marker survives only when scoring paused across a bucket (a validator restart), and left
+        # in place it would weight a real kappa to the worst possible value. Seed it at neutral and
+        # persist it, so the book is scored on its kappa and later ticks treat it like any other.
+        if norm_kappa is not None and activity_factor == 0.0:
+            activity_factor = 1.0
+            activity_factors_uid[book_id] = 1.0
+
+        combined_factor = activity_factor * pnl_factor
         
         if norm_kappa is None:
             # No Kappa data for this book (insufficient trading history)
@@ -1131,17 +1141,19 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     try:
         # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
         # full-run p_last-p_first. Equals book_alphas_from_mtm over a non-pruned run (asserted in tests).
-        alphas = book_alphas_from_drift(
-            getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
-            getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
+        # The pool for the skill leg and its floor: the books each uid FILLED inside the window. The
+        # accumulators also carry every book a uid merely holds a position on, and a static holder's
+        # alpha is exactly zero by the invariant; on a long-running validator those pairs are half
+        # of all pairs and a floor over every pair collapses to a rounding residue. The capture maps
+        # are pruned on the same clock and hold exactly the fill pairs (traded_book_alphas).
+        self.debeta_alphas_by_book = traded_book_alphas(
+            book_alphas_by_book(
+                getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
+                getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
+            ),
+            getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {},
         )
-        # Book identity is discarded by book_alphas_from_drift (it returns a LIST per uid), so
-        # rebuild the keyed form for the per-book dashboard gauges. Same inputs and values; only
-        # the keys survive. Cheap: it is the dict the list was built from.
-        self.debeta_alphas_by_book = book_alphas_by_book(
-            getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
-            getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
-        )
+        alphas = {uid: list(by_book.values()) for uid, by_book in self.debeta_alphas_by_book.items()}
         floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
         p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
         cp = {int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()} if p11_strength > 0 else None

@@ -1053,7 +1053,7 @@ class SimulationEngine(MarketEngine):
             v.kappa_values = {
                 uid: {
                     'books': {bookId: None for bookId in range(book_count)},
-                    'books_weighted': {bookId: 0.0 for bookId in range(book_count)},
+                    'books_weighted': {bookId: None for bookId in range(book_count)},
                     'total': None, 'average': None, 'median': None,
                     'normalized_average': 0.0, 'normalized_median': 0.0,
                     'normalized_total': 0.0,
