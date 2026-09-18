@@ -51,6 +51,8 @@ def test_no_default_record_fills_the_weighted_map_with_zero():
                root.parent / "neurons" / "validator.py"]
     offenders = []
     for path in sources:
+        if not path.exists():           # the published tree carries only the simulation engine
+            continue
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if "books_weighted" in line and re.search(r":\s*0\.0\s+for\s", line):
                 offenders.append(f"{path.name}:{lineno}")

@@ -108,6 +108,14 @@ def _read_first_and_last_nonempty(path: str, tail_chunk: int = 131072) -> tuple[
     return first, None
 
 
+# How long one receive waits before it counts as silence, and how many consecutive silences
+# mean the queue we hold is dead rather than merely quiet. 30s x 2 = re-attach after a minute:
+# far longer than any normal gap between sim steps, so ordinary quiet never triggers it, and
+# short enough that a restart on the engine side cannot strand this end for longer than that.
+_MQ_RECV_TIMEOUT_S = 30
+_MQ_REATTACH_AFTER = 2
+
+
 class SimulationEngine(MarketEngine):
 
     """The simulation-mechanism engine: drives the C++ simulator and consumes its events.
@@ -1349,9 +1357,53 @@ class SimulationEngine(MarketEngine):
         _mq_done = [0.0]
 
         def _mq_recv():
-            _r = self._req_socket.receive()
-            _mq_done[0] = time.time()
-            return _r
+            # RE-ATTACH TO THE QUEUE WHEN THE ENGINE HAS RECREATED IT.
+            #
+            # The engine UNLINKS this queue when it stops (ipc/PosixMessageQueue.cpp:47) and creates a
+            # fresh one on start. Our descriptor keeps the OLD queue object alive -- it still exists,
+            # nothing will ever write to it again -- so an unbounded receive() here blocks forever and
+            # the validator sits healthy-looking and deaf: it goes on reporting the simulator online
+            # while issuing no query rounds at all, and only a validator restart clears it.
+            #
+            # Restarting the ENGINE cannot fix this and makes it worse: it unlinks and recreates the
+            # queue again, so the stranded descriptor misses the new one too. The peer that must
+            # reconnect is this one. Re-opening by name attaches to whatever queue currently owns it,
+            # which is exactly the re-pairing that a validator restart was achieving by brute force.
+            #
+            # Bounded by consecutive silence rather than a single timeout, because a quiet interval is
+            # normal between sim steps and re-opening on every lull would be churn. Re-open is
+            # idempotent: O_CREAT on an existing name just opens it.
+            import posix_ipc as _pi
+            _misses = 0
+            while True:
+                try:
+                    _r = self._req_socket.receive(timeout=_MQ_RECV_TIMEOUT_S)
+                    _mq_done[0] = time.time()
+                    return _r
+                except _pi.BusyError:
+                    _misses += 1
+                    if _misses < _MQ_REATTACH_AFTER:
+                        continue
+                    _misses = 0
+                    try:
+                        self._req_socket.close()
+                    except Exception:
+                        pass
+                    try:
+                        self._req_socket = _pi.MessageQueue(
+                            "/taosim-req",
+                            flags=_pi.O_CREAT,
+                            max_messages=1,
+                            max_message_size=8,
+                        )
+                        logger.warning(
+                            "No state for %ss on /taosim-req: re-opened the queue in case the engine "
+                            "restarted and unlinked the one we held",
+                            _MQ_RECV_TIMEOUT_S * _MQ_REATTACH_AFTER,
+                        )
+                    except Exception as _reattach_ex:
+                        logger.error("Could not re-open /taosim-req: %r", _reattach_ex)
+                        raise
 
         msg, _ = await loop.run_in_executor(None, _mq_recv)
         _t_resume = time.time()

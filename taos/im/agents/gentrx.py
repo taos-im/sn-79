@@ -169,8 +169,8 @@ def group_assignments_by_shard(assignments):
     mechanism, which is what it was written for. Under dual-mechanism SN79 the two validators serve
     DIFFERENT shards, and each assignment's data keys live under its own bucket_prefix -- so the
     merge trains a single model on both shards' data and publishes it to whichever shard was learned
-    last. Observed with both mechanisms live: "assignments: 2 validator(s), round=5237
-    ... data=5 files total", two shard lines in the same tick, one gradient.
+    last. With both mechanisms live the log reads "assignments: 2 validator(s), round=5237
+    ... data=5 files total": two shard lines in the same tick, one gradient.
     """
     groups: dict[str, list[dict]] = {}
     for a in assignments or []:
@@ -1750,8 +1750,8 @@ class GenTRXAgent(FinanceAgent):
         #
         #   - the merge concatenated data keys across shards, so a single gradient was trained on
         #     simulation AND exchange data and published to whichever shard was learned last.
-        #     Observed with both mechanisms live: "2 validator(s), round=5237 ... data=5
-        #     files total", two shard lines in one tick, one gradient uploaded.
+        #     With both mechanisms live the log reads "2 validator(s), round=5237 ... data=5
+        #     files total": two shard lines in one tick, one gradient uploaded.
         #   - the round filter takes one max() over a round number each validator counts
         #     INDEPENDENTLY, so a mechanism a round behind had its whole assignment dropped as stale.
         #

@@ -189,7 +189,7 @@ def test_calculate_kappa_score_present_uid_with_no_books_is_zero():
     max_inactive_books is int(ratio*0)==0, and 0 <= 0 takes the "ignore inactive books"
     branch with an EMPTY books_with_scores -> data == np.array([]). np.percentile then
     raises IndexError, and guarding only the penalty would leave np.median([]) == nan to
-    propagate into the weights. Observed on a live exchange-mode validator: repeated
+    propagate into the weights. On an exchange-mode validator the symptom is repeated
     "Rewarding failed: index -1 is out of bounds for axis 0 with size 0".
     """
     uid = 3

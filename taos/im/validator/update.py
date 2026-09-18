@@ -450,7 +450,19 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
                 "pm2", "start", "--no-autorestart", "--name=simulator",
                 "../build/src/cpp/taosim -c latest"
             ]
-            
+
+            # STAMP THE RESTART BEFORE ATTEMPTING IT, so the health check two lines below judges this
+            # engine by its own age rather than by a start_time belonging to the previous episode.
+            #
+            # `check_simulator` is called after a 2s sleep to decide whether the resume worked, and no
+            # engine has delivered a state update 2s in. Its "no state yet" grace is anchored on
+            # self.start_time, which is refreshed only when a state EVENT arrives carrying a new
+            # episode -- so at this moment it still holds the OLD episode's start, the grace reads as
+            # long expired, the resume is judged unhealthy, and control falls through to
+            # "Falling back to new simulation" -- a COLD START that discards the episode the resume
+            # had just correctly restored, losing the accumulated state and the run's continuity.
+            self._sim_restart_at = time.time()
+
             bt.logging.info(f"ATTEMPTING TO RESUME SIMULATOR FROM CHECKPOINT: {' '.join(resume_cmd)}")
             resume_result = subprocess.run(
                 resume_cmd, 
@@ -536,7 +548,30 @@ def check_exchange(self: Validator) -> bool:
         bool: True if the exchange/simulator process is alive, False otherwise.
     """
     try:
-        if not self.last_state_time or self.last_state_time >= time.time() - 300:
+        # "NEVER SEEN A STATE" IS NOT HEALTHY ONCE THE GRACE HAS PASSED.
+        #
+        # engines/simulation.py sets `v.last_state_time = None` on every engine restart or
+        # reconnect, so `not self.last_state_time` is the NORMAL state immediately after a restart --
+        # and returning True for it unconditionally means the one condition this monitor exists to
+        # catch is the one it can never see: the validator goes on logging "Simulator online!" every
+        # 300s while issuing zero query rounds, and only a manual restart recovers it.
+        #
+        # Grace is measured from start_time, which simulation.py refreshes in the same handler that
+        # clears last_state_time, so it means "since this episode began" rather than "since the
+        # process started".
+        if not self.last_state_time:
+            # ANCHOR THE GRACE ON WHICHEVER HAPPENED LATER: the episode start, or the last time we
+            # restarted the engine ourselves. start_time alone is wrong immediately after a restart --
+            # it is refreshed only when a state EVENT arrives with a new episode, so a freshly resumed
+            # engine is judged against the PREVIOUS episode's clock, reads as long past its grace, and
+            # is declared unhealthy seconds after a perfectly good resume. restart_simulator then
+            # treats that verdict as "the resume failed" and cold-starts instead.
+            _ref = max(getattr(self, "start_time", None) or 0,
+                       getattr(self, "_sim_restart_at", None) or 0)
+            # 300s, matching the recency rule below. A literal rather than an env read: `os` is not
+            # imported in this module, and a NameError here would fire inside the health check itself.
+            return (time.time() - _ref) < 300
+        if self.last_state_time >= time.time() - 300:
             return True
         try:
             pm2_result = subprocess.run(
@@ -593,7 +628,30 @@ def check_simulator(self : Validator) -> bool:
         return check_exchange(self)
 
     try:
-        if not self.last_state_time or self.last_state_time >= time.time() - 300:
+        # "NEVER SEEN A STATE" IS NOT HEALTHY ONCE THE GRACE HAS PASSED.
+        #
+        # engines/simulation.py sets `v.last_state_time = None` on every engine restart or
+        # reconnect, so `not self.last_state_time` is the NORMAL state immediately after a restart --
+        # and returning True for it unconditionally means the one condition this monitor exists to
+        # catch is the one it can never see: the validator goes on logging "Simulator online!" every
+        # 300s while issuing zero query rounds, and only a manual restart recovers it.
+        #
+        # Grace is measured from start_time, which simulation.py refreshes in the same handler that
+        # clears last_state_time, so it means "since this episode began" rather than "since the
+        # process started".
+        if not self.last_state_time:
+            # ANCHOR THE GRACE ON WHICHEVER HAPPENED LATER: the episode start, or the last time we
+            # restarted the engine ourselves. start_time alone is wrong immediately after a restart --
+            # it is refreshed only when a state EVENT arrives with a new episode, so a freshly resumed
+            # engine is judged against the PREVIOUS episode's clock, reads as long past its grace, and
+            # is declared unhealthy seconds after a perfectly good resume. restart_simulator then
+            # treats that verdict as "the resume failed" and cold-starts instead.
+            _ref = max(getattr(self, "start_time", None) or 0,
+                       getattr(self, "_sim_restart_at", None) or 0)
+            # 300s, matching the recency rule below. A literal rather than an env read: `os` is not
+            # imported in this module, and a NameError here would fire inside the health check itself.
+            return (time.time() - _ref) < 300
+        if self.last_state_time >= time.time() - 300:
             return True
         try:
             pm2_result = subprocess.run(

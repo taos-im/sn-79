@@ -41,6 +41,13 @@ class ExchangeConfig(BaseModel):
     response_timeout:     float = 60.0
     max_response_retries: int   = 3
 
+    @property
+    def book_ids(self) -> list[int]:
+        """The book ids of this exchange run, dense: the same surface MarketSimulationConfig and
+        MultiAssetSimulationConfig expose, so FinanceAgentBase.update iterates one attribute
+        whichever config class the state carries."""
+        return list(range(self.book_count))
+
     def label(self) -> str:
         """Human-readable label for this book's parameters."""
         return "exchange"

@@ -154,8 +154,8 @@ class RandomTakerAgent(GenTRXAgent):
         # shared deadline therefore breaks the simulation half completely -- the first
         # exchange response sets the next-trade time to a wall-clock instant that sim
         # time never reaches, and every later simulation query returns no instructions
-        # for the life of the process. Observed: 16h of exchange trades
-        # against zero simulation instructions.
+        # for the life of the process: the agent goes on trading one mechanism while the other
+        # receives no instructions at all.
         _ts = int(getattr(state, 'timestamp', 0) or 0)
         _slot = 'exchange' if response.exchange_mode else 'simulation'
         if not hasattr(self, '_next_trade_ts') or not isinstance(self._next_trade_ts, dict):

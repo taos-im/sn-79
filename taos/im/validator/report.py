@@ -1375,8 +1375,9 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'pnl_factor': pnl_factor,
                 # .get, never []: a stub entry (a uid kappa-3 could not score while the de-beta weight is
                 # nonzero) carried no median, and the KeyError killed the whole report worker every cycle.
-                # Observed at a nonzero rung: validator gauges kept publishing, every miner,
-                # book and simulation gauge froze, and nothing named the report as the cause.
+                # At a nonzero rung the failure is near-silent: validator gauges keep publishing
+                # while every miner, book and simulation gauge freezes, and nothing names the
+                # report worker as the cause.
                 'kappa': kappa_values.get('median') if kappa_values else None,
                 'kappa_penalty': kappa_values.get('penalty') if kappa_values else None,
                 'activity_weighted_normalized_median': kappa_values.get('activity_weighted_normalized_median') if kappa_values else None,
@@ -1838,6 +1839,9 @@ async def report(self: ReportingService) -> None:
                                     f"metrics: skipping a miner trade with no fee field (role {role})"
                                 )
                                 continue
+                            # The other party's agent id; background flow carries a negative id, so the
+                            # dashboard can show it as market rather than as a miner.
+                            counterparty = miner_trade.takerAgentId if role == 'maker' else miner_trade.makerAgentId
                             for name, val in (
                                 ("timestamp", _ts / 1e9),
                                 ("price", miner_trade.price),
@@ -1845,6 +1849,7 @@ async def report(self: ReportingService) -> None:
                                 ("fee", fee),
                                 ("side", side),
                                 ("role", 1 if role == 'taker' else 0),
+                                ("counterparty", counterparty),
                             ):
                                 updates.append((self.prometheus_miner_trades, val,
                                     wallet_addr, netuid, simid, miner_trade.bookId, uid, slot, name))

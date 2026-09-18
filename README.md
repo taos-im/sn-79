@@ -9,12 +9,12 @@
 
 - **τaos**: agent-based simulation of automated trading strategies in intelligent markets, incentivising risk-managed, high-quality market participation
 - **GenTRX**: distributed training of a shared order-book generative model, built on top of τaos simulation data (and future exchange data)
-- **MVTRX Exchange**: off-chain limit order book exchange for Bittensor alpha tokens at [mvtrx.exchange](https://mvtrx.exchange), running the same C++ matching engine as the simulation. This release provides the tools and documentation to build and test agents against a **localnet** exchange; the mainnet exchange mechanism is a later release (see [Exchange](#exchange))
+- **MVTRX Exchange**: off-chain limit order book exchange for Bittensor alpha tokens at [mvtrx.ai](https://mvtrx.ai), running the same C++ matching engine as the simulation. This release provides the tools and documentation to build and test agents against a **localnet** exchange; the mainnet exchange mechanism is a later release (see [Exchange](#exchange))
 
 [![Website](https://img.shields.io/badge/website-black?logo=googlechrome
 )](https://mvtrx.fi)
 [![Exchange UI](https://img.shields.io/badge/exchange-black?logo=googlechrome
-)](https://mvtrx.exchange)
+)](https://mvtrx.ai)
 [![Grafana](https://img.shields.io/badge/grafana-white?logo=grafana
 )](https://taos.simulate.trading)
 [![Simulation Terminal](https://img.shields.io/badge/dashboard-white?logo=grafana
@@ -174,7 +174,7 @@ Miners participating in GenTRX distributed training define their agent by subcla
 ## Exchange <span id="exchange"><span>
 
 **MVTRX Exchange** is a live off-chain limit order book exchange for Bittensor alpha tokens, running at
-[mvtrx.exchange](https://mvtrx.exchange). It uses the same C++ matching engine as the τaos simulation, so
+[mvtrx.ai](https://mvtrx.ai). It uses the same C++ matching engine as the τaos simulation, so
 an agent written against the simulation is written against the exchange too.
 
 **What this release gives you.** 0.6.0 ships the agent interface, the wire protocol and the documentation
@@ -211,7 +211,7 @@ aliases of `BASE`/`QUOTE`).
 | Writing an exchange agent | [agents/README.md](agents/README.md), section "Exchange venue behaviours that catch people out" |
 | Migrating an existing agent | [agents/MIGRATION_0.6.0.md](agents/MIGRATION_0.6.0.md) |
 | Full agent guide | [agents/README.md](agents/README.md) |
-| Exchange UI | [mvtrx.exchange](https://mvtrx.exchange) |
+| Exchange UI | [mvtrx.ai](https://mvtrx.ai) |
 | Market data and terminal | [mvtrx.fi](https://mvtrx.fi) |
 
 ---

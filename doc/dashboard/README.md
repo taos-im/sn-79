@@ -501,6 +501,8 @@ The Trades table sits to the right of the agent info at the top of the page and 
 
 - **Role** - The role of the selected agent in the trade, either maker (providing liquidity with passive order) or taker (taking liquidity with aggressive order).
 
+- **Counterparty** - UID of the agent on the other side of the trade, or `BG` when the other side was a background agent.  Clicking a UID here opens the Agent page for that agent.
+
 - **Fee (QUOTE)** - Fee charged to or rebate earned in the trade by the selected agent.
 
 - **Validator** - Hotkey of the validator in whose simulation the trade took place.

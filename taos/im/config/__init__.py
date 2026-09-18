@@ -147,7 +147,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.kappa.weight",
         type=float,
         help="Weight applied to Kappa evaluation in final score calculation",
-        default=0.5925,
+        default=0.395,
     )
 
     parser.add_argument(
@@ -210,7 +210,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.pnl.weight",
         type=float,
         help="Weight applied to Realized PnL evaluation in final score calculation",
-        default=0.1575,
+        default=0.105,
     )
 
     parser.add_argument(
@@ -223,7 +223,7 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.weight",
         type=float,
-        default=0.25,
+        default=0.50,
         help="The de-beta component's share of the FLAT trading score: trading = kappa.weight*kappa + "
              "pnl.weight*pnl + debeta.weight*debeta, the three weights validated to sum to 1 at init. "
              "Default is the current ladder rung (see the kappa.weight comment). At 0.0 emissions are "
@@ -253,9 +253,9 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.w_make",
         type=float,
         help="De-beta operator dial: weight on the making (liquidity) rank vs (1-w_make) on the "
-             "drift-stripped skill rank. Conservative launch weight 0.30 (skill-led); raise toward "
-             "0.50-0.65 to emphasise liquidity provision.",
-        default=0.30,
+             "drift-stripped skill rank. Launched at 0.30 (skill-led); 0.50 from the second rung of the "
+             "ladder so the liquidity leg carries the weight added at that rung.",
+        default=0.50,
     )
 
     parser.add_argument(

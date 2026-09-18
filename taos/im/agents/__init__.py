@@ -751,9 +751,9 @@ class FinanceAgentBase(SimulationAgent):
     def simulation_output_dir(self, state : MarketSimulationStateUpdate | ExchangeStateUpdate):
         # simulation_id is OPTIONAL on the model (`simulation_id : str | None = None`), so joining it
         # unguarded raises TypeError: join() argument must be str ... not 'NoneType' and takes the
-        # agent's whole respond() with it. Observed: an agent raised this on every state
-        # update and logged it roughly every 2.5s, which reads downstream as the agent seeing no
-        # updates at all -- a crash in a path shared by every GenTRX agent, reported as silence.
+        # agent's whole respond() with it. Unguarded it fires on every state update, in a path
+        # shared by every GenTRX agent, and downstream that reads as the agent seeing no updates at
+        # all: a crash reported as silence.
         #
         # A missing id is a real gap (it is what keeps one run's data out of another's directory), so
         # this does not paper over it: it names the state type and the netuid in the label, and warns

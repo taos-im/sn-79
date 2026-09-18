@@ -3828,9 +3828,8 @@ if __name__ == "__main__":
         The validator's engine, chain and reconcile modules log through
         logging.getLogger(__name__): 242 call sites across 8 modules. bittensor installs
         its own logging stack and those records reach none of it, so every one of those
-        diagnostics was discarded. Observed: build_reconciliation logs
-        unconditionally at INFO on each reconciliation cycle, yet across three hours and
-        ten settled trades it appeared zero times in the pm2 logs.
+        diagnostics was discarded. build_reconciliation logs unconditionally at INFO on
+        every reconciliation cycle, and none of those lines reach the process logs at all.
 
         That silence costs twice: it hides the state of a running validator, and it makes
         paths like the partial-fill remainder restore unobservable exactly when they need
