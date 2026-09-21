@@ -39,6 +39,8 @@ SHADOW_PARITY_NS = int(os.environ.get("SHADOW_PARITY_NS", "10000000000"))
 # re-INIT only stalls main for the snapshot: the service suspends itself and main scores in-process
 # until the validator restarts. 0 disables. A storm of re-INITs inside the window, none of which
 # holds parity, is the signature this breaker exists for.
+# The side queue's cap, matching the pre-INIT queue's 64. Both hold whole rounds of raw state.
+SHADOW_SIDE_BUFFER_MAX = int(os.environ.get("SHADOW_SIDE_BUFFER_MAX", "64"))
 SHADOW_REINIT_STORM_N = int(os.environ.get("SHADOW_REINIT_STORM_N", "3"))
 SHADOW_REINIT_STORM_S = float(os.environ.get("SHADOW_REINIT_STORM_S", "900"))
 # Cutover VERIFY (main recomputes every SCORING_PROC_VERIFY_EVERY-th boundary and cross-checks the
@@ -554,6 +556,37 @@ def _shadow_child_main(sock, cores, parity_ns):
         init_parts = {}
         buffered = []       # pre-INIT state frames
         side_buffer = []    # states arriving while awaiting a score_at
+
+        def _side_push(ts, raw):
+            """Queue a frame that arrived while a score was awaited, BOUNDED.
+
+            This queue had no cap while its sibling `buffered` has had one all along, and both hold
+            the same thing: whole rounds of raw state, megabytes each. A scoring round that stalls
+            therefore accumulated them until the box noticed -- which is the validator-restart memory
+            spike long blamed on the metagraph sync worker, a child that ships a 0.16MB pickle and
+            peaks around 125MB.
+
+            A DROP IS NOT FREE, and it is not the same as the pre-INIT queue's drop. State frames are
+            applied CUMULATIVELY -- apply_state_bytes advances shadow.step and accumulates trade
+            volumes -- so a dropped frame leaves this shadow permanently short of a round and it
+            diverges from main from that point on. `buffered` can drop safely because those frames
+            precede INIT and the INIT snapshot supersedes them; these do not.
+
+            The divergence is caught rather than hidden: the parent's parity check sees the mismatch
+            and calls request_reinit(), and the shadow rebuilds from a fresh INIT. That is the
+            system's own self-heal path, and it is why this cap can be a drop at all. It is expensive,
+            and enough repeats trip the reinit storm breaker, which suspends the shadow until the
+            validator restarts -- so the cap is set high enough to fire only in genuine pathology, not
+            in the ordinary course of a slow round.
+            """
+            side_buffer.append((ts, raw))
+            if len(side_buffer) > SHADOW_SIDE_BUFFER_MAX:
+                print(
+                    f"[SHADOW] score overdue — dropping oldest of {len(side_buffer)} side-buffered "
+                    f"round(s); this shadow will diverge and re-INIT. Main scoring is unaffected.",
+                    flush=True,
+                )
+                side_buffer.pop(0)
         awaiting_score_at = None
         pending_score_inputs = {}   # eager inputs by boundary ts
         applied = 0
@@ -633,7 +666,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         if awaiting_score_at is None:
                             _apply_one(ts, raw)
                         else:
-                            side_buffer.append((ts, raw))
+                            _side_push(ts, raw)
                 continue
             if kind == "stop":
                 break
@@ -659,7 +692,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         _apply_one(ts, raw)
                         replayed += 1
                     elif ts > base_ts:
-                        side_buffer.append((ts, raw))
+                        _side_push(ts, raw)
                 buffered = []
                 print(f"[SHADOW] init applied base_ts={base_ts} (replayed {replayed} buffered rounds)", flush=True)
             elif kind == "state":
@@ -673,7 +706,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                 if ts <= base_ts:
                     continue
                 if awaiting_score_at is not None:
-                    side_buffer.append((ts, raw))
+                    _side_push(ts, raw)
                     continue
                 _apply_one(ts, raw)
             elif kind == "sim_start":
@@ -698,7 +731,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         if awaiting_score_at is None:
                             _apply_one(ts, raw)
                         else:
-                            side_buffer.append((ts, raw))
+                            _side_push(ts, raw)
                     print(f"[SHADOW] sim_start applied ({old_ts} -> {new_ts})", flush=True)
             elif kind == "resets":
                 if shadow is not None:
@@ -741,7 +774,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         if awaiting_score_at is None:
                             _apply_one(ts, raw)
                         else:
-                            side_buffer.append((ts, raw))
+                            _side_push(ts, raw)
                 else:
                     pending_score_inputs[s_ts] = (sim_ts, deregs, gtx_scores, gtx_ema,
                                                   t_ema, t_ema_n, t_ema_ts, absent)
@@ -768,7 +801,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         if awaiting_score_at is None:
                             _apply_one(ts, raw)
                         else:
-                            side_buffer.append((ts, raw))
+                            _side_push(ts, raw)
             _maybe_save()
     except (EOFError, OSError):
         pass

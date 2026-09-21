@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 import asyncio
+import time
+from concurrent.futures import TimeoutError as FuturesTimeout
 import traceback
 import subprocess
 from typing import TYPE_CHECKING
@@ -274,6 +276,19 @@ def cleanup_executors(self: Validator):
     bt.logging.info("Executor cleanup complete")
 
 
+# The push tasks are named rather than imported, so this module keeps no reference back to the
+# validator module. Kept in step with validator.PUSH_TASK_NAME by
+# tests/test_a_stopping_validator_finishes_the_block_it_built.py.
+PUSH_TASK_NAME = "mvtrx-push"
+# One block of state is worth a few seconds of shutdown and no more: past that the data is stale and
+# a push that has not completed is not going to.
+PUSH_DRAIN_TIMEOUT_S = 10.0
+# Cancellation is cooperative: a task that swallows CancelledError would hold shutdown open forever,
+# so both waits are bounded and say so rather than hanging.
+PENDING_CANCEL_TIMEOUT_S = 10.0
+LOOP_STOP_TIMEOUT_S = 5.0
+
+
 def cleanup_event_loop(self: Validator):
     """
     Gracefully shuts down the main event loop and any pending tasks.
@@ -291,18 +306,96 @@ def cleanup_event_loop(self: Validator):
         if hasattr(self, 'main_loop') and self.main_loop and not self.main_loop.is_closed():
             bt.logging.info("Shutting down main event loop...")
 
+            # FINISH THE BLOCK BEFORE CANCELLING THE LOOPS.
+            #
+            # Cancelling is right for the long-lived tasks: the query service, the reporting service
+            # and the metagraph sync all exist to be stopped. It is wrong for a detached state push,
+            # which is one block of data already built and already on its way. Cancel it and its
+            # trades never reach the tape, while the service has already written the same fills down
+            # its per-fill path -- so the fills read as floating free of a tape that was simply never
+            # sent. The losses cluster in the minutes that contain a validator restart, which is
+            # what separates this from a steady-state ingest fault.
+            _pushes = [t for t in asyncio.all_tasks(self.main_loop)
+                       if not t.done() and (t.get_name() or "").startswith(PUSH_TASK_NAME)]
+            if _pushes:
+                bt.logging.info(
+                    f"Waiting up to {PUSH_DRAIN_TIMEOUT_S:.0f}s for {len(_pushes)} in-flight "
+                    f"state push(es) so their blocks are not discarded..."
+                )
+                try:
+                    # ACROSS A THREAD, because the loop belongs to another one. main_loop runs in its
+                    # own daemon thread and this cleanup is called from a different thread, so
+                    # run_until_complete raises "this event loop is already running" without waiting
+                    # for anything -- the drain then logs a warning and the block is cancelled anyway,
+                    # which is the outcome it exists to prevent. run_coroutine_threadsafe hands the
+                    # wait to the loop that owns these tasks and blocks this thread for its result.
+                    if self.main_loop.is_running():
+                        _fut = asyncio.run_coroutine_threadsafe(
+                            asyncio.wait(_pushes, timeout=PUSH_DRAIN_TIMEOUT_S), self.main_loop
+                        )
+                        # A margin over the inner timeout, so the bound that reports which pushes were
+                        # left is the inner one rather than this.
+                        _done, _left = _fut.result(timeout=PUSH_DRAIN_TIMEOUT_S + 5)
+                    else:
+                        _done, _left = self.main_loop.run_until_complete(
+                            asyncio.wait(_pushes, timeout=PUSH_DRAIN_TIMEOUT_S)
+                        )
+                    if _left:
+                        bt.logging.warning(
+                            f"{len(_left)} state push(es) did not finish within "
+                            f"{PUSH_DRAIN_TIMEOUT_S:.0f}s; their blocks are NOT ingested"
+                        )
+                    else:
+                        bt.logging.info("All in-flight state pushes completed before shutdown")
+                except Exception as ex:
+                    bt.logging.warning(f"Could not drain in-flight state pushes: {ex!r}")
+
             pending = asyncio.all_tasks(self.main_loop)
+            _threaded = self.main_loop.is_running()
             if pending:
                 bt.logging.info(f"Cancelling {len(pending)} pending tasks...")
-                for task in pending:
-                    task.cancel()
+                # EVERY STEP CROSSES A THREAD, for the reason the drain above already gives.
+                # Task.cancel() from a foreign thread is not safe, and the gather cannot be driven
+                # with run_until_complete on a loop that is already running -- it raised, so the
+                # cancellations were never awaited and the two statements below never ran. Shutdown
+                # ended in an error with the loop still open, surviving only because its thread is a
+                # daemon and the process was exiting regardless.
+                if _threaded:
+                    for task in pending:
+                        self.main_loop.call_soon_threadsafe(task.cancel)
+                    # BUILT ON THE LOOP'S OWN THREAD. gather() returns a Future, not a coroutine,
+                    # and constructing it here would bind it to whatever loop this thread has --
+                    # which is not the one holding these tasks. So the gather happens inside a
+                    # coroutine that run_coroutine_threadsafe schedules on the right loop.
+                    async def _await_cancelled(_tasks=tuple(pending)):
+                        await asyncio.gather(*_tasks, return_exceptions=True)
 
-                self.main_loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _await_cancelled(), self.main_loop
+                        ).result(timeout=PENDING_CANCEL_TIMEOUT_S)
+                    except FuturesTimeout:
+                        bt.logging.warning(
+                            f"{len(pending)} task(s) did not finish cancelling within "
+                            f"{PENDING_CANCEL_TIMEOUT_S:.0f}s; closing anyway"
+                        )
+                else:
+                    for task in pending:
+                        task.cancel()
+                    self.main_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
 
             if self.main_loop.is_running():
-                self.main_loop.stop()
+                # stop() is not thread-safe either, and close() on a loop that has not finished
+                # stopping raises. Ask the loop to stop, then wait for it to actually be stopped.
+                self.main_loop.call_soon_threadsafe(self.main_loop.stop)
+                _deadline = time.time() + LOOP_STOP_TIMEOUT_S
+                while self.main_loop.is_running() and time.time() < _deadline:
+                    time.sleep(0.02)
+                if self.main_loop.is_running():
+                    bt.logging.warning("Main event loop did not stop; leaving it open rather than closing it")
+                    return
 
             self.main_loop.close()
             bt.logging.info("Main event loop shut down successfully")

@@ -217,6 +217,44 @@ if __name__ != "__mp_main__":
             return
         await _push(payload, url)
 
+    # A DETACHED PUSH THAT NOTHING HOLDS CAN BE COLLECTED BEFORE IT SENDS.
+    #
+    # asyncio.create_task returns the only strong reference to the task; the running loop keeps a weak
+    # one. Discard the return value and an UNFINISHED task becomes eligible for garbage collection, at
+    # which point the push never happens -- no exception, no log line, nothing to find afterwards. This
+    # repo's own standard says so: "Background tasks: always keep a strong ref. Pattern in
+    # service/main.py:_spawn_bg (set + add_done_callback(set.discard))".
+    #
+    # The state pushes are the worst case for it. _build_sim_push_payload spends 7-11s in an executor
+    # before anything is sent, so on every tick the task sits alive, unreferenced and collectable for
+    # seconds rather than microseconds.
+    #
+    # The consequence is visible on the tape: agent_fills holds the fill (written per notice, down a
+    # different path) while trades never receives the block, so the fill reads as floating free of the
+    # tape. The signature is a loss rate that is roughly uniform across books irrespective of their
+    # activity, which is what whole pushes disappearing looks like; a per-book cause would not be
+    # uniform, and the ingest POSTs that DO arrive all return 200.
+    _PUSH_TASKS: set = set()
+    # NAMED, SO SHUTDOWN CAN TELL A BLOCK IN FLIGHT FROM A LOOP THAT SHOULD BE CANCELLED.
+    # cleanup_event_loop cancels every pending task, which is correct for the query, reporting and
+    # metagraph loops and wrong for a POST that is already built: nothing will send that block again.
+    # A name travels with the task and needs no import, so cleanup.py stays free of a cycle back here.
+    PUSH_TASK_NAME = "mvtrx-push"
+
+    def _spawn_push(coro):
+        """Schedule a detached push and hold a strong reference to it until it finishes."""
+        _t = asyncio.ensure_future(coro)
+        try:
+            _t.set_name(PUSH_TASK_NAME)
+        except AttributeError:
+            pass
+        _PUSH_TASKS.add(_t)
+        # Discard on completion so the set cannot grow without bound, and retrieve the exception so a
+        # failed push is not reported later as "Task exception was never retrieved".
+        _t.add_done_callback(_PUSH_TASKS.discard)
+        _t.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return _t
+
     class Validator(BaseValidatorNeuron):
         """
         Intelligent market simulation validator implementation.
@@ -3260,7 +3298,7 @@ if __name__ != "__mp_main__":
                 _pending_recon = dict(getattr(self.engine, '_pending_ingest_reconciliation', None) or {})
                 if _pending_recon:
                     self.engine._pending_ingest_reconciliation = {}
-                asyncio.create_task(_push_mvtrx({
+                _spawn_push(_push_mvtrx({
                     "mode":                "exchange",
                     "network":             getattr(getattr(self.config, 'exchange', None), 'network', '') or '',
                     "timestamp":           int(time.time() * 1e9),
@@ -3323,7 +3361,7 @@ if __name__ != "__mp_main__":
                     or getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')
                 )
                 if _push_url:
-                    asyncio.create_task(self._push_sim_state_bg(state, _push_url))
+                    _spawn_push(self._push_sim_state_bg(state, _push_url))
 
             # GenTRX: poll for round advance and deliver assignments after the
             # mining query completes. Round-check stays triggered per state
@@ -3458,7 +3496,7 @@ if __name__ != "__mp_main__":
                             f"open_orders={sum(_soo.values())} "
                             f"({time.time()-_t0:.2f}s)"
                         )
-                        asyncio.create_task(_push_mvtrx({
+                        _spawn_push(_push_mvtrx({
                             "mode":                "exchange",
                             "network":             getattr(getattr(self.config, 'exchange', None), 'network', '') or '',
                             "timestamp":           int(time.time() * 1e9),

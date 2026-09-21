@@ -53,6 +53,18 @@ async def _push_to_mvtrx_data_service(state_dict: dict, url: str) -> None:
 # (HTTP 503 = a scrape gap, not zeros) until the first publish, but never
 # indefinitely: after this many seconds we serve whatever we have so a validator
 # that genuinely never publishes can't wedge /metrics at 503 and hide the box.
+# GZIP OF THE PROMETHEUS EXPOSITION -- opt-in, read once here rather than at each server start.
+#
+# Level 6, not the library's default of 9: on Prometheus text the two land within a few percent of
+# each other on size while 9 costs several times the CPU, and that cost is paid on the event loop
+# that is serving the scrape. A level high enough to make the scrape slower than the transfer it
+# saves defeats the purpose.
+_METRICS_GZIP_ENABLED = os.environ.get("MVTRX_METRICS_GZIP", "0").strip().lower() in ("1", "true", "yes", "on")
+try:
+    _METRICS_GZIP_LEVEL = min(9, max(1, int(os.environ.get("MVTRX_METRICS_GZIP_LEVEL", "6"))))
+except ValueError:
+    _METRICS_GZIP_LEVEL = 6
+
 _EXPOSITION_WARMUP_MAX_SECONDS = 600
 
 
@@ -161,6 +173,18 @@ class ReportingService:
         thread so it shuts down automatically when the process exits.
         """
         app = FastAPI()
+        # OFF UNLESS ASKED FOR. Compressing the exposition trades CPU on the scrape path against
+        # transfer size, and whether that trade pays depends on how large the exposition is, how often
+        # it is scraped and what sits between the two -- none of which match between a development box
+        # and a production deployment. Where this was a problem it was resolved by giving the host more
+        # capacity, so the capability stays available rather than applied by default.
+        if _METRICS_GZIP_ENABLED:
+            from fastapi.middleware.gzip import GZipMiddleware
+
+            app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=_METRICS_GZIP_LEVEL)
+            bt.logging.info(
+                f"Prometheus exposition will be gzipped at level {_METRICS_GZIP_LEVEL}"
+            )
 
         def _warmup_response():
             # None => ready to serve; an empty 200 => still warming up. We return
@@ -1180,6 +1204,13 @@ def _set_if_changed_metric(gauge, value, **labels):
     if child._value.get() != value:
         child.set(value)
 
+def report_book_ids(validator_data: Dict):
+    """The books a report iterates: the run's id set when the caller supplies it, else the dense range.
+    A dense range on a sparse layout skips real books and visits phantom ones."""
+    ids = validator_data.get('book_ids')
+    return list(ids) if ids is not None else range(int(validator_data['book_count']))
+
+
 def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
     """
     Compute per-miner and per-book metrics from a snapshot of validator state.
@@ -1224,7 +1255,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         daily_volumes = {}
         for agentId in accounts.keys():
             daily_volumes[agentId] = {}
-            for bookId in range(validator_data['book_count']):
+            for bookId in report_book_ids(validator_data):
                 total_vol = volume_sums.get(agentId, {}).get(bookId, 0.0)
                 total_maker_vol = maker_volume_sums.get(agentId, {}).get(bookId, 0.0)
                 total_taker_vol = taker_volume_sums.get(agentId, {}).get(bookId, 0.0)
@@ -1239,7 +1270,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         daily_roundtrip_volumes = {}
         for agentId in accounts.keys():
             daily_roundtrip_volumes[agentId] = {}
-            for bookId in range(validator_data['book_count']):
+            for bookId in report_book_ids(validator_data):
                 roundtrip_vol = roundtrip_volume_sums.get(agentId, {}).get(bookId, 0.0)
                 daily_roundtrip_volumes[agentId][bookId] = roundtrip_vol
         
@@ -1644,6 +1675,7 @@ async def report(self: ReportingService) -> None:
             'debeta_scores': getattr(self, 'debeta_scores', {}) or {},
             'gentrx_scores': self.gentrx_scores,
             'book_count': self.simulation.book_count,
+            'book_ids': list(self.simulation.book_ids),
             'simulation_config': {
                 'volumeDecimals': self.simulation.volumeDecimals,
                 'baseDecimals': getattr(self.simulation, 'baseDecimals', self.simulation.volumeDecimals),
@@ -1698,7 +1730,7 @@ async def report(self: ReportingService) -> None:
         bt.logging.debug(f"Pre-extraction complete ({time.time()-extract_start:.4f}s)")
 
         for agentId, accounts in self.last_state.accounts.items():
-            initial_balance_publish_status = {bookId: False for bookId in range(self.simulation.book_count)}
+            initial_balance_publish_status = {bookId: False for bookId in self.simulation.book_ids}
             for bookId, _account in accounts.items():
                 if agentId in self.initial_balances and self.initial_balances[agentId][bookId]['BASE'] is not None and not self.initial_balances_published.get(agentId, False):
                     updates.append((agent_gauges, self.initial_balances[agentId][bookId]['BASE'],

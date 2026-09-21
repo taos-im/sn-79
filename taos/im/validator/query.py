@@ -293,7 +293,9 @@ class QueryService:
 
             book_ids = request_data.get('book_ids')
             engine_mode = request_data.get('engine_mode', 'simulation')
-            if engine_mode == 'exchange' and book_ids is not None:
+            # The id set is the authority in every mode: a run whose books are not 0..book_count-1 (exchange
+            # netuids, or a multi-book layout with gaps) would otherwise refuse real books and forward phantom ids.
+            if book_ids is not None:
                 valid_book_ids = set(book_ids)
                 def book_id_valid(bid): return bid in valid_book_ids
             else:
@@ -305,7 +307,7 @@ class QueryService:
                 volume_cap = round(capital_turnover_cap * miner_wealth, volume_decimals)
             volume_sums = request_data.get('volume_sums', {})
 
-            effective_book_ids = book_ids if (engine_mode == 'exchange' and book_ids is not None) else range(book_count)
+            effective_book_ids = book_ids if book_ids is not None else range(book_count)
             all_miner_volumes = {}
             for uid in synapses.keys():
                 if uid not in deregistered_uids:

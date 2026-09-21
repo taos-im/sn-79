@@ -214,9 +214,9 @@ The Trades table shows details of the latest 25 trades on each book:
 
 - **Book** - Order book identifier where the trade occurred.  Note that clicking on the book ID here will redirect to the Book details page for that orderbook.
 
-- **Taker** - Agent ID of the taker (the agent whose order removed liquidity).  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
+- **Taker** - Agent ID of the taker (the agent whose order removed liquidity), or `BG` when it was a background agent.  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
 
-- **Maker** - Agent ID of the maker (the agent whose order provided liquidity).  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
+- **Maker** - Agent ID of the maker (the agent whose order provided liquidity), or `BG` when it was a background agent.  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
 
 - **Side** - Direction of the taker's order (BUY or SELL).
 
@@ -363,9 +363,9 @@ The Trades table shows details of the latest 25 trades on each book:
 
 - **Time** - Simulation timestamp of when the trade was executed.
 
-- **Taker** - Agent ID of the taker (the agent whose order removed liquidity).  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
+- **Taker** - Agent ID of the taker (the agent whose order removed liquidity), or `BG` when it was a background agent.  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
 
-- **Maker** - Agent ID of the maker (the agent whose order provided liquidity).  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
+- **Maker** - Agent ID of the maker (the agent whose order provided liquidity), or `BG` when it was a background agent.  Note that clicking on the agent ID here will redirect to the Agent details page for that UID.
 
 - **Side** - Direction of the taker's order (BUY or SELL).
 
@@ -501,7 +501,7 @@ The Trades table sits to the right of the agent info at the top of the page and 
 
 - **Role** - The role of the selected agent in the trade, either maker (providing liquidity with passive order) or taker (taking liquidity with aggressive order).
 
-- **Counterparty** - UID of the agent on the other side of the trade, or `BG` when the other side was a background agent.  Clicking a UID here opens the Agent page for that agent.
+- **CP** - Counterparty: UID of the agent on the other side of the trade, or `BG` when the other side was a background agent.  Clicking a UID here opens the Agent page for that agent.
 
 - **Fee (QUOTE)** - Fee charged to or rebate earned in the trade by the selected agent.
 

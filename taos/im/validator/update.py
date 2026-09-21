@@ -13,6 +13,7 @@ import bittensor as bt
 
 from typing import Tuple
 
+import os
 import subprocess
 import psutil
 
@@ -446,10 +447,36 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
                 bt.logging.debug(f"EOF-checkpoint pre-check failed (will attempt resume anyway): {_eof_ex}")
 
         if not end:
-            resume_cmd = [
-                "pm2", "start", "--no-autorestart", "--name=simulator",
-                "../build/src/cpp/taosim -c latest"
-            ]
+            # THROUGH THE WRAPPER, AND WITH THE KILL TIMEOUT, because pm2 re-runs whatever is
+            # registered here verbatim for the rest of the box's life.
+            #
+            # A bare `taosim -c latest` replaces the entry run_mvtrx.sh installed, and takes two
+            # things with it. The one-shot cold-start marker is read by start_simulator.sh, so
+            # nothing that asks for a new simulation can be honoured once this has run -- the
+            # request is silently a resume. And pm2 SIGKILLs 1600ms after the signal by default,
+            # well before the engine reaches a barrier and writes its shutdown checkpoint, so every
+            # intended stop becomes a crash and leaves nothing clean to resume from.
+            #
+            # start_simulator.sh resumes when there is a checkpoint and opens a new simulation when
+            # there is not, which is the decision this line was trying to express in the first place.
+            # ONLY WHERE THE WRAPPER EXISTS. start_simulator.sh is not part of the public release,
+            # so a deployed validator has the engine binary and nothing to wrap it. Registering the
+            # wrapper unconditionally would make every restart out there run a script that is not
+            # there, and the engine would simply never come back -- breaking the one path this
+            # function exists to serve. Fall back to the binary, which is what those hosts had all
+            # along.
+            _run_dir = (self.repo_path / 'simulate' / 'trading' / 'run')
+            if (_run_dir / 'start_simulator.sh').exists():
+                _sim_cfg = os.environ.get('SIMULATION_CONFIG', 'simulation_0_acceptance')
+                resume_cmd = [
+                    "pm2", "start", "--no-autorestart", "--kill-timeout", "60000", "--name=simulator",
+                    f"bash start_simulator.sh {_sim_cfg}"
+                ]
+            else:
+                resume_cmd = [
+                    "pm2", "start", "--no-autorestart", "--kill-timeout", "60000", "--name=simulator",
+                    "../build/src/cpp/taosim -c latest"
+                ]
 
             # STAMP THE RESTART BEFORE ATTEMPTING IT, so the health check two lines below judges this
             # engine by its own age rather than by a start_time belonging to the previous episode.
@@ -614,6 +641,45 @@ def check_exchange(self: Validator) -> bool:
         return False
 
 
+# Remembered between calls so growth is measured across them, keyed by episode directory so a new
+# episode measures itself rather than inheriting the previous one's size.
+_ENGINE_PROGRESS: dict = {}
+
+
+def _engine_log_is_growing(self) -> bool:
+    """Is the engine still writing its episode log? Asked while it is too early to expect state.
+
+    Conservative on every uncertainty: an unreadable directory reads as healthy. A false unhealthy
+    kills a good engine and costs the whole episode; a false healthy only defers a restart by one
+    check interval.
+    """
+    try:
+        # A DEAD ENGINE IS UNHEALTHY AT ONCE, whatever its log looks like. Growth is the right
+        # question ONLY for a process that is still there: a crashed or stopped engine writes
+        # nothing, and waiting a whole check interval to notice would slow the production recovery
+        # this monitor exists to perform. So absence is decided first, and only then progress.
+        if not any(p.info["name"] == "taosim" for p in psutil.process_iter(["name"])):
+            return False
+        _dir = getattr(getattr(self, "simulation", None), "logDir", None)
+        if not _dir:
+            return True
+        _size = 0
+        for _entry in os.scandir(_dir):
+            try:
+                if _entry.is_file():
+                    _size += _entry.stat().st_size
+            except OSError:
+                pass
+        _prev_dir = _ENGINE_PROGRESS.get("dir")
+        _prev_size = _ENGINE_PROGRESS.get("size")
+        _ENGINE_PROGRESS["dir"], _ENGINE_PROGRESS["size"] = _dir, _size
+        if _prev_dir != _dir or _prev_size is None:
+            return True
+        return _size > _prev_size
+    except Exception:
+        return True
+
+
 def check_simulator(self : Validator) -> bool:
     """
     Check if the simulator (or exchange) process is still running.
@@ -650,7 +716,24 @@ def check_simulator(self : Validator) -> bool:
                        getattr(self, "_sim_restart_at", None) or 0)
             # 300s, matching the recency rule below. A literal rather than an env read: `os` is not
             # imported in this module, and a NameError here would fire inside the health check itself.
-            return (time.time() - _ref) < 300
+            if (time.time() - _ref) < 300:
+                return True
+            # PAST THE ALLOWANCE, ASK WHETHER IT IS WARMING UP OR WEDGED -- SILENCE ALONE CANNOT TELL.
+            #
+            # The engine publishes NO state during its grace period: SimulationManager gates the
+            # publish on warmingUp(), and CheckpointManager gates the checkpoint on the same thing.
+            # That period is 600 SIM-seconds, ten real minutes at 1x and far longer on a loaded box,
+            # so a flat wall-clock allowance condemns every cold-started simulation minutes before it
+            # could ever speak. restart_simulator reads that verdict as a failed resume and starts
+            # another, which dies the same way -- and since no checkpoint exists until grace ends,
+            # none of them is ever resumable, so each restart cold-starts again.
+            #
+            # Left alone, this repeats: each restart cold-starts, dies at the same point, and the run
+            # never advances -- while every log line says the engine was restarted successfully.
+            #
+            # A warming engine is not silent on disk -- it writes its episode log throughout. Judge
+            # PROGRESS rather than speech, and keep the unhealthy verdict for one that has stopped.
+            return _engine_log_is_growing(self)
         if self.last_state_time >= time.time() - 300:
             return True
         try:

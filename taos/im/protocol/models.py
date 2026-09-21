@@ -358,6 +358,12 @@ class MarketSimulationConfig(BaseModel):
     futures_agent_order_latency_max : int | None = None
     futures_agent_selection_scale : float | None = None
 
+    @property
+    def book_ids(self) -> list[int]:
+        """The book ids of this simulation, dense: the same surface ExchangeConfig exposes, so the validator's
+        query, report and scoring loops iterate one attribute whichever config class the run carries."""
+        return list(range(self.book_count))
+
     @classmethod
     def from_xml(cls, xml : Element):
         """

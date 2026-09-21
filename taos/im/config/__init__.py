@@ -138,7 +138,7 @@ def add_im_validator_args(cls, parser):
     )
 
     # The three trading weights below are the CURRENT LADDER RUNG, set as defaults so a deployment
-    # is a file copy. Final rung of the 0.6.1 de-beta ladder (testnet): (0, 0, 1), the
+    # is a file copy. The 0.6.1 de-beta ladder stands at its final rung, (0, 0, 1), the
     # characterised full replacement. At kappa weight 0 the kappa-3 batch is not computed (its
     # carrier is a stub) and an empty de-beta cycle carries the previous map rather than scoring the
     # board 0. Rehearsal rung was (0.79, 0.21, 0.0), rung 1 (0.5925, 0.1575, 0.25), rung 2
@@ -147,7 +147,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.kappa.weight",
         type=float,
         help="Weight applied to Kappa evaluation in final score calculation",
-        default=0.395,
+        default=0.0,
     )
 
     parser.add_argument(
@@ -210,7 +210,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.pnl.weight",
         type=float,
         help="Weight applied to Realized PnL evaluation in final score calculation",
-        default=0.105,
+        default=0.0,
     )
 
     parser.add_argument(
@@ -223,7 +223,7 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.weight",
         type=float,
-        default=0.50,
+        default=1.0,
         help="The de-beta component's share of the FLAT trading score: trading = kappa.weight*kappa + "
              "pnl.weight*pnl + debeta.weight*debeta, the three weights validated to sum to 1 at init. "
              "Default is the current ladder rung (see the kappa.weight comment). At 0.0 emissions are "
