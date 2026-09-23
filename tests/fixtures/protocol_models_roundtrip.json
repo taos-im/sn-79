@@ -1,0 +1,217 @@
+{
+ "Account": {
+  "how": "validate",
+  "input": {
+   "agent_id": 1,
+   "base_balance": {
+    "currency": "x",
+    "free": 1.5,
+    "reserved": 1.5,
+    "total": 1.5
+   },
+   "book_id": 1,
+   "fees": {
+    "maker_fee_rate": 1.5,
+    "taker_fee_rate": 1.5
+   },
+   "quote_balance": {
+    "currency": "x",
+    "free": 1.5,
+    "reserved": 1.5,
+    "total": 1.5
+   }
+  },
+  "json": "{\"i\":1,\"b\":1,\"bb\":{\"c\":\"x\",\"t\":1.5,\"f\":1.5,\"r\":1.5,\"i\":null},\"qb\":{\"c\":\"x\",\"t\":1.5,\"f\":1.5,\"r\":1.5,\"i\":null},\"bl\":0.0,\"ql\":0.0,\"bc\":0.0,\"qc\":0.0,\"o\":[],\"l\":{},\"f\":{\"v\":null,\"m\":1.5,\"t\":1.5},\"v\":null,\"ds\":{}}"
+ },
+ "Balance": {
+  "how": "validate",
+  "input": {
+   "currency": "x",
+   "free": 1.5,
+   "reserved": 1.5,
+   "total": 1.5
+  },
+  "json": "{\"c\":\"x\",\"t\":1.5,\"f\":1.5,\"r\":1.5,\"i\":null}"
+ },
+ "BaseModel": {
+  "how": "validate",
+  "input": {},
+  "json": "{}"
+ },
+ "Book": {
+  "how": "validate",
+  "input": {
+   "asks": [
+    {
+     "price": 1.5,
+     "quantity": 1.5
+    }
+   ],
+   "bids": [
+    {
+     "price": 1.5,
+     "quantity": 1.5
+    }
+   ],
+   "events": [
+    {
+     "id": 1,
+     "price": 1.5,
+     "quantity": 1.5,
+     "side": 1,
+     "timestamp": 1
+    }
+   ],
+   "id": 1
+  },
+  "json": "{\"i\":1,\"r\":null,\"b\":[{\"p\":1.5,\"q\":1.5,\"o\":null}],\"a\":[{\"p\":1.5,\"q\":1.5,\"o\":null}],\"e\":[{\"y\":\"o\",\"i\":1,\"c\":null,\"t\":1,\"q\":1.5,\"s\":1,\"p\":1.5,\"l\":0.0}]}"
+ },
+ "Cancellation": {
+  "how": "validate",
+  "input": {
+   "orderId": 1,
+   "quantity": 1.5
+  },
+  "json": "{\"y\":\"c\",\"i\":1,\"t\":null,\"p\":null,\"q\":1.5}"
+ },
+ "FeePolicy": {
+  "how": "construct",
+  "json": "{}"
+ },
+ "FeeTier": {
+  "how": "validate",
+  "input": {
+   "maker_fee": 1.5,
+   "taker_fee": 1.5,
+   "volume_required": 1.5
+  },
+  "json": "{\"volume_required\":1.5,\"maker_fee\":1.5,\"taker_fee\":1.5}"
+ },
+ "Fees": {
+  "how": "validate",
+  "input": {
+   "maker_fee_rate": 1.5,
+   "taker_fee_rate": 1.5
+  },
+  "json": "{\"v\":null,\"m\":1.5,\"t\":1.5}"
+ },
+ "L2Snapshot": {
+  "how": "construct",
+  "json": "{}"
+ },
+ "LazyBook": {
+  "how": "construct",
+  "json": "{\"r\":null}"
+ },
+ "LevelInfo": {
+  "how": "validate",
+  "input": {
+   "price": 1.5,
+   "quantity": 1.5
+  },
+  "json": "{\"p\":1.5,\"q\":1.5,\"o\":null}"
+ },
+ "Loan": {
+  "how": "validate",
+  "input": {
+   "amount": 1.5,
+   "base_collateral": 1.5,
+   "currency": 0,
+   "order_id": 1,
+   "quote_collateral": 1.5
+  },
+  "json": "{\"i\":1,\"a\":1.5,\"c\":0,\"bc\":1.5,\"qc\":1.5}"
+ },
+ "MarketSimulationConfig": {
+  "how": "validate",
+  "input": {
+   "baseDecimals": 1,
+   "block_count": 1,
+   "book_count": 1,
+   "book_levels": 1,
+   "books_per_block": 1,
+   "duration": 1,
+   "grace_period": 1,
+   "hft_agent_base_balance": 1.5,
+   "hft_agent_capital_type": "x",
+   "hft_agent_count": 1,
+   "hft_agent_delta": 1,
+   "hft_agent_feed_latency_min": 1,
+   "hft_agent_gHFT": 1.5,
+   "hft_agent_kappa": 1.5,
+   "hft_agent_order_latency_max": 1,
+   "hft_agent_order_latency_min": 1,
+   "hft_agent_order_latency_scale": 1.5,
+   "hft_agent_order_size_mean": 1.5,
+   "hft_agent_price_noise": 1.5,
+   "hft_agent_price_shift": 1.5,
+   "hft_agent_psi": 1.5,
+   "hft_agent_quote_balance": 1.5,
+   "hft_agent_spread": 1.5,
+   "hft_agent_tau": 1.5,
+   "hft_agent_wealth": 1.5,
+   "init_agent_base_balance": 1.5,
+   "init_agent_capital_type": "x",
+   "init_agent_count": 1,
+   "init_agent_quote_balance": 1.5,
+   "init_agent_tau": 1,
+   "init_agent_wealth": 1.5,
+   "init_price": 1.5,
+   "maintenance_margin": 1.5,
+   "max_leverage": 1.5,
+   "max_loan": 1.5,
+   "miner_base_balance": 1.5,
+   "miner_capital_type": "x",
+   "miner_quote_balance": 1.5,
+   "miner_wealth": 1.5,
+   "priceDecimals": 1,
+   "publish_interval": 1,
+   "quoteDecimals": 1,
+   "sta_agent_base_balance": 1.5,
+   "sta_agent_capital_type": "x",
+   "sta_agent_chartist_weight": 1.5,
+   "sta_agent_count": 1,
+   "sta_agent_decision_latency_mean": 1,
+   "sta_agent_decision_latency_std": 1,
+   "sta_agent_feed_latency_mean": 1,
+   "sta_agent_feed_latency_std": 1,
+   "sta_agent_fundamentalist_weight": 1.5,
+   "sta_agent_noise_weight": 1.5,
+   "sta_agent_order_latency_max": 1,
+   "sta_agent_order_latency_min": 1,
+   "sta_agent_order_latency_scale": 1.5,
+   "sta_agent_quote_balance": 1.5,
+   "sta_agent_r_aversion": 1.5,
+   "sta_agent_selection_scale": 1.5,
+   "sta_agent_sigmaEps": 1.5,
+   "sta_agent_tau": 1,
+   "sta_agent_tauF": 1,
+   "sta_agent_tauHist": 1,
+   "sta_agent_wealth": 1.5,
+   "volumeDecimals": 1
+  },
+  "json": "{\"simulation_id\":null,\"logDir\":null,\"remoteAgentCount\":null,\"block_count\":1,\"time_unit\":\"ns\",\"duration\":1,\"grace_period\":1,\"publish_interval\":1,\"log_window\":null,\"books_per_block\":1,\"book_count\":1,\"book_levels\":1,\"detailed_book_levels\":5,\"baseDecimals\":1,\"quoteDecimals\":1,\"priceDecimals\":1,\"volumeDecimals\":1,\"fee_policy\":null,\"min_order_size\":0.0,\"max_open_orders\":null,\"max_leverage\":1.5,\"max_loan\":1.5,\"maintenance_margin\":1.5,\"miner_capital_type\":\"x\",\"miner_base_balance\":1.5,\"miner_quote_balance\":1.5,\"miner_wealth\":1.5,\"init_price\":1.5,\"fp_update_period\":null,\"fp_seed_interval\":null,\"fp_mu\":null,\"fp_sigma\":null,\"fp_lambda\":null,\"fp_mu_jump\":null,\"fp_sigma_jump\":null,\"init_agent_count\":1,\"init_agent_capital_type\":\"x\",\"init_agent_base_balance\":1.5,\"init_agent_quote_balance\":1.5,\"init_agent_wealth\":1.5,\"init_agent_tau\":1,\"hft_agent_count\":1,\"hft_agent_capital_type\":\"x\",\"hft_agent_base_balance\":1.5,\"hft_agent_quote_balance\":1.5,\"hft_agent_wealth\":1.5,\"hft_agent_feed_latency_min\":1,\"hft_agent_order_latency_min\":1,\"hft_agent_order_latency_max\":1,\"hft_agent_order_latency_scale\":1.5,\"hft_agent_tau\":1.5,\"hft_agent_delta\":1,\"hft_agent_psi\":1.5,\"hft_agent_gHFT\":1.5,\"hft_agent_kappa\":1.5,\"hft_agent_spread\":1.5,\"hft_agent_order_size_mean\":1.5,\"hft_agent_price_noise\":1.5,\"hft_agent_price_shift\":1.5,\"sta_agent_count\":1,\"sta_agent_capital_type\":\"x\",\"sta_agent_base_balance\":1.5,\"sta_agent_quote_balance\":1.5,\"sta_agent_wealth\":1.5,\"sta_agent_feed_latency_min\":0,\"sta_agent_feed_latency_mean\":1,\"sta_agent_feed_latency_std\":1,\"sta_agent_order_latency_min\":1,\"sta_agent_order_latency_max\":1,\"sta_agent_order_latency_scale\":1.5,\"sta_agent_decision_latency_mean\":1,\"sta_agent_decision_latency_std\":1,\"sta_agent_selection_scale\":1.5,\"sta_agent_noise_weight\":1.5,\"sta_agent_chartist_weight\":1.5,\"sta_agent_fundamentalist_weight\":1.5,\"sta_agent_tau\":1,\"sta_agent_tauHist\":1,\"sta_agent_tauF\":1,\"sta_agent_tauF_exact\":null,\"sta_agent_sigmaEps\":1.5,\"sta_agent_r_aversion\":1.5,\"futures_agent_count\":null,\"futures_agent_capital_type\":null,\"futures_agent_base_balance\":null,\"futures_agent_quote_balance\":null,\"futures_agent_wealth\":null,\"futures_agent_volume\":null,\"futures_agent_sigmaEps\":null,\"futures_agent_lambda\":null,\"futures_agent_feed_latency_mean\":null,\"futures_agent_feed_latency_std\":null,\"futures_agent_order_latency_min\":null,\"futures_agent_order_latency_max\":null,\"futures_agent_selection_scale\":null}"
+ },
+ "Order": {
+  "how": "validate",
+  "input": {
+   "id": 1,
+   "price": 1.5,
+   "quantity": 1.5,
+   "side": 1,
+   "timestamp": 1
+  },
+  "json": "{\"y\":\"o\",\"i\":1,\"c\":null,\"t\":1,\"q\":1.5,\"s\":1,\"p\":1.5,\"l\":0.0}"
+ },
+ "TradeInfo": {
+  "how": "validate",
+  "input": {
+   "id": 1,
+   "price": 1.5,
+   "quantity": 1.5,
+   "side": 1,
+   "timestamp": 1
+  },
+  "json": "{\"y\":\"t\",\"i\":1,\"s\":1,\"t\":1,\"q\":1.5,\"p\":1.5,\"Ti\":null,\"Ta\":null,\"Tf\":null,\"Mi\":null,\"Ma\":null,\"Mf\":null}"
+ }
+}

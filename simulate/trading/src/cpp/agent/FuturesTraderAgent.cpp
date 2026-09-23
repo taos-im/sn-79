@@ -72,6 +72,8 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
             ctx, m_opl.min, m_opl.max));
     }
 
+    m_volumeFrac = std::max(node.attribute("volumeFrac").as_double(0.0), 0.0);
+    m_volumeWindowBars = std::max(node.attribute("volumeWindowBars").as_uint(30u), 1u);
     attr = node.attribute("volume");
     m_volume = (attr.empty() || attr.as_double() <= 0.0) ? 1.0 : attr.as_double();
 
@@ -171,9 +173,6 @@ void FuturesTraderAgent::receiveMessage(Message::Ptr msg)
     else if (msg->type == "RESPONSE_SUBSCRIBE_EVENT_TRADE") {
         handleTradeSubscriptionResponse();
     }
-    else if (msg->type == "RESPONSE_RETRIEVE_L1") {
-        handleRetrieveL1Response(msg);
-    }
     else if (msg->type == "RESPONSE_PLACE_ORDER_MARKET") {
         handleMarketOrderPlacementResponse(msg);
     }
@@ -202,14 +201,26 @@ void FuturesTraderAgent::handleSimulationStart()
         for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
 
             auto chosenAgent = selectTurn();
+            const Timestamp initDelay = decisionMakingDelay();
 
-            simulation()->dispatchMessage(
+            auto& chains = simulation()->exchange()->wakeupChains().at(bookId);
+            // The bound the watchdog waits out is the widest hop delay PLUS the L1 round
+            // trip, because the token is consumed at the wake and handed on only once the
+            // response lands.
+            chains.registerChain(
+                m_baseName,
                 simulation()->currentTimestamp(),
-                decisionMakingDelay(),
-                name(),
-                fmt::format("{}_{}", m_baseName, chosenAgent),
-                "WAKEUP",
-                MessagePayload::create<RetrieveL1Payload>(bookId));
+                decisionMakingDelayBound() + marketFeedLatencyBound(),
+                simulation()->localAgentManager()->roster()->at(m_baseName));
+            if (chains.arm(m_baseName, simulation()->currentTimestamp(), initDelay)) {
+                simulation()->dispatchMessage(
+                    simulation()->currentTimestamp(),
+                    initDelay,
+                    name(),
+                    fmt::format("{}_{}", m_baseName, chosenAgent),
+                    "WAKEUP",
+                    MessagePayload::create<WakeupPayload>(bookId));
+            }
         }
     }
 }
@@ -237,38 +248,35 @@ uint64_t FuturesTraderAgent::selectTurn() {
 
 void FuturesTraderAgent::handleWakeup(Message::Ptr &msg)
 {
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        marketFeedLatency(),
-        name(),
-        m_exchange,
-        "RETRIEVE_L1",
-        msg->payload);
-}
-
-//-------------------------------------------------------------------------
-
-void FuturesTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
-{
-    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
+    const Timestamp now = simulation()->currentTimestamp();
+
+    simulation()->exchange()->wakeupChains().at(bookId).noteWake(m_baseName, now);
+
+    // Drawn FIRST, and included in the hop below. The gap between two wakes is the market
+    // feed latency plus the decision delay, which is the arrival intensity this class was
+    // calibrated at; drawing before selectTurn fixes the per-hop rng sequence.
+    const Timestamp marketFeedDelay = marketFeedLatency();
 
     uint64_t chosenOne = selectTurn();
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        decisionMakingDelay(),
-        name(),
-        fmt::format("{}_{}", m_baseName, chosenOne),
-        "WAKEUP",
-        MessagePayload::create<RetrieveL1Payload>(bookId));
-
+    const Timestamp hop = decisionMakingDelay() + marketFeedDelay;
+    if (simulation()->exchange()->wakeupChains().at(bookId).arm(m_baseName, now, hop)) {
+        simulation()->dispatchMessage(
+            now,
+            hop,
+            name(),
+            fmt::format("{}_{}", m_baseName, chosenOne),
+            "WAKEUP",
+            MessagePayload::create<WakeupPayload>(bookId));
+    }
 
     if (m_orderFlag[bookId]) return;
-    
 
-    const double bestBid = taosim::util::decimal2double(payload->bestBidPrice);
-    const double bestAsk = taosim::util::decimal2double(payload->bestAskPrice);
+    const auto l1 = simulation()->exchange()->statsHub()->l1(bookId);
+    const double bestBid = taosim::util::decimal2double(l1.bestBidPrice);
+    const double bestAsk = taosim::util::decimal2double(l1.bestAskPrice);
     placeOrder(bookId, bestAsk, bestBid);
 }
 
@@ -351,9 +359,29 @@ void FuturesTraderAgent::placeOrder(BookId bookId, double bestAsk, double bestBi
     const double epsilon = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
     const double forecast =  sign + epsilon;
     
-    const float newMean = std::log(m_volume) * futuresDetails.volumeFactor;
+    // `volumeFrac` states the clip against the book's traded volume per second, so the same
+    // signal is proportionate at any price level. Absent, the legacy absolute `volume`
+    // applies, which is exponential in the signal strength rather than proportional.
+    const double signalStrength = futuresDetails.volumeFactor;
+    const double anchoredMean = [&] -> double {
+        if (m_volumeFrac <= 0.0) return 0.0;
+        const auto window =
+            simulation()->exchange()->statsHub()->window(bookId, m_volumeWindowBars);
+        if (!(window.seconds > 0.0) || !(window.volume > 0.0)) return 0.0;
+        return m_volumeFrac * (window.volume / window.seconds) * signalStrength;
+    }();
+    // sigma is 1, so a lognormal's mean is exp(mu + 1/2); solve for the mu that lands the mean
+    // on the target.
+    const double newMean = anchoredMean > 0.0
+        ? std::log(anchoredMean) - 0.5
+        : std::log(m_volume) * signalStrength;
     std::lognormal_distribution<> lognormalDist(newMean, 1); 
     double volume = lognormalDist(*m_rng);
+    // NOTE: this ties the limit offset to the ORDER SIZE, with a threshold at one base unit and
+    // a sign flip below it. It was already odd when the size was an absolute constant; with the
+    // size anchored to the book's flow the threshold has no fixed meaning at all, since a clip
+    // of "one" is whatever a second of volume happens to be. Left alone here because changing
+    // it moves where the class posts rather than how much, which is a separate decision.
     const double priceShift =  volume > 1.0 ? std::floor(volume)*m_priceIncrement : -1*std::floor(volume/m_priceIncrement)*m_priceIncrement;
     volume =  std::floor(volume / m_volumeIncrement) * m_volumeIncrement;
     if (volume == 0) return;
@@ -458,6 +486,23 @@ Timestamp FuturesTraderAgent::marketFeedLatency()
 {
     return static_cast<Timestamp>(std::min(std::abs(m_marketFeedLatencyDistribution(*m_rng)),
             m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev()));
+}
+
+//-------------------------------------------------------------------------
+
+Timestamp FuturesTraderAgent::marketFeedLatencyBound() const
+{
+    return static_cast<Timestamp>(
+        m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev());
+}
+
+//-------------------------------------------------------------------------
+
+Timestamp FuturesTraderAgent::decisionMakingDelayBound() const
+{
+    return static_cast<Timestamp>(
+        m_decisionMakingDelayDistribution.mean()
+        + 3.0 * m_decisionMakingDelayDistribution.stddev());
 }
 
 //-------------------------------------------------------------------------

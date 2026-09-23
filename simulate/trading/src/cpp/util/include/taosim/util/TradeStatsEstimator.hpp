@@ -17,6 +17,16 @@ namespace taosim::util
 
 //-------------------------------------------------------------------------
 
+// UNWIRED as of August 2026, and deliberately kept. Every consumer moved onto the shared
+// fixed-clock bar series in `stats::BarSeries`, which answers the same question without
+// depending on when the reader last looked. This is retained rather than deleted because the
+// property it has and the bars do not is per-agent measurement: a private window per reader,
+// which is the documented defence against reflexivity below. If a population of agents holding
+// genuinely different beliefs about the same prices turns out to be wanted, this is the piece
+// to wire back in, and the reasoning for it is here rather than in a commit message.
+//
+// Nothing constructs one today. Treat the text below as a description of what it would do.
+//
 // Per-agent VARIANCE and TREND estimates differenced out of the book's monotonic trade
 // accumulator (BookTradeStats, delivered by RETRIEVE_L1_EXT).
 //

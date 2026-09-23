@@ -10,8 +10,6 @@
 #include "Distribution.hpp"
 #include "Order.hpp"
 
-#include <taosim/util/TradeStatsEstimator.hpp>
-
 
 //-------------------------------------------------------------------------
 
@@ -41,8 +39,6 @@ public:
     [[nodiscard]] auto&& orderFlag(this auto&& self) noexcept { return self.m_orderFlag; }
     [[nodiscard]] auto&& regimeChangeProb(this auto&& self) noexcept { return self.m_regimeChangeProb; }
     [[nodiscard]] auto&& regimeState(this auto&& self) noexcept { return self.m_regimeState; }
-    [[nodiscard]] auto&& topLevel(this auto&& self) noexcept { return self.m_topLevel; }
-    [[nodiscard]] auto&& lastMid(this auto&& self) noexcept { return self.m_lastMid; }
     [[nodiscard]] auto&& tradePrice(this auto&& self) noexcept { return self.m_tradePrice; }
 
     virtual void configure(const pugi::xml_node& node) override;
@@ -70,8 +66,6 @@ private:
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
     void handleWakeup(Message::Ptr &msg);
-    void handleRetrieveL1Response(Message::Ptr msg);
-    void handleRetrieveL1ExtResponse(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
     void handleLimitOrderPlacementErrorResponse(Message::Ptr msg);
     void handleCancelOrdersResponse(Message::Ptr msg);
@@ -102,6 +96,8 @@ private:
         double freeBase,
         double freeQuote);
     double getProcessValue(BookId bookId, const std::string& name);
+    [[nodiscard]] TopLevel topOfBook(BookId bookId) const;
+    [[nodiscard]] double referencePrice(BookId bookId) const;
     void updateRegime(BookId bookId);
     Timestamp orderPlacementLatency();
     Timestamp marketFeedLatency();
@@ -120,9 +116,13 @@ private:
     double m_hara;
     double m_riskAversion0;
     double m_riskAversion;
+    // Post-only guard, in horizon-sigma space. `m_volGuardX0` is the sigma at which the
+    // post-only probability is one half; `m_volGuardBand` is how far above it the transition
+    // completes. Separate on purpose: one number used to set both.
     float m_volatilityGuard;
     float m_slopeVolGuard;
-    float m_volGuardX0;
+    double m_volGuardX0{};
+    double m_volGuardBand{};
     DelayBounds m_opl;
     double m_price;
     double m_priceIncrement;
@@ -139,7 +139,8 @@ private:
     Timestamp m_tau;
     Timestamp m_tauHist;
     Timestamp m_historySize;
-    double m_horizonSeconds{};
+    // Horizon for the variance and drift reads, counted in bars of the shared clock.
+    uint32_t m_horizonBars{};
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     std::string m_baseName;
     uint32_t m_catUId;
@@ -158,11 +159,6 @@ private:
     std::vector<bool> m_orderFlag;
     std::vector<float> m_regimeChangeProb;
     std::vector<RegimeState> m_regimeState;
-    std::vector<TopLevel> m_topLevel;
-    std::vector<double> m_lastMid;
-    std::vector<taosim::util::TradeStatsEstimator> m_varEst;
-    double m_varHalflifeSeconds{};
-    bool m_varJumpRobust{};
     std::vector<taosim::process::Process*> m_fundamental;
 };
 

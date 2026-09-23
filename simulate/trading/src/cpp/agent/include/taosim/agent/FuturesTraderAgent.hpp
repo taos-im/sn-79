@@ -49,7 +49,6 @@ private:
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
     void handleWakeup(Message::Ptr &msg);
-    void handleRetrieveL1Response(Message::Ptr msg);
     void handleMarketOrderPlacementResponse(Message::Ptr msg);
     void handleMarketOrderPlacementErrorResponse(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
@@ -69,6 +68,9 @@ private:
     Timestamp orderPlacementLatency();
     Timestamp marketFeedLatency();
     Timestamp decisionMakingDelay();
+    // The clamps the two delay draws apply, without drawing from the rng.
+    [[nodiscard]] Timestamp marketFeedLatencyBound() const;
+    [[nodiscard]] Timestamp decisionMakingDelayBound() const;
 
     // Parameters, injections.
     std::mt19937* m_rng;
@@ -78,6 +80,10 @@ private:
     double m_sigmaEps;
     DelayBounds m_opl;
     double m_volume;
+    // Clip as a multiple of the book's traded volume per second, times the signal strength.
+    // Zero keeps the absolute `volume`.
+    double m_volumeFrac{};
+    uint32_t m_volumeWindowBars{};
     float m_lambda;
     Timestamp m_tau;
     float m_orderTypeProb;

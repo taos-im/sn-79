@@ -57,8 +57,17 @@ MessagePayload::Ptr PayloadFactory::createFromJsonMessage(const rapidjson::Value
     else if (type == "ERROR_RESPONSE_CANCEL_ORDERS") {
         return CancelOrdersErrorResponsePayload::fromJson(payloadJson);
     }
-    else if (type == "RETRIEVE_L1" || type == "WAKEUP") {
+    else if (type == "RETRIEVE_L1") {
         return RetrieveL1Payload::fromJson(payloadJson);
+    }
+    else if (type == "WAKEUP"
+        || type == "WAKEUP_ALGOTRADER_BOOK"
+        || type == "WAKEUP_ALGOTRADER_EXECUTE"
+        || type == "WAKEUP_HFT_FILL") {
+        return WakeupPayload::fromJson(payloadJson);
+    }
+    else if (type == "WAKEUP_ALGOTRADER") {
+        return MessagePayload::create<EmptyPayload>();
     }
     else if (type == "RESPONSE_RETRIEVE_L1") {
         return RetrieveL1ResponsePayload::fromJson(payloadJson);
@@ -173,8 +182,34 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
     else if (type == "ERROR_RESPONSE_CANCEL_ORDERS") {
         return makePayload.operator()<CancelOrdersErrorResponsePayload>();
     }
-    else if (type == "RETRIEVE_L1" || type == "WAKEUP") {
+    else if (type == "RETRIEVE_L1") {
         return makePayload.operator()<RetrieveL1Payload>();
+    }
+    else if (type == "WAKEUP"
+        || type == "WAKEUP_ALGOTRADER_BOOK"
+        || type == "WAKEUP_ALGOTRADER_EXECUTE"
+        || type == "WAKEUP_HFT_FILL") {
+        // A NIL HERE IS AN OLD CHECKPOINT, NOT A CORRUPT ONE, AND MUST STILL LOAD.
+        //
+        // packMessagePayload had no WakeupPayload branch, so every checkpoint written before that
+        // was fixed stored its WAKEUPs as nil. Casting nil to WakeupPayload throws std::bad_cast and
+        // the engine crash-loops on its own checkpoint. The writer is fixed, but the checkpoints
+        // already on disk are not, and a validator resumes `-c latest` -- so refusing them turns the
+        // first restart after this ships into exactly the outage the fix was meant to remove.
+        //
+        // Book 0 is the honest default: the book id was never written, so it cannot be recovered,
+        // and every wakeup handler reads bookId to pick a book. A wakeup that fires against book 0
+        // once, on the first restore after an upgrade, is a far smaller thing than an engine that
+        // cannot start. New checkpoints carry the real id.
+        if (o.is_nil()) {
+            return MessagePayload::create<WakeupPayload>(BookId{});
+        }
+        return makePayload.operator()<WakeupPayload>();
+    }
+    // Carries no payload; without a branch here a checkpoint holding one in the queue
+    // cannot be restored, since an unrecognized type throws.
+    else if (type == "WAKEUP_ALGOTRADER") {
+        return MessagePayload::create<EmptyPayload>();
     }
     else if (type == "RESPONSE_RETRIEVE_L1") {
         return makePayload.operator()<RetrieveL1ResponsePayload>();

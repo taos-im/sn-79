@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The incident: validator restore + simulator restart raced the scoring-service
-INIT, whose snapshot carried the OLD sim clock as base_ts; the child then discarded every new-clock
-frame as pre-snapshot replay (applied=0) and never scored, so each boundary burned the full child
-timeout PLUS an in-process compute and the query loop logged "Waiting for rewarding to catch up"
-for hours. Source-level wiring assertions for the two guards that close it."""
+"""A validator restore racing the simulator restart can leave the scoring service unable to score.
+
+The service's INIT snapshot carries the sim clock as base_ts. When the clock has since moved, the
+child reads every new-clock frame as pre-snapshot replay, applies none of them and produces no
+score, so each boundary costs the full child timeout plus an in-process compute while the query
+loop waits on it. Source-level wiring assertions for the two guards that close it."""
 from pathlib import Path
 
 DEV = Path(__file__).resolve().parents[1]

@@ -83,10 +83,10 @@ namespace taosim::checkpoint
 //-------------------------------------------------------------------------
 
 CheckpointManager::CheckpointManager(const CheckpointingDesc& desc)
-    : m_simuMngr{desc.simuMngr},
-      m_intervalInSteps{desc.intervalInSteps},
-      m_numLastFilesToKeep{desc.numLastFilesToKeep},
-      m_measureWallClockTime{desc.measureWallClockTime}
+    : m_simuMngr{desc.simuMngr}
+    , m_intervalInSteps{desc.intervalInSteps}
+    , m_numLastFilesToKeep{desc.numLastFilesToKeep}
+    , m_measureWallClockTime{desc.measureWallClockTime}
 {
     if (desc.runDir.empty()) {
         throw CheckpointError{"'runDir' must be non-empty"};
@@ -221,13 +221,13 @@ void CheckpointManager::cleanup()
     const auto dirs = ckptDirsSortedByWriteTime(m_dir);
 
     auto dirsToRemoveView = dirs
-        | views::filter([&](auto&& f) {
+        | ranges::views::filter([&](auto&& f) {
             static const std::regex pattern{fmt::format("^\\d+\\{}$", s_dirExtension)};
             const auto name = f.filename();
             return std::regex_match(name.string(), pattern)
                 && name != m_latestCkptDir.filename();
         })
-        | views::take(std::max(0z, std::ssize(dirs) - m_numLastFilesToKeep));
+        | ranges::views::take(std::max(0z, std::ssize(dirs) - m_numLastFilesToKeep));
 
     for (auto&& dir : dirsToRemoveView) {
         fs::remove_all(dir);

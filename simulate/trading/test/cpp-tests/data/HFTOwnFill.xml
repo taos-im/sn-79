@@ -13,10 +13,10 @@
   (rnd-taos scripts/run/config/simulation_template.xml) so the agent under test is
   configured the way it actually runs.
 -->
-<Simulation start="0" duration="11" timescale="s" mode="test">
+<Simulation start="0" duration="11" timescale="s">
     <Agents>
         <MultiBookExchangeAgent name="EXCHANGE" priceDecimals="2" volumeDecimals="4"
-            baseDecimals="4" quoteDecimals="10" remoteAgentCount="2" eps="2e-8"
+            baseDecimals="4" quoteDecimals="10" remoteAgentCount="2"
             maxLeverage="4" maxLoan="10000" maintenanceMargin="0.25"
             initialPrice="300.0" minOrderSize="0.25">
             <Books instanceCount="1" algorithm="PriceTime"/>

@@ -4,8 +4,13 @@
  */
 #pragma once
 
+#include <taosim/xml/KnownAttributes.hpp>
+
+#include <fmt/format.h>
 #include <pugixml.hpp>
 
+#include <algorithm>
+#include <functional>
 #include <string_view>
 
 //-------------------------------------------------------------------------
@@ -51,7 +56,29 @@ void setAttribute(pugi::xml_node node, std::string_view name, const T& value)
 
 //-------------------------------------------------------------------------
 
-inline size_t removeChildren(pugi::xml_node node, std::function<bool(pugi::xml_node)> criterion)
+// Names in the config that no read site anywhere asks for. pugixml answers a missing
+// attribute with an empty one, so a renamed parameter is silently ignored. Warns, does not
+// throw: tightening to a hard failure is reasonable once every config is clean.
+inline size_t warnOnUnknownAttributes(pugi::xml_node root, std::string_view origin = {})
+{
+    size_t unknown{};
+    for (const auto& node : root.select_nodes("//*")) {
+        for (const auto& attr : node.node().attributes()) {
+            const std::string_view name{attr.name()};
+            if (std::ranges::find(kKnownAttributes, name) != kKnownAttributes.end()) continue;
+            ++unknown;
+            fmt::println(
+                "CONFIG unknown attribute '{}' on <{}>{}{} - nothing reads it, so setting it "
+                "has no effect",
+                name, node.node().name(), origin.empty() ? "" : " in ", origin);
+        }
+    }
+    return unknown;
+}
+
+//-------------------------------------------------------------------------
+
+size_t removeChildren(pugi::xml_node node, std::predicate<pugi::xml_node> auto criterion)
 {
     size_t removeCounter{};
     auto child = node.first_child();

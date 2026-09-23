@@ -20,6 +20,77 @@ import psutil
 from taos.common.utils.misc import run_process
 from taos.im.neurons.validator import Validator
         
+def classify_changes(self, old_commit, new_commit) -> Tuple[bool, bool, bool, bool]:
+    """
+    Sort the files that differ between two commits into the four classes the updater acts on.
+
+    old(local) → new(incoming): b_path is the incoming file path, a_path the fallback for deletions.
+    Used for local→remote (what a pull would bring) and for start→HEAD (what a pull by hand already
+    brought under a running process).
+
+    Returns:
+        Tuple[bool, bool, bool, bool]: (validator_py_changed, simulator_config_changed,
+            simulator_py_changed, simulator_cpp_changed).
+    """
+    validator_py = simulator_config = simulator_py = simulator_cpp = False
+    diff = old_commit.diff(new_commit)
+    for cht in diff.change_type:
+        for c in diff.iter_change_type(cht):
+            path = c.b_path or c.a_path
+            if not path:
+                continue
+            # getattr: this can run at startup before the engine init has set simulator_config_file.
+            if str(self.repo_path / path) == getattr(self, 'simulator_config_file', None):
+                simulator_config = True
+            if path.endswith('.cpp'):
+                simulator_cpp = True
+            if path.endswith('.py'):
+                if 'simulate/trading' in path:
+                    simulator_py = True
+                else:
+                    validator_py = True
+    return validator_py, simulator_config, simulator_py, simulator_cpp
+
+
+def _process_chain():
+    """This process and its ancestors, nearest first (psutil objects); patched in tests."""
+    chain = []
+    try:
+        proc = psutil.Process(os.getpid())
+        while proc is not None:
+            chain.append(proc)
+            proc = proc.parent()
+    except psutil.Error:
+        pass
+    return chain
+
+
+def pm2_self_entry():
+    """
+    The pm2 entry supervising THIS process, or None.
+
+    pm2 runs `bash -c "<VALIDATOR_CMD>"`, so the entry's pid is an ancestor of the Python process rather
+    than the process itself; match any ancestor's pid against `pm2 jlist`. Resolving the entry from the
+    process tree, rather than assuming it is named "validator", is what lets a restart keep the name and
+    the full command line run_validator.sh registered (validator-sim-<network> with every flag).
+    """
+    try:
+        r = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True, timeout=10.0)
+        entries = json.loads(r.stdout) if r.stdout else []
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+    by_pid = {}
+    for e in entries:
+        try:
+            by_pid[int(e.get('pid'))] = e
+        except (TypeError, ValueError):
+            continue
+    for proc in _process_chain():
+        if proc.pid in by_pid:
+            return by_pid[proc.pid]
+    return None
+
+
 def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
     """
     Check the git repository for updates with timeout protection.
@@ -75,26 +146,8 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
             )
         elif local_commit != remote_commit:
             diff_start = time.time()
-            # local(old) → remote(new): b_path is the incoming file path.
-            diff = local_commit.diff(remote_commit)
-            for cht in diff.change_type:
-                changes = list(diff.iter_change_type(cht))
-                for c in changes:
-                    # b_path is None for pure deletions; fall back to a_path.
-                    path = c.b_path or c.a_path
-                    if not path:
-                        continue
-                    # getattr: check_repo can run at startup before the engine
-                    # init has set simulator_config_file on the validator.
-                    if str(self.repo_path / path) == getattr(self, 'simulator_config_file', None):
-                        simulator_config_changed = True
-                    if path.endswith('.cpp'):
-                        simulator_cpp_files_changed = True
-                    if path.endswith('.py'):
-                        if 'simulate/trading' in path:
-                            simulator_py_files_changed = True
-                        else:
-                            validator_py_files_changed = True
+            (validator_py_files_changed, simulator_config_changed,
+             simulator_py_files_changed, simulator_cpp_files_changed) = classify_changes(self, local_commit, remote_commit)
             diff_time = time.time() - diff_start
             bt.logging.debug(f"Git diff processed in {diff_time:.1f}s")
         total_time = time.time() - start_time
@@ -162,39 +215,26 @@ def update_validator(self : Validator) -> None:
             bt.logging.warning(f"Failed to parse PM2 JSON: {e}")
             pm2_js = []
         
+        # Restart the entry that supervises THIS process, by pm_id, so the name and the full command line
+        # run_validator.sh registered (validator-sim-<network>, --port, --prometheus.port, --neuron.timeout,
+        # the engine and gentrx flags) survive the restart. The old fallback re-registered the validator as
+        # "validator" with five flags, which on a deployed host moves the metrics port and drops the engine
+        # arguments: a misconfigured validator that looks alive. Better to stay on the old code and page.
         restart_cmd = None
-        if len(pm2_js) > 0:
-            pm2_processes = {p['name']: p for p in pm2_js}
-            if 'validator' in pm2_processes:
-                bt.logging.info("FOUND VALIDATOR IN pm2 PROCESSES.")
-                restart_cmd = ["pm2", "restart", "validator"]
-        
+        entry = pm2_self_entry()
+        if entry is not None:
+            bt.logging.info(f"FOUND OUR pm2 ENTRY: {entry.get('name')} (pm_id {entry.get('pm_id')}).")
+            restart_cmd = ["pm2", "restart", str(entry.get('pm_id'))]
+        elif len(pm2_js) > 0 and 'validator' in {p['name']: p for p in pm2_js}:
+            bt.logging.info("FOUND VALIDATOR IN pm2 PROCESSES.")
+            restart_cmd = ["pm2", "restart", "validator"]
         if not restart_cmd:
-            killed_count = 0
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    cmdline = ' '.join(proc.info['cmdline'] or [])
-                    if 'python validator.py' in cmdline:
-                        bt.logging.info(f"FOUND VALIDATOR PROCESS `{proc.info['name']}` WITH PID {proc.info['pid']}")
-                        proc.kill()
-                        proc.wait(timeout=5.0)
-                        killed_count += 1
-                except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
-                    bt.logging.warning(f"Error killing process: {e}")
-            
-            if killed_count > 0:
-                bt.logging.info(f"Killed {killed_count} validator process(es)")
-                time.sleep(2.0)  # Brief pause after kill
-            
-            restart_cmd = [
-                "pm2", "start", "--name=validator",
-                f"python validator.py --netuid {self.config.netuid} "
-                f"--subtensor.chain_endpoint {self.config.subtensor.chain_endpoint} "
-                f"--wallet.path {self.config.wallet.path} "
-                f"--wallet.name {self.config.wallet.name} "
-                f"--wallet.hotkey {self.config.wallet.hotkey}"
-            ]
-        
+            bt.logging.error("No pm2 entry supervises this validator; not restarting with a truncated command line.")
+            self.pagerduty_alert(
+                "Validator code updated but not restarted: no pm2 entry resolves to this process, so an "
+                "automatic restart would drop the registered flags. Restart it by hand with its full command line."
+            )
+            return
         bt.logging.info(f"RESTARTING VALIDATOR: {' '.join(restart_cmd)}")
         validator = subprocess.run(
             restart_cmd, 

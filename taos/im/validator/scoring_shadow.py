@@ -96,12 +96,14 @@ class VerifyScheduler:
 # (debeta_inv is {book: {uid: x}}) as two-level float defaultdicts; the rest plain dicts: the
 # reconstruction state, the capture-mid print windows, the P11 counterparty sums and the
 # timestamped histories every sum is pruned from.
-_DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv"]
+_DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
+               "debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional"]
 _DEBETA_PLAIN = [
     "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
     "debeta_capture_mid", "debeta_cp",
     "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
     "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
+    "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
 ]
 
 _STRUCT_NAMES = [
@@ -313,7 +315,7 @@ class ShadowState:
 def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
                  gentrx_scores=None, gentrx_ema=None,
                  trading_ema=None, trading_ema_n=None, trading_ema_ts=None,
-                 absent=None) -> dict:
+                 absent=None, presence=None, debeta_pool_ema=None) -> dict:
     """Run the SAME scoring main runs (score_uids + Pareto distribute) on the
     shadow's structures. Mutates kappa/activity/pnl factors in place exactly as
     main's reward does, keeping the shadow in lockstep.
@@ -334,16 +336,20 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         trading_ema: Carried trading EMA.
         trading_ema_n: Carried per-uid EMA counts.
         trading_ema_ts: Carried per-uid EMA timestamps.
+        debeta_pool_ema: Carried smoothed making term and share, under the proportional making pool.
 
     Returns:
         The shadow's scoring result for parity comparison.
     """
-    from taos.im.validator.reward import (apply_reward_floor, apply_track_record_ema,
-                                          compute_debeta_scores, distribute_rewards, score_uids)
+    from taos.im.validator.reward import (allocate_trading, apply_reward_floor, apply_track_record_ema,
+                                          compute_debeta_scores, distribute_rewards,
+                                          making_pool_inputs, score_uids)
 
     shadow.deregistered_uids = list(deregs)
     # The presence gate's absent set is main-side knowledge (query outcomes), shipped with the inputs.
     shadow.debeta_absent = (set(int(u) for u in absent) if absent is not None else None)
+    # The graded presence share, main-side knowledge too, shipped the same way.
+    shadow.debeta_presence_shares = ({int(u): float(v) for u, v in presence.items()} if presence is not None else None)
     all_uids = list(range(shadow.effective_max_uids))
     _ema = dict(gentrx_ema or {})
     validator_data = {
@@ -380,19 +386,48 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     _tema_n = dict(trading_ema_n or {})
     _tema_ts = trading_ema_ts
     _hl = (shadow.scoring_config.get('scoring', {}) or {}).get('score_ema_halflife', 0)
+    _pema = {k: dict(v or {}) for k, v in (debeta_pool_ema or {}).items()}
+    _n_snap, _last_snap = dict(_tema_n), _tema_ts
     if _hl and _hl > 0:
         # Parity with main: fresh miners still in min_lookback (no valid Kappa) keep k=0.
         _scorable = {uid for uid in all_uids if (shadow.kappa_values.get(uid) or {}).get('scorable')}
         trading_scores, _tema_ts = apply_track_record_ema(
             trading_scores, all_uids, shadow.deregistered_uids,
             sim_ts, _hl, _tema, _tema_n, _tema_ts, _scorable)
-    # Identical allocation pipeline to main's get_rewards: soft floor THEN Pareto.
+    # Identical allocation pipeline to main's get_rewards: the proportional making pool when the
+    # dial is on (same helpers, same auxiliary-EMA schedule), otherwise soft floor THEN Pareto.
     # (The floor was missing here — a pre-existing divergence whenever
     # rewarding.floor.enabled is on; a no-op when it is off.)
-    floored = apply_reward_floor(
-        [trading_scores[uid] for uid in all_uids], shadow.scoring_config
-    )
-    distributed = distribute_rewards(floored, shadow.scoring_config)
+    _dcfg = ((shadow.scoring_config.get('scoring', {}) or {}).get('debeta') or {})
+    _pool_mode = str(_dcfg.get('making_pool', 'rank') or 'rank')
+    _pool = max(0.0, min(1.0, float(_dcfg.get('weight', 0.0) or 0.0) * float(_dcfg.get('w_make', 0.0) or 0.0)))
+    # computed, smoothed and published under BOTH settings, exactly as main does, so the state main
+    # adopts in cutover mode stays warm and the gauges exist whichever way the dial is set
+    _ladder, _term, _share = making_pool_inputs(
+        getattr(shadow, 'debeta_detail', {}) or {}, all_uids, trading_scores,
+        float(_dcfg.get('weight', 0.0) or 0.0), float(_dcfg.get('w_make', 0.0) or 0.0))
+    if _hl and _hl > 0 and _pool > 0.0:
+        for _k, _vec in (("term", _term), ("share", _share)):
+            _st = dict(_pema.get(_k) or {})
+            _sm, _ = apply_track_record_ema(
+                _vec, all_uids, shadow.deregistered_uids,
+                sim_ts, _hl, _st, dict(_n_snap), _last_snap, _scorable)
+            _pema[_k] = _st
+            _vec.update(_sm)
+        _ladder = {uid: max(0.0, float(trading_scores[uid]) - float(_term[uid])) for uid in all_uids}
+    _share_tot = sum(_share.values())
+    for uid in all_uids:
+        _kv = shadow.kappa_values.get(uid)
+        if _kv is not None:
+            _kv['making_share'] = (float(_share[uid]) / _share_tot) if _share_tot > 0 else 0.0
+            _kv['ladder_input'] = float(_ladder[uid])
+    if _pool_mode == "proportional" and _pool > 0.0:
+        distributed = allocate_trading(_ladder, _share, _pool, all_uids, shadow.scoring_config)
+    else:
+        floored = apply_reward_floor(
+            [trading_scores[uid] for uid in all_uids], shadow.scoring_config
+        )
+        distributed = distribute_rewards(floored, shadow.scoring_config)
     return {
         'trading': [float(x) for x in distributed.tolist()],
         'gentrx': [float(gentrx_scores_out[uid]) for uid in all_uids],
@@ -405,6 +440,7 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         'trading_ema': _tema,
         'trading_ema_n': _tema_n,
         'trading_ema_ts': _tema_ts,
+        'debeta_pool_ema': _pema,
     }
 
 
@@ -622,11 +658,13 @@ def _shadow_child_main(sock, cores, parity_ns):
                     pass
 
         def _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
-                            t_ema=None, t_ema_n=None, t_ema_ts=None, absent=None):
+                            t_ema=None, t_ema_n=None, t_ema_ts=None, absent=None, presence=None,
+                            pool_ema=None):
             t0 = time.time()
             try:
                 result = shadow_score(shadow, sim_ts, deregs, gtx_scores, gtx_ema,
-                                      t_ema, t_ema_n, t_ema_ts, absent=absent)
+                                      t_ema, t_ema_n, t_ema_ts, absent=absent, presence=presence,
+                                      debeta_pool_ema=pool_ema)
                 _send_frame(sock, ("scores", (s_ts, result, time.time() - t0)))
             except Exception as e:
                 import traceback
@@ -764,11 +802,13 @@ def _shadow_child_main(sock, cores, parity_ns):
                 t_ema_n = payload[6] if len(payload) > 6 else None
                 t_ema_ts = payload[7] if len(payload) > 7 else None
                 absent = payload[8] if len(payload) > 8 else None
+                presence = payload[9] if len(payload) > 9 else None
+                pool_ema = payload[10] if len(payload) > 10 else None
                 if shadow is not None and awaiting_score_at is not None and awaiting_score_at[0] == s_ts:
                     # inputs arrived after the boundary was applied — score now
                     awaiting_score_at = None
                     _score_and_send(s_ts, sim_ts, deregs, gtx_scores, gtx_ema,
-                                    t_ema, t_ema_n, t_ema_ts, absent)
+                                    t_ema, t_ema_n, t_ema_ts, absent, presence, pool_ema)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -777,7 +817,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                             _side_push(ts, raw)
                 else:
                     pending_score_inputs[s_ts] = (sim_ts, deregs, gtx_scores, gtx_ema,
-                                                  t_ema, t_ema_n, t_ema_ts, absent)
+                                                  t_ema, t_ema_n, t_ema_ts, absent, presence, pool_ema)
                     while len(pending_score_inputs) > 4:
                         pending_score_inputs.pop(next(iter(pending_score_inputs)))
             elif kind == "score_at":
@@ -788,6 +828,8 @@ def _shadow_child_main(sock, cores, parity_ns):
                 t_ema_n = payload[6] if len(payload) > 6 else None
                 t_ema_ts = payload[7] if len(payload) > 7 else None
                 absent = payload[8] if len(payload) > 8 else None
+                presence = payload[9] if len(payload) > 9 else None
+                pool_ema = payload[10] if len(payload) > 10 else None
                 if shadow is None or awaiting_score_at is None or awaiting_score_at[0] != s_ts:
                     print(f"[SHADOW] unexpected score_at ts={s_ts} (awaiting={awaiting_score_at}) — ignored", flush=True)
                     if shadow is not None:
@@ -795,7 +837,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                 else:
                     awaiting_score_at = None
                     _score_and_send(s_ts, sim_ts, deregs, gentrx_scores, gentrx_ema,
-                                    t_ema, t_ema_n, t_ema_ts, absent)
+                                    t_ema, t_ema_n, t_ema_ts, absent, presence, pool_ema)
                     pending, side_buffer = side_buffer, []
                     for ts, raw in pending:
                         if awaiting_score_at is None:
@@ -986,7 +1028,8 @@ class ScoringShadow:
 
     def tee_score_inputs(self, timestamp: int, sim_ts: int, deregs: list,
                          gentrx_scores=None, gentrx_ema=None,
-                         trading_ema=None, trading_ema_n=None, trading_ema_ts=None, absent=None) -> None:
+                         trading_ema=None, trading_ema_n=None, trading_ema_ts=None, absent=None,
+                         presence=None, debeta_pool_ema=None) -> None:
         """Eager scoring: ship the boundary round's scoring inputs at TEE time,
         so the child computes during the seconds main's _reward spends queued
         behind _reward_lock — request_scores then collects a (usually) finished
@@ -1001,6 +1044,7 @@ class ScoringShadow:
             trading_ema: Carried trading EMA.
             trading_ema_n: Carried per-uid EMA counts.
             trading_ema_ts: Carried per-uid EMA timestamps.
+            debeta_pool_ema: Carried smoothed making term and share, under the proportional making pool.
         inputs are recorded for the verify pin (eager_inputs_for)."""
         if not self.is_alive() or not self.initialized:
             return
@@ -1013,6 +1057,8 @@ class ScoringShadow:
             'trading_ema_n': dict(trading_ema_n or {}),
             'trading_ema_ts': trading_ema_ts,
             'absent': (sorted(int(u) for u in absent) if absent is not None else None),
+            'presence': ({int(u): float(v) for u, v in presence.items()} if presence is not None else None),
+            'debeta_pool_ema': {str(k): dict(v or {}) for k, v in (debeta_pool_ema or {}).items()},
         }
         self._stash(self._eager_inputs, timestamp, pin, 4)
 
@@ -1022,7 +1068,8 @@ class ScoringShadow:
                     "score_inputs",
                     (timestamp, sim_ts, pin['deregistered_uids'],
                      pin['gentrx_scores'], pin['gentrx_ema'],
-                     pin['trading_ema'], pin['trading_ema_n'], pin['trading_ema_ts'], pin['absent']),
+                     pin['trading_ema'], pin['trading_ema_n'], pin['trading_ema_ts'], pin['absent'],
+                     pin['presence'], pin['debeta_pool_ema']),
                 ))
             except Exception:
                 pass
@@ -1038,7 +1085,7 @@ class ScoringShadow:
                        gentrx_scores=None, gentrx_ema=None, timeout: float = 45.0,
                        eager: bool = False,
                        trading_ema=None, trading_ema_n=None, trading_ema_ts=None,
-                       absent=None):
+                       absent=None, presence=None, debeta_pool_ema=None):
         """Cutover mode: collect this boundary's full scoring result, blocking
         until it arrives (call via run_in_executor — the wait is GIL-free).
         eager=True means the inputs were already shipped at tee time (the child
@@ -1058,6 +1105,7 @@ class ScoringShadow:
             trading_ema: Carried trading EMA.
             trading_ema_n: Carried per-uid EMA counts.
             trading_ema_ts: Carried per-uid EMA timestamps.
+            debeta_pool_ema: Carried smoothed making term and share, under the proportional making pool.
 
         Returns:
             The child's full scoring result.
@@ -1088,7 +1136,9 @@ class ScoringShadow:
                         (timestamp, sim_ts, list(deregs),
                          dict(gentrx_scores or {}), dict(gentrx_ema or {}),
                          dict(trading_ema or {}), dict(trading_ema_n or {}), trading_ema_ts,
-                         (sorted(int(u) for u in absent) if absent is not None else None)),
+                         (sorted(int(u) for u in absent) if absent is not None else None),
+                         ({int(u): float(v) for u, v in presence.items()} if presence is not None else None),
+                         {str(k): dict(v or {}) for k, v in (debeta_pool_ema or {}).items()}),
                     ))
                 except Exception:
                     pass
@@ -1481,13 +1531,29 @@ def _config_duck(config):
                 centered_window=_num(getattr(_d, 'centered_window', None), 15, int),
                 min_books=_num(getattr(_d, 'min_books', None), 4, int),
                 p11_strength=_num(getattr(_d, 'p11_strength', None), 0.0, float),
+                p11_topk=_num(getattr(_d, 'p11_topk', None), 2, int),
                 making_floor_scale=_num(getattr(_d, 'making_floor_scale', None), 0.0, float),
                 skill_rank_scope=str(_d_scope if (_d_scope := getattr(_d, 'skill_rank_scope', None)) is not None
                                      else 'positives'),
                 making_rank_scope=str(_d_mscope if (_d_mscope := getattr(_d, 'making_rank_scope', None)) is not None
                                       else 'positives'),
+                making_pool=str(_d_pool if (_d_pool := getattr(_d, 'making_pool', None)) is not None
+                                else 'rank'),
                 presence_gate=_num(getattr(_d, 'presence_gate', None), 1, int),
                 presence_window=_num(getattr(_d, 'presence_window', None), 50, int),
+                skill_variant=str(_d_var if (_d_var := getattr(_d, 'skill_variant', None)) is not None else 'drift'),
+                skill_subwindows=_num(getattr(_d, 'skill_subwindows', None), 1, int),
+                skill_subwindow_form=str(_d_form if (_d_form := getattr(_d, 'skill_subwindow_form', None)) is not None
+                                         else 'sign_gated'),
+                skill_subwindow_min_agree=_num(getattr(_d, 'skill_subwindow_min_agree', None), 2, int),
+                skill_hurdle_bps=_num(getattr(_d, 'skill_hurdle_bps', None), 0.0, float),
+                skill_hurdle_books=_num(getattr(_d, 'skill_hurdle_books', None), 4, int),
+                skill_pool_scaling=_num(getattr(_d, 'skill_pool_scaling', None), 0, int),
+                skill_max_inactive_books=_num(getattr(_d, 'skill_max_inactive_books', None), 0.0, float),
+                skill_min_books=_num(getattr(_d, 'skill_min_books', None), 4, int),
+                skill_p11_strength=_num(getattr(_d, 'skill_p11_strength', None), 0.0, float),
+                presence_share_weighting=_num(getattr(_d, 'presence_share_weighting', None), 0, int),
+                presence_min_share=_num(getattr(_d, 'presence_min_share', None), 0.0, float),
                 mark_mode=str(_d_mark if (_d_mark := getattr(_d, 'mark_mode', None)) is not None
                               else 'last'),
                 mark_window=_num(getattr(_d, 'mark_window', None), 200, int),

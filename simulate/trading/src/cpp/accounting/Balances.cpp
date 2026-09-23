@@ -4,6 +4,9 @@
  */
 #include <taosim/accounting/Balances.hpp>
 
+#include <mutex>
+#include <set>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::accounting
@@ -334,6 +337,51 @@ Balances Balances::fromJson(const rapidjson::Value& json)
 
 //-------------------------------------------------------------------------
 
+namespace
+{
+double requiredWealthAttr(
+    pugi::xml_attribute canonicalAttr, const char* canonical,
+    pugi::xml_attribute legacyAttr, const char* legacy, const char* type)
+{
+    if (canonicalAttr && legacyAttr) {
+        const auto msg = fmt::format(
+            "[Balances] FATAL: a '{}' <Balances> element carries both '{}' ({}) and the "
+            "deprecated '{}' ({}). Pick one: with both, an override on the deprecated name is "
+            "silently discarded.",
+            type, canonical, canonicalAttr.as_string(), legacy, legacyAttr.as_string());
+        fmt::println(stderr, "{}", msg);
+        throw std::invalid_argument(fmt::format(
+            "{}: {}", std::source_location::current().function_name(), msg));
+    }
+    if (canonicalAttr) {
+        return canonicalAttr.as_double();
+    }
+    if (legacyAttr) {
+        static std::mutex warnMutex;
+        static std::set<std::string> warned;
+        std::string key = fmt::format("{}::{}", type, legacy);
+        std::scoped_lock lock{warnMutex};
+        if (warned.insert(key).second) {
+            fmt::println(
+                "[Balances] DEPRECATED attribute '{}' on a '{}' element: use '{}'. "
+                "Reading '{}' for now; support will be removed.",
+                legacy, type, canonical, legacy);
+        }
+        return legacyAttr.as_double();
+    }
+    const auto msg = fmt::format(
+        "[Balances] FATAL: a '{}' <Balances> element needs '{}' (legacy name '{}'); neither is "
+        "present, and defaulting it to 0 would start every agent with no capital",
+        type, canonical, legacy);
+    fmt::println(stderr, "{}", msg);
+    throw std::invalid_argument(fmt::format(
+        "{}: {}", std::source_location::current().function_name(), msg));
+}
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
 Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams, std::mt19937* rng)
 {
     // A local std::random_device stream here made every run draw different starting wealth, which is
@@ -358,11 +406,46 @@ Balances Balances::fromXML(pugi::xml_node node, const RoundParams& roundParams, 
             .roundParams = roundParams
         });
     }
+    else if (std::string_view{node.attribute("type").as_string()} == "uniform-50") {
+        const auto minWealth = requiredWealthAttr(
+            node.attribute("wealthMin"), "wealthMin",
+            node.attribute("wealth"), "wealth", "uniform-50");
+        const auto maxWealth = requiredWealthAttr(
+            node.attribute("wealthMax"), "wealthMax",
+            node.attribute("cap"), "cap", "uniform-50");
+        if (maxWealth < minWealth) {
+            const auto msg = fmt::format(
+                "[Balances] FATAL: uniform-50 needs wealthMax >= wealthMin, got [{}, {}]",
+                minWealth, maxWealth);
+            fmt::println(stderr, "{}", msg);
+            throw std::invalid_argument(fmt::format(
+                "{}: {}", std::source_location::current().function_name(), msg));
+        }
+        const auto wealth = std::uniform_real_distribution{minWealth, maxWealth}(wealthRng);
+        const auto price = node.attribute("price").as_double();
+        const auto symbol = node.attribute("symbol").as_string();
+        // Clamps: modify docs to reflect as an option for future featuring
+        // Default: off.
+        const auto qMin = node.attribute("qMin").as_double(0.0);
+        const auto qMax = node.attribute("qMax").as_double(1.0);
+        const auto quoteShare = std::uniform_real_distribution{qMin, qMax}(wealthRng);
+        return Balances({
+            .base = Balance{
+                decimal_t{(1.0 - quoteShare) * wealth / price}, symbol, roundParams.baseDecimals},
+            .quote = std::make_shared<Balance>(
+                decimal_t{quoteShare * wealth}, symbol, roundParams.quoteDecimals),
+            .roundParams = roundParams
+        });
+    }
     else if (std::string_view{node.attribute("type").as_string()} == "pareto-50") {
         const auto scale = node.attribute("scale").as_double();
         const auto shape = node.attribute("shape").as_double();
-        const auto minWealth = node.attribute("wealth").as_double();
-        const auto maxWealth = node.attribute("cap").as_double();
+        const auto minWealth = requiredWealthAttr(
+            node.attribute("wealthMin"), "wealthMin",
+            node.attribute("wealth"), "wealth", "pareto-50");
+        const auto maxWealth = requiredWealthAttr(
+            node.attribute("wealthMax"), "wealthMax",
+            node.attribute("cap"), "cap", "pareto-50");
         const auto u2 = std::uniform_real_distribution{0.0,1.0}(wealthRng);
         const auto wealth = std::min(minWealth/std::pow(u2,1.0/1.16), maxWealth);
         const auto price = node.attribute("price").as_double();

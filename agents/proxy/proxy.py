@@ -210,7 +210,15 @@ class Proxy(Validator):
                 async with session.post(url=url, json=json, timeout=self.config.neuron.timeout) as r:
                     response = await r.json()
                     response_time = time.time() - start
-                    bt.logging.success(f"{agent} | Response : {response} ({response_time}s)")
+                    # Bounded: a rejected body comes back with the whole request echoed inside it,
+                    # which at this book count is megabytes on one line. Report the status too, so a
+                    # rejection reads as one rather than as a success.
+                    body = str(response)
+                    body = body if len(body) <= 512 else body[:512] + f"... ({len(body)} chars)"
+                    if r.status == 200:
+                        bt.logging.success(f"{agent} | Response : {body} ({response_time}s)")
+                    else:
+                        bt.logging.error(f"{agent} | HTTP {r.status} : {body} ({response_time}s)")
                 return uid, agent, response, response_time
             except asyncio.exceptions.TimeoutError:
                 bt.logging.error(f"{agent} | Timed out after {self.config.neuron.timeout}s while awaiting response from {url}.")

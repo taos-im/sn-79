@@ -92,7 +92,7 @@ void MagneticField::insertDurationComp(const std::string& agentBaseName, Duratio
     m_state.agentBaseNameToDuration[agentBaseName] = std::move(event);
 }
 
-void MagneticField::emitDiagnostics(const std::string& agentBaseName, uint32_t bookId) const
+void MagneticField::emitDiagnostics(const std::string& agentBaseName, uint32_t bookIdCanon) const
 {
     const auto it = m_state.agentBaseNameToStats.find(agentBaseName);
     if (it == m_state.agentBaseNameToStats.end() || it->second.n == 0) return;
@@ -106,7 +106,7 @@ void MagneticField::emitDiagnostics(const std::string& agentBaseName, uint32_t b
         "AGENTDIAG {{\"agent\":\"{}\",\"book\":{},\"n\":{},"
         "\"delay_mean\":{},\"delay_std\":{},\"delay_min\":{},\"delay_max\":{},"
         "\"psi_mean\":{},\"psi_std\":{}}}\n",
-        agentBaseName, bookId, s.n,
+        agentBaseName, bookIdCanon, s.n,
         delayMean, delayStd, s.delayMin, s.delayMax, psiMean, psiStd);
     std::fflush(stdout);
 }

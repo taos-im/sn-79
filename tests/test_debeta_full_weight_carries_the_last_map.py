@@ -5,8 +5,7 @@
 Below weight 1.0 an empty map renormalises the de-beta share onto the legacy components and the
 cycle scores normally. At weight 1.0 kappa and pnl carry weight 0 and are not computed, so there is
 nothing to renormalise onto: the warming guard (fewer positive scores than min_books) or any exception
-inside the computation scored every miner 0 for that cycle (miner report on the 0.6.1 testnet
-ratchet). The previous cycle's map is carried for up to ten minutes, with its
+inside the computation scores every miner 0 for that cycle. The previous cycle's map is carried for up to ten minutes, with its
 decomposition, and every carry is logged; with nothing to carry the zero cycle is logged as an error.
 """
 import time

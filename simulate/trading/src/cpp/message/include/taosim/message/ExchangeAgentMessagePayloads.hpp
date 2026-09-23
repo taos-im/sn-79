@@ -638,6 +638,32 @@ struct RetrieveL2ResponsePayload : public MessagePayload
 
 //-------------------------------------------------------------------------
 
+// Wakeup token for a book-scoped agent clock.
+//
+// One field on the wire, structurally identical to RetrieveL1Payload, so a checkpoint
+// written while WAKEUP still carried that type decodes into this one unchanged. It is a
+// separate type because a wakeup is not a data request: the woken agent reads market
+// state directly from the exchange rather than asking for it by message.
+struct WakeupPayload : public MessagePayload
+{
+    using Ptr = std::shared_ptr<WakeupPayload>;
+
+    BookId bookId;
+
+    WakeupPayload() = default;
+
+    WakeupPayload(BookId bookId) noexcept : bookId{bookId} {}
+
+    virtual void jsonSerialize(
+        rapidjson::Document& json, const std::string& key = {}) const override;
+
+    [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
+
+    MSGPACK_DEFINE_MAP(bookId);
+};
+
+//-------------------------------------------------------------------------
+
 struct RetrieveL1Payload : public MessagePayload
 {
     using Ptr = std::shared_ptr<RetrieveL1Payload>;

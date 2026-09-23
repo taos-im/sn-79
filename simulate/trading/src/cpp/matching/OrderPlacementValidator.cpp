@@ -155,7 +155,9 @@ OrderPlacementValidator::ExpectedResult
     bool instantTrade = false;
 
     if (payload->direction == OrderDirection::BUY) {
-        if (book->sellQueue().empty()) {
+        // Ghost-only levels leave the deque non-empty with nothing to trade against and no best
+        // price, so the test is for an active best level rather than for levels.
+        if (!book->bestSellLevel()) {
             return std::unexpected{OrderErrorCode::EMPTY_BOOK};
         }
         if (payload->leverage > 0_dec && (balances.m_baseLoan > 0_dec || !balances.m_sellLeverages.empty())){
@@ -269,7 +271,7 @@ OrderPlacementValidator::ExpectedResult
         };
 
     } else {
-        if (book->buyQueue().empty()) {
+        if (!book->bestBuyLevel()) {
             return std::unexpected{OrderErrorCode::EMPTY_BOOK};
         }
         if (payload->leverage > 0_dec && (balances.m_quoteLoan > 0_dec || !balances.m_buyLeverages.empty())){
@@ -552,13 +554,31 @@ OrderPlacementValidator::ExpectedResult
             if (takerVolume > 0_dec) instantTrade = true;
             const decimal_t makerTotalPrice = util::round(payloadTotalAmount - takerTotalPrice, m_params.quoteIncrementDecimals);
             const decimal_t makerVolume = util::round(makerTotalPrice / payload->price, m_params.baseIncrementDecimals);
+            // RESERVE WHAT THE RESTING ORDER CAN SPEND, NOT WHAT THE PAYLOAD NAMED.
+            //
+            // makerTotalPrice is the quote the payload asked to spend; makerVolume is that quote
+            // divided by the price and truncated onto the base grid. They agree only when the
+            // division lands on the grid, so reserving makerTotalPrice locks quote the order can
+            // never consume -- and canReserve below then tests an amount it will not use, refusing
+            // INSUFFICIENT_QUOTE an order that exactly fits the balance after truncation. That is a
+            // wrong rejection, and spend-the-balance orders are its natural case.
+            //
+            // The SELL path never had this: it reserves BASE straight from the truncated volume, so
+            // no conversion sits between the reserved unit and the order's unit.
+            //
+            // Two worked examples, both quote-denominated BUY placements:
+            //   reserved 45.303114 against 0.3001 * 150.95 = 45.300095   (over by 0.003019)
+            //   reserved 93.347194 against 0.3001 * 311.03 = 93.340103   (over by 0.007091)
+            // The narration also printed makerTotalPrice beside makerTotalPrice/price as "({}*{})",
+            // asserting a product that was false; it now prints the quantities it actually used.
+            const decimal_t makerQuote = util::round(makerVolume * payload->price, m_params.quoteIncrementDecimals);
             m_exchange->simulation()->logDebug(
                 "{} | AGENT #{} BOOK {} : CALCULATED PRE-RESERVATION OF {} QUOTE ({}*{}) FOR PLACE OF BUY ORDER {}x{}@{}",
                 m_exchange->simulation()->currentTimestamp(), agentId, m_exchange->simulation()->bookIdCanon(book->id()),
-                makerTotalPrice, util::round(makerTotalPrice / payload->price, m_params.baseIncrementDecimals), payload->price,
+                makerQuote, makerVolume, payload->price,
                 util::dec1p(payload->leverage), payload->volume, payload->price);
             volumeWeightedPrice = util::round(
-                takerTotalPrice + makerTotalPrice, m_params.quoteIncrementDecimals);
+                takerTotalPrice + makerQuote, m_params.quoteIncrementDecimals);
             orderSize = util::round(
                 (takerVolume + makerVolume) / util::dec1p(payload->leverage), m_params.baseIncrementDecimals);
         }
@@ -1303,8 +1323,9 @@ bool OrderPlacementValidator::checkPostOnly(
     if (payload->timeInForce == TimeInForce::IOC || payload->timeInForce == TimeInForce::FOK) [[unlikely]] {
         return false;
     }
-    if (payload->direction == OrderDirection::BUY && book->sellQueue().empty()
-        || payload->direction == OrderDirection::SELL && book->buyQueue().empty()) [[unlikely]] {
+    // A ghost-only opposite side has no best price to cross, so the order can only rest.
+    if (payload->direction == OrderDirection::BUY && !book->bestSellLevel()
+        || payload->direction == OrderDirection::SELL && !book->bestBuyLevel()) [[unlikely]] {
         return true;
     }
 

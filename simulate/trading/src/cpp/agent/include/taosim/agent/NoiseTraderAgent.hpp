@@ -52,7 +52,6 @@ private:
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
     void handleWakeup(Message::Ptr &msg);
-    void handleRetrieveL1Response(Message::Ptr msg);
     void handleMarketOrderPlacementResponse(Message::Ptr msg);
     void handleMarketOrderPlacementErrorResponse(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
@@ -79,6 +78,8 @@ private:
     void placeSell(BookId bookId, double volume);
     Timestamp orderPlacementLatency();
     Timestamp marketFeedLatency();
+    // The clamp marketFeedLatency() applies, without drawing from the rng.
+    [[nodiscard]] Timestamp marketFeedLatencyBound() const;
 
     // Parameters, injections.
     //General params
@@ -100,6 +101,7 @@ private:
     Timestamp m_tau;
     double m_sigma;
     double m_mWeight;
+    double m_forecastVar;
 
     // Delays, latencys activations and more
     float m_omegaDu;
@@ -117,7 +119,7 @@ private:
     // State.
     NoiseTraderAgentState m_state;
     // Cached per-bookId MagneticField pointer — eliminates per-tick string
-    // lookup + RTTI cast in handleWakeup/handleRetrieveL1Response paths.
+    // lookup + RTTI cast on the handleWakeup path.
     std::vector<taosim::process::MagneticField*> m_magneticField;
 };
 

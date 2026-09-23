@@ -148,6 +148,7 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     m_sigma = node.attribute("sigmaExp").as_double(0.00001);
     m_feeReserveFrac = std::clamp(node.attribute("feeReserveFrac").as_double(0.01), 0.0, 0.5);
     m_mWeight = node.attribute("weight").as_double(0.1);
+    m_forecastVar = node.attribute("forecastVar").as_double(0.0);
 
     try {
         (void)simulation()->exchange()->process("magneticfield", 0);
@@ -192,9 +193,6 @@ void NoiseTraderAgent::receiveMessage(Message::Ptr msg)
     else if (msg->type == "RESPONSE_SUBSCRIBE_EVENT_TRADE") {
         handleTradeSubscriptionResponse();
     }
-    else if (msg->type == "RESPONSE_RETRIEVE_L1") {
-        handleRetrieveL1Response(msg);
-    }
     else if (msg->type == "RESPONSE_PLACE_ORDER_MARKET") {
         handleMarketOrderPlacementResponse(msg);
     }
@@ -222,13 +220,25 @@ void NoiseTraderAgent::handleSimulationStart()
         for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
 
             auto chosenAgent = selectTurn();
-            simulation()->dispatchMessage(
+            const Timestamp initDelay = marketFeedLatency();
+            auto& chains = simulation()->exchange()->wakeupChains().at(bookId);
+            // The bound the watchdog waits out is the widest hop delay PLUS the L1
+            // round trip, because the token is consumed at the wake and handed on only
+            // once the response lands.
+            chains.registerChain(
+                m_baseName,
                 simulation()->currentTimestamp(),
-                marketFeedLatency(),
-                name(),
-                fmt::format("{}_{}", m_baseName, chosenAgent),
-                "WAKEUP",
-                MessagePayload::create<RetrieveL1Payload>(bookId));
+                m_maxDelay + marketFeedLatencyBound(),
+                simulation()->localAgentManager()->roster()->at(m_baseName));
+            if (chains.arm(m_baseName, simulation()->currentTimestamp(), initDelay)) {
+                simulation()->dispatchMessage(
+                    simulation()->currentTimestamp(),
+                    initDelay,
+                    name(),
+                    fmt::format("{}_{}", m_baseName, chosenAgent),
+                    "WAKEUP",
+                    MessagePayload::create<WakeupPayload>(bookId));
+            }
 
             const auto field = m_magneticField[bookId];
             const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
@@ -245,7 +255,10 @@ void NoiseTraderAgent::handleSimulationStop()
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         const auto field = dynamic_cast<process::MagneticField*>(
             simulation()->exchange()->process("magneticfield", bookId));
-        if (field) field->emitDiagnostics(m_baseName, bookId);
+        // CANONICAL, matching the other two AGENTDIAG sites and the WAKEUPCHAIN lines. The
+        // loop is over LOCAL ids, which restart at zero in every block, so passing bookId
+        // through has every block reporting its own "book 0".
+        if (field) field->emitDiagnostics(m_baseName, simulation()->bookIdCanon(bookId));
     }
 }
 
@@ -268,22 +281,17 @@ uint64_t NoiseTraderAgent::selectTurn()
 
 void NoiseTraderAgent::handleWakeup(Message::Ptr &msg)
 {
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        marketFeedLatency(),
-        name(),
-        m_exchange,
-        "RETRIEVE_L1",
-        msg->payload);
-}
-
-//-------------------------------------------------------------------------
-
-void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
-{
-    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
+    const Timestamp now = simulation()->currentTimestamp();
+
+    simulation()->exchange()->wakeupChains().at(bookId).noteWake(m_baseName, now);
+
+    // Drawn FIRST, and included in the hop below. The gap between two wakes is the market
+    // feed latency plus the ACD delay, which is the arrival intensity this class was
+    // calibrated at; drawing before selectTurn fixes the per-hop rng sequence.
+    const Timestamp marketFeedDelay = marketFeedLatency();
 
     uint64_t chosenOne = selectTurn();
     const auto field = m_magneticField[bookId];
@@ -301,18 +309,24 @@ void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     }
     Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delayRaw), m_minDelay, m_maxDelay);
     const float delay = static_cast<float>(delay_timestamped);
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        delay_timestamped,
-        name(),
-        fmt::format("{}_{}", m_baseName, chosenOne),
-        "WAKEUP",
-        MessagePayload::create<RetrieveL1Payload>(bookId));
+    const Timestamp hop = delay_timestamped + marketFeedDelay;
+    if (simulation()->exchange()->wakeupChains().at(bookId).arm(m_baseName, now, hop)) {
+        simulation()->dispatchMessage(
+            now,
+            hop,
+            name(),
+            fmt::format("{}_{}", m_baseName, chosenOne),
+            "WAKEUP",
+            MessagePayload::create<WakeupPayload>(bookId));
+    }
 
+    // Fed the ACD's own drawn duration, not the hop: the market feed delay is not part of
+    // the duration process being recursed on.
     field->insertDurationComp(m_baseName, process::DurationComp{.delay=std::log(delay), .psi=psi_next});
 
-    double bestBid = taosim::util::decimal2double(payload->bestBidPrice);
-    double bestAsk = taosim::util::decimal2double(payload->bestAskPrice);    
+    const auto l1 = simulation()->exchange()->statsHub()->l1(bookId);
+    double bestBid = taosim::util::decimal2double(l1.bestBidPrice);
+    double bestAsk = taosim::util::decimal2double(l1.bestAskPrice);    
     if  (bestBid == 0.0) bestBid = m_price; 
     if  (bestAsk == 0.0) bestAsk = bestBid + m_priceIncrement; 
     const double midQuote = 0.5*(bestAsk + bestBid);
@@ -401,7 +415,8 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     const auto freeQuote =
         taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote->getFree());
     float adjustedRet = m_sigma +  m_mWeight*magnetism + field->magnetismReturn();
-    ForecastResult forecastResult = {.price= m_price*std::exp(adjustedRet), .varianceOfLastLogReturns=m_sigma};
+    const float correctedRet = adjustedRet - 0.5f*static_cast<float>(m_forecastVar);
+    ForecastResult forecastResult = {.price= m_price*std::exp(correctedRet), .varianceOfLastLogReturns=m_sigma};
     const auto [indifferencePrice, indifferencePriceConverged] =
         calculateIndifferencePrice(forecastResult, freeBase, freeQuote);
     if (!indifferencePriceConverged) return;
@@ -592,6 +607,14 @@ Timestamp NoiseTraderAgent::orderPlacementLatency()
 {
     return static_cast<Timestamp>(
         std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
+}
+
+//-------------------------------------------------------------------------
+
+Timestamp NoiseTraderAgent::marketFeedLatencyBound() const
+{
+    return static_cast<Timestamp>(
+        m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev());
 }
 
 //-------------------------------------------------------------------------

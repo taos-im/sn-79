@@ -71,7 +71,7 @@ bool PosixMessageQueue::send(std::span<const char> msg, uint32_t priority) noexc
 
 //-------------------------------------------------------------------------
 
-ssize_t PosixMessageQueue::receive(std::span<char> msg, uint32_t* priority) noexcept
+ptrdiff_t PosixMessageQueue::receive(std::span<char> msg, uint32_t* priority) noexcept
 {
     if (!m_desc.timeout) {
         return blockingReceive(msg, priority);
@@ -82,7 +82,7 @@ ssize_t PosixMessageQueue::receive(std::span<char> msg, uint32_t* priority) noex
 
 //-------------------------------------------------------------------------
 
-ssize_t PosixMessageQueue::blockingReceive(std::span<char> msg, uint32_t* priority) noexcept
+ptrdiff_t PosixMessageQueue::blockingReceive(std::span<char> msg, uint32_t* priority) noexcept
 {
     return mq_receive(m_handle, msg.data(), msg.size(), priority);
 }

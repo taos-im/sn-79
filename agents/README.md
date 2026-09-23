@@ -797,7 +797,7 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
 
 - `config`
 
-  Contains details of the simulation configuration ([`MarketSimulationConfig`](../taos/im/protocol/models.py)) used by the sending validator.  Includes simulation parameters, fee settings, and agent configurations.
+  Contains details of the simulation configuration ([`MarketSimulationConfig`](../taos/im/protocol/config.py)) used by the sending validator.  Includes simulation parameters, fee settings, and agent configurations.
 
   The fields which are important for miners are:
 

@@ -127,7 +127,8 @@ def _snap_hist2(h):
     return {k: dict(tsd) for k, tsd in (h or {}).items()}
 
 
-_DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist")
+_DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist",
+                 "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist")
 _DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist")
 
 
@@ -184,6 +185,8 @@ def build_validator_state(
         "trading_score_ema": dict(getattr(self, '_trading_score_ema', {}) or {}),
         "trading_score_ema_ts": getattr(self, '_trading_score_ema_ts', None),
         "trading_score_ema_n": dict(getattr(self, '_trading_score_ema_n', {}) or {}),
+        # the proportional making pool's smoothed term and share; empty under the rank default
+        "debeta_pool_ema": {k: dict(v or {}) for k, v in (getattr(self, '_debeta_pool_ema', {}) or {}).items()},
         "inventory_history": inventory_snapshot,
         "kappa_values": self.kappa_values,
         "realized_pnl_history": realized_pnl_snapshot,
@@ -280,6 +283,8 @@ def build_save_light_fields(self: Validator) -> dict:
         "trading_score_ema": dict(getattr(self, '_trading_score_ema', {}) or {}),
         "trading_score_ema_ts": getattr(self, '_trading_score_ema_ts', None),
         "trading_score_ema_n": dict(getattr(self, '_trading_score_ema_n', {}) or {}),
+        # the proportional making pool's smoothed term and share; empty under the rank default
+        "debeta_pool_ema": {k: dict(v or {}) for k, v in (getattr(self, '_debeta_pool_ema', {}) or {}).items()},
         "miner_stats": snapshot_miner_stats(self),
         "miner_presence": snapshot_miner_presence(self),
     }
@@ -1279,6 +1284,11 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_mtm_hist = _load_hist3("debeta_mtm_hist")
     self.debeta_invsum_hist = _load_hist3("debeta_invsum_hist")
     self.debeta_cp_hist = _load_hist3("debeta_cp_hist")
+    # 0.6.2 skill-leg histories; absent from a snapshot written before them, so they warm from empty.
+    self.debeta_heldn_hist = _load_hist3("debeta_heldn_hist")
+    self.debeta_heldinv_hist = _load_hist3("debeta_heldinv_hist")
+    self.debeta_helddrift_hist = _load_hist3("debeta_helddrift_hist")
+    self.debeta_notional_hist = _load_hist3("debeta_notional_hist")
     self.debeta_invn_hist = _load_hist2("debeta_invn_hist")
     self.debeta_drift_hist = _load_hist2("debeta_drift_hist")
     # rebuild running sums from the histories
@@ -1286,6 +1296,10 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.capture_sell_sums = _dd2(sum_hist_2level(self.debeta_capsell_hist))
     self.debeta_mtm = _dd2(sum_hist_2level(self.debeta_mtm_hist))
     self.debeta_invsum = _dd2(sum_hist_2level(self.debeta_invsum_hist))
+    self.debeta_heldn = _dd2(sum_hist_2level(self.debeta_heldn_hist))
+    self.debeta_heldinv = _dd2(sum_hist_2level(self.debeta_heldinv_hist))
+    self.debeta_helddrift = _dd2(sum_hist_2level(self.debeta_helddrift_hist))
+    self.debeta_notional = _dd2(sum_hist_2level(self.debeta_notional_hist))
     self.debeta_cp = sum_hist_2level(self.debeta_cp_hist)
     self.debeta_invn = sum_hist_1level(self.debeta_invn_hist)
     self.debeta_drift = sum_hist_1level(self.debeta_drift_hist)
@@ -1532,6 +1546,9 @@ def _load_validator_state(self):
             self._trading_score_ema_ts = validator_state.get("trading_score_ema_ts", None)
             _ema_n = validator_state.get("trading_score_ema_n", {}) or {}
             self._trading_score_ema_n = {int(u): int(v) for u, v in _ema_n.items()}
+            _pema = validator_state.get("debeta_pool_ema") or {}
+            self._debeta_pool_ema = {str(k): {int(u): float(x) for u, x in (v or {}).items()}
+                                     for k, v in _pema.items()}
 
             loaded_activity = validator_state.get("activity_factors", {})
             if loaded_activity and isinstance(list(loaded_activity.values())[0], float):

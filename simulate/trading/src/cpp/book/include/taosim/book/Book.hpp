@@ -65,6 +65,7 @@ public:
     [[nodiscard]] taosim::decimal_t midPrice() const noexcept;
     [[nodiscard]] taosim::decimal_t bestBid() const noexcept;
     [[nodiscard]] taosim::decimal_t bestAsk() const noexcept;
+    [[nodiscard]] std::optional<taosim::decimal_t> spread() const noexcept;
     [[nodiscard]] OptLevelRef bestBuyLevel() const noexcept;
     [[nodiscard]] OptLevelRef bestSellLevel() const noexcept;
 
@@ -83,8 +84,9 @@ public:
     void placeLimitSell(const LimitOrder::Ptr& order);
     bool cancelOrder(OrderID orderId, std::optional<taosim::decimal_t> volumeToCancel = {});
     // Restore un-executed volume onto a still-resting order (partial-fill reconciliation).
-    // Updates BOTH the order and its price-level aggregate so the L2 level stays consistent
-    // (a raw setVolume would desync the level and later underflow it on cancel/match).
+    // Updates BOTH the order and its price-level aggregate (by the order's totalVolume change) so
+    // the L2 level stays consistent (a raw setVolume would desync the level and later underflow
+    // it on cancel/match).
     bool restoreRestingOrderVolume(OrderID orderId, taosim::decimal_t deltaVolume);
     [[nodiscard]] std::optional<LimitOrder::Ptr> getOrder(OrderID orderId) const;
     void registerLimitOrder(const LimitOrder::Ptr& order);

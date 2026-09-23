@@ -4,6 +4,8 @@
  */
 #include <taosim/book/L3EventLogger.hpp>
 
+#include "L3Fmt.hpp"
+
 #include "Simulation.hpp"
 #include "util.hpp"
 
@@ -47,23 +49,28 @@ void L3EventLogger::log(taosim::L3LogEvent event)
         ? std::chrono::system_clock::time_point{std::chrono::nanoseconds{blockTs}}
         : m_startTimePoint + m_timeConverter(m_simulation->currentTimestamp());
 
-    rapidjson::Document json = std::visit(
+    // Emitted via fmt straight from the event objects (no rapidjson Document, no
+    // decimal->double conversion); same lines as the previous L3Serialize + json2str
+    // path except numbers keep their full decimal digits — see util/L3Fmt.hpp and
+    // L3FmtTests.
+    fmt::memory_buffer buf;
+    std::visit(
         [&](auto&& item) {
             using T = std::remove_cvref_t<decltype(item)>;
-            static_assert(taosim::json::IsL3Serializable<T>);
-            rapidjson::Document json;
-            item.L3Serialize(json);
-            if constexpr (!std::same_as<T, taosim::InstructionLogContext>) {
-                json["g"]["b"].SetUint(
-                    m_simulation->bookIdCanon(json["g"]["b"].GetUint()));
+            if constexpr (std::same_as<T, taosim::InstructionLogContext>) {
+                taosim::l3fmt::formatItem(buf, item, event.id);
+            } else if constexpr (std::same_as<T, AgentResetLogContext>) {
+                taosim::l3fmt::formatItem(
+                    buf, item, m_simulation->bookIdCanon(item.bookId), event.id);
+            } else {
+                taosim::l3fmt::formatItem(
+                    buf, item, m_simulation->bookIdCanon(item.logContext->bookId), event.id);
             }
-            json.AddMember("k", rapidjson::Value{event.id}, json.GetAllocator());
-            return json;
         },
         event.item);
 
-    const auto line =
-        fmt::format("{:%Y-%m-%d,%H:%M:%S},{}", time, taosim::json::json2str(json));
+    const auto line = fmt::format(
+        "{:%Y-%m-%d,%H:%M:%S},{}", time, fmt::string_view{buf.data(), buf.size()});
     m_logger->trace(line);
     m_logger->flush();
     m_loggedSignal(line);

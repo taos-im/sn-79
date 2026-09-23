@@ -94,7 +94,7 @@ inline constexpr Timestamp kLogWindowMax =
 
 // Above this, a timestamp is a real Unix time in nanoseconds; below it, simulation-relative.
 //
-// 1e18 ns is 2001-09-09. Simulation clocks start at zero and kLogWindowMax caps a run's windows at 99
+// 1e18 ns is 9 September 2001. Simulation clocks start at zero and kLogWindowMax caps a run's windows at 99
 // days (8.6e15 ns), two orders of magnitude below the floor, so the two domains cannot be confused.
 // Used to decide whether a log file's window should be named as a calendar date or as the simulation's
 // own DDHHMMSS offset, and deliberately NOT a mode flag: the first log sink is opened while the

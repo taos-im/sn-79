@@ -110,3 +110,31 @@ TEST(ALGOTraderTest, ThrowsCorrectly)
 }
 
 //-------------------------------------------------------------------------
+
+TEST(ALGOTraderTest, SliceLiquidityModePreservesImpactOrCapsAtTheTouch)
+{
+    EXPECT_DOUBLE_EQ(
+        selectALGOSliceQuantity(9.0, 40.0, ALGOSliceLiquidityMode::CLEAR_TOUCH), 40.0);
+    EXPECT_DOUBLE_EQ(
+        selectALGOSliceQuantity(50.0, 40.0, ALGOSliceLiquidityMode::CLEAR_TOUCH), 50.0);
+    EXPECT_DOUBLE_EQ(
+        selectALGOSliceQuantity(9.0, 40.0, ALGOSliceLiquidityMode::CAP_AT_TOUCH), 9.0);
+    EXPECT_DOUBLE_EQ(
+        selectALGOSliceQuantity(50.0, 40.0, ALGOSliceLiquidityMode::CAP_AT_TOUCH), 40.0);
+    EXPECT_DOUBLE_EQ(
+        selectALGOSliceQuantity(9.0, 0.0, ALGOSliceLiquidityMode::CAP_AT_TOUCH), 0.0);
+}
+
+TEST(ALGOTraderTest, SliceLiquidityModeRejectsUnknownValues)
+{
+    EXPECT_EQ(
+        algoSliceLiquidityModeFromString("clear_touch"),
+        ALGOSliceLiquidityMode::CLEAR_TOUCH);
+    EXPECT_EQ(
+        algoSliceLiquidityModeFromString("cap_at_touch"),
+        ALGOSliceLiquidityMode::CAP_AT_TOUCH);
+    // Cast: the function is [[nodiscard]] and the build is warnings-as-errors.
+    EXPECT_THROW((void)algoSliceLiquidityModeFromString("adaptive"), std::invalid_argument);
+}
+
+//-------------------------------------------------------------------------

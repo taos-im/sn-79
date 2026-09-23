@@ -71,6 +71,20 @@ void packMessagePayload(auto& o, MessagePayload::Ptr payload)
     else if (auto pld = std::dynamic_pointer_cast<RetrieveL1Payload>(payload)) {
         o.pack(*pld);
     }
+    // WITHOUT THIS BRANCH A WAKEUP IS WRITTEN AS NIL AND THE ENGINE CANNOT RESTART.
+    //
+    // Every branch here is a dynamic_pointer_cast and the chain ends in `o.pack_nil()`, so a payload
+    // with no branch is not a compile error -- it is silently serialised as nothing. WakeupPayload
+    // had no branch, so every WAKEUP in a checkpointed queue lost its bookId and came back nil.
+    //
+    // That was harmless until 0.6.2: PayloadFactory used to turn a restored WAKEUP into an
+    // EmptyPayload, which nil satisfies. It now casts to WakeupPayload, and nil throws std::bad_cast
+    // during restore -- so the engine crash-loops on its own checkpoint, the validator issues zero
+    // query rounds, and every miner goes quiet until someone cold-starts past it by hand. Ten such
+    // failures in one error log, every one of type WAKEUP; caught twice by restarts/restingsurvives.
+    else if (auto pld = std::dynamic_pointer_cast<WakeupPayload>(payload)) {
+        o.pack(*pld);
+    }
     else if (auto pld = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(payload)) {
         o.pack(*pld);
     }

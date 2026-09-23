@@ -383,8 +383,8 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
         }
 
         m_L3Record = taosim::event::L3RecordContainer{bookCount};
-        m_bookTradeStats.assign(bookCount, taosim::book::BookTradeStats{});
         m_acdClocks.assign(bookCount, taosim::book::AcdClockRegistry{});
+        m_wakeupChains.assign(bookCount, taosim::book::WakeupChainRegistry{});
 
         m_L2Loggers.resize(bookCount);
         m_L3EventLoggers.resize(bookCount);
@@ -574,6 +574,15 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                 }
             }
         }
+
+        m_statsHub = std::make_unique<taosim::stats::StatsHub>(
+            taosim::stats::StatsHub::Desc{
+                .books = m_books,
+                .now = [this] { return simulation()->currentTimestamp(); },
+                .barPeriod = node.attribute("statsBarPeriod").as_ullong(1'000'000'000),
+                .barCapacity = node.attribute("statsBarCapacity").as_uint(3600)});
+
+        simulation()->signals().step.connect([this] { sweepWakeupChains(); });
 
         auto doc = std::make_shared<pugi::xml_document>();
         doc->append_copy(balancesNode);
@@ -782,6 +791,50 @@ void MultiBookExchangeAgent::jsonSerialize(
         taosim::json::serializeHelper(json, "accounts", serializeAccounts);
     };
     taosim::json::serializeHelper(json, key, serialize);
+}
+
+//-------------------------------------------------------------------------
+
+// Reseeds any token-passing wakeup chain that missed its deadline. Runs once per step,
+// after the queue has been drained to the step boundary, so a token still in flight
+// within the step is never mistaken for a lost one.
+//
+// The repair is a plain WAKEUP to one instance of the class, which is exactly what the
+// chain's own seed does at simulation start. It draws no rng and picks its target by a
+// rotating cursor, so a repair cannot shift the rng stream and make the rest of the run
+// incomparable to a healthy one.
+void MultiBookExchangeAgent::sweepWakeupChains()
+{
+    const Timestamp now = simulation()->currentTimestamp();
+    const Timestamp grace = std::max(simulation()->time().step, Timestamp{1});
+
+    for (BookId bookId{}; bookId < m_wakeupChains.size(); ++bookId) {
+        for (const auto& [key, target] : m_wakeupChains[bookId].collectOverdue(now, grace)) {
+            if (simulation()->localAgentManager()->findByName(target) == nullptr) {
+                // Reseeding at a name nobody answers to would leave the chain dead while
+                // the fault counter kept rising, so say so instead.
+                fmt::println(
+                    "WAKEUPCHAIN {{\"event\":\"reseed_target_missing\",\"chain\":\"{}\","
+                    "\"book\":{},\"target\":\"{}\",\"t\":{}}}",
+                    key, simulation()->bookIdCanon(bookId), target, now);
+                std::fflush(stdout);
+                continue;
+            }
+            fmt::println(
+                "WAKEUPCHAIN {{\"event\":\"reseed\",\"chain\":\"{}\",\"book\":{},"
+                "\"target\":\"{}\",\"t\":{},\"count\":{}}}",
+                key, simulation()->bookIdCanon(bookId), target, now,
+                m_wakeupChains[bookId].find(key)->reseedCount);
+            std::fflush(stdout);
+            simulation()->dispatchMessage(
+                now,
+                1,
+                name(),
+                target,
+                "WAKEUP",
+                MessagePayload::create<WakeupPayload>(bookId));
+        }
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -1771,51 +1824,11 @@ void MultiBookExchangeAgent::handleLocalClosePositions(const Message::Ptr&  msg)
 
 //-------------------------------------------------------------------------
 
-namespace
-{
-
-// Shared by both L1 handlers so the two responses can never disagree on what the
-// top of book is.
-struct TopOfBook
-{
-    taosim::decimal_t bestAskPrice{};
-    taosim::decimal_t bestAskVolume{};
-    taosim::decimal_t askTotalVolume{};
-    taosim::decimal_t bestBidPrice{};
-    taosim::decimal_t bestBidVolume{};
-    taosim::decimal_t bidTotalVolume{};
-};
-
-[[nodiscard]] TopOfBook topOfBook(const taosim::book::Book::Ptr& book)
-{
-    TopOfBook res{};
-
-    if (!book->sellQueue().empty()) {
-        const auto& bestSellLevel = book->sellQueue().front();
-        res.bestAskPrice = bestSellLevel.price();
-        res.bestAskVolume = bestSellLevel.volume();
-        res.askTotalVolume = book->sellQueue().volume();
-    }
-
-    if (!book->buyQueue().empty()) {
-        const auto& bestBuyLevel = book->buyQueue().back();
-        res.bestBidPrice = bestBuyLevel.price();
-        res.bestBidVolume = bestBuyLevel.volume();
-        res.bidTotalVolume = book->buyQueue().volume();
-    }
-
-    return res;
-}
-
-}  // namespace
-
-//-------------------------------------------------------------------------
-
 void MultiBookExchangeAgent::handleLocalRetrieveL1(const Message::Ptr&  msg)
 {
     const auto payload = std::static_pointer_cast<RetrieveL1Payload>(msg->payload);
 
-    const auto top = topOfBook(m_books[payload->bookId]);
+    const auto top = m_statsHub->l1(payload->bookId);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -1840,7 +1853,7 @@ void MultiBookExchangeAgent::handleLocalRetrieveL1Ext(const Message::Ptr&  msg)
 {
     const auto payload = std::dynamic_pointer_cast<RetrieveL1ExtPayload>(msg->payload);
 
-    const auto top = topOfBook(m_books[payload->bookId]);
+    const auto top = m_statsHub->l1(payload->bookId);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -1856,7 +1869,7 @@ void MultiBookExchangeAgent::handleLocalRetrieveL1Ext(const Message::Ptr&  msg)
             top.bestBidPrice,
             top.bestBidVolume,
             top.bidTotalVolume,
-            m_bookTradeStats.at(payload->bookId),
+            m_statsHub->tradeStats(payload->bookId),
             payload->bookId));
 }
 
@@ -2263,9 +2276,6 @@ void MultiBookExchangeAgent::tradeCallback(Trade::Ptr trade, BookId bookId)
         .aggressingAgentId = aggressiveClientInfo.agentId,
         .trade = trade
     });
-
-    m_bookTradeStats.at(bookId).record(
-        trade->price(), trade->volume(), simulation()->currentTimestamp());
 
     auto tradeCtx = TradeContext(bookId, aggressiveClientInfo.agentId, restingClientInfo.agentId, fees);
     tradeCtx.initiatorAgentId             = aggressiveClientInfo.initiatorAgentId;

@@ -38,6 +38,16 @@ std::unique_ptr<Process> ProcessFactory::createFromXML(pugi::xml_node node, uint
         return GBM::fromXML(node, seedShift);
     }
     else if (name == "FundamentalPrice") {
+        // SharedResources is owned by SimulationManager, so a bare Simulation has none. Without
+        // this the dereference below is a segfault inside the process constructor, with nothing
+        // to connect it to the config that caused it; it has cost a debugging session twice.
+        if (m_shared == nullptr) {
+            throw std::invalid_argument{fmt::format(
+                "{}: FundamentalPrice needs the shared resources owned by SimulationManager, "
+                "and this simulation has none. Use a GBM process, or drive the config through "
+                "SimulationManager",
+                std::source_location::current().function_name())};
+        }
         return FundamentalPrice::fromXML(
             m_simulation,
             node,

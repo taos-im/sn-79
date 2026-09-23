@@ -33,7 +33,12 @@ private:
     void handleSimulationStart();
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
-    void handleRetrieveResponse(Message::Ptr msg);
+    void handleWakeup(Message::Ptr msg);
+    void scheduleWakeup(BookId bookId, Timestamp delay);
+
+    // First quote goes up after this, and the agent requotes every `m_stepDelay` after that.
+    Timestamp m_graceDelay{};
+    Timestamp m_stepDelay{};
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
     void handleLimitOrderPlacementErrorResponse(Message::Ptr msg);
     void handleCancelOrdersResponse(Message::Ptr msg);

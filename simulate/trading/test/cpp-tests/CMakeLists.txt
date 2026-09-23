@@ -15,13 +15,6 @@ add_subdirectory(util)
 
 add_executable(taosim-tests
     ${TEST_SOURCES}
-    # NOTE: agent/ is deliberately NOT add_subdirectory'd. Its collect_test_sources()
-    # glob would also pull in agent/ALGOTraderTests.cpp, which no longer compiles —
-    # it was never wired into this target, so it rotted unnoticed (stale
-    # "ALGOTraderAgent.hpp" include, and ALGOTraderVolumeStats{period} no longer
-    # matches any constructor). Listing the file we do want keeps this target green;
-    # fixing that test is a separate change.
-    agent/HighFrequencyTraderTests.cpp
     UtilTests.cpp
     ChainAmountPrecisionTests.cpp
     RequestFingerprintTests.cpp
@@ -33,8 +26,20 @@ add_executable(taosim-tests
     SLTPContainerTests.cpp
     QuoteBasedOrderTests.cpp
     LoanSettlementTests.cpp
+    L3FmtTests.cpp
     L3SignalWiringTests.cpp
+    StatsHubTests.cpp
+    WakeupChainTests.cpp
+    BarSeriesTests.cpp
+    StylizedTraderBarsTests.cpp
+    HighFrequencyQuoteCycleTests.cpp
     MinQuoteOrderSizeTests.cpp
+    BookAggregateInvariantTests.cpp
+    ReferenceConfigTests.cpp
+    BlockBookIdTests.cpp
+    WakeupPayloadContractTests.cpp
+    WakeupCheckpointRoundTripTests.cpp
+    FuturesTraderActivityTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the
 # target always configures.

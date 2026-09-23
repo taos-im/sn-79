@@ -390,3 +390,46 @@ TEST_F(QuoteFloorBothFloors, AtProductionFloorsTheAlphaFloorBindsFirstOnACheapBo
 }
 
 //-------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------
+// A QUOTE-denominated BUY must reserve what its RESTING ORDER can spend.
+//
+// The engine derived the order's volume by dividing the named quote by the price and truncating onto
+// the base grid, then reserved the NAMED quote anyway. The two agree only when that division lands on
+// the grid, so the order held quote it could never consume, and canReserve tested an amount it would
+// not use -- refusing INSUFFICIENT_QUOTE an order that exactly fits the balance after truncation.
+//
+// Two worked examples of the over-reservation:
+//     reserved 45.303114 against 0.3001 * 150.95 = 45.300095   (over by 0.003019)
+//     reserved 93.347194 against 0.3001 * 311.03 = 93.340103   (over by 0.007091)
+// The behaviour is unchanged from the previous release, so the defect shipped rather than being
+// introduced: nothing compared the reserved amount against what the truncated order could spend.
+
+TEST_F(QuoteFloorSet, AQuoteDenominatedBuyReservesWhatTheRestingOrderCanSpend)
+{
+    seedBook();
+
+    // THE QUOTIENT MUST NOT TERMINATE IN *THIS* CONFIG. The live numbers (45.303114 @ 150.95) divide
+    // exactly at five places, and they only truncated in production because simulation_0 carries
+    // baseDecimals="4"; this fixture carries "8", so reusing them exercises nothing and the test
+    // passes without touching the defect. 1 / 7 recurs, so it truncates at any precision.
+    const auto price = DEC(7.0);
+    const auto named = DEC(1.0);
+
+    const auto freeBefore = exchange->accounts()[remoteAgent].at(bookId).quote->getFree();
+    const auto [order, ec] = placeLimit(exchange, remoteAgent, bookId, Currency::QUOTE,
+        OrderDirection::BUY, named, price, DEC(0.));
+    ASSERT_EQ(ec, OrderErrorCode::VALID);
+    ASSERT_NE(order, nullptr);
+
+    const auto freeAfter = exchange->accounts()[remoteAgent].at(bookId).quote->getFree();
+    const auto reserved = freeBefore - freeAfter;
+
+    EXPECT_EQ(reserved, util::round(order->volume() * price, 10u))
+        << "reserved " << reserved << " for an order of " << order->volume() << " @ " << price
+        << ", which can spend only " << (order->volume() * price)
+        << ". The excess is locked for the order's life and makes canReserve test an amount the "
+           "order will never use.";
+    EXPECT_LT(reserved, named)
+        << "the named amount was reserved verbatim; the truncated order cannot consume it";
+}

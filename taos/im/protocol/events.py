@@ -5,7 +5,7 @@ Finance event classes: simulation lifecycle, order placement, trade, cancellatio
 and position-close events for the intelligent markets protocol.
 """
 from taos.common.protocol import BaseModel
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import Literal
 from taos.im.protocol.simulator import *
 from taos.common.protocol import SimulationEvent
@@ -554,6 +554,15 @@ class TradeEvent(FinanceEvent):
     # exchange path sends the string; normalised to the string in FinanceEvent.from_json so a miner
     # can write one check that holds on both mechanisms.
     cr : str | None = Field(alias="closeReason", default=None)
+
+    # The simulation mechanism packs this as the raw integer (0/1/2), and the proxy hands notices
+    # straight to a miner as a typed body, so the validate door has to normalise it too. The
+    # model_construct door still cannot -- it skips validators -- which is what
+    # trade_event_from_wire above is for.
+    @field_validator("cr", mode="before")
+    @classmethod
+    def _normalize_close_reason(cls, raw):
+        return _close_reason_str(raw)
     
     @property
     def closeReason(self) -> str | None:

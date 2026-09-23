@@ -20,8 +20,18 @@ def _coro(fn):
 
 
 async def _watch(name, stream, is_err=False):
-    async for line in stream:
-        text = line.decode().rstrip()
+    while True:
+        try:
+            line = await stream.readline()
+        except ValueError:
+            # One child line longer than the stream limit. readline has already dropped the
+            # oversized chunk; carry on reading rather than letting the exception kill this
+            # watcher, which would leave the child's pipe undrained and block it on write.
+            logger.warning(f"{name} | <log line over the stream limit, dropped>")
+            continue
+        if not line:
+            return
+        text = line.decode(errors="replace").rstrip()
         parts = text.split("|")
         parsed = "|".join(parts[2:]) if datetime.now().strftime("%Y-%m-%d") in text and len(parts) >= 3 else text
         if is_err:
@@ -88,7 +98,12 @@ async def main(config_path: str, train: bool, sim_xml_override: str | None):
         logger.error(f"Simulation XML not found: {sim_xml}")
         return
 
+    # A bare name (the default) stays a bare name, so it resolves on PATH the way the
+    # `run` wrapper arranges. Anything path-shaped is resolved like simulation_xml is,
+    # letting a config point straight at a build tree without an absolute path in it.
     taosim_bin = cfg.get("taosim", {}).get("bin", "taosim")
+    if os.sep in taosim_bin:
+        taosim_bin = str(_resolve(repo_root, taosim_bin))
     sim_delay = cfg.get("taosim", {}).get("delay", 5)
 
     endpoint = os.environ.get("GENTRX_CHAIN_ENDPOINT_OVERRIDE", "http://localhost:9000")

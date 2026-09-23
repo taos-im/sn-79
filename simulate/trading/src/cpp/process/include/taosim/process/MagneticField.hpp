@@ -93,7 +93,7 @@ public:
 
     void setValAt(uint32_t pos, int32_t val);
     void insertDurationComp(const std::string& name, DurationComp event);
-    void emitDiagnostics(const std::string& agentBaseName, uint32_t bookId) const;
+    void emitDiagnostics(const std::string& agentBaseName, uint32_t bookIdCanon) const;
     void logState(Timestamp timestamp, uint32_t lastPosition = 0);
 
     virtual void update(Timestamp timestamp) override;

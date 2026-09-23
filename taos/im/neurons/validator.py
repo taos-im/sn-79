@@ -702,8 +702,9 @@ if __name__ != "__mp_main__":
                 bool: True if update steps completed successfully, False on error.
             """
             endpoint = getattr(getattr(self.config, "subtensor", None), "chain_endpoint", "") or ""
-            if "localhost" in endpoint or "127.0.0.1" in endpoint:
-                # Auto-update assumes pm2 supervision; localnet runs raw python.
+            if ("localhost" in endpoint or "127.0.0.1" in endpoint) and not os.environ.get("TAOS_AUTO_UPDATE_ON_LOCALNET"):
+                # Auto-update assumes pm2 supervision; localnet runs raw python. Set
+                # TAOS_AUTO_UPDATE_ON_LOCALNET=1 to exercise the run-end update path on localnet.
                 return True
             try:
                 validator_py_files_changed, simulator_config_changed, simulator_py_files_changed, simulator_cpp_files_changed = check_repo(self)
@@ -712,7 +713,10 @@ if __name__ != "__mp_main__":
                 exchange_mode = getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
 
                 if not end:
-                    if validator_py_files_changed and not (simulator_cpp_files_changed or simulator_py_files_changed):
+                    # Defer to the run end whenever the push also moves the engine or its config, so a
+                    # release applies as one piece at the boundary rather than half at the hour.
+                    if validator_py_files_changed and not (
+                            simulator_cpp_files_changed or simulator_py_files_changed or simulator_config_changed):
                         bt.logging.warning("VALIDATOR LOGIC UPDATED - PULLING AND DEPLOYING.")
                         remote.pull()
                         update_validator(self)
@@ -721,6 +725,21 @@ if __name__ != "__mp_main__":
                         remote.pull()
                     except Exception as ex:
                         self.pagerduty_alert(f"Failed to pull changes from repo on simulation end : {ex}")
+                    # A tree pulled by hand before the boundary reads as nothing to pull, but the process
+                    # is still running the code it started on. Classify start → HEAD and act on that too.
+                    _start = getattr(self, '_start_commit', None)
+                    try:
+                        _head = self.repo.head.commit
+                        if _start and _head.hexsha != _start:
+                            _mv = classify_changes(self, self.repo.commit(_start), _head)
+                            if any(_mv):
+                                bt.logging.warning(f"TREE MOVED UNDER THE RUNNING PROCESS ({_start[:8]} -> {_head.hexsha[:8]}): {_mv}")
+                            validator_py_files_changed = validator_py_files_changed or _mv[0]
+                            simulator_config_changed = simulator_config_changed or _mv[1]
+                            simulator_py_files_changed = simulator_py_files_changed or _mv[2]
+                            simulator_cpp_files_changed = simulator_cpp_files_changed or _mv[3]
+                    except Exception as _mx:
+                        bt.logging.warning(f"Could not compare the tree with the start commit: {_mx}")
                     if not exchange_mode:
                         if simulator_cpp_files_changed or simulator_py_files_changed:
                             bt.logging.warning("SIMULATOR SOURCE CHANGED")
@@ -1051,6 +1070,12 @@ if __name__ != "__mp_main__":
 
             self.repo_path = Path(os.path.dirname(os.path.realpath(__file__))).parent.parent.parent
             self.repo = Repo(self.repo_path)
+            # The commit this process started on: update_repo compares HEAD against it at a run end, so a
+            # tree pulled by hand under a running validator still restarts it (see update_repo).
+            try:
+                self._start_commit = self.repo.head.commit.hexsha
+            except Exception:
+                self._start_commit = None
             self.update_repo()
 
             self._reap_orphaned_services()
@@ -2438,7 +2463,12 @@ if __name__ != "__mp_main__":
                                 _t_ema = _eager.get('trading_ema', {})
                                 _t_ema_n = _eager.get('trading_ema_n', {})
                                 _t_ema_ts = _eager.get('trading_ema_ts')
+                                _p_ema = _eager.get('debeta_pool_ema')
                                 _absent = _eager.get('absent')
+                                # Pinned alongside 'absent' at tee time (ScoringShadow.tee_score_inputs
+                                # stashes both). Without this the eager path leaves _presence unbound
+                                # and every eagerly dispatched boundary dies in the lambda below.
+                                _presence = _eager.get('presence')
                             else:
                                 _sim_ts = self.simulation_timestamp
                                 _deregs = list(self.deregistered_uids)
@@ -2450,8 +2480,11 @@ if __name__ != "__mp_main__":
                                 _t_ema = dict(getattr(self, '_trading_score_ema', {}) or {})
                                 _t_ema_n = dict(getattr(self, '_trading_score_ema_n', {}) or {})
                                 _t_ema_ts = getattr(self, '_trading_score_ema_ts', None)
-                                from taos.im.validator.debeta import absent_now
+                                _p_ema = {k: dict(v or {}) for k, v in
+                                          (getattr(self, '_debeta_pool_ema', {}) or {}).items()}
+                                from taos.im.validator.debeta import absent_now, presence_shares_now
                                 _absent = absent_now(self)
+                                _presence = presence_shares_now(self)
                             adopted = await loop.run_in_executor(
                                 None,
                                 lambda: _shadow.request_scores(
@@ -2459,7 +2492,8 @@ if __name__ != "__mp_main__":
                                     timeout=float(os.environ.get("SCORING_PROC_TIMEOUT", "45")),
                                     eager=_eager is not None,
                                     trading_ema=_t_ema, trading_ema_n=_t_ema_n,
-                                    trading_ema_ts=_t_ema_ts, absent=_absent,
+                                    trading_ema_ts=_t_ema_ts, absent=_absent, presence=_presence,
+                                    debeta_pool_ema=_p_ema,
                                 ),
                             )
                             if adopted is not None and len(adopted['trading']) != self.effective_max_uids:
@@ -2521,6 +2555,7 @@ if __name__ != "__mp_main__":
                                 'gentrx_scores': _gtx_scores,
                                 'gentrx_ema': _gtx_ema,
                                 'trading_ema': _t_ema,
+                                'debeta_pool_ema': _p_ema,
                                 'trading_ema_n': _t_ema_n,
                                 'trading_ema_ts': _t_ema_ts,
                             } if _verify else None
@@ -2558,6 +2593,8 @@ if __name__ != "__mp_main__":
                                 self._trading_score_ema_n = {int(k): int(v) for k, v in
                                                              (adopted.get('trading_ema_n') or {}).items()}
                                 self._trading_score_ema_ts = adopted.get('trading_ema_ts')
+                                self._debeta_pool_ema = {str(k): {int(u): float(x) for u, x in (v or {}).items()}
+                                                         for k, v in (adopted.get('debeta_pool_ema') or {}).items()}
 
                         bt.logging.info(
                             f"Reward calculation completed ({time.time()-calc_start:.4f}s"
@@ -3593,7 +3630,7 @@ if __name__ != "__mp_main__":
                                     # instead of after _reward finally asks. sim_ts is
                                     # the boundary's own timestamp — deterministic and
                                     # main-defined (verify pins to the same values).
-                                    from taos.im.validator.debeta import absent_now
+                                    from taos.im.validator.debeta import absent_now, presence_shares_now
                                     self._scoring_shadow.tee_score_inputs(
                                         normalized_state.timestamp,
                                         normalized_state.timestamp,
@@ -3605,6 +3642,9 @@ if __name__ != "__mp_main__":
                                         trading_ema_n=dict(getattr(self, '_trading_score_ema_n', {}) or {}),
                                         trading_ema_ts=getattr(self, '_trading_score_ema_ts', None),
                                         absent=absent_now(self),
+                                        presence=presence_shares_now(self),
+                                        debeta_pool_ema={k: dict(v or {}) for k, v in
+                                                         (getattr(self, '_debeta_pool_ema', {}) or {}).items()},
                                     )
                             response = await self.handle_state(normalized_state, receive_start)
                     except Exception as ex:
@@ -3833,7 +3873,7 @@ if __name__ == "__main__":
 
     _warnings.showwarning = _showwarning_with_stack
 
-    from taos.im.validator.update import check_repo, update_validator, check_simulator, rebuild_simulator, restart_simulator
+    from taos.im.validator.update import check_repo, classify_changes, update_validator, check_simulator, rebuild_simulator, restart_simulator
     from taos.im.validator.forward import forward, notify, deliver_gentrx
     from taos.im.validator.reward import get_rewards, compute_debeta_scores
 

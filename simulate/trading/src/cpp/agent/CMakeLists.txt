@@ -32,6 +32,7 @@ target_link_libraries(agent
         taosim::replay
         taosim::simulation
         taosim::stats
+        taosim::statshub
         taosim::util
         Eigen3::Eigen
         date::date

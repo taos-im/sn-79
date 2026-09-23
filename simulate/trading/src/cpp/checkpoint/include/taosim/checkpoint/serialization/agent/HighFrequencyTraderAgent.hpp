@@ -47,14 +47,20 @@ struct convert<taosim::agent::HighFrequencyTraderAgent>
             else if (key == "quoteFree") {
                 val.convert(v.quoteFree());
             }
-            else if (key == "orderFlag") {
-                val.convert(v.orderFlag());
+            else if (key == "restingBid") {
+                val.convert(v.restingBid());
             }
-            else if (key == "deltaHFT") {
-                val.convert(v.deltaHFT());
+            else if (key == "restingAsk") {
+                val.convert(v.restingAsk());
             }
-            else if (key == "tauHFT") {
-                val.convert(v.tauHFT());
+            else if (key == "pendingBid") {
+                val.convert(v.pendingBid());
+            }
+            else if (key == "pendingAsk") {
+                val.convert(v.pendingAsk());
+            }
+            else if (key == "fillWakeScheduled") {
+                val.convert(v.fillWakeScheduled());
             }
             else if (key == "lastPrice") {
                 val.convert(v.lastPrice());
@@ -86,7 +92,15 @@ struct pack<taosim::agent::HighFrequencyTraderAgent>
     msgpack::packer<Stream>& operator()(
         msgpack::packer<Stream>& o, const taosim::agent::HighFrequencyTraderAgent& v) const
     {
-        o.pack_map(10);
+        // "deltaHFT" went with the self timer it fed: the maker's routine churn is on a token now, so
+// nothing reads an inventory-adaptive interval any more.
+//
+// "orderFlag" and "tauHFT" were dropped when the maker stopped scheduling a cancel
+        // per order: the first was never read by anything, and the second was the quote
+        // lifetime, which a quote no longer has. The resting-quote ids take their place, and
+        // they DO have to survive a restore: without them the agent cannot cancel what it
+        // left in the book and would simply quote on top of it.
+        o.pack_map(12);
 
         o.pack("topLevel");
         o.pack(v.topLevel());
@@ -100,14 +114,20 @@ struct pack<taosim::agent::HighFrequencyTraderAgent>
         o.pack("quoteFree");
         o.pack(v.quoteFree());
 
-        o.pack("orderFlag");
-        o.pack(v.orderFlag());
+        o.pack("restingBid");
+        o.pack(v.restingBid());
 
-        o.pack("deltaHFT");
-        o.pack(v.deltaHFT());
+        o.pack("restingAsk");
+        o.pack(v.restingAsk());
 
-        o.pack("tauHFT");
-        o.pack(v.tauHFT());
+        o.pack("pendingBid");
+        o.pack(v.pendingBid());
+
+        o.pack("pendingAsk");
+        o.pack(v.pendingAsk());
+
+        o.pack("fillWakeScheduled");
+        o.pack(v.fillWakeScheduled());
 
         o.pack("lastPrice");
         o.pack(v.lastPrice());

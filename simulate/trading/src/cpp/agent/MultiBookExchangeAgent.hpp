@@ -8,6 +8,7 @@
 #include "Agent.hpp"
 #include <taosim/accounting/BalanceLogger.hpp>
 #include <taosim/book/AcdClockRegistry.hpp>
+#include <taosim/book/WakeupChainRegistry.hpp>
 #include <taosim/book/Book.hpp>
 #include <taosim/book/BookProcessManager.hpp>
 #include "CheckpointSerializable.hpp"
@@ -31,6 +32,7 @@
 #include <taosim/exchange/ExchangeConfig.hpp>
 #include <taosim/matching/ReplayEventLogger.hpp>
 #include <taosim/net/net.hpp>
+#include <taosim/statshub/StatsHub.hpp>
 
 #include <boost/asio.hpp>
 
@@ -131,10 +133,19 @@ public:
     [[nodiscard]] auto&& localTradeSubs(this auto&& self) noexcept { return self.m_localTradeSubscribers; }
     [[nodiscard]] auto&& localTradeByOrderSubs(this auto&& self) noexcept { return self.m_localTradeByOrderSubscribers; }
     [[nodiscard]] auto&& localOwnTradeSubs(this auto&& self) noexcept { return self.m_localOwnTradeSubscribers; }
-    [[nodiscard]] auto&& bookTradeStats(this auto&& self) noexcept { return self.m_bookTradeStats; }
+    // Lives in the StatsHub, reached the same way l1() is; this stays as the name every
+    // existing reader and the checkpoint sections already use.
+    [[nodiscard]] auto&& bookTradeStats(this auto&& self) noexcept
+    {
+        return self.m_statsHub->tradeStats();
+    }
+    [[nodiscard]] auto&& statsHub(this auto&& self) noexcept { return self.m_statsHub; }
     // Per-book ACD wakeup chains. Exchange-side shared state, reached like bookTradeStats,
     // but never copied into a response payload — see AcdClockRegistry.hpp.
     [[nodiscard]] auto&& acdClocks(this auto&& self) noexcept { return self.m_acdClocks; }
+    // Per-book wakeup chain watchdogs. Same placement and the same reason as acdClocks:
+    // scheduling state stays exchange-side. See WakeupChainRegistry.hpp.
+    [[nodiscard]] auto&& wakeupChains(this auto&& self) noexcept { return self.m_wakeupChains; }
     [[nodiscard]] auto&& sltpContainer(this auto&& self) noexcept { return self.m_sltpContainer; }
     [[nodiscard]] auto&& L2Loggers(this auto&& self) noexcept { return self.m_L2Loggers; }
     [[nodiscard]] auto&& L3EventLoggers(this auto&& self) noexcept { return self.m_L3EventLoggers; }
@@ -152,6 +163,9 @@ public:
 
 private:
     void handleException();
+
+    // Per-step sweep for token-passing wakeup chains that missed their deadline.
+    void sweepWakeupChains();
 
     void handleDistributedMessage(const Message::Ptr&  msg);
     void handleDistributedAgentReset(const Message::Ptr&  msg);
@@ -206,6 +220,7 @@ private:
     taosim::accounting::AccountRegistry m_accounts;
     std::vector<taosim::book::Book::Ptr> m_books;
     std::map<BookId, std::unique_ptr<ExchangeSignals>> m_signals;
+    std::unique_ptr<taosim::stats::StatsHub> m_statsHub;
     std::unique_ptr<taosim::book::BookProcessManager> m_bookProcessManager;
     std::unique_ptr<taosim::matching::ClearingManager> m_clearingManager;
     taosim::event::L3RecordContainer m_L3Record;
@@ -221,14 +236,11 @@ private:
     // Own-fill feed: recipients get only the trades they were a party to, on either
     // side, unlike m_localTradeSubscribers which is the whole public tape.
     taosim::util::SubscriptionRegistry<LocalAgentId> m_localOwnTradeSubscribers;
-    // Cumulative tape statistics per book, served by RETRIEVE_L1_EXT. Pure
-    // observation: nothing here is read back by the matching engine or consumes
-    // rng, so accumulating it leaves simulation output bit-identical.
-    std::vector<taosim::book::BookTradeStats> m_bookTradeStats;
     // ACD wakeup chains per book, keyed by agent class base name. Held here rather than
     // inside the MagneticField process so that an agent with a clock does not thereby
     // depend on the herding field.
     std::vector<taosim::book::AcdClockRegistry> m_acdClocks;
+    std::vector<taosim::book::WakeupChainRegistry> m_wakeupChains;
     std::shared_ptr<OrderID> m_orderIdCounter;
     std::shared_ptr<TradeID> m_tradeIdCounter;
     static constexpr size_t s_poolPlacementCapacity = 4096;

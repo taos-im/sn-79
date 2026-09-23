@@ -41,8 +41,8 @@ namespace taosim::checkpoint
 // a map<BookId, positive integer> on disk either way.
 //
 // NEVER convert the signals map wholesale. There is no custom convert to stop you; msgpack's default
-// will happily replace every object and the only symptom is log files that contain their header and
-// nothing else, which is how this went unnoticed from May to August.
+// will happily replace every object, and the only symptom is log files that contain their header
+// and nothing else -- a failure with no error and no missing file, so nothing reports it.
 void restoreSignalCounters(MultiBookExchangeAgent* exchange, const msgpack::object& section);
 
 [[nodiscard]] CheckpointToken postProcessToken(const CheckpointToken& token);

@@ -6,9 +6,16 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <iomanip>
+#include <spanstream>
+#include <string>
+#include <vector>
+
 //-------------------------------------------------------------------------
 
 using namespace taosim;
+using namespace taosim::literals;
 
 using namespace testing;
 
@@ -87,5 +94,45 @@ INSTANTIATE_TEST_SUITE_P(
         DEC(42.0),
         DEC(-69420.0),
         DEC(1.234567890123456e-42)));
+
+//-------------------------------------------------------------------------
+// fmt::formatter<decimal_t> used to render inline exactly like this; decimalToChars is the
+// extraction of that body and must keep every spelling (relocated here from the retired
+// PriceVolume level-text cache's tests).
+
+TEST(DecimalToCharsTest, MatchesLegacyFormatter)
+{
+    auto legacyFormat = [](decimal_t val) {
+        char buf[64]{};
+        std::ospanstream oss{buf};
+        if (val == 0_dec) {
+            oss << "0.0";
+        } else {
+            oss << std::setprecision(34) << val;
+            const size_t len = std::strlen(buf);
+            if (len > 3uz && std::memchr(buf, '.', len) != nullptr) {
+                size_t i = len - 1;
+                while (i > 1 && buf[i] == '0' && buf[i - 1] != '.') {
+                    --i;
+                }
+                buf[i + 1] = '\0';
+            }
+        }
+        return std::string{buf};
+    };
+
+    const std::vector<decimal_t> values{
+        0_dec, -0_dec, 1_dec, 3000_dec, 260_dec, DEC(300.25), DEC(300.50), DEC(2.0), DEC(0.0001),
+        DEC(-0.0001), DEC(-1.5), DEC(123456789.12345678), DEC(0.00000001),
+        DEC(0.1234567890123456789012345678901234), DEC(1234567890.123456789012345678901234),
+        DEC(0.000000000000000000001), DEC(1000000000000000000000000000.0),
+        decimal_t{1} / 3_dec, DEC(2.5) * DEC(1.1), DEC(39.992),
+    };
+    for (const auto value : values) {
+        char buf[util::kDecimalTextCapacity];
+        EXPECT_EQ(util::decimalToChars(buf, value), legacyFormat(value));
+        EXPECT_EQ(fmt::format("{}", value), legacyFormat(value));
+    }
+}
 
 //-------------------------------------------------------------------------

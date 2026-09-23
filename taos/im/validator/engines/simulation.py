@@ -789,9 +789,30 @@ class SimulationEngine(MarketEngine):
                             archive = log_path / f"{label}.zip"
                             logger.info(f"Compressing {label} files to {archive.name}...")
                             with zipfile.ZipFile(archive, "w" if not archive.exists() else "a", compression=zipfile.ZIP_DEFLATED) as zipf:
+                                # TWO EPISODES CAN OWN THE SAME FILE NAME, AND ONE WOULD BE LOST.
+                                #
+                                # The entry name was the basename alone while log_files is collected
+                                # across episode directories, and the archive is reopened in append
+                                # mode. Block ranges restart with every new simulation, so after a
+                                # restart `L3-19.00010000-00020000.log` exists in two of them, both
+                                # are written under one name, and os.remove deletes both sources.
+                                # The zip then holds two entries a reader cannot tell apart, and
+                                # fetching by name yields one -- the other is gone for good.
+                                #
+                                # Disambiguate ONLY on collision, so every archive that never had one
+                                # keeps the exact layout its readers already expect.
+                                _taken = set(zipf.namelist())
                                 for log_file in log_files:
                                     try:
-                                        zipf.write(log_file, arcname=Path(log_file).name)
+                                        _arc = Path(log_file).name
+                                        if _arc in _taken:
+                                            _arc = f"{Path(log_file).parent.name}__{_arc}"
+                                            logger.warning(
+                                                f"{archive.name}: {Path(log_file).name} already present from "
+                                                f"another episode; storing it as {_arc} rather than overwriting"
+                                            )
+                                        _taken.add(_arc)
+                                        zipf.write(log_file, arcname=_arc)
                                         os.remove(log_file)
                                         logger.debug(f"Added {log_file.name} to {archive.name}")
                                     except Exception as ex:
@@ -1335,6 +1356,39 @@ class SimulationEngine(MarketEngine):
     # Replace the bodies with the actual IPC calls from _listen().
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _within_grace(self) -> bool:
+        """Is the engine still inside the grace period during which it publishes nothing?
+
+        Answered from the only two facts available while it is silent.
+
+        NOT from `validator.start_time`: that is assigned inside the state handler, so it is None for
+        exactly the window this covers, and reading it made the guard unable to fire at all. Nor
+        from `v.simulation.config.grace_period`: grace_period sits on `v.simulation` itself, so the
+        `.config` hop yielded None and ended the guard a second time. Both were live at once --
+        the 10:06 cold start logged the reattach every 60s straight through its grace.
+
+        Grace is over the instant ANY state has arrived, whatever a clock says. Before that, the
+        suppression is bounded by a COUNT rather than a clock, so it is self-limiting without a new
+        dependency: a genuinely dead engine is still reattached, one grace period later than a hung
+        one, which is the right way round because the reattach cannot help an engine that is merely
+        warming up.
+        """
+        try:
+            v = self.validator
+            if getattr(v, "last_state", None) is not None:
+                return False
+            _grace_ns = getattr(getattr(v, "simulation", None), "grace_period", None)
+            if not _grace_ns:
+                return False
+            _budget = max(1, int(float(_grace_ns) / 1e9 / max(1, _MQ_RECV_TIMEOUT_S * _MQ_REATTACH_AFTER)))
+            _n = getattr(self, "_grace_suppressions", 0)
+            if _n >= _budget:
+                return False
+            self._grace_suppressions = _n + 1
+            return True
+        except Exception:
+            return False
+
     async def _recv_bytes(self) -> bytes:
         """
         Read one full state update from the simulator via Posix MQ + SHM.
@@ -1385,6 +1439,23 @@ class SimulationEngine(MarketEngine):
                     if _misses < _MQ_REATTACH_AFTER:
                         continue
                     _misses = 0
+                    # SILENCE DURING GRACE IS EXPECTED, NOT A STALL.
+                    #
+                    # The engine publishes nothing at all until its grace period ends -- the publish
+                    # is gated on warmingUp() -- so a freshly started simulation is deliberately
+                    # quiet for gracePeriod. Reattaching there recreates the queue every minute for
+                    # a condition that is working as designed, and reports it as a warning, which
+                    # trains the reader to ignore the one message that would matter if the engine
+                    # really had gone away.
+                    #
+                    # Wall clock against the sim's grace, which is close enough: the engine runs near
+                    # real time, and being generous only delays a warning that has nothing to report.
+                    if self._within_grace():
+                        logger.debug(
+                            "No state on /taosim-req, but the simulation is still inside its grace "
+                            "period; not reattaching"
+                        )
+                        continue
                     try:
                         self._req_socket.close()
                     except Exception:

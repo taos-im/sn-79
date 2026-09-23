@@ -31,8 +31,9 @@ void TickContainer::updateVolume(taosim::decimal_t deltaVolume) noexcept
 void TickContainer::push_back(const TickContainer::value_type& order)
 {
     BaseType::push_back(order);
-    m_volume += order->totalVolume();
-    m_orderContainer->updateVolume(order->totalVolume());
+    const auto totalVolume = order->totalVolume();
+    m_volume += totalVolume;
+    m_orderContainer->updateVolume(totalVolume);
 }
 
 //-------------------------------------------------------------------------
@@ -49,7 +50,7 @@ void TickContainer::jsonSerialize(rapidjson::Document& json, const std::string& 
     auto serialize = [this](rapidjson::Document& json) {
         json.SetObject();
         auto& allocator = json.GetAllocator();
-        json.AddMember("price", rapidjson::Value{taosim::util::decimal2double(m_price)}, allocator);
+        json.AddMember("price", rapidjson::Value{taosim::util::decimal2double(price())}, allocator);
         rapidjson::Value ordersJson{rapidjson::kArrayType};
         for (const auto order : *this) {
             rapidjson::Document orderJson{&allocator};
@@ -58,7 +59,8 @@ void TickContainer::jsonSerialize(rapidjson::Document& json, const std::string& 
             ordersJson.PushBack(orderJson, allocator);
         }
         json.AddMember("orders", ordersJson, allocator);
-        json.AddMember("volume", rapidjson::Value{taosim::util::decimal2double(m_volume)}, allocator);
+        json.AddMember(
+            "volume", rapidjson::Value{taosim::util::decimal2double(volume())}, allocator);
     };
     taosim::json::serializeHelper(json, key, serialize);
 }

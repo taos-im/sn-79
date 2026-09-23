@@ -20,15 +20,24 @@ FuturesSignal::FuturesSignal(const FuturesSignalDesc& desc) noexcept
     : m_simulation{desc.simulation},
       m_bookId{desc.bookId},
       m_seedInterval{desc.seedInterval},
-      m_lambda{desc.lambda}
+      m_lambda{desc.lambda},
+      m_staleIntervals{desc.staleIntervals}
 {
     m_state.value = desc.X0;
     m_updatePeriod = desc.proc.updatePeriod;
-    m_seedfile = (m_simulation->logDir() / "external_seed_sampled.csv").generic_string();
+    // Guarded: resolving the path unconditionally dereferenced the simulation in the
+    // constructor, which made the class unconstructible without one -- the same shape as the
+    // ProcessFactory null-deref, and the reason this had no unit test.
+    if (m_simulation != nullptr) {
+        m_seedfile = (m_simulation->logDir() / "external_seed_sampled.csv").generic_string();
+    }
 }
 
 //-------------------------------------------------------------------------
 
+// Decay is per CONSUMPTION, not per elapsed time: the collector's clock and the simulation's
+// are unrelated, so "how long has this news been out" is not a quantity either can state.
+// The counter resets on each new seed; running it for the whole run compounds the decay.
 double FuturesSignal::volumeFactor() noexcept
 {
     ++m_state.factorCounter;
@@ -38,10 +47,61 @@ double FuturesSignal::volumeFactor() noexcept
 
 //-------------------------------------------------------------------------
 
+// News has a shelf life. The log return is set when a seed arrives and was never cleared, so
+// with the feed stopped the agents kept trading the last move they saw for the rest of the
+// run, in the same direction, forever. Past the staleness bound the signal reads as no signal,
+// which is what an absent feed actually is.
+//
+void FuturesSignal::expireIfStale(Timestamp timestamp)
+{
+    if (!(m_state.lastSeedTime > 0 && m_staleIntervals > 0
+          && timestamp - m_state.lastSeedTime > m_staleIntervals * m_seedInterval)) {
+        return;
+    }
+    if (!m_state.stale) {
+        m_state.stale = true;
+        fmt::println(
+            "FuturesSignal::update : SIGNAL STALE at {}, no new seed for {} ns; "
+            "the class goes flat until one arrives",
+            timestamp, timestamp - m_state.lastSeedTime);
+        std::fflush(stdout);
+    }
+    m_state.logReturn = 0.0;
+    m_state.volumeFactor = 0.0;
+}
+
+//-------------------------------------------------------------------------
+
+bool FuturesSignal::acceptSeed(uint64_t count, double value, Timestamp at)
+{
+    if (count == m_state.lastCount) return false;
+
+    if (m_state.value > 0.0) {
+        m_state.logReturn = std::log(value / m_state.value);
+        m_state.volumeFactor = std::min(2.0, std::exp(std::abs(m_state.logReturn)));
+    }
+    m_state.value = value;
+    m_valueSignal(m_state.value);
+    // A new seed is new news: the decay starts again from it rather than continuing a count
+    // that has been running since the simulation began.
+    m_state.factorCounter = 0;
+    m_state.stale = false;
+    m_state.lastCount = count;
+    m_state.lastSeed = value;
+    m_state.lastSeedTime = at;
+    if (auto simulation = dynamic_cast<Simulation*>(m_simulation)) {
+        simulation->logDebug("FuturesSignal::update : PUBLISH {}", m_state.value);
+    }
+    return true;
+}
+
+//-------------------------------------------------------------------------
+
 void FuturesSignal::update(Timestamp timestamp)
 {
     if (m_values.empty()) {
         if (timestamp - m_state.lastSeedTime >= m_seedInterval) {
+            expireIfStale(timestamp);
             if ( fs::exists( m_seedfile ) ) {
                 int count = m_state.lastCount;
                 float seed = 0.0;
@@ -66,20 +126,7 @@ void FuturesSignal::update(Timestamp timestamp)
                 } catch (const std::exception &exc) {
                     fmt::println("FuturesSignal::update : ERROR GETTING SEED FROM FILE - {}", exc.what());
                 }
-                if (count != m_state.lastCount) {
-                    if (m_state.value> 0.0) {
-                        m_state.logReturn = std::log(seed / m_state.value);
-                        m_state.volumeFactor = std::min(2.0, std::exp(std::abs(m_state.logReturn)));
-                    }
-                    m_state.value = seed;
-                    m_valueSignal(m_state.value);
-                    m_state.lastCount = count;
-                    m_state.lastSeed = seed;
-                    m_state.lastSeedTime = timestamp;
-                    if (auto simulation = dynamic_cast<Simulation*>(m_simulation)) {
-                        simulation->logDebug("FuturesSignal::update : PUBLISH {}", m_state.value);
-                    }
-                }
+                acceptSeed(static_cast<uint64_t>(count), seed, timestamp);
             } else {
                 if (m_state.lastCount > 0) {
                     fmt::println("FuturesSignal::update : NO SEED FILE PRESENT AT {}", m_seedfile);
@@ -127,6 +174,7 @@ std::unique_ptr<FuturesSignal> FuturesSignal::fromXML(
         .seedInterval = getNonNegativeUint64Attribute(node, "seedInterval"),
         .X0 = X0,
         .lambda = node.attribute("lambda").as_double(0.001155),
+        .staleIntervals = node.attribute("staleIntervals").as_ullong(3),
         .proc = {
             .updatePeriod = node.attribute("updatePeriod").as_ullong(1)
         }

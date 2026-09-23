@@ -250,6 +250,43 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.debeta.making_pool",
+        type=str,
+        choices=["rank", "proportional", "proportional_blended", "proportional_both"],
+        default="rank",
+        help="How the making leg's share of emission (debeta.weight * debeta.w_make) is paid. "
+             "'rank' (default, the shipped behaviour): the making rank enters the blended score and "
+             "the whole score goes through the Pareto sort-multiply. 'proportional': the making leg "
+             "comes out of the ladder and its share is paid in proportion to each uid's captured "
+             "spread, with the ladder kept for the skill leg. The ladder pays rank POSITIONS with a "
+             "steep top, so an operator whose accounts occupy the top positions collects many "
+             "top-of-curve weights whatever its aggregate service; seen on a mainnet board where "
+             "2026, one coldkey with 35 per cent of the board's captured spread took 64 per cent of "
+             "emission. Proportional pay makes an operator's total equal its share of the liquidity "
+             "actually provided, so splitting a strategy across more uids gains nothing and no "
+             "identity rule is needed. 'proportional_blended': the same pool on the same shares, "
+             "but the ladder keeps ranking the full blended score, so an account with no maker "
+             "volume is capped by its making rank as it is under 'rank'. Plain 'proportional' leaves "
+             "the ladder on the skill leg alone, which at w_make 0.50 makes half of emission a pot "
+             "decided on skill only; on twelve mainnet boards of 22 September 2026 zero-maker "
+             "accounts took 42.1 per cent of emission under it, against 10.4 with the pool off and "
+             "5.2 under the blended setting. The blended setting's cost is that making is paid on "
+             "both surfaces, so the largest operator takes 59.5 per cent against 26.9 under plain "
+             "proportional, and cloning the same capture across 16 uids gains 1.18x against 1.04x "
+             "(4.00x under 'rank'). 'proportional_both': both halves additive. The making half as "
+             "under 'proportional'; the skill half in proportion to each uid's net alpha over the books "
+             "it filled, times its counterparty factor (skill_p11_strength), among uids with positive "
+             "skill on at least skill_min_books qualifying books. The skill ladder over kappa is a "
+             "tournament: kappa is magnitude-blind, so one predictor split sixteen ways gained 14.03x on "
+             "real alphas (22 September 2026); net alpha is additive, so this share is cloning-invariant "
+             "by construction (1.00x measured). Real markets pay traders on realised P&L and let "
+             "consistency decide who is allocated capital. Falls back to the ladder for the skill half "
+             "when nobody is eligible. All settings publish debeta_making_share and "
+             "debeta_ladder_input per uid, so the alternative is visible before it is enabled. "
+             "Switching is announced and dated on the scoring page.",
+    )
+
+    parser.add_argument(
         "--scoring.debeta.w_make",
         type=float,
         help="De-beta operator dial: weight on the making (liquidity) rank vs (1-w_make) on the "
@@ -293,6 +330,19 @@ def add_im_validator_args(cls, parser):
              "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
              "sacrificial-feeder hole in the making metric.",
         default=1.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.p11_topk",
+        type=int,
+        help="How many of a maker's largest takers the P11 excess-concentration measure looks at, for "
+             "both the making discount and the skill-leg factor. 2, the default, is the shipped scorer "
+             "and catches a dedicated feeder. A ring that spreads the same feeding over ten or twenty "
+             "takers reads as diverse at 2 (each feeder a few per cent of the maker's fills) and is "
+             "exposed at 10 or more, because the measure subtracts the same takers' share of everyone "
+             "else's flow: common takers cancel, private feeders do not. On a later mainnet "
+             "2026 mainnet tape at 10: fed makers 0.25 to 0.68, honest makers 0.90 to 0.97.",
+        default=10,  # 0.6.2 launch value: a many-taker ring is exposed at 10 (2 caught only a dedicated feeder)
     )
 
     parser.add_argument(
@@ -350,6 +400,134 @@ def add_im_validator_args(cls, parser):
         help="Number of most recent validator queries a uid must have failed in a row to count as absent "
              "for the presence gate; fewer outcomes than this (fresh restart) count as present.",
         default=50,
+    )
+
+    # 0.6.2 skill-leg forms. Every default reproduces the 0.6.1 leg exactly; the new quantities are
+    # published as gauges at every setting so they can be read on a live board before they score.
+    parser.add_argument(
+        "--scoring.debeta.skill_variant",
+        type=str,
+        choices=["drift", "held"],
+        help="Which drift strip the skill leg's alpha uses. drift (default): the window's whole drift, "
+             "so a position closed inside the window keeps being re-marked by later prints. held: the "
+             "drift over the prints on which the agent held inventory, so a closed round trip is scored "
+             "once and a single constant position scores exactly zero. The other variant is published "
+             "alongside as debeta_skill_held or debeta_skill_drift.",
+        default="drift",
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_subwindows",
+        type=int,
+        help="Temporal consistency: split the skill window into this many equal sub-windows and assess "
+             "skill with skill_subwindow_form. 1 (default) is the plain windowed leg. The three-way "
+             "weakest kappa is published as debeta_skill_weakest3 whatever the setting.",
+        default=1,
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_subwindow_form",
+        type=str,
+        choices=["weakest", "sign_gated"],
+        help="weakest: skill is the smallest floored kappa across the sub-windows. sign_gated (default): "
+             "a book enters the full-window kappa only when its sub-window alphas agree in sign with its "
+             "full-window alpha on at least skill_subwindow_min_agree sub-windows.",
+        default="sign_gated",
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_subwindow_min_agree",
+        type=int,
+        help="Sub-windows whose alpha sign must agree with the full-window alpha for a book to count under "
+             "sign_gated.",
+        default=2,
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_hurdle_bps",
+        type=float,
+        help="Absolute skill hurdle in basis points of the agent's filled notional on a book: a book's "
+             "alpha counts toward skill only above it. 0 (default) keeps the pool-relative floor alone.",
+        default=0.0,
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_hurdle_books",
+        type=int,
+        help="Books an agent must clear the hurdle on to stay in the skill pool used by skill_pool_scaling.",
+        default=4,
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_min_books",
+        type=int,
+        help="Qualifying books the skill leg needs before kappa is computed at all; below it skill is "
+             "0. The shipped value 4 was chosen to stop single-book scoring and carries more weight "
+             "than that: kappa divides by the median absolute deviation of the per-book alphas, so it "
+             "is maximised at its smallest admissible sample, and an agent whose magnitude floor "
+             "leaves four survivors out of a hundred-odd traded books scores a consistency ratio on "
+             "three per cent of its own evidence. Raising it is a statement about statistical "
+             "validity, not about size. Never falls below 4.",
+        default=20,  # 0.6.2 launch value (23 Sep 2026): the skill leg needs a real sample; 4 is the mechanism's own floor
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.skill_max_inactive_books",
+        type=float,
+        help="The skill leg's twin of scoring.max_inactive_books: the share of the field's books an "
+             "agent may carry no qualifying alpha on without penalty. Below that its skill is scaled "
+             "by coverage / (1 - this) * field books, before ranking. kappa is normalised by the "
+             "median absolute deviation of the per-book alphas, so it is maximised at its smallest "
+             "admissible sample and kappa_floored's four-book minimum is a floor to sit on rather "
+             "than a bar to clear. The kappa leg pads neglected books into its average as zero; that "
+             "shape cannot be reused here because padding a MAD-normalised ratio saturates it "
+             "instead of collapsing it, so the penalty is multiplicative. The counts are books the "
+             "agent FILLED, pre-floor, because the post-floor count falls with size per book rather "
+             "than with breadth. Presence in a book is cheap, so this bounds narrowness and not "
+             "activity; skill_min_books is the load-bearing constraint. 0 (default) disables and "
+             "reproduces the 0.6.1 leg exactly. debeta_skill_coverage_factor publishes the "
+             "multiplier per agent either way.",
+        default=0.375,  # 0.6.2 launch value: coverage scaling below 62.5% of the field's books
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.skill_p11_strength",
+        type=float,
+        help="The counterparty factor applied to the SKILL leg: skill *= max(0, 1 - strength * EC+), "
+             "with EC+ the same excess top-2 counterparty concentration p11_strength discounts making "
+             "by, taken at unit strength so this does not depend on the making discount being on. "
+             "Feeding a maker at chosen prices manufactures per-book alpha on the fed side, and on 22 "
+             "September 2026 that is where a same-operator feeding ring was paid: fed makers with making "
+             "ranks of 0.003 to 0.36 held skill ranks of 0.94 to 1.00 on four to nine books, 6.75 per "
+             "cent of incentive. Against real alphas the factor left every genuine skill account at "
+             "exactly 1.0 and moved no uid outside the pattern by more than 0.20 of rank; it is "
+             "cloning-invariant because it is a property of the flow, not the account count. Only partly "
+             "effective on the rank ladder (kappa 9.9 x 0.25 is still top-decile), fully effective under "
+             "making_pool=proportional_both, which is not to be enabled without it. Calibrated on the "
+             "simulation, where background agents make concentration visible; exchange mode needs its "
+             "own calibration as P11 on making did. 0 (default) disables. debeta_skill_p11_factor "
+             "publishes the multiplier per agent either way.",
+        default=1.0,  # 0.6.2 launch value: the counterparty factor reaches the skill leg at full strength
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.skill_pool_scaling",
+        type=int,
+        choices=[0, 1],
+        help="1: scale the skill leg's rank by the share of the skill pool that clears the hurdle on "
+             "skill_hurdle_books books, so an emptying pool pays less rather than the same to fewer. "
+             "0 (default): off. Published as debeta_skill_pool_factor either way.",
+        default=0,
+    )
+    parser.add_argument(
+        "--scoring.debeta.presence_share_weighting",
+        type=int,
+        choices=[0, 1],
+        help="1: multiply the de-beta score by the agent's share of successful responses over the presence "
+             "window. 0 (default): the absent set alone gates. The share is published as "
+             "debeta_presence_share either way.",
+        default=0,
+    )
+    parser.add_argument(
+        "--scoring.debeta.presence_min_share",
+        type=float,
+        help="Agents whose success share over the presence window is below this are absent outright. "
+             "0 (default): off.",
+        default=0.0,
     )
 
     parser.add_argument(

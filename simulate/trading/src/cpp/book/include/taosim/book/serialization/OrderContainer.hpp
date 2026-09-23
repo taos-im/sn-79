@@ -8,6 +8,10 @@
 #include <taosim/book/serialization/TickContainer.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
 
+#include <range/v3/numeric/accumulate.hpp>
+
+#include <functional>
+
 //-------------------------------------------------------------------------
 
 namespace msgpack
@@ -47,6 +51,10 @@ struct convert<taosim::book::OrderContainer>
                 v.volume() = val.as<taosim::decimal_t>();
             }
         }
+
+        // Derived from the restored levels for the same reason a level derives its own aggregate.
+        v.volume() = ranges::accumulate(
+            v, taosim::decimal_t{}, std::plus{}, [](const auto& level) { return level.volume(); });
 
         return o;
     }

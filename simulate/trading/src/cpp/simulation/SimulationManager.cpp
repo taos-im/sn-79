@@ -570,11 +570,21 @@ void SimulationManager::publishStateMessagePack()
         fmt::println("MAP type check failed for responses");
         return;
     }
-    if (obj.via.map.size != 1) {
-        fmt::println("MAP size == 1 check failed for responses");
+    // Looked up rather than positional, and no size check. The batch used to be required to
+    // hold exactly one member, so ANY future addition alongside the responses would have been
+    // rejected wholesale -- silently dropping that tick's order flow to complain about
+    // something it did not need to read. Kept from the reverted seed delivery because the
+    // hazard is real regardless of what the extra member turns out to be.
+    const msgpack::object* responsesVal{};
+    for (const auto& [k, v] : obj.via.map) {
+        const auto key = k.as<std::string_view>();
+        if (key != "responses" && obj.via.map.size > 1) continue;
+        responsesVal = &v;
+    }
+    if (responsesVal == nullptr) {
         return;
     }
-    const auto& val = obj.via.map.ptr[0].val;
+    const auto& val = *responsesVal;
     if (val.type != msgpack::type::ARRAY) {
         fmt::println("ARRAY type check failed for responses");
         return;
@@ -804,7 +814,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
                 .simuMngr = mngr.get(),
                 .runDir = mngr->m_logDir,
                 .intervalInSteps = ckptIntervalInSteps,
-                .numLastFilesToKeep = (ssize_t)node.attribute("ckptNumLastFilesToKeep").as_ullong(),
+                .numLastFilesToKeep = (ptrdiff_t)node.attribute("ckptNumLastFilesToKeep").as_ullong(),
                 .measureWallClockTime = node.attribute("ckptMeasureWallClockTime").as_bool()
             });
     }

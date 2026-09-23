@@ -341,7 +341,15 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
         // Notices.
         o.pack("notices"s);
-        
+
+        // Book ids are canonized at write time by handing each notice its source block's
+        // offset; the buffered payload objects are never mutated.
+        struct NoticeWithOffset
+        {
+            Message::Ptr msg;
+            BookId bookIdOffset;
+        };
+
         auto collectiveRemoteResponses = [&] {
             std::unordered_map<std::string, uint32_t> msgTypeToCount{
                 { "RESPONSE_DISTRIBUTED_RESET_AGENT", 0 },
@@ -362,12 +370,12 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 it->second++;
                 return true;
             };
-            std::vector<Message::Ptr> res;
+            std::vector<NoticeWithOffset> res;
             for (const auto& [blockIdx, simulation] : views::enumerate(v.mngr->simulations())) {
+                const BookId bookIdOffset = blockIdx * blockInfo.dimension;
                 for (const auto& msg : simulation->proxy()->messages()) {
                     if (!checkGlobalDuplicate(msg)) continue;
-                    taosim::simulation::canonize(msg, blockIdx, blockInfo.dimension);
-                    res.push_back(msg);
+                    res.push_back({msg, bookIdOffset});
                 }
                 simulation->proxy()->clearMessages();
             }
@@ -376,37 +384,39 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
         ranges::sort(
             collectiveRemoteResponses,
             [](auto&& lhs, auto&& rhs) {
-                if (lhs->occurrence != rhs->occurrence) {
-                    return lhs->occurrence < rhs->occurrence;
+                if (lhs.msg->occurrence != rhs.msg->occurrence) {
+                    return lhs.msg->occurrence < rhs.msg->occurrence;
                 }
-                return lhs->arrival - lhs->occurrence > rhs->arrival - rhs->occurrence;
+                return lhs.msg->arrival - lhs.msg->occurrence
+                    > rhs.msg->arrival - rhs.msg->occurrence;
             });
         const auto remoteResponsesPerAgent = [&] {
-            std::map<AgentId, std::vector<Message::Ptr>> res;
-            for (const auto& msg : collectiveRemoteResponses) {
-                if (std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                    || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr) {
+            std::map<AgentId, std::vector<NoticeWithOffset>> res;
+            for (const auto& notice : collectiveRemoteResponses) {
+                if (std::dynamic_pointer_cast<StartSimulationPayload>(notice.msg->payload) != nullptr
+                    || std::dynamic_pointer_cast<EmptyPayload>(notice.msg->payload) != nullptr) {
                     for (auto agentId : views::keys(representativeSimulation->exchange()->accounts())) {
                         if (agentId < 0) continue;
-                        res[agentId].push_back(msg);
+                        res[agentId].push_back(notice);
                     }
                     continue;
                 }
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+                const auto pld =
+                    std::dynamic_pointer_cast<DistributedAgentResponsePayload>(notice.msg->payload);
                 if (pld == nullptr) {
                     throw std::runtime_error{fmt::format(
                         "{}: Failed to cast to DistributedAgentResponsePayload in 'remoteResponsesPerAgent'", ctx)};
                 }
-                res[pld->agentId].push_back(msg);
+                res[pld->agentId].push_back(notice);
             }
             return res;
         }();
 
-        auto packNotice = [&](auto& o, Message::Ptr msg) {
+        auto packNotice = [&](auto& o, const NoticeWithOffset& notice) {
             // Body lives in NoticePack.hpp so the exchange mechanism serializes notices with the very
             // same code. See that header for why.
             taosim::simulation::serialization::packNotice(
-                o, msg, v.mngr->logDir().string(), std::string{ctx});
+                o, notice.msg, v.mngr->logDir().string(), std::string{ctx}, notice.bookIdOffset);
         };
 
         o.pack_map(remoteAgentCount);
@@ -416,10 +426,10 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
             if (it == remoteResponsesPerAgent.end()) {
                 o.pack_array(0);
             } else {
-                const auto& msgs = it->second;
-                o.pack_array(msgs.size());
-                for (const auto& msg : msgs) {
-                    packNotice(o, msg);
+                const auto& notices = it->second;
+                o.pack_array(notices.size());
+                for (const auto& notice : notices) {
+                    packNotice(o, notice);
                 }
             }
         }

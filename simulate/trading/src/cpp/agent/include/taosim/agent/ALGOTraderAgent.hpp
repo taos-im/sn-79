@@ -5,6 +5,7 @@
 #pragma once
 
 #include <taosim/agent/common.hpp>
+#include <taosim/statshub/StatsHub.hpp>
 #include <taosim/dsa/PriorityQueue.hpp>
 #include <taosim/message/ExchangeAgentMessagePayloads.hpp>
 #include "Agent.hpp"
@@ -16,6 +17,7 @@
 #include <memory>
 #include <queue>
 #include <random>
+#include <string_view>
 
 //-------------------------------------------------------------------------
 
@@ -30,6 +32,18 @@ enum class ALGOTraderStatus : uint32_t
     READY,
     EXECUTING
 };
+
+enum class ALGOSliceLiquidityMode : uint32_t
+{
+    CLEAR_TOUCH,
+    CAP_AT_TOUCH
+};
+
+[[nodiscard]] ALGOSliceLiquidityMode algoSliceLiquidityModeFromString(std::string_view value);
+[[nodiscard]] double selectALGOSliceQuantity(
+    double drawnQuantity,
+    double topLevelVolume,
+    ALGOSliceLiquidityMode mode) noexcept;
 
 struct TimestampedVolume
 {
@@ -68,7 +82,14 @@ public:
     void push(const Trade& trade);
     void push(TimestampedVolume timestampedVolume);
     void pushLevels(
-        Timestamp timestamp, std::span<const BookLevel> bids, std::span<const BookLevel> asks);
+        Timestamp timestamp,
+        std::span<const taosim::stats::L2Level> bids,
+        std::span<const taosim::stats::L2Level> asks);
+    // Steps the GARCH recursion by one regularly sampled return. See the .cpp.
+    void pushReturn(double logReturn);
+    // The interval those returns are spaced by, which the daily scaling needs.
+    // Also rescales `omega`; see the .cpp, it is not a bookkeeping setter.
+    void setReturnPeriod(Timestamp period);
     
     [[nodiscard]] double estimatedVolatility() const noexcept;
     [[nodiscard]] double bidSlope() noexcept { return lastSlopes().bid; }
@@ -82,6 +103,7 @@ public:
     [[nodiscard]] auto&& priceLast(this auto&& self) noexcept { return self.m_priceLast; }
     [[nodiscard]] auto&& variance(this auto&& self) noexcept { return self.m_variance; }
     [[nodiscard]] auto&& estimatedVol(this auto&& self) noexcept { return self.m_estimatedVol; }
+    [[nodiscard]] auto&& barsConsumed(this auto&& self) noexcept { return self.m_barsConsumed; }
     [[nodiscard]] auto&& lastSeq(this auto&& self) noexcept { return self.m_lastSeq; }
     [[nodiscard]] auto&& bookSlopes(this auto&& self) noexcept { return self.m_bookSlopes; }
     [[nodiscard]] auto&& bookVolumes(this auto&& self) noexcept { return self.m_bookVolumes; }
@@ -90,7 +112,8 @@ public:
 
 private:
     [[nodiscard]] double slopeOLS(std::span<const BookLevel> side);
-    [[nodiscard]] double volumeSum(std::span<const BookLevel> side, size_t depth = 5);
+    [[nodiscard]] double volumeSum(
+        std::span<const taosim::stats::L2Level> side, size_t depth = 5);
     [[nodiscard]] const BookStat& lastSlopes() const { return m_bookSlopes.at(m_lastSeq); }
     [[nodiscard]] const BookStat& lastVolume() const { return m_bookVolumes.at(m_lastSeq); }
 
@@ -112,12 +135,17 @@ private:
 
     // Parameters, injections.
     Timestamp m_period;
+    // Spacing of the returns the recursion is stepped on: the shared bar period, not the
+    // agent's own depth tick.
+    Timestamp m_returnPeriod{};
     double m_alpha;
     double m_beta;
     double m_omega;
     double m_gamma;
     double m_initPrice;
     size_t m_depth;
+    // Bars of the shared clock already folded in, so a catch-up never double counts.
+    uint64_t m_barsConsumed{};
 
     // State.
     dsa::PriorityQueue<
@@ -177,11 +205,15 @@ private:
     void handleWakeup(Message::Ptr msg);
     void handleMarketOrderResponse(Message::Ptr msg);
     void handleMarketOrderPlacementErrorResponse(Message::Ptr msg);
-    void handleBookResponse(Message::Ptr msg);
-    void handleL1Response(Message::Ptr msg);
+    void handleBookTick(Message::Ptr msg);
+    void handleExecuteTick(Message::Ptr msg);
+    void scheduleBookTick(BookId bookId);
+    void stepVolatility(BookId bookId);
+    [[nodiscard]] double immediateThreshold(const ALGOTraderState& state) const;
+    void scheduleExecuteTick(BookId bookId, Timestamp delay);
 
     void execute(BookId bookId, ALGOTraderState& state);
-    decimal_t drawNewVolume(uint32_t baseDecimals);
+    decimal_t drawNewVolume(BookId bookId, uint32_t baseDecimals);
     double getProcessValue(BookId bookId, const std::string& name);
     uint64_t getProcessCount(BookId bookId, const std::string& name);
     double wakeupProb(ALGOTraderState& state, double fundDist);
@@ -210,6 +242,11 @@ private:
     size_t m_depth;
     std::normal_distribution<double> m_delay;
     double m_immediateBase;
+    double m_immediateDepthFrac{};
+    ALGOSliceLiquidityMode m_sliceLiquidityMode{ALGOSliceLiquidityMode::CLEAR_TOUCH};
+    // Parent order as a fraction of estimated daily volume; zero keeps the absolute draw.
+    double m_parentOrderAdvFraction{};
+    uint32_t m_advBars{};
     
     // State.
     std::vector<ALGOTraderState> m_state;

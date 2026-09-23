@@ -125,8 +125,7 @@ class RandomTakerAgent(GenTRXAgent):
         #
         #   settlement  one signal per book per tick, and the executor prices a signal GROUP against the
         #               proxy's balance. 129 books became ~109 signals at ~1.7 mtao each -- a 0.184 tao
-        #               fee against a 0.0855 tao proxy -- so it skipped every group and NOTHING settled
-        #               for hours.
+        #               fee against a 0.0855 tao proxy -- so every group is skipped and nothing settles.
         #   simulation  per-book volume limits mean a continuous stream of market orders is refused more
         #               often than filled (INSUFFICIENT_BASE / INSUFFICIENT_QUOTE / MINIMUM_ORDER_SIZE).
         #

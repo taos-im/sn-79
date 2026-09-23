@@ -28,8 +28,16 @@ namespace taosim::simulation::serialization
 
 //-------------------------------------------------------------------------
 
+// bookIdOffset is the canonical-book-id offset of the notice's source block
+// (blockIdx * booksPerBlock); it is applied to the book ids as they are written,
+// leaving the buffered payload objects untouched.
 template<typename Packer>
-void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const std::string& ctx)
+void packNotice(
+    Packer& o,
+    Message::Ptr msg,
+    const std::string& logDir,
+    const std::string& ctx,
+    BookId bookIdOffset = 0)
 {
     using namespace std::string_literals;
 
@@ -106,7 +114,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto reqPld = subPld->requestPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("o"s);
                 o.pack(subPld->id);
@@ -142,7 +150,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto errPld = subPld->errorPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("o"s);
                 o.pack_nil();
@@ -177,7 +185,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto reqPld = subPld->requestPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("o"s);
                 o.pack(subPld->id);
@@ -213,7 +221,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto errPld = subPld->errorPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("o"s);
                 o.pack_nil();
@@ -247,7 +255,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto subPld = std::dynamic_pointer_cast<EventTradePayload>(pld->payload);
 
                 o.pack("b"s);
-                o.pack(subPld->bookId);
+                o.pack(bookIdOffset + subPld->bookId);
 
                 o.pack("i"s);
                 o.pack(subPld->trade.m_id);
@@ -299,7 +307,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto reqPld = subPld->requestPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("c"s);
                 o.pack_array(reqPld->cancellations.size());
@@ -310,7 +318,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                     o.pack(msg->occurrence);
 
                     o.pack("b"s);
-                    o.pack(reqPld->bookId);
+                    o.pack(bookIdOffset + reqPld->bookId);
 
                     o.pack("o"s);
                     o.pack(cancellation.id);
@@ -332,7 +340,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                 const auto errPld = subPld->errorPayload;
 
                 o.pack("b"s);
-                o.pack(reqPld->bookId);
+                o.pack(bookIdOffset + reqPld->bookId);
 
                 o.pack("c"s);
                 o.pack_array(reqPld->cancellations.size());
@@ -343,7 +351,7 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                     o.pack(msg->occurrence);
 
                     o.pack("b"s);
-                    o.pack(reqPld->bookId);
+                    o.pack(bookIdOffset + reqPld->bookId);
 
                     o.pack("o"s);
                     o.pack(cancellation.id);
@@ -358,6 +366,9 @@ void packNotice(Packer& o, Message::Ptr msg, const std::string& logDir, const st
                     o.pack(errPld->message);
                 }
             }
+            // The close-positions book ids are written WITHOUT bookIdOffset: the retired
+            // in-place canonize never covered the close-positions response payloads, and
+            // this transfer preserves the wire behavior exactly.
             else if (msg->type == "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
                 const auto subPld = std::dynamic_pointer_cast<ClosePositionsResponsePayload>(pld->payload);

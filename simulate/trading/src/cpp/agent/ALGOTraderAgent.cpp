@@ -23,6 +23,29 @@ namespace taosim::agent
 
 //-------------------------------------------------------------------------
 
+ALGOSliceLiquidityMode algoSliceLiquidityModeFromString(std::string_view value)
+{
+    if (value == "clear_touch") return ALGOSliceLiquidityMode::CLEAR_TOUCH;
+    if (value == "cap_at_touch") return ALGOSliceLiquidityMode::CAP_AT_TOUCH;
+    throw std::invalid_argument{fmt::format(
+        "ALGOTraderAgent: sliceLiquidityMode must be 'clear_touch' or 'cap_at_touch', was '{}'",
+        value)};
+}
+
+double selectALGOSliceQuantity(
+    double drawnQuantity,
+    double topLevelVolume,
+    ALGOSliceLiquidityMode mode) noexcept
+{
+    const double draw = std::max(drawnQuantity, 0.0);
+    const double touch = std::max(topLevelVolume, 0.0);
+    return mode == ALGOSliceLiquidityMode::CLEAR_TOUCH
+        ? std::max(draw, touch)
+        : std::min(draw, touch);
+}
+
+//-------------------------------------------------------------------------
+
 ALGOTraderVolumeStats::ALGOTraderVolumeStats(const ALGOTraderVolumeStatsDesc& desc)
     : m_period{desc.period},
       m_alpha{desc.alpha},
@@ -53,12 +76,20 @@ ALGOTraderVolumeStats::ALGOTraderVolumeStats(const ALGOTraderVolumeStatsDesc& de
             std::source_location::current().file_name(), m_omega)};
     }
     m_priceLast = 0.0;
+    // Start at the unconditional variance of the recursion. The old code reached this on its
+    // first pushLevels, through a branch that also consumed a return against `initPrice`;
+    // with the recursion stepped on bars there is no such first call to hide it in.
+    m_estimatedVol = (m_alpha + m_beta < 1.0)
+        ? m_omega / (1.0 - m_alpha - m_beta)
+        : m_omega;
 }
 
 //-------------------------------------------------------------------------
 
 void ALGOTraderVolumeStats::pushLevels(
-    Timestamp timestamp, std::span<const BookLevel> bids, std::span<const BookLevel> asks)
+    Timestamp timestamp,
+    std::span<const taosim::stats::L2Level> bids,
+    std::span<const taosim::stats::L2Level> asks)
 {
     BookStat volumes = {.bid=volumeSum(bids, 5), .ask=volumeSum(asks, 5)};
     double bidSlope = (volumeSum(bids, m_depth) - taosim::util::decimal2double(bids.front().quantity))/(m_depth - 1); // absolute value
@@ -66,36 +97,61 @@ void ALGOTraderVolumeStats::pushLevels(
     double midquote = (taosim::util::decimal2double(bids.front().price) + taosim::util::decimal2double(asks.front().price))/2; 
     m_bookVolumes[timestamp] = volumes;
     m_bookSlopes[timestamp] = BookStat{.bid=bidSlope, .ask=askSlope};
-    m_lastSeq = timestamp; 
-    double logret;
-    if (m_priceLast <= 0.0) {
-        m_priceLast = midquote;
-        logret = std::log(midquote / m_initPrice);
+    m_lastSeq = timestamp;
+    m_priceLast = midquote;
+}
+
+//-------------------------------------------------------------------------
+
+// One GARCH step, on one return from the shared clock.
+//
+// This used to be folded into pushLevels, taking a return between two mid quotes read at the
+// agent's own depth tick. That tick is `volumeStatsPeriod` plus a market-feed latency draw, so
+// the returns were irregularly spaced, and GARCH is defined on regularly sampled ones. Nothing
+// about the recursion changes here; it is the input that is now what the model assumes.
+void ALGOTraderVolumeStats::pushReturn(double logReturn)
+{
+    if (!std::isfinite(logReturn)) return;
+
+    m_estimatedVol = m_omega + m_alpha * std::pow(logReturn, 2) + m_beta * m_estimatedVol
+        + m_gamma * m_variance;
+    // online error recovery
+    if (isnan(m_estimatedVol)) {
         m_estimatedVol = m_omega/(1-m_alpha-m_beta);
-    } 
-    else {
-        logret = std::log(midquote/m_priceLast);
-        m_priceLast = midquote;
-        m_estimatedVol = m_omega + m_alpha * std::pow(logret,2) + m_beta * m_estimatedVol + m_gamma * m_variance;
-        // online error recovery
-        if (isnan(m_estimatedVol)) {
-            m_estimatedVol = m_omega/(1-m_alpha-m_beta);
-        }
     }
 }
 
 //-------------------------------------------------------------------------
 
-double ALGOTraderVolumeStats::estimatedVolatility() const noexcept
+void ALGOTraderVolumeStats::setReturnPeriod(Timestamp period)
 {
-    return std::pow(m_estimatedVol, 0.5) * std::pow((double)86'400'000'000'000 / m_period, 0.5);
+    if (period == 0 || m_period == 0) return;
+    m_returnPeriod = period;
+    m_omega *= static_cast<double>(period) / static_cast<double>(m_period);
+    m_estimatedVol = (m_alpha + m_beta < 1.0)
+        ? m_omega / (1.0 - m_alpha - m_beta)
+        : m_omega;
 }
 
 //-------------------------------------------------------------------------
 
-double ALGOTraderVolumeStats::volumeSum(std::span<const BookLevel> side, size_t depth)
+// A daily volatility, which is what `activationMidpoint` is stated in. The square-root-of-time
+// scaling has to use the interval the recursion is actually stepped on, which is the bar
+// period, not the agent's own depth tick. Those were assumed equal and never were: the tick
+// carries a latency draw on top of `volumeStatsPeriod`.
+double ALGOTraderVolumeStats::estimatedVolatility() const noexcept
 {
-    auto volumesView = side | views::take(depth) | views::transform(&BookLevel::quantity);
+    const double step = m_returnPeriod > 0 ? static_cast<double>(m_returnPeriod)
+                                           : static_cast<double>(m_period);
+    return std::pow(m_estimatedVol, 0.5) * std::pow(86'400'000'000'000.0 / step, 0.5);
+}
+
+//-------------------------------------------------------------------------
+
+double ALGOTraderVolumeStats::volumeSum(
+    std::span<const taosim::stats::L2Level> side, size_t depth)
+{
+    auto volumesView = side | views::take(depth) | views::transform(&taosim::stats::L2Level::quantity);
     return taosim::util::decimal2double(ranges::accumulate(volumesView, decimal_t{}));
 }
 
@@ -364,10 +420,22 @@ void ALGOTraderAgent::configure(const pugi::xml_node& node)
     double initPrice = simulation()->exchange()->process("fundamental", BookId{})->value();
     m_state = [&] {
         std::vector<ALGOTraderState> state;
+        const Timestamp barPeriod = simulation()->exchange()->statsHub()->barPeriod();
         for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+            auto volumeStats = ALGOTraderVolumeStats::fromXML(node, initPrice, m_depth);
+            // The daily scaling in estimatedVolatility() has to know what its returns are
+            // spaced by, and that is now the shared clock rather than this agent's tick.
+            volumeStats.setReturnPeriod(barPeriod);
+            if (bookId == 0) {
+                fmt::println(
+                    "ALGOTRADER garch rebased from volumeStatsPeriod={}ns to bar={}ns "
+                    "(omega scaled to hold the daily level; alpha/beta persistence is now "
+                    "per bar and is a tuning decision)",
+                    node.attribute("volumeStatsPeriod").as_ullong(), barPeriod);
+            }
             state.push_back(ALGOTraderState{
                 .status = ALGOTraderStatus::ASLEEP,
-                .volumeStats = ALGOTraderVolumeStats::fromXML(node, initPrice, m_depth),
+                .volumeStats = std::move(volumeStats),
                 .volumeToBeExecuted = 0_dec,
                 .direction = OrderDirection::BUY,
                 .statusChangeTime = 0,
@@ -436,7 +504,29 @@ void ALGOTraderAgent::configure(const pugi::xml_node& node)
     m_volatilityBounds.activationRate = (attr.empty() || attr.as_double() <= 0.0) ? 100.0 : attr.as_double();
     attr = node.attribute("capacity");
     m_volatilityBounds.activationCapacity = (attr.empty() || attr.as_double() <= 0.0 || attr.as_double() > 1.0) ? 1.0 : attr.as_double();
+    // How much resting liquidity counts as "enough to work into".
+    //
+    // `immediateDepthFrac` states it against the order the agent is trying to execute, which
+    // is the comparison that means something to an executor and which survives a change of
+    // order sizes or balances. `immediateBase` states it as an absolute quantity of base,
+    // which does not. The legacy form is honoured exactly; the notice reports what it works
+    // out to as a fraction, using the mean of the volume draw.
+    // A Rayleigh draw has mean scale*sqrt(pi/2), so a fraction of 0.05 gives a mean parent of
+    // about 6.3% of daily volume, roughly 25 bps of impact at the calibration above.
+    m_parentOrderAdvFraction =
+        std::max(node.attribute("parentOrderAdvFraction").as_double(0.0), 0.0);
+    m_advBars = std::max(node.attribute("advBars").as_uint(3600u), 1u);
+    m_immediateDepthFrac = node.attribute("immediateDepthFrac").as_double(0.0);
     m_immediateBase = node.attribute("immediateBase").as_double(600.0);
+    m_sliceLiquidityMode = algoSliceLiquidityModeFromString(
+        node.attribute("sliceLiquidityMode").as_string("clear_touch"));
+    if (m_immediateDepthFrac <= 0.0) {
+        const double meanDraw = scale2 * std::sqrt(std::numbers::pi / 2.0);
+        fmt::println(
+            "ALGOTRADER immediateBase={} is absolute base; against a mean draw of {} that is "
+            "immediateDepthFrac={}",
+            m_immediateBase, meanDraw, meanDraw > 0.0 ? m_immediateBase / meanDraw : 0.0);
+    }
     m_topLevel = std::vector<TopLevel>(m_bookCount, TopLevel{});
 
     m_deviationProbCoef = node.attribute("wakeDeviationCoef").as_double(1.0);
@@ -472,11 +562,11 @@ void ALGOTraderAgent::receiveMessage(Message::Ptr msg)
     else if (msg->type == "ERROR_RESPONSE_PLACE_ORDER_MARKET") {
         handleMarketOrderPlacementErrorResponse(msg);
     }
-    else if (msg->type == "RESPONSE_RETRIEVE_L2") {
-        handleBookResponse(msg);
+    else if (msg->type == "WAKEUP_ALGOTRADER_BOOK") {
+        handleBookTick(msg);
     } 
-    else if (msg->type == "RESPONSE_RETRIEVE_L1") {
-        handleL1Response(msg);
+    else if (msg->type == "WAKEUP_ALGOTRADER_EXECUTE") {
+        handleExecuteTick(msg);
     }
 }
 
@@ -506,16 +596,9 @@ void ALGOTraderAgent::handleSimulationStart(Message::Ptr msg)
 
         auto& state = m_state.at(bookId);
         const auto& balances =  simulation()->account(name()).at(bookId);
-        const decimal_t volumeToBeExecuted = drawNewVolume(balances.m_baseDecimals); 
+        const decimal_t volumeToBeExecuted = drawNewVolume(bookId, balances.m_baseDecimals); 
         state.volumeToBeExecuted = std::min(volumeToBeExecuted, balances.base.getFree());
-        simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            m_period + marketFeedLatency(),
-            name(),
-            m_exchange,
-            "RETRIEVE_L2",
-            MessagePayload::create<RetrieveL2Payload>(m_depth,bookId)
-        );
+        scheduleBookTick(bookId);
     }
 }
 
@@ -531,15 +614,29 @@ void ALGOTraderAgent::handleTrade(Message::Ptr msg)
 
 //-------------------------------------------------------------------------
 
-void ALGOTraderAgent::handleBookResponse(Message::Ptr msg) 
+// The periodic depth read, taken directly off the exchange: once per period plus the agent's
+// market feed latency.
+void ALGOTraderAgent::handleBookTick(Message::Ptr msg)
 {
-    const auto payload = std::static_pointer_cast<RetrieveL2ResponsePayload>(msg->payload);
-    BookId bookId = payload->bookId;
-    m_state.at(bookId).volumeStats.pushLevels(
-        static_cast<Timestamp>(payload->time / m_period), payload->bids, payload->asks);
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
+    const BookId bookId = payload->bookId;
+    const auto now = simulation()->currentTimestamp();
+
+    const auto book = simulation()->exchange()->statsHub()->l2(bookId, m_depth);
+    // A one-sided book has no level to read on the empty side. The request path returned an
+    // empty vector here too and this call site took front() of it regardless; there is
+    // nothing to measure, so wait for the next tick.
+    if (book.bids.empty() || book.asks.empty()) {
+        scheduleBookTick(bookId);
+        return;
+    }
+
+    auto& volumeStats = m_state.at(bookId).volumeStats;
+    volumeStats.pushLevels(static_cast<Timestamp>(now / m_period), book.bids, book.asks);
+    stepVolatility(bookId);
     auto& topLevel = m_topLevel.at(bookId);
-    topLevel.bid = taosim::util::decimal2double(payload->bids.front().quantity);
-    topLevel.ask = taosim::util::decimal2double(payload->asks.front().quantity);
+    topLevel.bid = taosim::util::decimal2double(book.bids.front().quantity);
+    topLevel.ask = taosim::util::decimal2double(book.asks.front().quantity);
 
     const double fundamental = getProcessValue(bookId, "fundamental");
     const double lastPrice = util::decimal2double(m_lastPrice.at(bookId));
@@ -552,7 +649,8 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
         // inside the band: no immediate action; fall through to the periodic L2 request below
     }
     else if (fundamental >= lastPrice) {
-         if (state.status != ALGOTraderStatus::EXECUTING  && state.volumeStats.askVolume() >= m_immediateBase) {
+         if (state.status != ALGOTraderStatus::EXECUTING
+            && state.volumeStats.askVolume() >= immediateThreshold(state)) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::BUY;
             state.volumeToBeExecuted = taosim::util::double2decimal(topLevel.ask,balances.m_baseDecimals);
@@ -560,7 +658,8 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
          }
     }
     else {
-        if (state.status != ALGOTraderStatus::EXECUTING  && state.volumeStats.bidVolume() >= m_immediateBase) {
+        if (state.status != ALGOTraderStatus::EXECUTING
+            && state.volumeStats.bidVolume() >= immediateThreshold(state)) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::SELL;
             state.volumeToBeExecuted = taosim::util::double2decimal(topLevel.bid,balances.m_baseDecimals);
@@ -568,28 +667,84 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
          }
     }
 
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        m_period + marketFeedLatency(),
-        name(),
-        m_exchange,
-        "RETRIEVE_L2",
-        MessagePayload::create<RetrieveL2Payload>(m_depth,bookId)
-    );
-
+    scheduleBookTick(bookId);
 }
 
 //-------------------------------------------------------------------------
 
-void ALGOTraderAgent::handleL1Response(Message::Ptr msg)
+// Folds in every bar of the shared clock closed since the last visit, in order. Stepping the
+// recursion here rather than once per depth tick is what makes its sampling regular: the tick
+// carries a latency draw, the bars do not. Catching up several at once is the same recursion
+// run several times, so a slow tick costs nothing but the loop.
+void ALGOTraderAgent::stepVolatility(BookId bookId)
 {
-    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);    
+    const auto* hub = simulation()->exchange()->statsHub().get();
+    auto& volumeStats = m_state.at(bookId).volumeStats;
+
+    const uint64_t closed = hub->barsClosed(bookId);
+    const uint64_t consumed = volumeStats.barsConsumed();
+    if (closed <= consumed) return;
+
+    // A return needs the bar before it, so at most one fewer than exist can be handed out.
+    const auto pending = static_cast<uint32_t>(
+        std::min<uint64_t>(closed - consumed, hub->barsAvailable(bookId)));
+    for (const double logReturn : hub->returns(bookId, pending)) {
+        volumeStats.pushReturn(logReturn);
+    }
+    volumeStats.barsConsumed() = closed;
+}
+
+//-------------------------------------------------------------------------
+
+// The resting volume the book has to show before the agent will start working. Relative to
+// what it is trying to execute where that is configured, absolute otherwise.
+double ALGOTraderAgent::immediateThreshold(const ALGOTraderState& state) const
+{
+    if (m_immediateDepthFrac <= 0.0) return m_immediateBase;
+    const double parent = util::decimal2double(state.volumeToBeExecuted);
+    return m_immediateDepthFrac * std::max(parent, 0.0);
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderAgent::scheduleBookTick(BookId bookId)
+{
+    simulation()->dispatchMessage(
+        simulation()->currentTimestamp(),
+        m_period + marketFeedLatency(),
+        name(),
+        name(),
+        "WAKEUP_ALGOTRADER_BOOK",
+        MessagePayload::create<WakeupPayload>(bookId));
+}
+
+//-------------------------------------------------------------------------
+
+// The execution tick. Note the fields: this agent's `topLevel` holds the VOLUME resting at
+// the best bid and ask, not their prices, which is what execute() sizes its slice against.
+void ALGOTraderAgent::handleExecuteTick(Message::Ptr msg)
+{
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
     const BookId bookId = payload->bookId;
+    const auto l1 = simulation()->exchange()->statsHub()->l1(bookId);
     auto& topLevel = m_topLevel.at(bookId);
-    topLevel.bid = taosim::util::decimal2double(payload->bestBidVolume);
-    topLevel.ask = taosim::util::decimal2double(payload->bestAskVolume);
+    topLevel.bid = taosim::util::decimal2double(l1.bestBidVolume);
+    topLevel.ask = taosim::util::decimal2double(l1.bestAskVolume);
     auto& state = m_state.at(bookId);
     execute(bookId, state);
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderAgent::scheduleExecuteTick(BookId bookId, Timestamp delay)
+{
+    simulation()->dispatchMessage(
+        simulation()->currentTimestamp(),
+        delay,
+        name(),
+        name(),
+        "WAKEUP_ALGOTRADER_EXECUTE",
+        MessagePayload::create<WakeupPayload>(bookId));
 }
 
 //-------------------------------------------------------------------------
@@ -608,7 +763,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
         state.direction = fundamental >= lastPrice ? OrderDirection::BUY : OrderDirection::SELL;
         if (std::bernoulli_distribution{wakeupProb(state, relativeDiff)}(*m_rng)) {
             state.status = ALGOTraderStatus::EXECUTING;
-            decimal_t volumeToBeExecuted = drawNewVolume(balances.m_baseDecimals); 
+            decimal_t volumeToBeExecuted = drawNewVolume(bookId, balances.m_baseDecimals); 
             if (fundamental >= lastPrice) {
                 state.direction = OrderDirection::BUY;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
@@ -623,13 +778,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
         if (state.status == ALGOTraderStatus::EXECUTING) {
             state.statusChangeTime = simulation()->currentTimestamp();
             state.marketFeedLatency = marketFeedLatency();
-            simulation()->dispatchMessage(
-                simulation()->currentTimestamp(),
-                state.marketFeedLatency,
-                name(),
-                m_exchange,
-                "RETRIEVE_L1",
-                MessagePayload::create<RetrieveL1Payload>(bookId));
+            scheduleExecuteTick(bookId, state.marketFeedLatency);
         } 
     }
 
@@ -659,16 +808,10 @@ void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
         state.status = ALGOTraderStatus::ASLEEP; 
         state.statusChangeEndTime = simulation()->currentTimestamp();
         const auto& balances =  simulation()->account(name()).at(bookId);
-        state.volumeToBeExecuted =  drawNewVolume(balances.m_baseDecimals); 
+        state.volumeToBeExecuted =  drawNewVolume(bookId, balances.m_baseDecimals); 
     } else {
         state.marketFeedLatency = marketFeedLatency();
-        simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            state.marketFeedLatency + decisionMakingDelay(),
-            name(),
-            m_exchange,
-            "RETRIEVE_L1",
-            MessagePayload::create<RetrieveL1Payload>(bookId));
+        scheduleExecuteTick(bookId, state.marketFeedLatency + decisionMakingDelay());
     }
 }
 
@@ -691,15 +834,22 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
 {
     const auto& balances = simulation()->account(name()).at(bookId) ;
     const auto& baseBalance = balances.base;
-    double topLevelVolume = state.direction == OrderDirection::BUY ? m_topLevel.at(bookId).ask : m_topLevel.at(bookId).bid;
+    const double topLevelVolume =
+        state.direction == OrderDirection::BUY ? m_topLevel.at(bookId).ask : m_topLevel.at(bookId).bid;
     const decimal_t drawnQty = util::double2decimal(
-                                        std::max(m_volumeDistribution->sample(*m_rng), topLevelVolume),
-                                        balances.m_baseDecimals);
+        selectALGOSliceQuantity(
+            m_volumeDistribution->sample(*m_rng), topLevelVolume, m_sliceLiquidityMode),
+        balances.m_baseDecimals);
     const decimal_t volume = std::min(drawnQty,
                                          state.volumeToBeExecuted);
     const decimal_t volumeToExecute = state.direction == OrderDirection::BUY ? 
     std::min(volume, (balances.quote->getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
         : std::min(volume, (baseBalance.getFree() * (decimal_t{0.99}) ));
+
+    if (volumeToExecute <= 0_dec) {
+        scheduleExecuteTick(bookId, marketFeedLatency() + decisionMakingDelay());
+        return;
+    }
 
     simulation()->logDebug(
         "{} ATTEMPTING TO EXECUTE {} OF {}, | at {}", name(), state.direction, volumeToExecute, simulation()->currentTimestamp());
@@ -734,7 +884,20 @@ double ALGOTraderAgent::wakeupProb(ALGOTraderState& state, double fundDist)
 
 //-------------------------------------------------------------------------
 
-decimal_t ALGOTraderAgent::drawNewVolume(uint32_t baseDecimals) {
+// Parent order as a fraction of estimated daily volume when `parentOrderAdvFraction` is set,
+// else the absolute Rayleigh draw. Daily is extrapolated from an hour of bars.
+decimal_t ALGOTraderAgent::drawNewVolume(BookId bookId, uint32_t baseDecimals) {
+        if (m_parentOrderAdvFraction > 0.0) {
+            const auto window = simulation()->exchange()->statsHub()->window(bookId, m_advBars);
+            if (window.seconds > 0.0 && window.volume > 0.0) {
+                const double dailyVolume = window.volume / window.seconds * 86'400.0;
+                const double scale = m_parentOrderAdvFraction * dailyVolume;
+                if (scale > 0.0) {
+                    taosim::stats::RayleighDistribution scaled{scale, 1.0};
+                    return util::double2decimal(scaled.sample(*m_rng), baseDecimals);
+                }
+            }
+        }
         const double rayleighDraw = m_volumeDrawDistribution->sample(*m_rng);
         return  util::double2decimal(rayleighDraw,baseDecimals);
 }

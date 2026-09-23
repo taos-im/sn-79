@@ -10,7 +10,10 @@
 #include <fmt/format.h>
 
 #include <cstring>
+#include <iomanip>
+#include <span>
 #include <spanstream>
+#include <string_view>
 
 //-------------------------------------------------------------------------
 
@@ -150,22 +153,41 @@ namespace taosim::literals
 
 //-------------------------------------------------------------------------
 
-static inline void trim(std::span<char> span)
+namespace taosim::util
 {
-    const size_t len = std::strlen(span.data());
-    if (len <= 3uz) return;
-    // ONLY A FRACTIONAL PART HAS REDUNDANT TRAILING ZEROS. Decimal128 is unnormalised, so a whole
-    // number can render without a point -- 150000 is stored as 15e4 and streams as "150000" -- and
-    // stripping its zeros changes the value rather than tidying it: an untouched 150000.0 quote
-    // endowment renders as "15", while a 500 base endowment survives only because the length guard
-    // above returns early on three characters.
-    if (std::memchr(span.data(), '.', len) == nullptr) return;
-    size_t i = len - 1;
-    while (i > 1 && span[i] == '0' && span[i - 1] != '.') {
-        --i;
+
+// Upper bound on the character count of a single decimal_t rendering.
+inline constexpr size_t kDecimalTextCapacity = 64;
+
+// Renders val at the front of buf, which must hold at least kDecimalTextCapacity characters, and
+// returns the rendered characters (aliasing buf). Full Decimal128 precision: the stream's default
+// (6) silently truncated digits (e.g. a 10-decimal fee), which is never wanted for a value that
+// carries its own quantum. Trailing fractional zeros are trimmed and zero is spelled "0.0".
+[[nodiscard]] inline std::string_view decimalToChars(std::span<char> buf, decimal_t val)
+{
+    using namespace taosim::literals;
+    std::ospanstream oss{buf};
+    if (val == 0_dec) [[unlikely]] {
+        oss << "0.0";
+    } else {
+        oss << std::setprecision(34) << val;
     }
-    span[i + 1] = '\0';
+    std::string_view rendered{oss.span().data(), oss.span().size()};
+    // Only a fractional part may be trimmed: without this guard an integral rendering like
+    // "3000" would lose its trailing zeros ("30").
+    if (rendered.size() <= 3uz || rendered.find('.') == std::string_view::npos) {
+        return rendered;
+    }
+    auto last = rendered.size() - 1;
+    while (last > 1 && rendered[last] == '0' && rendered[last - 1] != '.') {
+        --last;
+    }
+    return rendered.substr(0, last + 1);
 }
+
+}  // namespace taosim::util
+
+//-------------------------------------------------------------------------
 
 template<>
 struct fmt::formatter<taosim::decimal_t>
@@ -175,16 +197,8 @@ struct fmt::formatter<taosim::decimal_t>
     template<typename FormatContext>
     auto format(taosim::decimal_t val, FormatContext& ctx) const
     {
-        using namespace taosim::literals;
-        char buf[64]{};
-        std::ospanstream oss{buf};
-        if (val == 0_dec) [[unlikely]] {
-            oss << "0.0";
-        } else {
-            oss << val;
-            trim(buf);
-        }
-        return fmt::format_to(ctx.out(), "{}", buf);
+        char buf[taosim::util::kDecimalTextCapacity];
+        return fmt::format_to(ctx.out(), "{}", taosim::util::decimalToChars(buf, val));
     }
 };
 

@@ -7,6 +7,8 @@
 #include <taosim/decimal/decimal.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
 
+#include <cstring>
+
 //-------------------------------------------------------------------------
 
 namespace msgpack

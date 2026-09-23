@@ -156,6 +156,15 @@ bool ClearingManager::handleClosePosition(const ClosePositionDesc &closeDesc)
 
         if (loan->get().direction() == OrderDirection::BUY){
             const auto bestBid = m_exchange->books()[bookId]->bestBid();
+            // No active bid means no price to size the closing sell; report the failure instead of
+            // dispatching an order for an infinite amount.
+            if (bestBid <= 0_dec) {
+                m_exchange->simulation()->logDebug(
+                    "{} | AGENT #{} BOOK {} : CLOSE POSITION OF ORDER #{} HAS NO BID TO PRICE IT",
+                    m_exchange->simulation()->currentTimestamp(), agentId,
+                    m_exchange->simulation()->bookIdCanon(bookId), orderId);
+                return false;
+            }
             settleAmount = util::roundUp(
                 bestBid * util::roundUp(settleAmount / bestBid, 
                     m_exchange->config().parameters().baseIncrementDecimals),
@@ -382,8 +391,12 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
     accounting::Balances& restingBalance = accounts()[restingAgentId][bookId];
     accounting::Balances& aggressingBalance = accounts()[aggressingAgentId][bookId];
 
-    const decimal_t bestBid = m_exchange->books()[bookId]->bestBid();
-    const decimal_t bestAsk = m_exchange->books()[bookId]->bestAsk();
+    // A side without active quotes reports 0, which is not a price: reservations would be valued
+    // at nothing and loan settlement would divide by it. The trade that just printed is the best
+    // mark available in that case.
+    auto markPrice = [&](decimal_t best) { return best > 0_dec ? best : trade->price(); };
+    const decimal_t bestBid = markPrice(m_exchange->books()[bookId]->bestBid());
+    const decimal_t bestAsk = markPrice(m_exchange->books()[bookId]->bestAsk());
 
     // Policy: The direction of the trade is that of the aggressing order.
     if (trade->direction() == OrderDirection::BUY) {

@@ -26,6 +26,10 @@ namespace adaptor
 
 //-------------------------------------------------------------------------
 
+// "topLevel" and "lastMid" were dropped when the agent moved to reading the book directly:
+// both were private copies of market state that is now shared and read live, so there is
+// nothing per-agent left to restore. An older checkpoint still carrying those keys loads
+// fine, the loop below simply has no branch for them.
 template<>
 struct convert<taosim::agent::StylizedTraderAgent>
 {
@@ -55,17 +59,6 @@ struct convert<taosim::agent::StylizedTraderAgent>
                 using T = std::remove_cvref_t<decltype(v.regimeState())>;
                 v.regimeState() = val.as<T>();
             }
-            else if (key == "topLevel") {
-                using T = std::remove_cvref_t<decltype(v.topLevel())>;
-                v.topLevel() = val.as<T>();
-            }
-            else if (key == "lastMid") {
-                // Only the last element of a full ring buffer is ever read, so this stores
-                // just that. Checkpoints carrying the older "priceHist" key will not restore
-                // this field; the agent reseeds it on the first L1.
-                using T = std::remove_cvref_t<decltype(v.lastMid())>;
-                v.lastMid() = val.as<T>();
-            }
         }
 
         return o;
@@ -80,7 +73,7 @@ struct pack<taosim::agent::StylizedTraderAgent>
         msgpack::packer<Stream>& o, const taosim::agent::StylizedTraderAgent& v) const
     {
         // MUST match the number of key/value pairs packed below.
-        o.pack_map(6);
+        o.pack_map(4);
 
         o.pack("tauF");
         o.pack(v.tauF());
@@ -93,12 +86,6 @@ struct pack<taosim::agent::StylizedTraderAgent>
 
         o.pack("regimeState");
         o.pack(v.regimeState());
-
-        o.pack("topLevel");
-        o.pack(v.topLevel());
-
-        o.pack("lastMid");
-        o.pack(v.lastMid());
 
         return o;
     }

@@ -21,6 +21,20 @@ cd "$(dirname "$0")" || exit 1
 # -- resume, or open a new simulation -- is the whole of its behaviour, and it ends in an exec, so the
 # only way to observe it is to exec something that reports its arguments.
 BIN=${TAOSIM_BIN:-../build/src/cpp/taosim}
+
+# WHERE THE ENGINE'S NARRATION GOES.
+#
+# At debug="1" the engine writes on the order of a megabyte a second. Routed through a process
+# manager's stdout capture that is a problem in its own right: the manager buffers it, its log
+# rotation runs continuously, and a rotation racing a write can take the manager down and with it
+# every process it supervises. Pointing the stream at a file takes the manager out of the path.
+#
+# Opt-in, so a plain launch still prints to the console as before. Set SIM_NARRATION_FILE to a path
+# and everything from here is appended to it instead.
+if [ -n "${SIM_NARRATION_FILE:-}" ]; then
+    mkdir -p "$(dirname "$SIM_NARRATION_FILE")" 2>/dev/null || true
+    exec >>"$SIM_NARRATION_FILE" 2>&1
+fi
 # THE CONFIG IS AN ARGUMENT, NOT AN INHERITED VARIABLE. The launchers set SIMULATION_CONFIG without
 # exporting it, so pm2 captures no such variable and the fallback below silently decided the config
 # for them. It matched only because the default is the same name; launched with -g on another config

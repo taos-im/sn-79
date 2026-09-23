@@ -746,6 +746,25 @@ RetrieveL2ResponsePayload::Ptr RetrieveL2ResponsePayload::fromJson(
 
 //-------------------------------------------------------------------------
 
+void WakeupPayload::jsonSerialize(rapidjson::Document& json, const std::string& key) const
+{
+    auto serialize = [this](rapidjson::Document& json) {
+        json.SetObject();
+        auto& allocator = json.GetAllocator();
+        json.AddMember("bookId", rapidjson::Value{bookId}, allocator);
+    };
+    taosim::json::serializeHelper(json, key, serialize);
+}
+
+//-------------------------------------------------------------------------
+
+WakeupPayload::Ptr WakeupPayload::fromJson(const rapidjson::Value& json)
+{
+    return MessagePayload::create<WakeupPayload>(json["bookId"].GetUint());
+}
+
+//-------------------------------------------------------------------------
+
 void RetrieveL1Payload::jsonSerialize(rapidjson::Document& json, const std::string& key) const
 {
     auto serialize = [this](rapidjson::Document& json) {

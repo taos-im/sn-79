@@ -20,6 +20,7 @@ add_subdirectory(replay)
 add_subdirectory(serialization)
 add_subdirectory(simulation)
 add_subdirectory(stats)
+add_subdirectory(statshub)
 add_subdirectory(util)
 add_subdirectory(xml)
 

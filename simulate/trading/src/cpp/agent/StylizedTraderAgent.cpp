@@ -67,6 +67,39 @@ StylizedTraderAgent::StylizedTraderAgent(Simulation* simulation) noexcept
 
 //-------------------------------------------------------------------------
 
+// The book as it stands, read straight off the exchange. What this replaced was a cached
+// copy refreshed by a poll running on its own interval, so a decision could be taken
+// against a top of book tens of seconds old while the real one had moved.
+TopLevel StylizedTraderAgent::topOfBook(BookId bookId) const
+{
+    const auto l1 = simulation()->exchange()->statsHub()->l1(bookId);
+    TopLevel topLevel{
+        .bid = taosim::util::decimal2double(l1.bestBidPrice),
+        .ask = taosim::util::decimal2double(l1.bestAskPrice)
+    };
+    if (topLevel.bid == 0.0) topLevel.bid = referencePrice(bookId);
+    if (topLevel.ask == 0.0) topLevel.ask = topLevel.bid + m_priceIncrement;
+    return topLevel;
+}
+
+//-------------------------------------------------------------------------
+
+// The price the agent reasons about. Mid when the book is two-sided; otherwise the last mid
+// the bar series carried, and only if the book has never been two-sided at all, the
+// configured starting price.
+double StylizedTraderAgent::referencePrice(BookId bookId) const
+{
+    const auto* hub = simulation()->exchange()->statsHub().get();
+    const auto l1 = hub->l1(bookId);
+    const double bid = taosim::util::decimal2double(l1.bestBidPrice);
+    const double ask = taosim::util::decimal2double(l1.bestAskPrice);
+    if (bid > 0.0 && ask > 0.0) return 0.5 * (bid + ask);
+    if (const double carried = hub->window(bookId, 1).close; carried > 0.0) return carried;
+    return m_price0;
+}
+
+//-------------------------------------------------------------------------
+
 void StylizedTraderAgent::configure(const pugi::xml_node& node)
 {
     Agent::configure(node);
@@ -145,18 +178,37 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
     const double riskAversionCoef = m_riskAversion0* (1.0f + sigmaC)/(1.0f + sigmaF);
     m_riskAversion = riskAversionCoef * (1.0f + m_weight.F) / (1.0f + m_weight.C);
 
-    attr = node.attribute("volGuard");
-    if (attr.empty() || attr.as_double() <= 0.0f) {
-        throw std::invalid_argument(fmt::format(
-            "{}: attribute 'volatility Guard (volGuard)' should have a value greater than 0.0f", ctx));
+    m_volGuardX0 = node.attribute("volGuardSigma").as_double();
+    m_volGuardBand = std::max(node.attribute("volGuardBand").as_double(2.0), 1.000001);
+    if (m_volGuardX0 <= 0.0) {
+        attr = node.attribute("volGuard");
+        if (attr.empty() || attr.as_double() <= 0.0) {
+            throw std::invalid_argument(fmt::format(
+                "{}: needs 'volGuardSigma' (the horizon sigma at which post-only probability "
+                "is one half), or the legacy 'volGuard'", ctx));
+        }
+        // Legacy conversion, preserving the midpoint. The old sigmoid sat at
+        // x0 = volGuard/10 + L1/slope in VARIANCE, so the equivalent sigma is its root. The
+        // transition width is NOT preserved: the old band was pathological, tied to the
+        // probability level, and its lower edge cannot survive the square root symmetrically.
+        const double legacy = attr.as_double();
+        const double l1 = std::log((1.0 - legacy) / legacy);
+        const double slopeOld = 2.0 * l1 / (10.0 * legacy - legacy / 100.0);
+        const double x0Old = legacy / 10.0 + l1 / slopeOld;
+        m_volGuardX0 = std::sqrt(x0Old);
+        if (m_catUId == 0) {
+            fmt::println(
+                "STYLIZEDTRADER volGuard={} converted to volGuardSigma={} (midpoint preserved; "
+                "transition width now set by volGuardBand={})",
+                legacy, m_volGuardX0, m_volGuardBand);
+        }
     }
-    m_volatilityGuard =  attr.as_double();
-    const float p_low  = m_volatilityGuard;
-    const float p_high = 1- m_volatilityGuard;    
-    const float L1 = std::log((1 - m_volatilityGuard) / m_volatilityGuard);
-    const float L2 = std::log(m_volatilityGuard / (1- m_volatilityGuard));
-    m_slopeVolGuard =  (L1 - L2) / (10*m_volatilityGuard - m_volatilityGuard/100);
-    m_volGuardX0 = m_volatilityGuard/10 + L1/m_slopeVolGuard;
+    m_volatilityGuard = static_cast<float>(m_volGuardX0);
+    // Reaches 99% post-only at band times the midpoint. A logistic is symmetric in its
+    // argument, so the lower edge is nearer the middle than the upper one; the band names the
+    // upper edge.
+    m_slopeVolGuard = static_cast<float>(
+        std::log(99.0) / (m_volGuardX0 * (m_volGuardBand - 1.0)));
 
     if (attr = node.attribute("minOPLatency"); attr.as_ullong() == 0) {
         throw std::invalid_argument(fmt::format(
@@ -296,7 +348,11 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
                         static_cast<Timestamp>(1000)
                 );
 
-    m_horizonSeconds = (m_tau / 1e9) * std::max(1.0, std::log(static_cast<double>(m_historySize)));
+    // The horizon is a count of bars, which at a one-second bar is also a count of seconds.
+    // It replaces a horizon derived from the poll interval times the log of the history
+    // size, a number that mixed a cadence with a window length.
+    m_horizonBars = static_cast<uint32_t>(std::clamp<uint64_t>(
+        node.attribute("varHorizonBars").as_ullong(m_historySize), 1, 3600));
     attr = node.attribute("GBM_X0");
     const double gbmX0 = (attr.empty() || attr.as_double() <= 0.0f) ?  0.001 : attr.as_double();
     attr = node.attribute("GBM_mu");
@@ -307,7 +363,7 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
     const uint64_t gbmSeed = attr.as_ullong(10000); 
 
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        m_topLevel.push_back(TopLevel{});
+
         const auto& Xt = simulation()->getOrComputeGbmPath(
             gbmSeed + bookId + 1, m_price0, gbmMu, gbmSigma, 86400);
         double price = Xt[86400-1];
@@ -318,10 +374,9 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
             price = Xt[86400-i];
             prevPrice = price;
         }
-        m_lastMid.push_back(prevPrice);
+
         m_fundamental.push_back(simulation()->exchange()->process("fundamental", bookId));
-        m_varEst.push_back({});
-        m_varEst.back().configure(m_varHalflifeSeconds, m_varJumpRobust);
+
     }
 
     attr = node.attribute("opLatencyScaleRay"); 
@@ -352,8 +407,6 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
     attr = node.attribute("minDMD");
     m_minDelay = (attr.empty() || attr.as_ullong() < 100'000'000) ? static_cast<Timestamp>(100'000'000) : attr.as_ullong();
     m_feeReserveFrac = std::clamp(node.attribute("feeReserveFrac").as_double(0.01), 0.0, 0.5);
-    m_varHalflifeSeconds = node.attribute("varHalflifeSeconds").as_double(60.0);
-    m_varJumpRobust = node.attribute("varJumpRobust").as_bool(true);
 
     m_baseName = [&] {
         std::string res = name();
@@ -381,9 +434,6 @@ void StylizedTraderAgent::receiveMessage(Message::Ptr msg)
     else if (msg->type == "RESPONSE_SUBSCRIBE_EVENT_TRADE") {
         handleTradeSubscriptionResponse();
     }
-    else if (msg->type == "RESPONSE_RETRIEVE_L1_EXT") {
-        handleRetrieveL1ExtResponse(msg);
-    }
     else if (msg->type == "RESPONSE_PLACE_ORDER_LIMIT") {
         handleLimitOrderPlacementResponse(msg);
     }
@@ -408,23 +458,24 @@ void StylizedTraderAgent::receiveMessage(Message::Ptr msg)
 void StylizedTraderAgent::handleSimulationStart()
 {
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            1,
-            name(),
-            m_exchange,
-            "RETRIEVE_L1_EXT",
-            MessagePayload::create<RetrieveL1ExtPayload>(bookId));
         if (m_catUId == 0) {
             auto chosenAgent = selectTurn();
             Timestamp initDelay = marketFeedLatency();
-            simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-                initDelay,
-                name(),
-                fmt::format("{}_{}", m_baseName, chosenAgent),
-                "WAKEUP",
-                MessagePayload::create<RetrieveL1Payload>(bookId));
+            auto& chains = simulation()->exchange()->wakeupChains().at(bookId);
+            chains.registerChain(
+                m_baseName,
+                simulation()->currentTimestamp(),
+                m_maxDelay,
+                simulation()->localAgentManager()->roster()->at(m_baseName));
+            if (chains.arm(m_baseName, simulation()->currentTimestamp(), initDelay)) {
+                simulation()->dispatchMessage(
+                    simulation()->currentTimestamp(),
+                    initDelay,
+                    name(),
+                    fmt::format("{}_{}", m_baseName, chosenAgent),
+                    "WAKEUP",
+                    MessagePayload::create<WakeupPayload>(bookId));
+            }
             const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
             simulation()->exchange()->acdClocks().at(bookId).insert(
                 m_baseName, taosim::book::AcdClock{.delay=initPsi, .psi=initPsi});
@@ -449,7 +500,10 @@ void StylizedTraderAgent::handleSimulationStop()
             "AGENTDIAG {{\"agent\":\"{}\",\"book\":{},\"n\":{},"
             "\"delay_mean\":{},\"delay_std\":{},\"delay_min\":{},\"delay_max\":{},"
             "\"psi_mean\":{},\"psi_std\":{}}}\n",
-            m_baseName, bookId, s.n,
+            // CANONICAL, matching the maker's line and the WAKEUPCHAIN lines. Local ids
+            // restart at zero in every block, so on a multi-block run every block emits its
+            // own "book 0" and the class's diagnostics cannot be attributed to a book at all.
+            m_baseName, simulation()->bookIdCanon(bookId), s.n,
             delayMean, delayStd, s.delayMin, s.delayMax, psiMean, psiStd);
         std::fflush(stdout);
     }
@@ -460,36 +514,6 @@ void StylizedTraderAgent::handleSimulationStop()
 void StylizedTraderAgent::handleTradeSubscriptionResponse()
 {
 
-}
-
-//-------------------------------------------------------------------------
-
-void StylizedTraderAgent::handleRetrieveL1ExtResponse(Message::Ptr msg)
-{
-    // Guards a null payload, not a type mismatch: static_pointer_cast cannot fail.
-    const auto payload = std::static_pointer_cast<RetrieveL1ExtResponsePayload>(msg->payload);
-    if (payload == nullptr) return;
-    m_varEst.at(payload->bookId).update(payload->tradeStats, simulation()->currentTimestamp());
-
-    const BookId bookId = payload->bookId;
-
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        marketFeedLatency() + m_tau,
-        name(),
-        m_exchange,
-        "RETRIEVE_L1_EXT",
-        MessagePayload::create<RetrieveL1ExtPayload>(bookId));
-
-    auto& topLevel = m_topLevel[bookId];
-    topLevel.bid = taosim::util::decimal2double(payload->bestBidPrice);
-    topLevel.ask = taosim::util::decimal2double(payload->bestAskPrice);
-    
-    if  (topLevel.bid == 0.0) topLevel.bid = m_lastMid.at(bookId);
-    if  (topLevel.ask == 0.0) topLevel.ask = topLevel.bid + m_priceIncrement;
-    const double midQuote = 0.5 * (topLevel.bid + topLevel.ask);
-
-    m_lastMid.at(bookId) = midQuote;
 }
 
 //-------------------------------------------------------------------------
@@ -545,22 +569,29 @@ StylizedTraderAgent::ForecastResult StylizedTraderAgent::forecast(BookId bookId)
 {
     const double pf = getProcessValue(bookId, "fundamental");
 
-    m_price = m_lastMid.at(bookId);
+    m_price = referencePrice(bookId);
     if (isnan(m_price) || m_price <= 0.0) {
         // Error recovery
         m_price = m_price0;
     }
+    const auto window = simulation()->exchange()->statsHub()->window(bookId, m_horizonBars);
     double compF =  1.0 / m_tauF[bookId] * std::log(pf/ m_price);
     // Error recovery, just in case
     if (isnan(compF)) {
         compF = 0.0;
     }
-    double compC = m_varEst.at(bookId).meanLogReturn();
+    // Mean log return per bar over the horizon, which telescopes to
+    // log(mid_now / mid_horizon_ago) / bars. Per BAR, so `sigmaC` is on a bar scale; see
+    // parameters.md, where its search box carries that caveat.
+    double compC = window.meanReturnPerBar();
     if (isnan(compC)) compC = 0.0;
     const double compN = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
     double logReturnForecast = std::clamp(m_weightNormalizer
         * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN), -1.0, 1.0);
-    double varLastLogs = m_varEst.at(bookId).value() * m_horizonSeconds;
+    // Realized variance over the horizon, already summed over it, so there is no per-second
+    // value to rescale and no question of which interval it covers. The price it is
+    // reads from is the bar's: its trades, or its mid quote on a second that had none.
+    double varLastLogs = window.realizedVariance;
     // Error recovery
     if (isnan(varLastLogs)) {
         varLastLogs = std::abs(std::log(pf/m_price)*0.33);
@@ -727,7 +758,10 @@ void StylizedTraderAgent::placeLimitBuy(
 
     m_orderFlag[bookId] = true;
 
-    const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
+    const float postOnlyProb = std::max(
+        1.0 / (1.0 + std::exp(
+            -m_slopeVolGuard * (std::sqrt(forecastResult.varianceOfLastLogReturns) - m_volGuardX0))),
+        m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
     if ((sampledPrice > m_price*(1.0 + m_wealthFrac) 
 			    && std::bernoulli_distribution{std::pow((sampledPrice-m_price)/m_price,0.20)} (*m_rng)) 
@@ -745,7 +779,7 @@ void StylizedTraderAgent::placeLimitBuy(
     } else {
         double restPrice = price;
         if (postOnly) {
-            restPrice = slideToRest(price, OrderDirection::BUY, m_topLevel.at(bookId), m_priceIncrement);
+            restPrice = slideToRest(price, OrderDirection::BUY, topOfBook(bookId), m_priceIncrement);
             if (restPrice <= 0.0) return;
         }
         simulation()->dispatchMessage(
@@ -786,7 +820,10 @@ void StylizedTraderAgent::placeLimitSell(
     }
 
     m_orderFlag[bookId] = true;
-    const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
+    const float postOnlyProb = std::max(
+        1.0 / (1.0 + std::exp(
+            -m_slopeVolGuard * (std::sqrt(forecastResult.varianceOfLastLogReturns) - m_volGuardX0))),
+        m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
     if (!postOnly &&
 	(sampledPrice < m_price*(1.0 - m_wealthFrac) && 
@@ -804,7 +841,7 @@ void StylizedTraderAgent::placeLimitSell(
     } else {
         double restPrice = price;
         if (postOnly) {
-            restPrice = slideToRest(price, OrderDirection::SELL, m_topLevel.at(bookId), m_priceIncrement);
+            restPrice = slideToRest(price, OrderDirection::SELL, topOfBook(bookId), m_priceIncrement);
             if (restPrice <= 0.0) return;
         }
         simulation()->dispatchMessage(
@@ -833,18 +870,32 @@ uint64_t StylizedTraderAgent::selectTurn() {
 
 void StylizedTraderAgent::handleWakeup(Message::Ptr &msg)
 {
-    const auto payload = std::static_pointer_cast<RetrieveL1Payload>(msg->payload);
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
     auto chosenAgent = selectTurn();
 
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-            decisionMakingDelay(bookId),
+    // Hand the token on before deciding, so the chain's continuation is already in the
+    // queue before anything that can fail runs.
+    //
+    // This buys protection against an EARLY RETURN inside the decision, which is real and
+    // happens: the affordability checks and the rebalance branch both bail. It does NOT save
+    // the chain from a THROW, because nothing between here and Simulation::simulate catches
+    // one, so a throw ends the run rather than the chain. The ordering is still the right
+    // shape, and would matter the moment anything did catch and continue.
+    const Timestamp now = simulation()->currentTimestamp();
+    auto& chains = simulation()->exchange()->wakeupChains().at(bookId);
+    chains.noteWake(m_baseName, now);
+    const Timestamp delay = decisionMakingDelay(bookId);
+    if (chains.arm(m_baseName, now, delay)) {
+        simulation()->dispatchMessage(
+            now,
+            delay,
             name(),
             fmt::format("{}_{}", m_baseName, chosenAgent),
             "WAKEUP",
-            MessagePayload::create<RetrieveL1Payload>(bookId));
+            MessagePayload::create<WakeupPayload>(bookId));
+    }
     placeOrderChiarella(bookId);
 }
 

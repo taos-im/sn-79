@@ -1,0 +1,1157 @@
+{
+ "Account": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "b": {
+    "alias": "book_id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "bb": {
+    "alias": "base_balance",
+    "annotation": "<class 'taos.im.protocol.models.Balance'>",
+    "required": true
+   },
+   "bc": {
+    "alias": "base_collateral",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "bl": {
+    "alias": "base_loan",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "ds": {
+    "alias": "delegate_stakes",
+    "annotation": "dict[str, float]",
+    "required": false
+   },
+   "f": {
+    "alias": "fees",
+    "annotation": "taos.im.protocol.models.Fees | None",
+    "required": true
+   },
+   "i": {
+    "alias": "agent_id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "l": {
+    "alias": "loans",
+    "annotation": "dict[int, taos.im.protocol.models.Loan]",
+    "required": false
+   },
+   "o": {
+    "alias": "orders",
+    "annotation": "list[taos.im.protocol.models.Order]",
+    "required": false
+   },
+   "qb": {
+    "alias": "quote_balance",
+    "annotation": "<class 'taos.im.protocol.models.Balance'>",
+    "required": true
+   },
+   "qc": {
+    "alias": "quote_collateral",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "ql": {
+    "alias": "quote_loan",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "v": {
+    "alias": "traded_volume",
+    "annotation": "float | None",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "Account"
+ },
+ "Any": {
+  "kind": "other"
+ },
+ "Balance": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "c": {
+    "alias": "currency",
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "f": {
+    "alias": "free",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "i": {
+    "alias": "initial",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "r": {
+    "alias": "reserved",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "t": {
+    "alias": "total",
+    "annotation": "<class 'float'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "Balance"
+ },
+ "BaseModel": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {},
+  "kind": "class",
+  "qualname": "BaseModel"
+ },
+ "Book": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "a": {
+    "alias": "asks",
+    "annotation": "list[taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "b": {
+    "alias": "bids",
+    "annotation": "list[taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "e": {
+    "alias": "events",
+    "annotation": "list[taos.im.protocol.models.Order | taos.im.protocol.models.TradeInfo | taos.im.protocol.models.Cancellation] | None",
+    "required": true
+   },
+   "i": {
+    "alias": "id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "r": {
+    "alias": "MTR",
+    "annotation": "float | None",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "Book"
+ },
+ "Cancellation": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "i": {
+    "alias": "orderId",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "p": {
+    "alias": "price",
+    "annotation": "float | None",
+    "required": false
+   },
+   "q": {
+    "alias": "quantity",
+    "annotation": "float | None",
+    "required": true
+   },
+   "t": {
+    "alias": "timestamp",
+    "annotation": "int | None",
+    "required": false
+   },
+   "y": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "Cancellation"
+ },
+ "Element": {
+  "bases": [
+   "object"
+  ],
+  "kind": "class",
+  "qualname": "Element"
+ },
+ "EventHistory": {
+  "bases": [
+   "History"
+  ],
+  "kind": "class",
+  "qualname": "EventHistory"
+ },
+ "FeePolicy": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "fee_type": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "params": {
+    "alias": null,
+    "annotation": "<class 'dict'>",
+    "required": true
+   },
+   "tiers": {
+    "alias": null,
+    "annotation": "list[taos.im.protocol.models.FeeTier]",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "FeePolicy"
+ },
+ "FeeTier": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "maker_fee": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "taker_fee": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "volume_required": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "FeeTier"
+ },
+ "Fees": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "m": {
+    "alias": "maker_fee_rate",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "t": {
+    "alias": "taker_fee_rate",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "v": {
+    "alias": "volume_traded",
+    "annotation": "float | None",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "Fees"
+ },
+ "Field": {
+  "kind": "function",
+  "name": "Field"
+ },
+ "History": {
+  "bases": [
+   "object"
+  ],
+  "kind": "class",
+  "qualname": "History"
+ },
+ "IntEnum": {
+  "bases": [
+   "int",
+   "Enum"
+  ],
+  "kind": "class",
+  "members": {},
+  "qualname": "IntEnum"
+ },
+ "L2History": {
+  "bases": [
+   "History"
+  ],
+  "kind": "class",
+  "qualname": "L2History"
+ },
+ "L2Snapshot": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "asks": {
+    "alias": null,
+    "annotation": "dict[float, taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "bids": {
+    "alias": null,
+    "annotation": "dict[float, taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "timestamp": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "L2Snapshot"
+ },
+ "LazyAccount": {
+  "bases": [
+   "object"
+  ],
+  "kind": "class",
+  "qualname": "LazyAccount"
+ },
+ "LazyAccounts": {
+  "bases": [
+   "Mapping"
+  ],
+  "kind": "class",
+  "qualname": "LazyAccounts"
+ },
+ "LazyBook": {
+  "bases": [
+   "Book"
+  ],
+  "fields": {
+   "a": {
+    "alias": "asks",
+    "annotation": "list[taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "b": {
+    "alias": "bids",
+    "annotation": "list[taos.im.protocol.models.LevelInfo]",
+    "required": true
+   },
+   "e": {
+    "alias": "events",
+    "annotation": "list[taos.im.protocol.models.Order | taos.im.protocol.models.TradeInfo | taos.im.protocol.models.Cancellation] | None",
+    "required": true
+   },
+   "i": {
+    "alias": "id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "r": {
+    "alias": "MTR",
+    "annotation": "float | None",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "LazyBook"
+ },
+ "LazyBooks": {
+  "bases": [
+   "Mapping"
+  ],
+  "kind": "class",
+  "qualname": "LazyBooks"
+ },
+ "LazyLevel": {
+  "bases": [
+   "Sequence"
+  ],
+  "kind": "class",
+  "qualname": "LazyLevel"
+ },
+ "LazyLevels": {
+  "bases": [
+   "Sequence"
+  ],
+  "kind": "class",
+  "qualname": "LazyLevels"
+ },
+ "LevelInfo": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "o": {
+    "alias": "orders",
+    "annotation": "list[taos.im.protocol.models.Order] | None",
+    "required": false
+   },
+   "p": {
+    "alias": "price",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "q": {
+    "alias": "quantity",
+    "annotation": "<class 'float'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "LevelInfo"
+ },
+ "Literal": {
+  "kind": "other"
+ },
+ "Loan": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "a": {
+    "alias": "amount",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "bc": {
+    "alias": "base_collateral",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "c": {
+    "alias": "currency",
+    "annotation": "<enum 'OrderCurrency'>",
+    "required": true
+   },
+   "i": {
+    "alias": "order_id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "qc": {
+    "alias": "quote_collateral",
+    "annotation": "<class 'float'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "Loan"
+ },
+ "LoanSettlementOption": {
+  "bases": [
+   "IntEnum"
+  ],
+  "kind": "class",
+  "members": {
+   "FIFO": -1,
+   "NONE": -2
+  },
+  "qualname": "LoanSettlementOption"
+ },
+ "Mapping": {
+  "bases": [
+   "Collection"
+  ],
+  "kind": "class",
+  "qualname": "Mapping"
+ },
+ "MarketSimulationConfig": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "baseDecimals": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "block_count": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "book_count": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "book_levels": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "books_per_block": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "detailed_book_levels": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": false
+   },
+   "duration": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "fee_policy": {
+    "alias": null,
+    "annotation": "taos.im.protocol.models.FeePolicy | None",
+    "required": false
+   },
+   "fp_lambda": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "fp_mu": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "fp_mu_jump": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "fp_seed_interval": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "fp_sigma": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "fp_sigma_jump": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "fp_update_period": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_base_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_capital_type": {
+    "alias": null,
+    "annotation": "str | None",
+    "required": false
+   },
+   "futures_agent_count": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_feed_latency_mean": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_feed_latency_std": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_lambda": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_order_latency_max": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_order_latency_min": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "futures_agent_quote_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_selection_scale": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_sigmaEps": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_volume": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "futures_agent_wealth": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "grace_period": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_base_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "hft_agent_capital_type": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "hft_agent_count": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_delta": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_feed_latency_min": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_gHFT": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_kappa": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_order_latency_max": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_order_latency_min": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "hft_agent_order_latency_scale": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_order_size_mean": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_price_noise": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_price_shift": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_psi": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_quote_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "hft_agent_spread": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_tau": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "hft_agent_wealth": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "init_agent_base_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "init_agent_capital_type": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "init_agent_count": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "init_agent_quote_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "init_agent_tau": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "init_agent_wealth": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "init_price": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "logDir": {
+    "alias": null,
+    "annotation": "str | None",
+    "required": false
+   },
+   "log_window": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "maintenance_margin": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "max_leverage": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "max_loan": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "max_open_orders": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "min_order_size": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "miner_base_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "miner_capital_type": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "miner_quote_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "miner_wealth": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "priceDecimals": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "publish_interval": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "quoteDecimals": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "remoteAgentCount": {
+    "alias": null,
+    "annotation": "int | None",
+    "required": false
+   },
+   "simulation_id": {
+    "alias": null,
+    "annotation": "str | None",
+    "required": false
+   },
+   "sta_agent_base_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "sta_agent_capital_type": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": true
+   },
+   "sta_agent_chartist_weight": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_count": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_decision_latency_mean": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_decision_latency_std": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_feed_latency_mean": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_feed_latency_min": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": false
+   },
+   "sta_agent_feed_latency_std": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_fundamentalist_weight": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_noise_weight": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_order_latency_max": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_order_latency_min": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_order_latency_scale": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_quote_balance": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": true
+   },
+   "sta_agent_r_aversion": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_selection_scale": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_sigmaEps": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "sta_agent_tau": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_tauF": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_tauF_exact": {
+    "alias": null,
+    "annotation": "float | None",
+    "required": false
+   },
+   "sta_agent_tauHist": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "sta_agent_wealth": {
+    "alias": null,
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "time_unit": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": false
+   },
+   "volumeDecimals": {
+    "alias": null,
+    "annotation": "<class 'int'>",
+    "required": true
+   }
+  },
+  "kind": "class",
+  "qualname": "MarketSimulationConfig"
+ },
+ "Optional": {
+  "kind": "other"
+ },
+ "Order": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "c": {
+    "alias": "client_id",
+    "annotation": "int | None",
+    "required": false
+   },
+   "i": {
+    "alias": "id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "l": {
+    "alias": "leverage",
+    "annotation": "<class 'float'>",
+    "required": false
+   },
+   "p": {
+    "alias": "price",
+    "annotation": "float | None",
+    "required": true
+   },
+   "q": {
+    "alias": "quantity",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "s": {
+    "alias": "side",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "t": {
+    "alias": "timestamp",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "y": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "Order"
+ },
+ "OrderCurrency": {
+  "bases": [
+   "IntEnum"
+  ],
+  "kind": "class",
+  "members": {
+   "BASE": 0,
+   "QUOTE": 1
+  },
+  "qualname": "OrderCurrency"
+ },
+ "OrderDirection": {
+  "bases": [
+   "IntEnum"
+  ],
+  "kind": "class",
+  "members": {
+   "BUY": 0,
+   "SELL": 1
+  },
+  "qualname": "OrderDirection"
+ },
+ "STP": {
+  "bases": [
+   "IntEnum"
+  ],
+  "kind": "class",
+  "members": {
+   "CANCEL_BOTH": 3,
+   "CANCEL_NEWEST": 2,
+   "CANCEL_OLDEST": 1,
+   "DECREASE_CANCEL": 4,
+   "NO_STP": 0
+  },
+  "qualname": "STP"
+ },
+ "Sequence": {
+  "bases": [
+   "Reversible",
+   "Collection"
+  ],
+  "kind": "class",
+  "qualname": "Sequence"
+ },
+ "TimeInForce": {
+  "bases": [
+   "IntEnum"
+  ],
+  "kind": "class",
+  "members": {
+   "FOK": 3,
+   "GTC": 0,
+   "GTT": 1,
+   "IOC": 2
+  },
+  "qualname": "TimeInForce"
+ },
+ "TradeInfo": {
+  "bases": [
+   "BaseModel"
+  ],
+  "fields": {
+   "Ma": {
+    "alias": "maker_agent_id",
+    "annotation": "int | None",
+    "required": false
+   },
+   "Mf": {
+    "alias": "maker_fee",
+    "annotation": "float | None",
+    "required": false
+   },
+   "Mi": {
+    "alias": "maker_id",
+    "annotation": "int | None",
+    "required": false
+   },
+   "Ta": {
+    "alias": "taker_agent_id",
+    "annotation": "int | None",
+    "required": false
+   },
+   "Tf": {
+    "alias": "taker_fee",
+    "annotation": "float | None",
+    "required": false
+   },
+   "Ti": {
+    "alias": "taker_id",
+    "annotation": "int | None",
+    "required": false
+   },
+   "i": {
+    "alias": "id",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "p": {
+    "alias": "price",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "q": {
+    "alias": "quantity",
+    "annotation": "<class 'float'>",
+    "required": true
+   },
+   "s": {
+    "alias": "side",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "t": {
+    "alias": "timestamp",
+    "annotation": "<class 'int'>",
+    "required": true
+   },
+   "y": {
+    "alias": null,
+    "annotation": "<class 'str'>",
+    "required": false
+   }
+  },
+  "kind": "class",
+  "qualname": "TradeInfo"
+ },
+ "Union": {
+  "kind": "other"
+ },
+ "YpyObject": {
+  "bases": [
+   "object"
+  ],
+  "kind": "class",
+  "qualname": "YpyObject"
+ },
+ "accumulate": {
+  "bases": [
+   "object"
+  ],
+  "kind": "class",
+  "qualname": "accumulate"
+ },
+ "np": {
+  "kind": "module",
+  "name": "numpy"
+ }
+}

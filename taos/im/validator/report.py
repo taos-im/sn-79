@@ -364,6 +364,8 @@ class ReportingService:
             'pnl_score', 'combined_score', 'gentrx_score',
             'unnormalized_score', 'score',
             'debeta_score', 'debeta_making_rank', 'debeta_skill_rank', 'debeta_p11_factor',
+            'debeta_making_share', 'debeta_ladder_input',
+            'debeta_present', 'debeta_coverage_books', 'debeta_skill_coverage_factor',
             'num_scored_books', 'scorable',
             'miner_gauge_name'
         ], registry=self.registry_miner)
@@ -1424,6 +1426,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'trading_score': kappa_values.get('trading_score') if kappa_values else None,
                 'debeta_score': kappa_values.get('debeta_score') if kappa_values else None,
                 'making_raw': kappa_values.get('making_raw') if kappa_values else None,
+            # published under BOTH making_pool settings: what this uid would be paid from the
+            # proportional pool, and what the ladder would rank, so the alternative is visible
+            # on the dashboards before the dial is turned
+            'making_share': kappa_values.get('making_share') if kappa_values else None,
+            'ladder_input': kappa_values.get('ladder_input') if kappa_values else None,
                 'making_rank': kappa_values.get('making_rank') if kappa_values else None,
                 'skill_raw': kappa_values.get('skill_raw') if kappa_values else None,
                 'skill_rank': kappa_values.get('skill_rank') if kappa_values else None,
@@ -1432,6 +1439,16 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'debeta_w_make': kappa_values.get('debeta_w_make') if kappa_values else None,
                 'debeta_weight': kappa_values.get('debeta_weight') if kappa_values else None,
                 'debeta_floor': kappa_values.get('debeta_floor') if kappa_values else None,
+                'skill_other': kappa_values.get('skill_other') if kappa_values else None,
+                'skill_weakest3': kappa_values.get('skill_weakest3') if kappa_values else None,
+                'skill_books_kept': kappa_values.get('skill_books_kept') if kappa_values else None,
+                'skill_pool_factor': kappa_values.get('skill_pool_factor') if kappa_values else None,
+                'skill_coverage_factor': kappa_values.get('skill_coverage_factor') if kappa_values else None,
+                'coverage_books': kappa_values.get('coverage_books') if kappa_values else None,
+                'skill_p11_factor': kappa_values.get('skill_p11_factor') if kappa_values else None,
+                'skill_net_alpha': kappa_values.get('skill_net_alpha') if kappa_values else None,
+                'notional': kappa_values.get('notional') if kappa_values else None,
+                'presence_share': kappa_values.get('presence_share') if kappa_values else None,
                 'num_scored_books': kappa_values.get('num_scored_books') if kappa_values else None,
                 'scorable': kappa_values.get('scorable') if kappa_values else None,
             }
@@ -1967,6 +1984,8 @@ async def report(self: ReportingService) -> None:
             # cycle (empty debeta map -> legacy kappa+pnl) cannot leave a stale making/skill series
             # implying de-beta still drives the score.
             for _k, _g in (('debeta_score', 'debeta_score'),
+                           ('making_share', 'debeta_making_share'),
+                           ('ladder_input', 'debeta_ladder_input'),
                            ('making_raw', 'debeta_making'),
                            ('making_rank', 'debeta_making_rank'),
                            ('skill_raw', 'debeta_skill'),
@@ -1976,6 +1995,19 @@ async def report(self: ReportingService) -> None:
                            ('debeta_weight', 'debeta_weight'),
                            ('debeta_w_make', 'debeta_w_make'),
                            ('debeta_floor', 'debeta_skill_floor'),
+                           # 0.6.2 skill-leg quantities: the other drift variant's skill, the three-way
+                           # weakest sub-window kappa, books left after the hurdle, the pool factor, the
+                           # filled notional and the graded presence share
+                           ('skill_other', 'debeta_skill_other_variant'),
+                           ('skill_weakest3', 'debeta_skill_weakest3'),
+                           ('skill_books_kept', 'debeta_skill_books_kept'),
+                           ('skill_pool_factor', 'debeta_skill_pool_factor'),
+                           ('skill_coverage_factor', 'debeta_skill_coverage_factor'),
+                           ('coverage_books', 'debeta_coverage_books'),
+                           ('skill_p11_factor', 'debeta_skill_p11_factor'),
+                           ('skill_net_alpha', 'debeta_skill_net_alpha'),
+                           ('notional', 'debeta_notional'),
+                           ('presence_share', 'debeta_presence_share'),
                            ('num_scored_books', 'num_scored_books')):
                 _v = m.get(_k)
                 if _v is not None:
@@ -2063,6 +2095,18 @@ async def report(self: ReportingService) -> None:
                 debeta_making_rank=(m['making_rank'] if m.get('making_rank') is not None else 0.0),
                 debeta_skill_rank=(m['skill_rank'] if m.get('skill_rank') is not None else 0.0),
                 debeta_p11_factor=(m['p11_factor'] if m.get('p11_factor') is not None else 0.0),
+                # EVERY DECLARED LABEL MUST BE SUPPLIED. prometheus_client rejects the whole call
+                # when one is missing -- "Incorrect label names" -- so a label added to the gauge
+                # without a matching argument here stops the entire miner gauge publishing, not just
+                # its own series.
+                debeta_making_share=(m['making_share'] if m.get('making_share') is not None else 0.0),
+                debeta_ladder_input=(m['ladder_input'] if m.get('ladder_input') is not None else 0.0),
+                # Presence and the two coverage counts belong on the summary row: the per-miner
+                # de-beta table that used to carry them duplicated six of its ten columns from here.
+                debeta_present=(m['present'] if m.get('present') is not None else 1.0),
+                debeta_coverage_books=(m['coverage_books'] if m.get('coverage_books') is not None else 0),
+                debeta_skill_coverage_factor=(m['skill_coverage_factor']
+                                              if m.get('skill_coverage_factor') is not None else 1.0),
                 num_scored_books=(m['num_scored_books'] if m.get('num_scored_books') is not None else 0),
                 scorable=(1.0 if m.get('scorable') else 0.0),
                 miner_gauge_name='miners'

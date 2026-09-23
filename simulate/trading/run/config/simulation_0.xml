@@ -14,11 +14,11 @@
                 targetMTR="0.4" shapeMakerFee="2" shapeMakerRebate="2"/>
             <Books instanceCount="16" maxDepth="21" detailedDepth="5">
                 <Processes>
-                    <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.034"
+                    <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.0277"
                         lambda="0.000206" muJump="0.0" sigmaJump="0.025" updatePeriod="30000000000"
-                        Hurst="0.75" epsilon="0.07"/>
+                        Hurst="0.729" epsilon="0.07"/>
                     <FuturesSignal name="external" lambda="0.001155" seedInterval="10000000000" updatePeriod="10000000000"/>
-                    <MagneticField name="magneticfield" numRows="32" beta="0.5" alpha="20.0" 
+                    <MagneticField name="magneticfield" numRows="32" beta="0.445" alpha="1.17" 
                         updatePeriod="60000000000"/>
                 </Processes>
             </Books>
@@ -77,7 +77,7 @@
         </ALGOTraderAgent>     
         <HighFrequencyTraderAgent
             name="HIGH_FREQUENCY_TRADER_AGENT"
-            instanceCount="10"
+            instanceCount="20"
             exchange="EXCHANGE"
             debug="0"
             minMFLatency="100000000"
@@ -86,20 +86,19 @@
             opLatencyScaleRay="0.235"
             tau="2"
             delta="750000000"
-            psiHFT_constant="100"
-            gHFT="0.5"
-            sigmaSqr="0.01"
-            kappa="1.6"
+            gHFT="1"
+            sigmaSqr="0.016"
+            kappa="260"
             spread="0.0015"
-            orderMean="2.5"
-            orderSTD="1.0"
-            noiseRay="0.23"
-            shiftPercentage="0.05"
+            orderMean="-0.175"
+            orderSTD="1.3"
+            noiseRay="0.41"
+            shiftPercentage="0.021"
             sensitivityCoef="100.0"
             spreadSensitivityExp="1.5"
             spreadSensitivityBase="0.00015"
             rateMax="0.0075"
-            marginNoiseSTD="0.00001"
+            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="5.8" minSpreadTicks="12" inventoryHorizon="0.67" undercutTicks="5" quoteSizeVolumeFrac="2.5" acdOmega="3.8"
             >
             <Balances>
                 <Base total="500" maxLeverage="4" maxLoan="10000" />
@@ -117,29 +116,26 @@
 			maxOPLatency="300000000"
 			meanVolume="2.3"
             tau="1800000000000"
-            balanceCoef="0.90"
-            acdOmega="2.5"
+            balanceCoef="0.38"
+            acdOmega="2.696"
 			acdAlpha="0.45"
 			acdBeta="0.45"
-            acdGamma="15.0"
-            sigmaExp="0.00000001"
-            weight="1.0"
-            minDMD="2000000000"
+            acdGamma="0.58"
+            sigmaExp="6.84e-08"
+            weight="0.053"
+            minDMD="30000000000"
             maxDMD="600000000000"
 			>
             <Balances
-                type="pareto-50"
-                scale="0.8"
-                shape="1.16"
-                seed="1337"
-                wealth="10000.0"
-                cap="500000.0"
+                type="uniform-50"
+                wealthMin="10000.0"
+                wealthMax="68000.0"
                 price="300.0"
             />
 		</NoiseTraderAgent>
         <FuturesTraderAgent
             name="FUTURES_TRADER_AGENT"
-            instanceCount="100"
+            instanceCount="0"
             exchange="EXCHANGE"
             debug="0"
             delayMean="5000000000"
@@ -170,30 +166,26 @@
             delayMean="10000000000"
             delaySTD="1000000000"
             sigmaN="0.7"
-            sigmaC="2.3"
-            sigmaF="5.0"
+            sigmaC="1.9"
+            sigmaF="1.4"
             tau="600000000000"
             tauHist="50"
-            tauF="1"
+            tauF="1.4"
             volGuard="0.000001"
             sigmaEps="0.002"
-            r_aversion="100000"
+            r_aversion="1630"
             HARA="2.0"
-            GBMSigma="0.01"
             regimeChangeFlag="0"
-            acdOmega="5.0"
+            acdOmega="4.61"
             acdAlpha="0.15"
 			acdBeta="0.65"
             minDMD="2000000000"
             maxDMD="600000000000"
-            pO_alpha="0.0">
+            pO_alpha="0.0" volGuardSigma="0.002257211" volGuardBand="2.0">
             <Balances
-                type="pareto-50"
-                scale="0.8"
-                shape="1.16"
-                seed="1337"
-                wealth="20000.0"
-                cap="3000000.0"
+                type="uniform-50"
+                wealthMin="20000.0"
+                wealthMax="158000.0"
                 price="300.0"
             />
         </StylizedTraderAgent>

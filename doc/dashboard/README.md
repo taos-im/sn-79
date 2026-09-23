@@ -41,7 +41,7 @@ This document serves to provide details on the data displayed at the [MVTRX dash
   - [Round-Trip Volume Plot](#round-trip-volume-plot)
   - [Realized PnL Plot](#realized-pnl-plot)
   - [De-beta Scoring (0.6.1)](#de-beta-scoring-061-1)
-  - [Kappa3 Plots](#kappa3-plots)
+  - [Skill Coverage, Making Pool and Skill Variants (0.6.2)](#skill-coverage-making-pool-and-skill-variants-062)
   - [Unrealized Profit \& Loss Plots](#unrealized-profit--loss-plots)
   - [Last Fee Rate](#last-fee-rate)
   - [Balances Plots](#balances-plots)
@@ -278,6 +278,8 @@ The Agents table provides summary performance information for all miners in the 
 
 - **De-beta Eligible** - Whether the miner passes the de-beta coverage guard and receives a de-beta score this cycle.
 
+- **Present** - Whether the miner answered at least one of its last fifty validator queries; an absent miner scores zero for the cycle with its accumulators untouched.
+
 - **CP Factor** - Counterparty-diversity factor on the making leg: 1.0 means diverse flow; lower means the making is fed by few counterparties and is discounted accordingly.
 
 - **Making Rank** - Rank among miners with positive balanced two-sided spread capture (per book `2*min(buy, sell)` versus the centered mid, after the CP discount), 0 to 1; a non-positive value ranks 0.
@@ -285,6 +287,14 @@ The Agents table provides summary performance information for all miners in the 
 - **Skill Rank** - Rank among miners with positive floored Kappa over drift-stripped per-book alpha, 0 to 1; a non-positive value ranks 0.
 
 - **De-beta Score** - `w_make x Making Rank + (1 - w_make) x Skill Rank`.  Enters the trading-side score by the configured De-beta Weight (1.0 = full replacement); the de-beta columns are always live; they affect emissions only in proportion to the weight.
+
+- **Books Filled** - Books the miner actually traded in the window, which is what the 0.6.2 coverage rule reads.  Distinct from Scored Books, which counts only those whose alpha cleared the magnitude floor and therefore tracks size per book rather than breadth.
+
+- **Coverage Factor** - The multiplier the 0.6.2 coverage rule applies to the skill leg: books filled over the required share of the field's books, capped at 1.0.  1.0 means at or above the bar, or that the rule is off.
+
+- **Making Share** - The agent's share of the measured two-sided capture: what the making leg pays when the proportional making pool is enabled, in place of the rank ladder.
+
+- **Ladder Input** - The score that enters the Pareto ladder under the proportional pool, with the making leg's own contribution removed.
 
 - **GenTRX Score** - The miner's EMA-smoothed GenTRX training reward, mirrored from the [GenTRX Page](#gentrx-page).  The final Score blends this with the Trading Score by the configured GenTRX Pool Share.
 
@@ -310,19 +320,7 @@ The Agents table provides summary performance information for all miners in the 
 
 ![alt text](validator_debeta.png)
 
-An appended section showing the de-beta decomposition per miner.  Both panels are published on every cycle since 0.6.1 and paid in proportion to the De-beta Weight.
-
-- **De-beta per miner** - Per-miner table of the de-beta decomposition this cycle: De-beta Score = w_make x Making Rank + (1 - w_make) x Skill Rank; Making and Skill are the raw legs (making after the counterparty discount); CP Factor is that discount (1.0 = none); Scored Books is the number of books whose |alpha| cleared the skill floor; Eligible is whether the uid received a score; Present is whether the miner answered at least one of its last fifty validator queries (an absent miner scores zero for the cycle with its accumulators untouched).
-  - **UID** - Miner uid on the subnet.
-  - **De-beta Score** - w_make x Making Rank + (1 - w_make) x Skill Rank; paid in proportion to the de-beta weight.
-  - **Making Rank** - Rank among miners with positive balanced capture, 0 to 1; non-positive ranks 0.
-  - **Skill Rank** - Rank among miners with positive floored kappa of alpha, 0 to 1; non-positive ranks 0.
-  - **Making** - Raw making leg: sum over books of 2 x min(buy capture, sell capture), after the counterparty discount, QUOTE units.
-  - **Skill** - Raw skill leg: kappa over the drift-stripped per-book alphas that clear the floor.
-  - **CP Factor** - Counterparty-concentration discount on the making leg; 1.0 = none.
-  - **Scored Books** - Books whose |alpha| cleared the skill floor.
-  - **Eligible** - Whether the miner received a de-beta score this cycle.
-  - **Present** - Whether the miner answered at least one of its last fifty validator queries.
+The per-miner de-beta decomposition is in the Agents table above: De-beta Score, Making Rank, Skill Rank, CP Factor, Scored Books, De-beta Eligible and Present, with the 0.6.2 columns Books Filled, Coverage Factor, Making Share and Ladder Input.  Below the table, one plot follows the score over time.
 
 - **De-beta Score (all miners)** - Per-miner de-beta score over time.  Published at every weight since 0.6.1 and paid in proportion to the de-beta weight.
 
@@ -561,32 +559,41 @@ Realized PnL of the agent over the Kappa3 window (the last 3 simulated hours by 
 
 ### De-beta Scoring (0.6.1)
 
-An appended row of panels decomposing the agent's de-beta score, published on every cycle since 0.6.1:
-
 ![alt text](agent_debeta.png)
 
-- **De-beta Score** - The combined `w_make x rank+(making) + (1 - w_make) x rank+(skill)`; blended into the trading score by the De-beta Weight (1.0 = full replacement).
+The de-beta decomposition of the agent's score, published on every cycle since 0.6.1: the score with its two ranked legs, the coverage and eligibility flags with the counterparty factor, and the per-book capture and alpha the legs are built from.
 
-- **Making vs Skill rank** - The two legs, each ranked among the miners with a positive value, 0 to 1; a non-positive value ranks 0.  They recombine exactly to the score.
+- **De-beta score and its two legs** - The score in bold, with the two ranked legs it is built from: `w_make x rank+(making) + (1 - w_make) x rank+(skill)`.  The legs recombine exactly to the score.
 
-- **Making raw** - Balanced two-sided spread capture summed over books, after the counterparty discount.
+- **Coverage, eligibility and counterparty factor** - Books filled and books whose alpha cleared the magnitude floor on the right axis; the coverage guard, presence in the query window and the counterparty factor on the left, all bounded 0 to 1 (factor 1.0 = diverse flow).
 
-- **Skill raw** - Floored Kappa over drift-stripped per-book alpha.
+- **Making: per-book capture and total** - Balanced two-sided capture per book, `2 x min(buy, sell)` against the centred mid, on the left axis; the agent's total after the counterparty discount in bold on the right.  The per-book values are orders of magnitude under the total, hence the separate scales.
 
-- **P11 counterparty factor** - The making discount for concentrated counterparties (1.0 = diverse flow).
-
-- **Scored books / scorable / present** - Skill-leg coverage (right axis), the coverage-guard flag and presence in the fifty-query window (left axis, 1 = yes).
+- **Skill: per-book alpha and total** - Drift-stripped alpha per book with the magnitude floor dashed, both on the left axis and in the same units; the agent's floored kappa on the right.  A book counts toward skill only once its |alpha| clears the floor.
 
 - **Scoring parameters** - The `w_make`, skill-floor and De-beta Weight values the validator applied that cycle.
 
-Once de-beta runs at weight 1.0, the Kappa3 plots below stop moving by design: the validator skips the Kappa3 computation only when de-beta fully replaces the trading score; at any partial weight both are computed and shown.
+### Skill Coverage, Making Pool and Skill Variants (0.6.2)
 
-### Kappa3 Plots
+The bottom row of the page carries the quantities the 0.6.2 skill controls read and publish, one series per agent over the current window.
 
-![alt text](agent_kappa.png)
+- **Skill coverage factor** - The multiplier the coverage rule applies to the skill leg: books filled over the required share of the field's books, capped at 1.0.  1.0 means at or above the bar, or that the rule is off.
 
-The raw (unnormalized and unweighted) Kappa3 ratio achieved by the agent on all books, as well as the median value.
-The normalized and weighted Kappa3 Score calculated for the agent for each book, as well as the median value.  The outlier penalty applied to the score is also plotted.
+- **Books filled vs books scored** - Books the agent actually filled in, which is what the coverage rule reads.  Distinct from scored books, which counts only those whose alpha cleared the magnitude floor and so tracks size per book rather than breadth.
+
+- **Making share of the pool** - Each agent's share of the measured two-sided capture.  This is what the making leg pays when the proportional making pool is on, in place of the rank ladder.
+
+- **Ladder input under the pool** - The score entering the Pareto ladder when the proportional pool is on, with the making leg's own contribution removed.
+
+- **Held-variant skill** - Skill under the held-period drift strip, where drift is removed only over the prints the agent actually held inventory on.
+
+- **Presence share** - Fraction of validator queries the agent answered over the presence window.
+
+- **Skill counterparty factor** - The counterparty factor applied to the skill leg (`scoring.debeta.skill_p11_strength`), the same excess-concentration measure as the making leg's CP factor, taken over the agent's largest counterparties (`scoring.debeta.p11_topk`).  1.0 means the agent's fills came from the market at large; a low value means most of them came from a few counterparties that trade with almost no one else.
+
+- **Skill net alpha** - The agent's drift-stripped alpha summed over the books the skill leg covers.  When the proportional pool covers both legs, this times the skill counterparty factor is what the skill half pays in proportion to.
+
+- **Notional under measurement** - The traded notional behind the de-beta legs in the current window; the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads each book's edge against it.
 
 ### Unrealized Profit & Loss Plots
 

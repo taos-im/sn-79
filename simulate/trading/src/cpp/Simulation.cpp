@@ -5,6 +5,7 @@
 #include "Simulation.hpp"
 
 #include <taosim/simulation/SimulationException.hpp>
+#include <taosim/xml/helpers.hpp>
 #include "GBMValuationModel.hpp"
 #include "util.hpp"
 
@@ -151,6 +152,12 @@ void Simulation::receiveMessage(Message::Ptr msg)
 
 void Simulation::configure(const pugi::xml_node& node)
 {
+    // Once, not once per block: every block is configured from the same document, so the
+    // per-block loop would print the same list `blockCount` times.
+    if (m_blockIdx == 0) {
+        taosim::xml::warnOnUnknownAttributes(node);
+    }
+
     m_config2 = taosim::simulation::SimulationConfig::fromXML(node);
 
     pugi::xml_attribute attr;

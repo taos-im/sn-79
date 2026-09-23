@@ -7,6 +7,10 @@
 #include <taosim/book/TickContainer.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
 
+#include <range/v3/numeric/accumulate.hpp>
+
+#include <functional>
+
 //-------------------------------------------------------------------------
 
 namespace msgpack
@@ -52,6 +56,12 @@ struct convert<taosim::book::TickContainer>
                 }
             }
         }
+
+        // The aggregate is derived rather than trusted: it must equal the sum of the restored
+        // orders regardless of what the writer recorded.
+        v.volume() = ranges::accumulate(
+            v, taosim::decimal_t{}, std::plus{},
+            [](const auto& order) { return order->totalVolume(); });
 
         return o;
     }

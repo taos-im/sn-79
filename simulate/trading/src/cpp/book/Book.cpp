@@ -193,6 +193,19 @@ taosim::decimal_t Book::bestAsk() const noexcept
 
 //-------------------------------------------------------------------------
 
+std::optional<taosim::decimal_t> Book::spread() const noexcept
+{
+    const auto bid = bestBid();
+    const auto ask = bestAsk();
+
+    if (bid == 0_dec || ask == 0_dec) [[unlikely]] {
+        return {};
+    }
+    return std::make_optional(ask - bid);
+}
+
+//-------------------------------------------------------------------------
+
 void Book::refreshTopOfBook() const noexcept
 {
     auto& buyQueue = const_cast<OrderContainer&>(m_buyQueue);
@@ -479,22 +492,28 @@ bool Book::cancelOrder(OrderID orderId, std::optional<taosim::decimal_t> volumeT
     auto& orderSideLevels = order->direction() == OrderDirection::BUY ? m_buyQueue : m_sellQueue;
     auto levelIt = std::lower_bound(orderSideLevels.begin(), orderSideLevels.end(), order->price());
 
+    // Invalidate BEFORE mutating: the unregister and cancel signals below both reach readers of the
+    // best levels (reservation release, L2 logger), and the level erased here may be the cached one.
+    m_topOfBook.invalidate();
+
+    // The level aggregates totalVolume (own plus borrowed), so it loses exactly what the order's
+    // total loses, not the own-volume figure the cancellation is expressed in.
     if (volumeToCancelActual == orderVolume) {
         std::erase_if(
             *levelIt, [orderId](const auto orderOnLevel) { return orderOnLevel->id() == orderId; });
-        levelIt->updateVolume(-volumeToCancelActual);
+        levelIt->updateVolume(-order->totalVolume());
         if (levelIt->empty()) {
             orderSideLevels.erase(levelIt);
         }
         unregisterLimitOrder(order);
     }
     else {
+        const auto totalVolumeBefore = order->totalVolume();
         order->removeVolume(volumeToCancelActual);
-        levelIt->updateVolume(-volumeToCancelActual);
+        levelIt->updateVolume(order->totalVolume() - totalVolumeBefore);
     }
 
     m_signals.cancel(order->id(), volumeToCancelActual);
-    m_topOfBook.invalidate();
 
     return true;
 }
@@ -513,8 +532,9 @@ bool Book::restoreRestingOrderVolume(OrderID orderId, taosim::decimal_t deltaVol
     auto levelIt = std::lower_bound(orderSideLevels.begin(), orderSideLevels.end(), order->price());
     if (levelIt == orderSideLevels.end() || levelIt->price() != order->price()) { return false; }
 
+    const auto totalVolumeBefore = order->totalVolume();
     order->setVolume(order->volume() + deltaVolume);
-    levelIt->updateVolume(deltaVolume);
+    levelIt->updateVolume(order->totalVolume() - totalVolumeBefore);
     m_topOfBook.invalidate();
 
     return true;
@@ -693,6 +713,10 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
                 m_order2clientCtx[iop->id()].agentId, m_order2clientCtx[order->id()].agentId);
         }
 
+        // The level is charged the resting order's actual totalVolume change once all of the
+        // rounding and dust handling below has settled, which keeps it equal to the sum of its
+        // orders by construction.
+        const auto restingTotalVolumeBefore = iop->totalVolume();
         order->removeLeveragedVolume(usedVolume);
         iop->removeLeveragedVolume(usedVolume);
 
@@ -709,11 +733,10 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
         const auto& restingBalances = accounts[iopAgentId][m_id];
         if ((iop->volume() > 0_dec && taosim::util::round(iop->volume(), volumeDecimals) == 0_dec) ||
             restingBalances.getReservationInBase(iop->id(), 1_dec) == 0_dec){
-            bestBuyDeque->updateVolume(-taosim::util::round(iop->totalVolume(), maxDecimals));
             iop->setVolume(0_dec);
         }
 
-        bestBuyDeque->updateVolume(-taosim::util::round(usedVolume, maxDecimals));
+        bestBuyDeque->updateVolume(iop->totalVolume() - restingTotalVolumeBefore);
         m_topOfBook.invalidate();
 
         // Ghost order: leave fully filled resting orders in place for reconciliation
@@ -885,6 +908,10 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
                 m_order2clientCtx[iop->id()].agentId, m_order2clientCtx[order->id()].agentId);
         }
 
+        // The level is charged the resting order's actual totalVolume change once all of the
+        // rounding and dust handling below has settled, which keeps it equal to the sum of its
+        // orders by construction.
+        const auto restingTotalVolumeBefore = iop->totalVolume();
         order->removeLeveragedVolume(usedVolume);
         iop->removeLeveragedVolume(usedVolume);
 
@@ -901,11 +928,10 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
         const auto& restingBalances = accounts[iopAgentId][m_id];
         if ((iop->volume() > 0_dec && taosim::util::round(iop->volume(), volumeDecimals) == 0_dec) ||
             restingBalances.getReservationInBase(iop->id(), 1_dec) == 0_dec){
-            bestSellDeque->updateVolume(-taosim::util::round(iop->totalVolume(), maxDecimals));
             iop->setVolume(0_dec);
         }
 
-        bestSellDeque->updateVolume(-taosim::util::round(usedVolume, maxDecimals));
+        bestSellDeque->updateVolume(iop->totalVolume() - restingTotalVolumeBefore);
         m_topOfBook.invalidate();
 
         // Ghost order: leave fully filled resting orders in place for reconciliation
@@ -1112,9 +1138,11 @@ void Book::clearFilledOrders() noexcept
                     ++orderIt;
                 }
             }
-            // Remove empty levels
+            // Remove empty levels; the unregister signal of a later iteration may read the best
+            // levels, so the cache must not outlive the erase.
             if (it->empty()) {
                 it = side.erase(it);
+                m_topOfBook.invalidate();
             } else {
                 ++it;
             }

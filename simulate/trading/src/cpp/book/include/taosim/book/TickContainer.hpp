@@ -37,7 +37,7 @@ public:
     [[nodiscard]] auto&& price(this auto&& self) noexcept { return self.m_price; }
     [[nodiscard]] auto&& volume(this auto&& self) noexcept { return self.m_volume; }
 
-    // NOTE: m_volume can retain rounding residue after ghost orders accumulate
+    // NOTE: the level volume (volume()) can retain rounding residue after ghost orders accumulate
     // (push_back adds unrounded totalVolume, trades decrement rounded amounts).
     // Checking orders directly is what makes bestBid/bestAsk skip fully-ghost levels
     // and prevents the matching loop from dead-ending on a residue level (which
@@ -68,9 +68,9 @@ public:
         rapidjson::Document& json, const std::string& key = {}) const override;
 
 private:
-    OrderContainer* m_orderContainer;
-    taosim::decimal_t m_price;
-    taosim::decimal_t m_volume;
+    OrderContainer* m_orderContainer{};
+    taosim::decimal_t m_price{};
+    taosim::decimal_t m_volume{};
 };
 
 //-------------------------------------------------------------------------

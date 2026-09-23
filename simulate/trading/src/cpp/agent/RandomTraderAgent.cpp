@@ -16,6 +16,13 @@ namespace taosim::agent
 
 //-------------------------------------------------------------------------
 
+// Defaults for the two delays, which were inline literals carrying notes that they ought to
+// come from the exchange gracePeriod and the simulation step. They are attributes now, which
+// at least makes them visible and settable; sourcing them from the config they belong to is
+// still open.
+
+//-------------------------------------------------------------------------
+
 RandomTraderAgent::RandomTraderAgent(Simulation* simulation) noexcept
     : Agent{simulation}
 {}
@@ -48,6 +55,8 @@ void RandomTraderAgent::configure(const pugi::xml_node& node)
             "{}: attribute 'tau' should have a value greater than 0", ctx));
     }
     m_tau = attr.as_ullong(120'000'000'000);
+    m_graceDelay = node.attribute("graceDelay").as_ullong(600'000'000'000);
+    m_stepDelay = node.attribute("stepDelay").as_ullong(1'000'000'000);
     m_quantityMin = node.attribute("minQuantity").as_double(0.01); 
     m_quantityMax = node.attribute("maxQuantity").as_double(2.0); 
 }
@@ -65,8 +74,8 @@ void RandomTraderAgent::receiveMessage(Message::Ptr msg)
     else if (msg->type == "RESPONSE_SUBSCRIBE_EVENT_TRADE") {
         handleTradeSubscriptionResponse();
     }
-    else if (msg->type == "RESPONSE_RETRIEVE_L1") {
-        handleRetrieveResponse(msg);
+    else if (msg->type == "WAKEUP") {
+        handleWakeup(msg);
     }
     else if (msg->type == "RESPONSE_PLACE_ORDER_LIMIT") {
         handleLimitOrderPlacementResponse(msg);
@@ -107,32 +116,32 @@ void RandomTraderAgent::handleSimulationStop()
 void RandomTraderAgent::handleTradeSubscriptionResponse()
 {
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            //Should take from gracePeriod
-            600'000'000'000,
-            name(),
-            m_exchange,
-            "RETRIEVE_L1",
-            MessagePayload::create<RetrieveL1Payload>(bookId));
+        simulation()->exchange()->wakeupChains().at(bookId).registerSelfTimer(
+            name(), simulation()->currentTimestamp(), m_graceDelay);
+        scheduleWakeup(bookId, m_graceDelay);
     }
 }
 
 //-------------------------------------------------------------------------
 
-void RandomTraderAgent::handleRetrieveResponse(Message::Ptr msg)
+void RandomTraderAgent::handleWakeup(Message::Ptr msg)
 {
-    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<WakeupPayload>(msg->payload);
     BookId bookId = payload->bookId;
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    simulation()->exchange()->wakeupChains().at(bookId).noteWake(
+        name(), simulation()->currentTimestamp());
+    const auto l1 = simulation()->exchange()->statsHub()->l1(bookId);
+
+    // The simulation's stream, not a fresh random_device draw. Seeding privately here made
+    // every run containing this agent irreproducible, seed attribute or not.
+    auto& gen = simulation()->rng();
     double quantityBid = std::uniform_real_distribution<double>{m_quantityMin, m_quantityMax}(gen);
     double quantityAsk = std::uniform_real_distribution<double>{m_quantityMin, m_quantityMax}(gen);
 
     OrderDirection direction; 
-    double bestAsk = util::decimal2double(payload->bestAskPrice);
-    double bestBid = util::decimal2double(payload->bestBidPrice);
+    double bestAsk = util::decimal2double(l1.bestAskPrice);
+    double bestBid = util::decimal2double(l1.bestBidPrice);
     double limitBidPrice = std::uniform_real_distribution<double>{bestBid,bestAsk}(gen);
     double limitAskPrice = std::uniform_real_distribution<double>{limitBidPrice, bestAsk}(gen);
 
@@ -142,14 +151,17 @@ void RandomTraderAgent::handleRetrieveResponse(Message::Ptr msg)
     sendOrder(bookId, OrderDirection::BUY, quantityBid, limitBidPrice, leverage);    
     sendOrder(bookId, OrderDirection::SELL, quantityAsk, limitAskPrice, leverage);    
     
+    scheduleWakeup(bookId, m_stepDelay);
+}
+
+//-------------------------------------------------------------------------
+
+void RandomTraderAgent::scheduleWakeup(BookId bookId, Timestamp delay)
+{
+    const Timestamp now = simulation()->currentTimestamp();
+    if (!simulation()->exchange()->wakeupChains().at(bookId).arm(name(), now, delay)) return;
     simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        // Should take from step
-        1'000'000'000,
-        name(),
-        m_exchange,
-        "RETRIEVE_L1",
-        MessagePayload::create<RetrieveL1Payload>(bookId));
+        now, delay, name(), name(), "WAKEUP", MessagePayload::create<WakeupPayload>(bookId));
 }
 
 //-------------------------------------------------------------------------
@@ -203,8 +215,7 @@ void RandomTraderAgent::sendOrder(BookId bookId, OrderDirection direction,
     double volume, double price, double leverage) {
 
     m_orderFlag.at(bookId) = true;
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto& gen = simulation()->rng();
     std::normal_distribution<float> delayDist{1'500.0f,500.0f};
 
     float min_delay = 10'000'000.0f; 

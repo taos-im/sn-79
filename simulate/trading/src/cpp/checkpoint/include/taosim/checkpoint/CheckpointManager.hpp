@@ -28,7 +28,7 @@ struct CheckpointingDesc
     simulation::SimulationManager* simuMngr;
     std::filesystem::path runDir;
     size_t intervalInSteps{};
-    ssize_t numLastFilesToKeep{};
+    ptrdiff_t numLastFilesToKeep{};
     bool measureWallClockTime{};
 };
 
@@ -68,9 +68,9 @@ private:
     simulation::SimulationManager* m_simuMngr;
     std::filesystem::path m_dir;
     size_t m_intervalInSteps;
-    ssize_t m_numLastFilesToKeep;
+    ptrdiff_t m_numLastFilesToKeep;
     bool m_measureWallClockTime;
-    ssize_t m_stepCounter{-1};
+    ptrdiff_t m_stepCounter{-1};
     std::filesystem::path m_latestCkptDir;
 
     friend class simulation::SimulationManager;

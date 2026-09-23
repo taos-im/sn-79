@@ -60,7 +60,7 @@ def test_rolling_matches_full_stream_centered_mid():
 
 
 def test_trend_leakage_to_the_early_buyer_is_stripped():
-    """The exploit shape from the miner report: in a trend, whoever buys EARLY within each batch
+    """Batch-mean mids leak trend to whoever buys EARLY within a batch:
     harvests capture against the batch-mean mid (the same 90 prints score more when split). With
     the rolling window the mid tracks the trend across batch edges, so interior capture is ~0 and
     the early buyer keeps only the genuine stream-edge truncation, a fraction of the leakage."""

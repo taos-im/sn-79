@@ -29,7 +29,9 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, median_abs_floor, traded_book_alphas,
+from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
+                                      book_alphas_held_by_book, hurdle_filter, kappa_floored, median_abs_floor,
+                                      presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas,
                                       debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
@@ -930,6 +932,11 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['skill_rank'] = _d['skill_rank'] if _d else None
         uid_kappa['p11_factor'] = _d['p11_factor'] if _d else None
         uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
+        # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
+        for _k in ('skill_other', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
+                   'presence_share', 'skill_coverage_factor', 'coverage_books',
+                   'skill_p11_factor', 'skill_net_alpha'):
+            uid_kappa[_k] = _d.get(_k) if _d else None
         uid_kappa['debeta_w_make'] = validator_data.get('debeta_w_make') if debeta_applied else None
         uid_kappa['debeta_floor'] = validator_data.get('debeta_floor') if debeta_applied else None
         # The weight is the CONFIG dial, meaningful every cycle (warming included): the live blend
@@ -1122,6 +1129,148 @@ def apply_reward_floor(rewards: list, config: Dict) -> list:
     return (arr * factor).tolist()
 
 
+
+def making_pool_inputs(detail, all_uids, trading_scores, w, w_make):
+    """Split the trading score into what the Pareto ladder ranks and what the making pool pays.
+
+    The making leg's own contribution to the score, w*w_make*making_rank, comes OUT of the ladder
+    input; the pool is paid on each uid's share of captured spread (making_raw, post-P11). That is
+    what a designated market maker programme pays for: a unit of obligation met, not an account
+    holding a rank position. The ladder pays rank positions with a steep top, so an operator whose
+    accounts occupy the top positions collects many top-of-curve weights whatever its aggregate
+    service; on a mainnet board, one coldkey with 35 per cent of the board's
+    captured spread collected 64 per cent of emission. Splitting one uid's capture across k uids
+    leaves the operator's pool total unchanged, so cloning gains nothing and no identity rule is
+    needed. Skill keeps the ladder: superlinear reward for the best predictors is that leg's
+    purpose, and clones of one signal compete for the same fills and split the same alpha.
+
+    Absent uids (presence gate) contribute nothing to the pool and receive nothing from it.
+
+    Args:
+        detail: The per-uid de-beta decomposition (``making_rank``, ``making_raw``, ``present``).
+        all_uids: Uids in emission order.
+        trading_scores: The published trading score per uid.
+        w: ``scoring.debeta.weight``.
+        w_make: ``scoring.debeta.w_make``.
+
+    Returns:
+        (ladder_scores, making_term, making_share) keyed by uid; the share sums to 1 (or to 0 when
+        nothing was captured).
+    """
+    term, raw = {}, {}
+    for uid in all_uids:
+        d = detail.get(uid) or {}
+        term[uid] = w * w_make * float(d.get('making_rank') or 0.0)
+        raw[uid] = max(0.0, float(d.get('making_raw') or 0.0)) if d.get('present', True) else 0.0
+    tot = sum(raw.values())
+    share = {uid: (raw[uid] / tot if tot > 0 else 0.0) for uid in all_uids}
+    ladder = {uid: max(0.0, float(trading_scores.get(uid, 0.0)) - term[uid]) for uid in all_uids}
+    return ladder, term, share
+
+
+def pool_ladder_input(mode, ladder_scores, trading_scores, all_uids):
+    """Which score the Pareto ladder ranks while a making pool is paying part of emission.
+
+    `proportional` ranks the making-stripped input from `making_pool_inputs`, which at de-beta weight
+    1.0 is exactly (1 - w_make) * skill_rank. That is what cures concentration and also what costs:
+    the ladder's share of emission becomes a pot decided on skill alone, and an account with no maker
+    volume can win it outright. On twelve mainnet boards of 22 September, zero-maker accounts took
+    42.1 per cent of emission under it against 10.4 with the pool off.
+
+    `proportional_blended` pays the same pool on the same shares and leaves the ladder on the full
+    blended score, so a zero-maker account is capped by its making rank again. The cost is that making
+    is then paid on both surfaces. It is a middle setting, not a free one: measured over the same
+    boards, the largest operator takes 59.5 per cent against 26.9 under plain proportional and 77.8
+    with the pool off, and cloning the same captured spread across 16 uids gains 1.18x against 1.04x
+    and 4.00x respectively.
+
+    Args:
+        mode: ``scoring.debeta.making_pool``.
+        ladder_scores: The making-stripped input from `making_pool_inputs`.
+        trading_scores: The published (post-EMA) trading score per uid.
+        all_uids: Uids in emission order.
+    Returns:
+        dict: The ladder input to rank, keyed by uid.
+    """
+    if mode == "proportional_blended":
+        return {uid: float(trading_scores.get(uid, 0.0)) for uid in all_uids}
+    return ladder_scores
+
+
+def skill_pool_share(detail, all_uids, min_books):
+    """What a proportional SKILL pool pays each uid: its share of net alpha, times its counterparty
+    factor, among uids whose skill is positive on at least `min_books` qualifying books.
+
+    The skill ladder over kappa is a tournament: kappa is magnitude-blind, so one predictor split k
+    ways keeps the full kappa on every clone and collects k rank positions (14.03x from one account to
+    sixteen, against real alphas). Net alpha is additive, so this share is cloning-invariant by
+    construction, and the magnitude floor then penalises the split. The kappa gate is the allocator's
+    track record: consistency decides who is in, P&L decides how much. The counterparty factor keeps a
+    fed maker's manufactured alpha out, which on a rank ladder it only partly does and here does in
+    full. Absent uids take nothing. Returns shares summing to 1, or all zero when nobody is eligible,
+    in which case the caller keeps the ladder for that half.
+
+    Args:
+        detail: The per-uid de-beta decomposition (``skill_raw``, ``skill_net_alpha``, ``skill_books``,
+            ``skill_p11_factor``, ``present``).
+        all_uids: Uids in emission order.
+        min_books: ``scoring.debeta.skill_min_books``.
+
+    Returns:
+        dict: ``{uid: share}``.
+    """
+    raw = {}
+    for uid in all_uids:
+        d = detail.get(uid) or {}
+        ok = (d.get("present", True) and float(d.get("skill_raw") or 0.0) > 0.0
+              and int(d.get("skill_books") or 0) >= int(min_books or 0))
+        raw[uid] = (max(0.0, float(d.get("skill_net_alpha") or 0.0)) * float(d.get("skill_p11_factor", 1.0) or 0.0)
+                    if ok else 0.0)
+    tot = sum(raw.values())
+    return {uid: (raw[uid] / tot if tot > 0 else 0.0) for uid in all_uids}
+
+
+def allocate_trading(ladder_scores, making_share, pool, all_uids, config, skill_share=None):
+    """Emission vector under the proportional making pool: the Pareto ladder over the score with the
+    making leg removed, mixed with the captured-spread share at the pool's weight. With `skill_share`
+    (proportional_both) the ladder half is itself paid proportionally, on that share, and the ladder
+    is kept only as the fallback when nothing is eligible for it.
+
+    Both parts are normalised to sum 1 before the mix, so the split is by share of emission and not
+    by the ladder's arbitrary scale. When nothing was captured anywhere the ladder takes the whole
+    vector rather than the pool being burned.
+
+    Shared by main (get_rewards) and the scoring shadow so both sides stay in exact parity.
+
+    Args:
+        ladder_scores: Per-uid score entering the Pareto ladder (making leg already removed).
+        making_share: Per-uid share of captured spread.
+        pool: Share of emission paid proportionally, i.e. debeta.weight * debeta.w_make.
+        all_uids: Uids in emission order.
+        config: Validator config (reward floor and Pareto parameters).
+        skill_share: Optional per-uid share for the skill half (skill_pool_share). None keeps the
+            Pareto ladder for that half; an all-zero share falls back to it.
+
+    Returns:
+        torch.FloatTensor in ``all_uids`` order, summing to 1.
+    """
+    floored = apply_reward_floor([ladder_scores[uid] for uid in all_uids], config)
+    lad = distribute_rewards(floored, config)
+    _s = float(lad.sum())
+    if _s > 0:
+        lad = lad / _s
+    if skill_share is not None:
+        sk = torch.FloatTensor([float(skill_share.get(uid, 0.0)) for uid in all_uids])
+        _sk = float(sk.sum())
+        if _sk > 0:
+            lad = sk / _sk
+    sh = torch.FloatTensor([float(making_share.get(uid, 0.0)) for uid in all_uids])
+    _s2 = float(sh.sum())
+    if _s2 <= 0:
+        return lad
+    return (1.0 - pool) * lad + pool * (sh / _s2)
+
+
 def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     """Finalize the de-beta (P8) per-uid trading score from the fill-stream accumulators
     (self.capture_buy_sums/capture_sell_sums + self.debeta_mtm/invsum/invn/pfirst/plast, populated
@@ -1153,10 +1302,58 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             ),
             getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {},
         )
-        alphas = {uid: list(by_book.values()) for uid, by_book in self.debeta_alphas_by_book.items()}
+        # 0.6.2 skill-leg forms, every one behind a dial whose default reproduces the 0.6.1 leg. The
+        # alternative quantities are computed at every setting and published, so a live board shows
+        # what a form would pay before it pays it.
+        _caps_b = getattr(self, 'capture_buy_sums', {}) or {}
+        _caps_s = getattr(self, 'capture_sell_sums', {}) or {}
+        held_by_book = traded_book_alphas(
+            book_alphas_held_by_book(getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_heldinv', {}),
+                                     getattr(self, 'debeta_heldn', {}), getattr(self, 'debeta_helddrift', {})),
+            _caps_b, _caps_s)
+        _variant = str(getattr(dcfg, 'skill_variant', None) or 'drift')
+        pool_by_book = held_by_book if _variant == 'held' else self.debeta_alphas_by_book
+        other_by_book = self.debeta_alphas_by_book if _variant == 'held' else held_by_book
+        alphas = {uid: list(by_book.values()) for uid, by_book in pool_by_book.items()}
         floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
+        other_floor = median_abs_floor({u: list(b.values()) for u, b in other_by_book.items()}, scale=float(dcfg.floor_scale))
+        other_skill = {u: kappa_floored(list(b.values()), other_floor) for u, b in other_by_book.items()}
+        # Absolute hurdle on filled notional, and the pool it leaves.
+        _hurdle_bps = float(getattr(dcfg, 'skill_hurdle_bps', 0.0) or 0.0)
+        _hurdle_books = int(getattr(dcfg, 'skill_hurdle_books', 4) or 4)
+        kept_by_book = hurdle_filter(pool_by_book, getattr(self, 'debeta_notional', {}) or {}, _hurdle_bps)
+        pool_factor = skill_pool_factor(kept_by_book, pool_by_book, _hurdle_books)
+        skill_pool = kept_by_book if _hurdle_bps > 0 else pool_by_book
+        # Temporal consistency over the window's sub-windows; the three-way weakest kappa is always read.
+        _hists = (getattr(self, 'debeta_mtm_hist', {}) or {}, getattr(self, 'debeta_invsum_hist', {}) or {},
+                  getattr(self, 'debeta_invn_hist', {}) or {}, getattr(self, 'debeta_drift_hist', {}) or {})
+        _t_end = max((ts for tsd in _hists[3].values() for ts in tsd), default=None)
+        _kcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'kappa', None)
+        _lookback = int(getattr(_kcfg, 'lookback', 0) or 0) if _t_end is not None else 0
+        _t_start = (_t_end - _lookback) if _t_end is not None else None
+        sub3 = book_alphas_by_subwindow(*_hists, _t_start, _t_end, 3) if _t_end is not None and _lookback > 0 else None
+        weakest3, _ = subwindow_skill(skill_pool, sub3, 'weakest', 2, floor) if sub3 else ({}, {})
+        _k = int(getattr(dcfg, 'skill_subwindows', 1) or 1)
+        _form = str(getattr(dcfg, 'skill_subwindow_form', None) or 'sign_gated')
+        _agree = int(getattr(dcfg, 'skill_subwindow_min_agree', 2) or 2)
+        skill_values, sub_info = None, {}
+        if _k > 1 and _t_end is not None and _lookback > 0:
+            sub_k = sub3 if _k == 3 else book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k)
+            skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor)
+        elif _hurdle_bps > 0:
+            skill_values = {u: kappa_floored(list(b.values()), floor) for u, b in skill_pool.items()}
+        _pool_scaling = int(getattr(dcfg, 'skill_pool_scaling', 0) or 0)
         p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
-        cp = {int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()} if p11_strength > 0 else None
+        skill_p11_strength = float(getattr(dcfg, 'skill_p11_strength', 0.0) or 0.0)
+        # getattr default 2: the shipped scope, so an older config duck reproduces 0.6.1 exactly.
+        p11_topk = int(getattr(dcfg, 'p11_topk', 2) or 2)
+        # The counterparty map feeds BOTH discounts. Building it only for the making one meant that
+        # with p11_strength 0 the skill-leg factor could never receive a map and silently stayed at
+        # 1.0, contradicting the dial's own help text (found by the deployment-conditions suite,
+        # 22 September). debeta_cp is the making-window sum of the counterparty history, so the
+        # factor the skill leg sees is the one the board publishes, not a short-window replica's.
+        cp = ({int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()}
+              if (p11_strength > 0 or skill_p11_strength > 0) else None)
         # The legs, for the dashboards. Stashed on the validator rather than returned so the
         # Dict[int, float] contract every caller relies on is unchanged. Cleared on every path
         # that returns {}, so a fallback cycle cannot publish the previous cycle's decomposition.
@@ -1175,7 +1372,22 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
             skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
             making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
+            skill_values=skill_values,
+            skill_rank_scale=(pool_factor if _pool_scaling else 1.0),
+            # getattr default 0.0: off reproduces the 0.6.1 leg exactly, and an older config duck
+            # (the scoring child, a test) degrades to off rather than to an exception fallback.
+            skill_max_inactive_books=float(getattr(dcfg, 'skill_max_inactive_books', 0.0) or 0.0),
+            skill_min_books=int(getattr(dcfg, 'skill_min_books', 4) or 4),
+            skill_p11_strength=skill_p11_strength,
+            p11_topk=p11_topk,
         )
+        _notional = getattr(self, 'debeta_notional', {}) or {}
+        for _u, _dd in _detail.items():
+            _dd['skill_other'] = float(other_skill.get(_u, 0.0))
+            _dd['skill_weakest3'] = float(weakest3.get(_u, 0.0)) if weakest3 else None
+            _dd['skill_books_kept'] = int(sub_info[_u]['books']) if _u in sub_info else len(skill_pool.get(_u, {}))
+            _dd['skill_pool_factor'] = float(pool_factor)
+            _dd['notional'] = float(sum((_notional.get(_u) or {}).values()))
         # PRESENCE GATE: a uid whose last presence_window queries all failed is not scorable this
         # cycle (dropped from the map, so the blend reads 0 and scorable is False); its legs stay in
         # the detail with present=False and its accumulators keep running. The scoring child gets the
@@ -1190,11 +1402,25 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             else:
                 _absent = absent_uids(getattr(self, 'miner_presence', {}) or {},
                                       int(getattr(dcfg, 'presence_window', None) or 50))
+        # Graded presence: the success share over the presence window, shipped from main to the child
+        # like the absent set. Weighting and the minimum share are dials that default to off.
+        _shares = getattr(self, 'debeta_presence_shares', None)
+        if _shares is None and _gate:
+            _shares = presence_shares(getattr(self, 'miner_presence', {}) or {},
+                                      int(getattr(dcfg, 'presence_window', None) or 50))
+        _shares = {int(u): float(v) for u, v in (_shares or {}).items()}
+        _min_share = float(getattr(dcfg, 'presence_min_share', 0.0) or 0.0)
+        _share_weighting = int(getattr(dcfg, 'presence_share_weighting', 0) or 0)
+        if _gate and _min_share > 0:
+            _absent |= {u for u, sh in _shares.items() if sh < _min_share}
         for _u in list(scores):
             if _u in _absent:
                 scores.pop(_u)
+            elif _share_weighting and _u in _shares:
+                scores[_u] = scores[_u] * _shares[_u]
         for _u, _dd in _detail.items():
             _dd['present'] = _u not in _absent
+            _dd['presence_share'] = _shares.get(_u)
         warm = sum(1 for v in scores.values() if v > 0.0)
         if warm < int(dcfg.min_books):
             bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
@@ -1290,8 +1516,10 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 'floor_scale': float(getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.5)),
                 'min_books': int(getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 4)),
                 'p11_strength': float(getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0)),
+                'p11_topk': int(getattr(getattr(self.config.scoring, 'debeta', None), 'p11_topk', 2) or 2),
                 'mark_mode': str(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_mode', 'last') or 'last'),
                 'mark_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_window', 200) or 200),
+                'making_pool': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_pool', 'rank') or 'rank'),
             },
             'gentrx': {
                 'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
@@ -1528,6 +1756,9 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     # shadow/cutover child: the SAME pre-round EMA state must produce the same outputs on
     # both sides, so verify uses the pinned (tee-time) state on copies, and the pre-round
     # snapshot is stashed for the shadow-compare tee (on_main_scored).
+    # carried between rounds only when the proportional making pool is on; bound here so the
+    # ladder block below can read it whether or not the EMA ran
+    _pool_ema, _n_snap, _last_snap = None, {}, None
     _ema_hl = validator_data['config']['scoring'].get('score_ema_halflife', 0)
     if _ema_hl and _ema_hl > 0:
         _ts = validator_data['simulation_timestamp']
@@ -1543,6 +1774,8 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
             _ema_n = dict(_pin['trading_ema_n'] or {})
             _last = _pin.get('trading_ema_ts')
             self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
+            _n_snap, _last_snap = dict(_ema_n), _last
+            _pool_ema = {k: dict(v or {}) for k, v in (_pin.get('debeta_pool_ema') or {}).items()}
             trading_uid_scores, _ = apply_track_record_ema(
                 trading_uid_scores, all_uids, validator_data['deregistered_uids'],
                 _ts, _ema_hl, _ema, _ema_n, _last, _scorable)
@@ -1557,6 +1790,11 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
                 self._trading_score_ema_n = _ema_n
             _last = getattr(self, '_trading_score_ema_ts', None)
             self._trading_score_ema_pre = (dict(_ema), dict(_ema_n), _last)
+            _n_snap, _last_snap = dict(_ema_n), _last
+            _pool_ema = getattr(self, '_debeta_pool_ema', None)
+            if _pool_ema is None:
+                _pool_ema = {}
+                self._debeta_pool_ema = _pool_ema
             trading_uid_scores, _new_last = apply_track_record_ema(
                 trading_uid_scores, all_uids, validator_data['deregistered_uids'],
                 _ts, _ema_hl, _ema, _ema_n, _last, _scorable)
@@ -1565,11 +1803,59 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     # Trading rewards run through Pareto sort-multiply. Optional soft floor (off by
     # default) tapers below-median scores toward zero before the Pareto step so a
     # fleet of merely-adequate UIDs stops earning; a no-op unless rewarding.floor is on.
-    trading_rewards_list = [trading_uid_scores[uid] for uid in all_uids]
-    trading_rewards_list = apply_reward_floor(trading_rewards_list, validator_data['config'])
-    distributed_trading = distribute_rewards(
-        trading_rewards_list, validator_data['config']
-    ).to(self.device)
+    #
+    # scoring.debeta.making_pool == "proportional" pays the making leg's share of emission in
+    # proportion to captured spread instead of through the ladder (see making_pool_inputs). The two
+    # auxiliary EMAs deliberately reuse the trading EMA's alpha schedule: alpha depends only on the
+    # sim-time gap, the per-uid application count and scorability, all identical across the three
+    # vectors, so a COPY of the pre-call count map and timestamp advances exactly as the real one
+    # did. Only the smoothed values carry between rounds, which keeps one state key on the wire.
+    _dcfg = (validator_data['config']['scoring'].get('debeta') or {})
+    _pool_mode = str(_dcfg.get('making_pool', 'rank') or 'rank')
+    _w_deb = float(_dcfg.get('weight', 0.0) or 0.0)
+    _w_mk = float(_dcfg.get('w_make', 0.0) or 0.0)
+    _pool = max(0.0, min(1.0, _w_deb * _w_mk))
+    # Computed and published under BOTH settings, and its EMA kept warm under both, so the
+    # alternative is visible on the dashboards before the dial turns and switching costs no
+    # re-warming. Only the allocation below depends on the dial.
+    _ladder_scores, _make_term, _make_share = making_pool_inputs(
+        validator_data.get('debeta_detail') or {}, all_uids, trading_uid_scores, _w_deb, _w_mk)
+    if _ema_hl and _ema_hl > 0 and _pool > 0.0:
+        _pool_ema = _pool_ema if isinstance(_pool_ema, dict) else {}
+        for _k, _vec in (("term", _make_term), ("share", _make_share)):
+            _st = dict(_pool_ema.get(_k) or {})
+            _sm, _ = apply_track_record_ema(
+                _vec, all_uids, validator_data['deregistered_uids'],
+                _ts, _ema_hl, _st, dict(_n_snap), _last_snap, _scorable)
+            _pool_ema[_k] = _st
+            _vec.update(_sm)
+        # trading_uid_scores is now the smoothed score; the ladder input is it minus the smoothed
+        # making term, so both sides of the subtraction carry the same standing.
+        _ladder_scores = {uid: max(0.0, float(trading_uid_scores[uid]) - float(_make_term[uid]))
+                          for uid in all_uids}
+        if not (_pin and 'trading_ema' in _pin):
+            self._debeta_pool_ema = _pool_ema
+    _share_tot = sum(_make_share.values())
+    for uid in all_uids:
+        _kv = validator_data['kappa_values'].get(uid)
+        if _kv is not None:
+            _kv['making_share'] = (float(_make_share[uid]) / _share_tot) if _share_tot > 0 else 0.0
+            _kv['ladder_input'] = float(_ladder_scores[uid])
+    if _pool_mode in ("proportional", "proportional_blended", "proportional_both") and _pool > 0.0:
+        _skill_share = None
+        if _pool_mode == "proportional_both":
+            _skill_share = skill_pool_share(validator_data.get('debeta_detail') or {}, all_uids,
+                                            int(_dcfg.get('skill_min_books', 4) or 4))
+        distributed_trading = allocate_trading(
+            pool_ladder_input(_pool_mode, _ladder_scores, trading_uid_scores, all_uids),
+            _make_share, _pool, all_uids, validator_data['config'], skill_share=_skill_share,
+        ).to(self.device)
+    else:
+        trading_rewards_list = [trading_uid_scores[uid] for uid in all_uids]
+        trading_rewards_list = apply_reward_floor(trading_rewards_list, validator_data['config'])
+        distributed_trading = distribute_rewards(
+            trading_rewards_list, validator_data['config']
+        ).to(self.device)
     _prof_pareto = time.perf_counter()
     # INFO (not debug): this is one line per scoring round and must land in the
     # same INFO log time_check.py reads on the live mainnet validator so the

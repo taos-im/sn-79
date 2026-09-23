@@ -654,7 +654,8 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "volume_sums", "maker_volume_sums", "taker_volume_sums",
         "self_volume_sums", "roundtrip_volume_sums",
         "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
-        "debeta_cp_hist", "debeta_invn_hist", "debeta_drift_hist", "debeta_inv", "debeta_plast",
+        "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
+        "debeta_invn_hist", "debeta_drift_hist", "debeta_inv", "debeta_plast",
         "miner_stats",
         "miner_presence",
     ]

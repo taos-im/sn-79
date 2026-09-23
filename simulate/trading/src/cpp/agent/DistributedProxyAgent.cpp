@@ -71,7 +71,7 @@ void DistributedProxyAgent::handleMessageForExchangeService(Message::Ptr msg)
     // notice. Forwarding the response as a notice as well would refuse the same order twice.
     if (msg->type.starts_with("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER")) {
         const auto pld = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-        const bool isLimit = msg->type.find("LIMIT") != std::string::npos;
+        const bool isLimit = msg->type.contains("LIMIT");
         if (isLimit) {
             const auto errPld =
                 std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(pld->payload);

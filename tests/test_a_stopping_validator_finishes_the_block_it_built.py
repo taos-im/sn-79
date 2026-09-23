@@ -111,8 +111,8 @@ def test_the_drain_works_against_a_loop_running_in_another_thread():
 
     main_loop runs in its own daemon thread and cleanup is called from a different one, so
     `loop.run_until_complete(...)` raises "this event loop is already running" before it waits for
-    anything. Caught in production, not here: the drain logged "Could not drain in-flight state
-    pushes" and cancelled the block regardless, which is the behaviour it was written to prevent.
+    anything. The assertions above do not catch it: the drain logs "Could not drain in-flight state
+    pushes" and cancels the block regardless, which is the behaviour it was written to prevent.
 
     So this drives a real loop on a real thread and asserts the push COMPLETED, rather than
     asserting the intent of the code that is supposed to make it complete.

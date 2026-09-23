@@ -543,7 +543,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     _debeta_on = True
     if _debeta_on:
         # Running SUMS (what the score reads).
-        for _name in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum'):
+        for _name in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum',
+                      'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional'):
             if not hasattr(self, _name):
                 setattr(self, _name, defaultdict(lambda: defaultdict(float)))
         if not hasattr(self, 'debeta_inv'):
@@ -567,7 +568,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         # Timestamped HISTORIES ({...:{sampled_ts: incr}}) so every sum can be live-pruned + shifted at a
         # sim boundary exactly like trade_volumes. Invariant: running == sum(history within window).
         for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist',
-                      'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist'):
+                      'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist',
+                      'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
             if not hasattr(self, _name):
                 setattr(self, _name, {})
 
@@ -601,6 +603,10 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     drift_hist=self.debeta_drift_hist, ts=sampled_timestamp,
                     mark_state=self.debeta_mark_state, mark_mode=_mark_mode,
                     mark_window=_mark_window,
+                    heldn=self.debeta_heldn, heldinv=self.debeta_heldinv, helddrift=self.debeta_helddrift,
+                    notional=self.debeta_notional, heldn_hist=self.debeta_heldn_hist,
+                    heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
+                    notional_hist=self.debeta_notional_hist,
                 )
                 accumulate_counterparties(
                     self.debeta_cp, bookId, de_trades, cp_hist=self.debeta_cp_hist, ts=sampled_timestamp
@@ -647,6 +653,10 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_heldn_hist, self.debeta_heldn, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_heldinv_hist, self.debeta_heldinv, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_helddrift_hist, self.debeta_helddrift, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_notional_hist, self.debeta_notional, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _debeta_prune_threshold)
         if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the same window
@@ -985,6 +995,10 @@ def shift_simulation_histories(
         shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_heldn_hist, self.debeta_heldn, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_heldinv_hist, self.debeta_heldinv, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_helddrift_hist, self.debeta_helddrift, old_ts, new_ts, new_threshold)
+        shift_hist_2level(self.debeta_notional_hist, self.debeta_notional, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_invn_hist, self.debeta_invn, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_drift_hist, self.debeta_drift, old_ts, new_ts, new_threshold)
         # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
@@ -1055,7 +1069,9 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     # de-beta is enabled; getattr guards the off/shadow case).
     # uid-keyed running sums + their timestamped histories (invn/drift are book-keyed, not per-uid).
     for _n in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum',
-               'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist'):
+               'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional',
+               'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist',
+               'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
         _d = getattr(self, _n, None)
         if _d is not None:
             _d.pop(uid, None)

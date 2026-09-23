@@ -33,6 +33,10 @@ _DEBETA_STRUCTS = (
     "debeta_invsum_hist",
     "debeta_invn_hist",
     "debeta_drift_hist",
+    "debeta_heldn_hist",
+    "debeta_heldinv_hist",
+    "debeta_helddrift_hist",
+    "debeta_notional_hist",
 )
 
 
