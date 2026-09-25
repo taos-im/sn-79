@@ -118,7 +118,7 @@ def test_the_rank_ladder_is_the_thing_being_improved_on():
     assert many / one > 3.0
 
 
-def test_the_default_is_untouched_by_the_addition():
+def test_the_default_is_proportional_both_and_the_blended_setting_is_still_accepted():
     from taos.im.config import add_im_validator_args
     import argparse
 
@@ -129,5 +129,5 @@ def test_the_default_is_untouched_by_the_addition():
 
     add_im_validator_args(_C, parser)
     action = next(a for a in parser._actions if a.dest == "scoring.debeta.making_pool")
-    assert action.default == "rank"
+    assert action.default == "proportional_both"
     assert set(action.choices) == {"rank", "proportional", "proportional_blended", "proportional_both"}

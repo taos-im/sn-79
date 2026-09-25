@@ -253,9 +253,9 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.making_pool",
         type=str,
         choices=["rank", "proportional", "proportional_blended", "proportional_both"],
-        default="rank",
+        default="proportional_both",
         help="How the making leg's share of emission (debeta.weight * debeta.w_make) is paid. "
-             "'rank' (default, the shipped behaviour): the making rank enters the blended score and "
+             "'rank' (the behaviour shipped through 0.6.1): the making rank enters the blended score and "
              "the whole score goes through the Pareto sort-multiply. 'proportional': the making leg "
              "comes out of the ladder and its share is paid in proportion to each uid's captured "
              "spread, with the ladder kept for the skill leg. The ladder pays rank POSITIONS with a "
@@ -273,7 +273,7 @@ def add_im_validator_args(cls, parser):
              "5.2 under the blended setting. The blended setting's cost is that making is paid on "
              "both surfaces, so the largest operator takes 59.5 per cent against 26.9 under plain "
              "proportional, and cloning the same capture across 16 uids gains 1.18x against 1.04x "
-             "(4.00x under 'rank'). 'proportional_both': both halves additive. The making half as "
+             "(4.00x under 'rank'). 'proportional_both' (default since 0.6.2): both halves additive. The making half as "
              "under 'proportional'; the skill half in proportion to each uid's net alpha over the books "
              "it filled, times its counterparty factor (skill_p11_strength), among uids with positive "
              "skill on at least skill_min_books qualifying books. The skill ladder over kappa is a "

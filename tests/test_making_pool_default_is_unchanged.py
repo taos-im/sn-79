@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""The making_pool dial defaults to `rank`, and at that setting the emission vector is exactly what
-shipped before the option existed: the Pareto sort-multiply over the whole blended score.
+"""The making_pool dial defaults to `proportional_both` since 0.6.2; at `rank` the emission vector is
+exactly what shipped before the option existed: the Pareto sort-multiply over the whole blended score.
 
-This is the guard that lets the option ride to mainnet switched off. It compares against
+This is the guard that keeps `rank` an exact way back to the shipped pay. It compares against
 distribute_rewards directly rather than against a recorded fixture, so it keeps holding if the
 ladder's own parameters change.
 """
@@ -23,15 +23,15 @@ from taos.im.validator.reward import (  # noqa: E402
 CONFIG = {"rewarding": {"seed": 898746039182, "pareto": {"shape": 1.5, "scale": 1.0}, "floor": {"enabled": False}}}
 
 
-def test_the_dial_defaults_to_rank_and_only_takes_the_four_settings():
+def test_the_dial_defaults_to_proportional_both_and_only_takes_the_four_settings():
     import argparse
 
     from taos.im.config import add_im_validator_args
     parser = argparse.ArgumentParser()
     add_im_validator_args(None, parser)
     known, _ = parser.parse_known_args([])
-    assert getattr(known, "scoring.debeta.making_pool") == "rank"
-    for _mode in ("proportional", "proportional_blended", "proportional_both"):
+    assert getattr(known, "scoring.debeta.making_pool") == "proportional_both"
+    for _mode in ("rank", "proportional", "proportional_blended"):
         known, _ = parser.parse_known_args(["--scoring.debeta.making_pool", _mode])
         assert getattr(known, "scoring.debeta.making_pool") == _mode
     with pytest.raises(SystemExit):

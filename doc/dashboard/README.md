@@ -16,7 +16,7 @@ This document serves to provide details on the data displayed at the [MVTRX dash
     - [Trades Table](#trades-table)
   - [Books Table](#books-table)
   - [Agents Table](#agents-table)
-  - [De-beta Scoring (0.6.1)](#de-beta-scoring-061)
+  - [De-beta Scoring](#de-beta-scoring)
   - [Incentives Plot](#incentives-plot)
 - [Book Page](#book-page)
   - [Book Info](#book-info)
@@ -28,7 +28,7 @@ This document serves to provide details on the data displayed at the [MVTRX dash
     - [Best Levels Plot](#best-levels-plot)
     - [Depth Plots](#depth-plots)
   - [Agents Table](#agents-table-1)
-  - [De-beta Book Panels (0.6.1)](#de-beta-book-panels-061)
+  - [De-beta Book Panels](#de-beta-book-panels)
   - [Dynamic Fee Rates Plot](#dynamic-fee-rates-plot)
 - [Agent Page](#agent-page)
   - [Agent Info](#agent-info)
@@ -40,8 +40,7 @@ This document serves to provide details on the data displayed at the [MVTRX dash
   - [Daily Volume Plot](#daily-volume-plot)
   - [Round-Trip Volume Plot](#round-trip-volume-plot)
   - [Realized PnL Plot](#realized-pnl-plot)
-  - [De-beta Scoring (0.6.1)](#de-beta-scoring-061-1)
-  - [Skill Coverage, Making Pool and Skill Variants (0.6.2)](#skill-coverage-making-pool-and-skill-variants-062)
+  - [De-beta Scoring](#de-beta-scoring-1)
   - [Unrealized Profit \& Loss Plots](#unrealized-profit--loss-plots)
   - [Last Fee Rate](#last-fee-rate)
   - [Balances Plots](#balances-plots)
@@ -288,9 +287,7 @@ The Agents table provides summary performance information for all miners in the 
 
 - **De-beta Score** - `w_make x Making Rank + (1 - w_make) x Skill Rank`.  Enters the trading-side score by the configured De-beta Weight (1.0 = full replacement); the de-beta columns are always live; they affect emissions only in proportion to the weight.
 
-- **Books Filled** - Books the miner actually traded in the window, which is what the 0.6.2 coverage rule reads.  Distinct from Scored Books, which counts only those whose alpha cleared the magnitude floor and therefore tracks size per book rather than breadth.
-
-- **Coverage Factor** - The multiplier the 0.6.2 coverage rule applies to the skill leg: books filled over the required share of the field's books, capped at 1.0.  1.0 means at or above the bar, or that the rule is off.
+- **Coverage Factor** - The multiplier the 0.6.2 coverage rule applies to the skill leg: books the miner actually filled in the window over the required share of the field's books, capped at 1.0.  1.0 means at or above the bar, or that the rule is off.  Filled books are breadth; Scored Books counts only those whose alpha cleared the magnitude floor.
 
 - **Making Share** - The agent's share of the measured two-sided capture: what the making leg pays when the proportional making pool is enabled, in place of the rank ladder.
 
@@ -316,7 +313,7 @@ The Agents table provides summary performance information for all miners in the 
 
 - **Sharpe Score**, **Inventory Score**, **Median Sharpe** - Legacy Sharpe leg, present only on validators older than 0.5.
 
-### De-beta Scoring (0.6.1)
+### De-beta Scoring
 
 ![alt text](validator_debeta.png)
 
@@ -448,7 +445,7 @@ Four per-book de-beta columns are published while `--scoring.debeta.publish_book
 
 - **Alpha** - This book's drift-stripped mark-to-market residual feeding the skill leg; it counts only when |alpha| clears the skill floor.
 
-### De-beta Book Panels (0.6.1)
+### De-beta Book Panels
 
 ![alt text](book_debeta.png)
 
@@ -557,11 +554,11 @@ Average over the selected validators of the volume the agent round-tripped (open
 
 Realized PnL of the agent over the Kappa3 window (the last 3 simulated hours by default), from round-tripped trades: price difference plus fees and rebates, in QUOTE.
 
-### De-beta Scoring (0.6.1)
+### De-beta Scoring
 
 ![alt text](agent_debeta.png)
 
-The de-beta decomposition of the agent's score, published on every cycle since 0.6.1: the score with its two ranked legs, the coverage and eligibility flags with the counterparty factor, and the per-book capture and alpha the legs are built from.
+The de-beta decomposition of the agent's score, published on every cycle since 0.6.1: the score with its two ranked legs, the coverage and eligibility flags with the counterparty factor, the per-book capture and alpha the legs are built from, and the four panels of the 0.6.2 skill controls' inputs.
 
 - **De-beta score and its two legs** - The score in bold, with the two ranked legs it is built from: `w_make x rank+(making) + (1 - w_make) x rank+(skill)`.  The legs recombine exactly to the score.
 
@@ -569,31 +566,17 @@ The de-beta decomposition of the agent's score, published on every cycle since 0
 
 - **Making: per-book capture and total** - Balanced two-sided capture per book, `2 x min(buy, sell)` against the centred mid, on the left axis; the agent's total after the counterparty discount in bold on the right.  The per-book values are orders of magnitude under the total, hence the separate scales.
 
-- **Skill: per-book alpha and total** - Drift-stripped alpha per book with the magnitude floor dashed, both on the left axis and in the same units; the agent's floored kappa on the right.  A book counts toward skill only once its |alpha| clears the floor.
+- **Skill: per-book alpha and total** - Drift-stripped alpha per book with the magnitude floor dashed, both on the left axis and in the same units; the agent's floored kappa on the right.  A book counts toward skill only once its |alpha| clears the floor.  The held-variant skill, where drift is removed only over the prints the agent actually held inventory on, is the dashed line on the same kappa axis.
+
+- **Skill factors: coverage, counterparty, presence** - Three multipliers bounded 0 to 1 on one axis.  Coverage is books filled over the required share of the field's books, capped at 1.0 (1.0 = at or above the bar, or the rule off).  Counterparty is the same excess-concentration measure as the making leg's CP factor, applied to the skill leg over the agent's largest counterparties (`scoring.debeta.skill_p11_strength`, `scoring.debeta.p11_topk`); 1.0 means the fills came from the market at large.  Presence is the fraction of validator queries the agent answered over the presence window.  The skill leg is scaled by the first two.
+
+- **Books filled vs books scored** - Books the agent filled in, which the coverage rule reads, against books whose alpha cleared the magnitude floor, which the skill leg counts, with the 20-book bar as a dashed line.  Breadth and size per book are different things: an agent can fill many books and have few qualify.
+
+- **Pool pay: making share and ladder input** - The agent's share of the field's measured two-sided capture on the left, which is what the making half pays when the proportional pool is on in place of the rank ladder, and on the right the score entering the Pareto ladder under that pool, with the making leg's own contribution removed.
+
+- **Skill: net alpha and notional (QUOTE)** - The agent's drift-stripped alpha summed over the books the skill leg covers on the left, and the traded notional behind those books on the right.  Their ratio is the edge per unit traded that the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads.  Under the proportional pool, net alpha times the skill counterparty factor is what the skill half pays in proportion to.
 
 - **Scoring parameters** - The `w_make`, skill-floor and De-beta Weight values the validator applied that cycle.
-
-### Skill Coverage, Making Pool and Skill Variants (0.6.2)
-
-The bottom row of the page carries the quantities the 0.6.2 skill controls read and publish, one series per agent over the current window.
-
-- **Skill coverage factor** - The multiplier the coverage rule applies to the skill leg: books filled over the required share of the field's books, capped at 1.0.  1.0 means at or above the bar, or that the rule is off.
-
-- **Books filled vs books scored** - Books the agent actually filled in, which is what the coverage rule reads.  Distinct from scored books, which counts only those whose alpha cleared the magnitude floor and so tracks size per book rather than breadth.
-
-- **Making share of the pool** - Each agent's share of the measured two-sided capture.  This is what the making leg pays when the proportional making pool is on, in place of the rank ladder.
-
-- **Ladder input under the pool** - The score entering the Pareto ladder when the proportional pool is on, with the making leg's own contribution removed.
-
-- **Held-variant skill** - Skill under the held-period drift strip, where drift is removed only over the prints the agent actually held inventory on.
-
-- **Presence share** - Fraction of validator queries the agent answered over the presence window.
-
-- **Skill counterparty factor** - The counterparty factor applied to the skill leg (`scoring.debeta.skill_p11_strength`), the same excess-concentration measure as the making leg's CP factor, taken over the agent's largest counterparties (`scoring.debeta.p11_topk`).  1.0 means the agent's fills came from the market at large; a low value means most of them came from a few counterparties that trade with almost no one else.
-
-- **Skill net alpha** - The agent's drift-stripped alpha summed over the books the skill leg covers.  When the proportional pool covers both legs, this times the skill counterparty factor is what the skill half pays in proportion to.
-
-- **Notional under measurement** - The traded notional behind the de-beta legs in the current window; the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads each book's edge against it.
 
 ### Unrealized Profit & Loss Plots
 

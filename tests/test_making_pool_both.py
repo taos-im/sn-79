@@ -35,14 +35,14 @@ def _d(mrank, mraw, skill_raw, net, books, factor=1.0, present=True):
             "skill_books": books, "skill_p11_factor": factor, "present": present}
 
 
-def test_the_dial_takes_four_settings_and_still_defaults_to_rank():
+def test_the_dial_takes_four_settings_and_defaults_to_proportional_both():
     import argparse
 
     from taos.im.config import add_im_validator_args
     parser = argparse.ArgumentParser()
     add_im_validator_args(None, parser)
     action = next(a for a in parser._actions if a.dest == "scoring.debeta.making_pool")
-    assert action.default == "rank"
+    assert action.default == "proportional_both"
     assert set(action.choices) == {"rank", "proportional", "proportional_blended", "proportional_both"}
 
 

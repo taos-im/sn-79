@@ -29,7 +29,7 @@
 namespace taosim::xml
 {
 
-inline constexpr std::array<std::string_view, 210> kKnownAttributes{{
+inline constexpr std::array<std::string_view, 211> kKnownAttributes{{
     "GBM_X0",
     "GBM_mu",
     "GBM_seed",
@@ -51,6 +51,9 @@ inline constexpr std::array<std::string_view, 210> kKnownAttributes{{
     "balanceCoef",
     "bandRefInterval",
     "bandRefWindow",
+    "bandReleaseAfter",
+    "bandReleaseMax",
+    "bandReleaseStep",
     "baseDecimals",
     "beta",
     "blockCount",
@@ -80,8 +83,6 @@ inline constexpr std::array<std::string_view, 210> kKnownAttributes{{
     "error",
     "exchange",
     "exchangeServiceMode",
-    "exetrxIntervalInSteps",
-    "exetrxWindowInSeconds",
     "feeReserveFrac",
     "file",
     "forecastVar",
