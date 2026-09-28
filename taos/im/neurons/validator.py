@@ -74,6 +74,7 @@ if __name__ != "__mp_main__":
     from taos.im.protocol.simulator import SimulatorResponseBatch
     from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification
     from taos.im.protocol.events import SimulationStartEvent
+    from taos.im.validator.trade import history_clock_health as _history_clock_health
     from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine
 
     # Optional exchange-mode component; not part of this tree. Import is guarded, so a validator without
@@ -748,7 +749,10 @@ if __name__ != "__mp_main__":
                             bt.logging.warning("SIMULATOR CONFIG CHANGED")
                         restart_simulator(self, end)
                     if validator_py_files_changed:
-                        update_validator(self)
+                        # Installed now, restarted by the engine handler once the new run has opened and its
+                        # state is saved on the new clock; a restart taken here replaced the process while it
+                        # was handling the new engine's start event, and the replacement never saw it.
+                        update_validator(self, restart=False)
                 return True
             except Exception as ex:
                 self.pagerduty_alert(f"Failed to update repo : {ex}", details={"traceback" : traceback.format_exc()})
@@ -2106,6 +2110,8 @@ if __name__ != "__mp_main__":
                     self._scoring_shadow.health()
                     if getattr(self, '_scoring_shadow', None) is not None else None
                 ),
+                # A run change that was not applied leaves stamps ahead of the clock; the gauge says so.
+                'history_clock': _history_clock_health(self),
                 'simulation': self.simulation.model_dump(),
                 'last_state': minimal_state,
                 'simulation_timestamp': self.simulation_timestamp,
@@ -2565,15 +2571,34 @@ if __name__ != "__mp_main__":
                             )
                             if _verify:
                                 _mine = [float(x) for x in trading_rewards.tolist()]
-                                if _mine == adopted['trading']:
+                                _theirs = [float(x) for x in (adopted['trading'] or [])]
+                                # NaN never equals itself, so a plain list equality can never
+                                # MATCH once one uid scores NaN, and the re-INITs that follow
+                                # cannot heal it: the third one suspends the shadow scorer for
+                                # the rest of the process. Two NaNs at one uid are agreement.
+                                _n = min(len(_mine), len(_theirs))
+                                _bad = [
+                                    (i, a, b) for i, (a, b) in enumerate(zip(_mine[:_n], _theirs[:_n]))
+                                    if not (a == b or (a != a and b != b))
+                                ]
+                                if len(_mine) != len(_theirs):
+                                    _bad.extend(
+                                        (i, _mine[i] if i < len(_mine) else None,
+                                         _theirs[i] if i < len(_theirs) else None)
+                                        for i in range(_n, max(len(_mine), len(_theirs)))
+                                    )
+                                if not _bad:
                                     bt.logging.info(
                                         f"[SCORING-PROC] VERIFY ts={timestamp} MATCH (n={len(_mine)})"
                                     )
                                 else:
-                                    _diffs = sum(1 for a, b in zip(_mine, adopted['trading']) if a != b)
+                                    _shown = ", ".join(
+                                        f"uid={i} main={a} child={b}" for i, a, b in _bad[:8]
+                                    )
                                     bt.logging.error(
                                         f"[SCORING-PROC] VERIFY ts={timestamp} MISMATCH "
-                                        f"(diff_uids={_diffs}) — preferring main + re-INIT child"
+                                        f"(diff_uids={len(_bad)} n_main={len(_mine)} n_child={len(_theirs)}) "
+                                        f"{_shown} — preferring main + re-INIT child"
                                     )
                                     _shadow.request_reinit()
                                 # verify path keeps main's outputs (already bound)

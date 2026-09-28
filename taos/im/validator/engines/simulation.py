@@ -40,6 +40,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Thread
+import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgpack
@@ -67,6 +68,8 @@ logger = logging.getLogger(__name__)
 # still-running run as new and prune its history. Floored well above the
 # per-run start (clock ~0) yet far below any multi-hour run.
 _FRESH_EPISODE_FLOOR_NS = 30 * 60 * 1_000_000_000  # 30 sim-minutes
+# How long a restart owed at the run end may wait for the new run to open before the next state update takes it.
+_DEFERRED_RESTART_CEILING_S = 3600.0
 
 
 def _network_label(network: str) -> str:
@@ -513,12 +516,30 @@ class SimulationEngine(MarketEngine):
     # if other code calls it directly (then remove the shim later).
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _fresh_threshold(self) -> int:
+        """The clock below which a run counts as just opened: the engine's grace period or thirty sim-minutes."""
+        _grace = int(getattr(self.validator.simulation, "grace_period", 0) or 0)
+        return max(_grace, _FRESH_EPISODE_FLOOR_NS)
+
     def on_start(self, timestamp, event) -> None:
         """Handle the simulator's start event: reset per-run state.
 
         Args:
             timestamp: The simulator's start timestamp.
             event: The start event payload.
+        """
+        self._open_run(self.validator.simulation_timestamp, timestamp, event.logDir, reason="start event")
+
+    def _open_run(self, old_simulation_timestamp, new_simulation_timestamp, log_dir, *, reason: str) -> None:
+        """Move the validator onto a run that has just opened. The start event's handling, and the same
+        transition the first state update applies when this process never received that event (a validator
+        replaced at the run boundary comes up after the new engine has already sent it).
+
+        Args:
+            old_simulation_timestamp: The clock the histories are on (the old run's end).
+            new_simulation_timestamp: The new run's start (0 for a fresh episode; the checkpoint's clock on a resume).
+            log_dir: The new run's output directory, from the event or the state update.
+            reason: What brought us here, for the log.
         """
         v = self.validator
         # Capture the locked simulation_id BEFORE _load_config() rebuilds
@@ -530,10 +551,7 @@ class SimulationEngine(MarketEngine):
         self._load_config()
         volume_decimals = v.simulation.volumeDecimals
 
-        logger.info("Shifting timestamps for simulation restart...")
-
-        old_simulation_timestamp = v.simulation_timestamp  # End time of old simulation
-        new_simulation_timestamp = timestamp  # Start time of new simulation (0)
+        logger.info(f"Shifting timestamps for simulation restart ({reason})...")
 
         # Tell the shadow scoring service to run the SAME shift on its own
         # structures. FIFO with the state tee: all old-sim frames precede this,
@@ -558,7 +576,7 @@ class SimulationEngine(MarketEngine):
         )
 
         v.start_time = time.time()
-        v.simulation_timestamp = timestamp
+        v.simulation_timestamp = new_simulation_timestamp
         v.start_timestamp = v.simulation_timestamp
         # A scoring-service INIT built AFTER this shift must stamp the NEW clock. When a validator
         # restore and a sim restart race the first INIT, its base_ts carries the OLD clock; the child
@@ -569,10 +587,10 @@ class SimulationEngine(MarketEngine):
             v._shadow_applied_ts = new_simulation_timestamp
         v.last_state_time = None
         v.step_rates = []
-        if event.logDir != v.simulation.logDir:
-            logger.info(f"Simulation log directory changed: {v.simulation.logDir} -> {event.logDir}")
-            self._notify_seed_log_dir_change(event.logDir)
-            v.simulation.logDir = event.logDir
+        if log_dir != v.simulation.logDir:
+            logger.info(f"Simulation log directory changed: {v.simulation.logDir} -> {log_dir}")
+            self._notify_seed_log_dir_change(log_dir)
+            v.simulation.logDir = log_dir
         # simulation_id lifecycle. A genuine new episode resets the clock to ~0
         # (start="0"), so on_tick should re-derive the id from the new logDir.
         # But a restart/reconnect that resumes an in-progress run fires this same
@@ -582,8 +600,7 @@ class SimulationEngine(MarketEngine):
         # service classify it as a new simulation and prune the entire in-progress
         # run's history. So: fresh episode (or no prior id) → reset + re-derive;
         # mid-run resume → preserve the locked id, decoupling it from the logDir.
-        _grace = int(getattr(v.simulation, "grace_period", 0) or 0)
-        _fresh_threshold = max(_grace, _FRESH_EPISODE_FLOOR_NS)
+        _fresh_threshold = self._fresh_threshold()
         if not _prev_sim_id or new_simulation_timestamp <= _fresh_threshold:
             v.simulation.simulation_id = None
             logger.info(
@@ -615,6 +632,20 @@ class SimulationEngine(MarketEngine):
 
         asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
         logger.info("Simulation restart complete")
+        self._restart_if_deferred(why="the new run is open and its state is saved on the new clock")
+
+    def _restart_if_deferred(self, *, why: str) -> None:
+        """The validator restart a run-end update owes (update.update_validator with restart=False) happens
+        only here, after the run change has been applied and saved: the process that handles the start event is
+        the one that saves the shifted state, and the replacement loads that. Scheduled a moment later so this
+        handler returns and answers the engine first."""
+        v = self.validator
+        if not getattr(v, '_restart_when_run_opens', None):
+            return
+        v._restart_when_run_opens = None
+        logger.warning(f"RESTARTING THE VALIDATOR ONTO THE UPDATED CODE: {why}")
+        from taos.im.validator.update import restart_validator_process
+        threading.Timer(2.0, lambda: restart_validator_process(v)).start()
 
     # ─────────────────────────────────────────────────────────────────────────
     # on_end()
@@ -651,6 +682,25 @@ class SimulationEngine(MarketEngine):
           5. Periodic log compression
         """
         v = self.validator
+        # 0. A run that opened without this process. The clock the process holds is the old run's end; the
+        #    update belongs to a run that has only just opened; no start event came between. Apply the run
+        #    change here, as the event would have, before anything sums the histories on the new clock.
+        from taos.im.validator.trade import missed_run_change
+        _prev_ts = v.simulation_timestamp
+        if missed_run_change(_prev_ts, state.timestamp, fresh_threshold=self._fresh_threshold()):
+            logger.warning(
+                f"RUN CHANGE NOT SEEN: the clock went from {_prev_ts} to {state.timestamp} without a start event; "
+                "applying the run change now, as the event would have"
+            )
+            self._open_run(_prev_ts, 0, state.logDir, reason="clock regression at the first state update")
+            v._run_changes_recovered = getattr(v, '_run_changes_recovered', 0) + 1
+        elif getattr(v, '_restart_when_run_opens', None) and \
+                time.time() - v._restart_when_run_opens > _DEFERRED_RESTART_CEILING_S:
+            # The run is ticking, so it opened, yet neither the start event nor the recovery consumed the
+            # owed restart. Save on this clock and take it now rather than run the old code for a whole run.
+            asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
+            self._restart_if_deferred(
+                why=f"the run has been ticking for over {_DEFERRED_RESTART_CEILING_S:.0f}s with a restart owed")
         # 1. Periodic validator-update check (uses OLD simulation_timestamp)
         if v.simulation_timestamp % 3_600_000_000_000 == 0 and v.simulation_timestamp != 0:
             v.update_repo()

@@ -1674,6 +1674,25 @@ def _load_validator_state(self):
             # Rebuild the MVTRX push running totals from the freshly-loaded
             # realized_pnl_history. From here on, trade.py maintains them
             # incrementally — but at boot we need the full walk once.
+            # A restart that missed the engine's start event loads the previous run's last window under
+            # the previous clock; put it on the new one before anything sums it.
+            from taos.im.validator.trade import rebase_entries_beyond_clock
+            # an operator-supplied correction next to the state file: the positions held at the previous run's
+            # end, so the phantoms are subtracted and the positions built since the run opened are kept
+            _corr_path = self.validator_state_file + ".inv_correction.json"
+            _corr = None
+            if os.path.exists(_corr_path):
+                try:
+                    import json as _json
+                    _corr = _json.load(open(_corr_path))
+                    _npos = sum(len(v or {}) for v in (_corr.get("positions", _corr) if isinstance(_corr, dict) else {}).values() if isinstance(v, dict))
+                    bt.logging.warning(f"Loaded fill-stream inventory correction from {_corr_path} ({_npos} positions)")
+                except Exception as _cx:
+                    bt.logging.error(f"Could not read {_corr_path}: {_cx}")
+            self._histories_rebased_at_load = rebase_entries_beyond_clock(
+                self, int(self.simulation_timestamp or 0),
+                lookback=int(self.config.scoring.kappa.lookback), log=bt.logging.warning,
+                inventory_correction=_corr)
             from taos.im.validator.trade import bootstrap_pnl_totals
             _bp_start = time.time()
             bootstrap_pnl_totals(self)

@@ -71,7 +71,7 @@ def _duck(start_sha, head_sha, head_paths=(), remote_endpoint="wss://entrypoint-
 
 def _spy(monkeypatch):
     seen = {"update_validator": 0, "rebuild_simulator": 0, "restart_simulator": []}
-    monkeypatch.setattr(vmod, "update_validator", lambda self: seen.__setitem__("update_validator", seen["update_validator"] + 1), raising=False)
+    monkeypatch.setattr(vmod, "update_validator", lambda self, **kw: seen.__setitem__("update_validator", seen["update_validator"] + 1), raising=False)
     monkeypatch.setattr(vmod, "rebuild_simulator", lambda self: seen.__setitem__("rebuild_simulator", seen["rebuild_simulator"] + 1), raising=False)
     monkeypatch.setattr(vmod, "restart_simulator", lambda self, end=False: seen["restart_simulator"].append(end), raising=False)
     return seen

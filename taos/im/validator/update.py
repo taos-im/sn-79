@@ -173,9 +173,14 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
         )
         return False, False, False, False
 
-def update_validator(self : Validator) -> None:
+def update_validator(self : Validator, restart: bool = True) -> None:
     """
-    Pull the latest code, reinstall the package, and restart the validator process.
+    Reinstall the package and restart the validator process, or leave the restart to the run that is about to open.
+
+    With restart=False (the run-end path) the code is installed and the restart is owed to the engine handler,
+    which takes it once the new run's start event has been handled and the state saved on the new clock. A restart
+    taken within seconds of starting the new engine replaced the process while it was handling that event, and the
+    replacement loaded the state saved before it, with the old run's last window still on the old clock.
 
     Attempts a PM2-managed restart first; falls back to killing the Python process
     directly if PM2 is not available.
@@ -196,9 +201,45 @@ def update_validator(self : Validator) -> None:
         update_time = time.time() - update_start
         
         if make.returncode == 0:
-            bt.logging.success(f"VALIDATOR PY UPDATE SUCCESSFUL ({update_time:.1f}s). RESTARTING...")
+            bt.logging.success(f"VALIDATOR PY UPDATE SUCCESSFUL ({update_time:.1f}s).")
         else:
             raise Exception(f"FAILED TO COMPLETE VALIDATOR PY UPDATE:\n{make.stderr}")
+        if not restart:
+            self._restart_when_run_opens = time.time()
+            bt.logging.warning(
+                "VALIDATOR PY UPDATED; the restart waits until the new run has opened and its state is saved on the "
+                "new clock (engines/simulation.py takes it after the start event)"
+            )
+            return
+        restart_validator_process(self)
+        return
+
+    except subprocess.TimeoutExpired:
+        bt.logging.error("Validator restart command timed out after 30s")
+        self.pagerduty_alert("Validator restart timeout")
+        raise
+    except Exception as ex:
+        bt.logging.error(f"Failed to update validator: {ex}")
+        bt.logging.error(traceback.format_exc())
+        self.pagerduty_alert(
+            f"Failed to update validator: {ex}",
+            details={"traceback": traceback.format_exc()}
+        )
+        raise
+
+
+def restart_validator_process(self : Validator) -> None:
+    """
+    Restart this validator through the pm2 entry that supervises it.
+
+    Args:
+        self (Validator): The intelligent markets simulation validator.
+
+    Raises:
+        subprocess.TimeoutExpired: If the restart command exceeds 30 s.
+        Exception: On any other process-management failure.
+    """
+    try:
         try:
             pm2_result = subprocess.run(
                 ['pm2', 'jlist'], 

@@ -31,7 +31,25 @@
 Simulation::Simulation() noexcept
     : IMessageable{this, "SIMULATION"},
       m_localAgentManager{std::make_unique<LocalAgentManager>(this)}
-{}
+{
+    // AN UNSET LOG DIRECTORY IS NOT "HERE". This constructor is used only by the unit tests -- every
+    // production path goes through the block-aware one, which is handed a real directory -- and it
+    // left m_logDir default-constructed. BookProcessManager then joins onto it, so
+    // `logDir() / "external.0-1.csv"` came out RELATIVE and resolved against the process working
+    // directory, which for the gtest runner is the source checkout. A routine suite run therefore
+    // dropped external/fundamental/magneticfield CSVs into simulate/trading, and because the public
+    // carve is an rsync rather than a git export, ignoring them would have hidden the mess from
+    // `git status` while still copying it. An absolute default makes the whole class impossible.
+    // IT MUST BE THE *BASE* DIRECTORY, NOT JUST THE CURRENT ONE. configureLogging() does
+    // `m_logDir = m_baseLogDir`, so a fixture that loads XML -- which is most of them -- reset
+    // m_logDir straight back to empty and resumed writing into the checkout. Setting only m_logDir
+    // here passed all three unit tests below and changed nothing about the actual pollution; the
+    // full suite run is what caught it.
+    std::error_code ec;
+    const auto tmp = fs::temp_directory_path(ec);
+    m_baseLogDir = (ec ? fs::path{"/tmp"} : tmp) / "taosim-unconfigured";
+    m_logDir = m_baseLogDir;
+}
 
 //-------------------------------------------------------------------------
 

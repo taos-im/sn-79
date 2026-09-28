@@ -308,8 +308,9 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="E5 magnitude floor for kappa-of-alpha: a per-book |alpha| must clear "
              "floor_scale*median(|alpha|) to count (kappa is magnitude-blind; kills tiny-consistent "
-             "spam). 0 disables the floor.",
-        default=0.5,
+             "spam). 0 (default since 0.6.2) disables the pool-relative floor in favour of the "
+             "size-neutral hurdle (skill_hurdle_bps); 0.5 is the basis shipped through 0.6.1.",
+        default=0.0,
     )
 
     parser.add_argument(
@@ -443,8 +444,10 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.skill_hurdle_bps",
         type=float,
         help="Absolute skill hurdle in basis points of the agent's filled notional on a book: a book's "
-             "alpha counts toward skill only above it. 0 (default) keeps the pool-relative floor alone.",
-        default=0.0,
+             "alpha counts toward skill only above it. 2.3 (default since 0.6.2) reproduces the "
+             "membership the 0.5 floor gave on both a young and a mature field and cannot be moved by "
+             "anyone else's size; 0 keeps the pool-relative floor alone.",
+        default=2.3,
     )
     parser.add_argument(
         "--scoring.debeta.skill_hurdle_books",

@@ -647,6 +647,7 @@ class ReportingService:
             setattr(self, key, data[key])
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.scoring_shadow_health = data.get('scoring_shadow')
+        self.history_clock = data.get('history_clock')
 
         def _int_keyed_books(d):
             """IPC serialization stringifies keys; the book-gauge block indexes by int uid/book."""
@@ -880,6 +881,16 @@ def publish_validator_gauges(self: ReportingService):
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
                 sim_id=self.simulation.simulation_id, validator_gauge_name=_gauge,
             ).set(float(_shadow_health.get(_key, 0) or 0))
+    _clock = getattr(self, 'history_clock', None)
+    if _clock:
+        # A run change the validator did not apply leaves the previous run's last window stamped ahead of the
+        # clock, inside every window and never pruned; the first gauge is that distance (0 when clean), the
+        # other two count the repairs (the load-time rebase and the first-update recovery).
+        for _gauge in ("history_stamp_ahead_ns", "run_changes_recovered", "histories_rebased_at_load"):
+            self.prometheus_validator_gauges.labels(
+                wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                sim_id=self.simulation.simulation_id, validator_gauge_name=_gauge,
+            ).set(float(_clock.get(_gauge, 0) or 0))
     bt.logging.debug(f"Validator metrics published ({time.time()-start:.4f}s).")
 
 def publish_gentrx_gauges(self: ReportingService) -> None:

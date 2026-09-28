@@ -1024,6 +1024,179 @@ def shift_simulation_histories(
     }
 
 
+def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inventory_correction=None) -> int:
+    """Repair a state whose histories carry timestamps ahead of the clock.
+
+    The rebase at a run change (shift_simulation_histories) runs from the engine's start event. A
+    validator that restarts after the engine has already opened the new run never receives that event,
+    so the previous run's last window stays in every history under the previous clock. On the new
+    clock those stamps are in the future: they sort after everything the new run writes, no window
+    ever prunes them, and every windowed sum counts them. This guard runs at load: any stamp ahead of
+    the clock is treated as the previous run's, moved onto the new time base with the previous run's
+    end mapped to the new run's start (so it sits at or below zero, where each structure's own prune
+    drops it), the de-beta windows are pruned here with their running sums rebuilt, and the inventory
+    history drops them outright: its entries are differences against initial balances the new run
+    reset, and nothing prunes that history by time. Entries on the clock are not touched.
+
+    The fill-stream reconstruction state (per-book inventory, last print, mark state) is carried too:
+    the run change resets it because the new engine opens every account flat, so a carried position
+    is a phantom that every later price step is charged against. With `inventory_correction`
+    ({book: {uid: qty}}, the positions held at the previous run's end) those phantoms are subtracted
+    and the positions built since the run opened are kept; without it the state is reset as the run
+    change would have done, which drops the positions built since the run opened.
+
+    Args:
+        now: The simulation clock the state was saved under.
+        lookback: The de-beta assessment window in simulation ns.
+        log: Optional logger for the summary line.
+        inventory_correction: Optional ``{book: {uid: qty}}`` to subtract from the fill-stream inventory.
+
+    Returns:
+        int: Entries moved; 0 when the state was already on the clock.
+    """
+    from taos.im.validator.debeta import sum_hist_1level, sum_hist_2level
+    tolerance = 600_000_000_000
+    limit = int(now) + tolerance
+    two_level = ("debeta_mtm_hist", "debeta_invsum_hist", "debeta_capbuy_hist", "debeta_capsell_hist",
+                 "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
+                 "debeta_notional_hist")
+    one_level = ("debeta_invn_hist", "debeta_drift_hist")
+    other = ("realized_pnl_history", "inventory_history", "trade_volumes", "roundtrip_volumes")
+
+    def stamps(d):
+        if not isinstance(d, dict):
+            return
+        keys = [k for k in d if isinstance(k, int) and k > 10**11]
+        if keys:
+            yield from keys
+            return
+        for v in d.values():
+            yield from stamps(v)
+
+    ahead = [ts for name in two_level + one_level + other for ts in stamps(getattr(self, name, None)) if ts > limit]
+    if not ahead:
+        return 0
+    old_end = max(ahead)
+
+    def shift(d):
+        if not isinstance(d, dict):
+            return 0
+        keys = [k for k in d if isinstance(k, int) and k > 10**11]
+        if keys:
+            moved = 0
+            for k in keys:
+                if k > limit:
+                    d[k - old_end] = d.pop(k)
+                    moved += 1
+            return moved
+        return sum(shift(v) for v in d.values())
+
+    moved = sum(shift(getattr(self, name, None)) for name in two_level + one_level + other)
+    # inventory entries are differences against initial balances the new run reset, and nothing prunes
+    # this history by time, so a moved entry would become an account's first entry and the previous
+    # run's final value its baseline
+    inv = getattr(self, "inventory_history", None) or {}
+    for uid in list(inv):
+        for ts in [t for t in inv[uid] if isinstance(t, int) and t <= 0]:
+            del inv[uid][ts]
+    threshold = int(now) - int(lookback)
+    for name in two_level:
+        hist = getattr(self, name, None) or {}
+        for k1 in list(hist):
+            for k2 in list(hist[k1]):
+                kept = {ts: v for ts, v in hist[k1][k2].items() if ts >= threshold}
+                if kept:
+                    hist[k1][k2] = kept
+                else:
+                    del hist[k1][k2]
+            if not hist[k1]:
+                del hist[k1]
+    for name in one_level:
+        hist = getattr(self, name, None) or {}
+        for k in list(hist):
+            kept = {ts: v for ts, v in hist[k].items() if ts >= threshold}
+            if kept:
+                hist[k] = kept
+            else:
+                del hist[k]
+    running = (("debeta_mtm_hist", "debeta_mtm"), ("debeta_invsum_hist", "debeta_invsum"),
+               ("debeta_capbuy_hist", "capture_buy_sums"), ("debeta_capsell_hist", "capture_sell_sums"),
+               ("debeta_cp_hist", "debeta_cp"), ("debeta_heldn_hist", "debeta_heldn"),
+               ("debeta_heldinv_hist", "debeta_heldinv"), ("debeta_helddrift_hist", "debeta_helddrift"),
+               ("debeta_notional_hist", "debeta_notional"))
+    for hist_name, sum_name in running:
+        sums = sum_hist_2level(getattr(self, hist_name, None) or {})
+        setattr(self, sum_name, defaultdict(lambda: defaultdict(float), {u: defaultdict(float, b) for u, b in sums.items()}))
+    for hist_name, sum_name in (("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift")):
+        setattr(self, sum_name, defaultdict(float, sum_hist_1level(getattr(self, hist_name, None) or {})))
+    inv = getattr(self, "debeta_inv", None)
+    inv_note = ""
+    if inv is not None:
+        if inventory_correction:
+            # {"positions": {book: {uid: qty}}, "hotkeys": {uid: hotkey}} gates each uid on the hotkey that held
+            # the slot at the previous run's end: a slot that changed hands since had its inventory reset
+            # already and carries nothing to subtract. A bare {book: {uid: qty}} applies to every uid.
+            positions = inventory_correction.get("positions", inventory_correction)
+            gate = inventory_correction.get("hotkeys") if isinstance(inventory_correction.get("positions"), dict) else None
+            current = list(getattr(self, "hotkeys", None) or [])
+            fixed = skipped = 0
+            for b, by_uid in positions.items():
+                for u, q in (by_uid or {}).items():
+                    if gate is not None:
+                        held = current[int(u)] if int(u) < len(current) else None
+                        was = gate.get(str(u), gate.get(int(u)))
+                        # a uid outside the metagraph on both sides (the validator's own agent) cannot have
+                        # changed hands; a uid with a hotkey on either side is corrected only when it matches
+                        if (held is not None or was is not None) and was != held:
+                            skipped += 1
+                            continue
+                    inv[int(b)][int(u)] -= float(q)
+                    fixed += 1
+            inv_note = (f"; fill-stream inventory corrected on {fixed} (book, uid) positions"
+                        + (f", {skipped} skipped on slots that changed hands" if skipped else ""))
+        else:
+            self.debeta_inv = defaultdict(lambda: defaultdict(float))
+            self.debeta_pfirst = {}
+            self.debeta_plast = {}
+            self.debeta_mark_state = {}
+            inv_note = "; fill-stream inventory, last print and mark state reset as the run change would have (no correction supplied)"
+    if log:
+        log(f"HISTORIES AHEAD OF THE CLOCK: {moved} entries stamped up to {old_end} moved onto the clock at {now} "
+            f"(a run change the process did not see); de-beta windows pruned below {threshold} and sums rebuilt{inv_note}")
+    return moved
+
+
+def missed_run_change(previous_ts, incoming_ts, *, fresh_threshold) -> bool:
+    """A state update whose clock is behind the one the process holds, on a run that has only just opened, is the
+    first update of a run whose start event this process never received: the process went down while the old
+    run's end handling was starting the new engine, and came up after the event had been delivered. A checkpoint
+    resume can also step the clock back, but it fires the start event itself and never lands near zero."""
+    try:
+        previous_ts = int(previous_ts or 0)
+        incoming_ts = int(incoming_ts or 0)
+    except (TypeError, ValueError):
+        return False
+    return incoming_ts < previous_ts and incoming_ts <= int(fresh_threshold)
+
+
+def history_clock_health(self) -> dict:
+    """What a dashboard needs to see a run change that was not applied: how far the furthest de-beta stamp sits
+    ahead of the clock (0 when clean; every book's history carries the same stamps, so the per-book inventory
+    history is the sentinel), and the counters of the two repairs."""
+    now = int(getattr(self, "simulation_timestamp", 0) or 0)
+    ahead = 0
+    for tsd in (getattr(self, "debeta_invn_hist", None) or {}).values():
+        if tsd:
+            gap = max(tsd) - now
+            if gap > ahead:
+                ahead = gap
+    return {
+        "history_stamp_ahead_ns": int(ahead),
+        "run_changes_recovered": int(getattr(self, "_run_changes_recovered", 0) or 0),
+        "histories_rebased_at_load": int(getattr(self, "_histories_rebased_at_load", 0) or 0),
+    }
+
+
 def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     """Zero one UID's history/scoring structures (deregistration reset).
 
