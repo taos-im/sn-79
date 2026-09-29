@@ -49,7 +49,8 @@ def test_the_shadow_carries_the_pool_state_in_and_out():
     assert "'debeta_pool_ema': _pema" in src, "returned so main can adopt it in cutover mode"
     # and it is advanced whatever the dial says, so switching the dial does not re-base the pool
     assert src.index("_share_tot = sum(_share.values())") > src.index("making_pool_inputs(")
-    assert "if _pool_mode == \"proportional\"" in src
+    # the vector itself is built by the one function main uses, for every pool setting
+    assert "pool_pay_vector(" in src
 
 
 def test_both_senders_ship_the_pool_state():

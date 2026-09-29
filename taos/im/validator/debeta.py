@@ -1272,6 +1272,27 @@ def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor):
     return skills, info
 
 
+def hurdle_skill(kept_by_book, floor, min_books):
+    """Skill per uid on the books the hurdle kept, with the configured bar, and the count of those books.
+
+    The count is what the pool gates on (``skill_books``): with the pool-relative floor off every filled book
+    clears the floor, so counting books above it counted books the hurdle had rejected.
+
+    Args:
+        kept_by_book: ``{uid: {book: alpha}}`` after `hurdle_filter`.
+        floor: The magnitude floor (0 when off).
+        min_books: ``scoring.debeta.skill_min_books``.
+    Returns:
+        (values, books): ``{uid: kappa or 0.0}`` and ``{uid: qualifying book count}``.
+    """
+    values, books = {}, {}
+    for u, b in (kept_by_book or {}).items():
+        a = list(b.values())
+        values[u] = kappa_floored(a, floor, min_books)
+        books[u] = sum(1 for x in a if abs(float(x)) >= floor)
+    return values, books
+
+
 def hurdle_filter(alphas_by_book, notional_by_book, hurdle_bps):
     """Keep the (uid, book) alphas whose magnitude clears hurdle_bps of the uid's filled notional on
     that book. A pool-relative floor lets a tiny consistent scalper through at negligible size; the

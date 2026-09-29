@@ -464,6 +464,15 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.warning(f"NaN values detected in gentrx rewards: {gentrx_rewards}")
             gentrx_rewards = torch.nan_to_num(gentrx_rewards, 0)
 
+        # ONE ROUND, ONE UNIT OF MASS. The Pareto ladder's output is unnormalised (about 390 per round on 257
+        # uids) and the proportional pool's sums to 1, so without this a single ladder round outweighed hundreds
+        # of pool rounds in the moving average, and the weights kept the ladder's shape until enough pool
+        # rounds had accumulated to displace it. The
+        # weights are L1-normalised downstream, so within one pay rule this changes nothing but the relative
+        # weight of rounds.
+        _tsum = float(trading_rewards.sum())
+        if _tsum > 0:
+            trading_rewards = trading_rewards / _tsum
         bt.logging.debug("Cloning UIDs...")
         if isinstance(uids, torch.Tensor):
             uids_tensor = uids.clone().detach().to(self.device)

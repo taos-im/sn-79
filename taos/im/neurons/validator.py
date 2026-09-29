@@ -1504,6 +1504,20 @@ if __name__ != "__mp_main__":
                 self._trading_score_ema.pop(uid, None)
             if hasattr(self, '_trading_score_ema_n') and self._trading_score_ema_n:
                 self._trading_score_ema_n.pop(uid, None)
+            # The proportional pool smooths the making term and share with the same EMA; without this the new
+            # occupant is paid the departed miner's smoothed making share until it makes something itself.
+            for _pool_state in (getattr(self, '_debeta_pool_ema', None) or {}).values():
+                if isinstance(_pool_state, dict):
+                    _pool_state.pop(uid, None)
+            # The track-record rollback snapshot holds the same per-uid entries; a rollback after the reset
+            # would otherwise restore the departed miner's.
+            for _pre in (getattr(self, '_trading_score_ema_pre', None) or ()):
+                if isinstance(_pre, dict):
+                    _pre.pop(uid, None)
+            # Query outcomes feed the presence gate. They were the departed hotkey's, so the new occupant
+            # starts with an empty window, as a new uid does.
+            if getattr(self, 'miner_presence', None):
+                self.miner_presence.pop(uid, None)
             if getattr(self, '_gentrx', None) is not None:
                 self._gentrx._scores.pop(uid, None)
 

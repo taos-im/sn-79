@@ -30,7 +30,7 @@ import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
 from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
-                                      book_alphas_held_by_book, hurdle_filter, kappa_floored, median_abs_floor,
+                                      book_alphas_held_by_book, hurdle_filter, hurdle_skill, kappa_floored, median_abs_floor,
                                       presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas,
                                       debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
@@ -1271,6 +1271,32 @@ def allocate_trading(ladder_scores, making_share, pool, all_uids, config, skill_
     return (1.0 - pool) * lad + pool * (sh / _s2)
 
 
+def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_scores, making_share, config,
+                    skill_min_books) -> torch.FloatTensor:
+    """The trading emission vector for a making_pool setting. ONE implementation for main (get_rewards) and the
+    scoring child (scoring_shadow.shadow_score): the child had its own copy that knew only 'proportional', so
+    under 'proportional_both' it paid the Pareto ladder and main adopted it after every restart.
+
+    Args:
+        pool_mode: ``scoring.debeta.making_pool``.
+        pool: Share of emission the making pool pays (debeta.weight * debeta.w_make).
+        detail: The per-uid de-beta decomposition.
+        all_uids: Uids in emission order.
+        ladder_scores: The making-stripped ladder input from `making_pool_inputs` (after its EMA).
+        trading_scores: The published (post-EMA) trading score per uid.
+        making_share: Per-uid smoothed share of captured spread.
+        config: Validator config (reward floor and Pareto parameters).
+        skill_min_books: ``scoring.debeta.skill_min_books``.
+    """
+    if pool_mode in ("proportional", "proportional_blended", "proportional_both") and pool > 0.0:
+        skill_share = skill_pool_share(detail or {}, all_uids, int(skill_min_books or 4)) \
+            if pool_mode == "proportional_both" else None
+        return allocate_trading(pool_ladder_input(pool_mode, ladder_scores, trading_scores, all_uids),
+                                making_share, pool, all_uids, config, skill_share=skill_share)
+    floored = apply_reward_floor([trading_scores[uid] for uid in all_uids], config)
+    return distribute_rewards(floored, config)
+
+
 def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     """Finalize the de-beta (P8) per-uid trading score from the fill-stream accumulators
     (self.capture_buy_sums/capture_sell_sums + self.debeta_mtm/invsum/invn/pfirst/plast, populated
@@ -1337,11 +1363,12 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         _form = str(getattr(dcfg, 'skill_subwindow_form', None) or 'sign_gated')
         _agree = int(getattr(dcfg, 'skill_subwindow_min_agree', 2) or 2)
         skill_values, sub_info = None, {}
+        _hurdle_books_by_uid = None
         if _k > 1 and _t_end is not None and _lookback > 0:
             sub_k = sub3 if _k == 3 else book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k)
             skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor)
         elif _hurdle_bps > 0:
-            skill_values = {u: kappa_floored(list(b.values()), floor) for u, b in skill_pool.items()}
+            skill_values, _hurdle_books_by_uid = hurdle_skill(skill_pool, floor, int(getattr(dcfg, 'skill_min_books', 4) or 4))
         _pool_scaling = int(getattr(dcfg, 'skill_pool_scaling', 0) or 0)
         p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
         skill_p11_strength = float(getattr(dcfg, 'skill_p11_strength', 0.0) or 0.0)
@@ -1383,6 +1410,9 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         )
         _notional = getattr(self, 'debeta_notional', {}) or {}
         for _u, _dd in _detail.items():
+            # under the hurdle a qualifying book is one it kept; the pool's bar reads this count
+            if _hurdle_books_by_uid is not None:
+                _dd['skill_books'] = int(_hurdle_books_by_uid.get(_u, 0))
             _dd['skill_other'] = float(other_skill.get(_u, 0.0))
             _dd['skill_weakest3'] = float(weakest3.get(_u, 0.0)) if weakest3 else None
             _dd['skill_books_kept'] = int(sub_info[_u]['books']) if _u in sub_info else len(skill_pool.get(_u, {}))
@@ -1520,6 +1550,8 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 'mark_mode': str(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_mode', 'last') or 'last'),
                 'mark_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_window', 200) or 200),
                 'making_pool': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_pool', 'rank') or 'rank'),
+                'skill_min_books': int(
+                    getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books', 4) or 4),
             },
             'gentrx': {
                 'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
@@ -1841,21 +1873,10 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         if _kv is not None:
             _kv['making_share'] = (float(_make_share[uid]) / _share_tot) if _share_tot > 0 else 0.0
             _kv['ladder_input'] = float(_ladder_scores[uid])
-    if _pool_mode in ("proportional", "proportional_blended", "proportional_both") and _pool > 0.0:
-        _skill_share = None
-        if _pool_mode == "proportional_both":
-            _skill_share = skill_pool_share(validator_data.get('debeta_detail') or {}, all_uids,
-                                            int(_dcfg.get('skill_min_books', 4) or 4))
-        distributed_trading = allocate_trading(
-            pool_ladder_input(_pool_mode, _ladder_scores, trading_uid_scores, all_uids),
-            _make_share, _pool, all_uids, validator_data['config'], skill_share=_skill_share,
-        ).to(self.device)
-    else:
-        trading_rewards_list = [trading_uid_scores[uid] for uid in all_uids]
-        trading_rewards_list = apply_reward_floor(trading_rewards_list, validator_data['config'])
-        distributed_trading = distribute_rewards(
-            trading_rewards_list, validator_data['config']
-        ).to(self.device)
+    distributed_trading = pool_pay_vector(
+        _pool_mode, _pool, validator_data.get('debeta_detail') or {}, all_uids, _ladder_scores,
+        trading_uid_scores, _make_share, validator_data['config'], int(_dcfg.get('skill_min_books', 4) or 4),
+    ).to(self.device)
     _prof_pareto = time.perf_counter()
     # INFO (not debug): this is one line per scoring round and must land in the
     # same INFO log time_check.py reads on the live mainnet validator so the

@@ -341,9 +341,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     Returns:
         The shadow's scoring result for parity comparison.
     """
-    from taos.im.validator.reward import (allocate_trading, apply_reward_floor, apply_track_record_ema,
-                                          compute_debeta_scores, distribute_rewards,
-                                          making_pool_inputs, score_uids)
+    from taos.im.validator.reward import (apply_track_record_ema, compute_debeta_scores, making_pool_inputs,
+                                          pool_pay_vector, score_uids)
 
     shadow.deregistered_uids = list(deregs)
     # The presence gate's absent set is main-side knowledge (query outcomes), shipped with the inputs.
@@ -421,13 +420,9 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         if _kv is not None:
             _kv['making_share'] = (float(_share[uid]) / _share_tot) if _share_tot > 0 else 0.0
             _kv['ladder_input'] = float(_ladder[uid])
-    if _pool_mode == "proportional" and _pool > 0.0:
-        distributed = allocate_trading(_ladder, _share, _pool, all_uids, shadow.scoring_config)
-    else:
-        floored = apply_reward_floor(
-            [trading_scores[uid] for uid in all_uids], shadow.scoring_config
-        )
-        distributed = distribute_rewards(floored, shadow.scoring_config)
+    distributed = pool_pay_vector(
+        _pool_mode, _pool, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _ladder, trading_scores, _share,
+        shadow.scoring_config, int(_dcfg.get('skill_min_books', 4) or 4))
     return {
         'trading': [float(x) for x in distributed.tolist()],
         'gentrx': [float(gentrx_scores_out[uid]) for uid in all_uids],

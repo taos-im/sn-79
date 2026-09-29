@@ -1523,6 +1523,13 @@ def _load_validator_state(self):
             self.scores = torch.zeros(self.effective_max_uids, dtype=torch.float32, device=self.device)
             num_scores_to_copy = min(len(loaded_scores), self.effective_max_uids)
             self.scores[:num_scores_to_copy] = torch.tensor(loaded_scores[:num_scores_to_copy])
+            # The moving average now takes each round at unit mass (update_scores). A state saved before that
+            # carries the Pareto ladder's scale (a sum in the hundreds), which would outweigh every new round for
+            # hours; at unit sum it carries the same weights, since weights are L1-normalised downstream.
+            _ssum = float(self.scores.sum())
+            if _ssum > 1.0 + 1e-6:
+                bt.logging.info(f"Rescaled the carried trading scores from sum {_ssum:.3f} to 1 (weights unchanged)")
+                self.scores = self.scores / _ssum
 
             if len(loaded_scores) > self.effective_max_uids:
                 bt.logging.warning(
