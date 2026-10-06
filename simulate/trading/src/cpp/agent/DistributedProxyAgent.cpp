@@ -25,9 +25,27 @@ DistributedProxyAgent::DistributedProxyAgent(Simulation* simulation)
 
 void DistributedProxyAgent::receiveMessage(Message::Ptr msg)
 {
+    // EVENT_SIMULATION_START BELONGS IN THE STATE UPDATE, like every other event.
+    //
+    // Ignoring it here was the first of two places a lifecycle notice was dropped on its way to an
+    // agent; the second was checkGlobalDuplicate in both state serializers, which discarded every
+    // notice whose payload is not an agent response. Between them, FinanceAgentBase.update's
+    // `case "EVENT_SIMULATION_START" | "ESS": self.onStart(event)` could never fire, and neither
+    // could its end-of-simulation counterpart -- the handlers existed, were dispatched correctly,
+    // and were never reached.
+    //
+    // The engine already serialises both (NoticePack packs StartSimulationPayload with its logDir)
+    // and already fans both to every agent (ValidatorRequest's EmptyPayload/StartSimulationPayload
+    // branch). Only the two drops above stood in the way.
+    //
+    // Safe against a resumed run re-announcing itself: Simulation::start() is the sole dispatcher of
+    // both events and both its callers guard on state() == INACTIVE (Simulation.cpp:119,
+    // MultiAssetSimulationOrchestrator.cpp:719), so a resume never re-sends them. Safe against the
+    // grace period too: publishState() returns before any serializer runs while warmingUp(), and the
+    // buffer is only cleared inside the serializer, so a notice queued at step 0 survives to the
+    // first real publish.
     static const std::set<std::string> ignoredMessageTypes{
-        "MULTIBOOK_STATE_PUBLISH",
-        "EVENT_SIMULATION_START"
+        "MULTIBOOK_STATE_PUBLISH"
     };
 
     if (ignoredMessageTypes.contains(msg->type)) {
@@ -110,7 +128,6 @@ void DistributedProxyAgent::handleMessageForExchangeService(Message::Ptr msg)
     const auto subPld = std::static_pointer_cast<EventTradePayload>(pld->payload);
 
     if (subPld->isResting) {
-        fmt::println("TRADE NOTIF {}", json::jsonSerializable2str(subPld));
         m_tradeSignal(subPld);
     }
 }

@@ -21,6 +21,12 @@ class ExchangeConfig(BaseModel):
     """
 
     book_count:           int
+    # THE IDS, NOT JUST HOW MANY. An exchange book id IS a netuid: the engine takes its books from
+    # the chain's pools and publishes agent-visible state keyed by that netuid. book_count is
+    # deliberately the TRADED count (reward.py scores against it), so it is not the width of the id
+    # space and the ids cannot be derived from it. Empty means "not told", and the properties below
+    # fall back to the dense range so state that carries only a count behaves as it always did.
+    traded_book_ids:      list[int] = []
     # ── engine precision + limits (read from MultiBookExchangeAgent in the XML) ──
     priceDecimals:        int   = 4
     volumeDecimals:       int   = 4
@@ -43,10 +49,27 @@ class ExchangeConfig(BaseModel):
 
     @property
     def book_ids(self) -> list[int]:
-        """The book ids of this exchange run, dense: the same surface MarketSimulationConfig and
+        """The book ids of this exchange run: the same surface MarketSimulationConfig and
         MultiAssetSimulationConfig expose, so FinanceAgentBase.update iterates one attribute
-        whichever config class the state carries."""
-        return list(range(self.book_count))
+        whichever config class the state carries.
+
+        The engine's ids when it has told us them, because they are netuids and need not begin at
+        zero; the dense range otherwise, which is what a state carrying only a count means."""
+        return list(self.traded_book_ids) if self.traded_book_ids else list(range(self.book_count))
+
+    def asset_classes(self) -> list:
+        """The exchange as one asset class over every book, on its own grid: the surface an agent reads a
+        book's grid from, the same calls in either mechanism."""
+        from taos.im.protocol.config import AssetClass
+
+        return [AssetClass(name="exchange", books=self.book_ids, priceDecimals=self.priceDecimals,
+                           volumeDecimals=self.volumeDecimals, config=self)]
+
+    def config_for_book(self, book_id: int) -> "ExchangeConfig":
+        """The configuration governing a book: this one, for every book the exchange has."""
+        if int(book_id) not in self.book_ids:
+            raise KeyError(f"book id {book_id} names no book of this {self.book_count}-book exchange")
+        return self
 
     def label(self) -> str:
         """Human-readable label for this book's parameters."""

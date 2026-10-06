@@ -216,9 +216,10 @@ struct PlaceOrderLimitPayload : public MessagePayload
     Currency currency{Currency::BASE};
     std::optional<ClientOrderID> clientOrderId;
     bool postOnly{};
-    // Agent-settable. When false, a marketable limit too large to fill entirely
-    // within its limit rests whole (all-or-nothing) instead of filling the
-    // marketable portion and resting the remainder. Defaults true.
+    // Agent-settable; consumed by the exchange service's eager sweep only (the core
+    // matching engine round-trips it untouched). When false, a marketable limit too
+    // large to fill entirely within its limit rests whole (all-or-nothing) instead of
+    // sweeping the marketable portion and resting the remainder. Defaults true.
     bool allowPartial{true};
     taosim::TimeInForce timeInForce{taosim::TimeInForce::GTC};
     std::optional<Timestamp> expiryPeriod;

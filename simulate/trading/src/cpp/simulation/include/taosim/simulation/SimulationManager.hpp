@@ -11,6 +11,7 @@
 #include <taosim/net/net.hpp>
 #include <taosim/replay/ReplayManager.hpp>
 #include <taosim/simulation/SharedResources.hpp>
+#include <taosim/simulation/SimulationOrchestrator.hpp>
 
 #include <boost/asio.hpp>
 #include <pugixml.hpp>
@@ -18,6 +19,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -60,17 +62,18 @@ void requestStop() noexcept;
 
 //-------------------------------------------------------------------------
 
-class SimulationManager
+class SimulationManager final
+    : public SimulationOrchestrator
+    , public checkpoint::CheckpointSource
 {
 public:
 
-    void runSimulations();
-    void runReplay();
-    void runReplayAdvanced();
+    void run() override;
+
     void publishStartInfo();
     void publishEndInfo();
     void publishState();
-    
+
     [[nodiscard]] SimulationBlockInfo blockInfo() const noexcept { return m_blockInfo; }
     [[nodiscard]] auto&& threadPool(this auto&& self) noexcept { return self.m_threadPool; }
     [[nodiscard]] auto&& simulations(this auto&& self) noexcept { return self.m_simulations; }
@@ -81,7 +84,23 @@ public:
     [[nodiscard]] auto&& sharedResources(this auto&& self) noexcept { return self.m_sharedResources; }
 
     [[nodiscard]] bool online() const noexcept;
-    [[nodiscard]] bool warmingUp() const noexcept;
+
+    // CheckpointSource: the manager checkpoints its blocks, parallelizing the writes on
+    // its own (deliberately over-sized) thread pool; the common state is timestamp +
+    // log file sizes off the single shared log directory.
+    [[nodiscard]] bool warmingUp() const noexcept override;
+
+    [[nodiscard]] std::span<const std::unique_ptr<Simulation>> checkpointBlocks() const override
+    {
+        return m_simulations;
+    }
+
+    [[nodiscard]] boost::asio::thread_pool& checkpointExecutor() const override
+    {
+        return *m_threadPool;
+    }
+
+    void writeCommonCheckpoint(const std::filesystem::path& commonFile) const override;
 
 
 
@@ -106,6 +125,9 @@ public:
     inline static const std::string s_remoteResponsesShmName = makeIpcName("responses");
 
 private:
+    void runSimulations();
+    void runReplay();
+    void runReplayAdvanced();
     void setupLogDir(pugi::xml_node simuNode, const fs::path& logPath);
     void publishStateJson();
     void publishStateMessagePack();

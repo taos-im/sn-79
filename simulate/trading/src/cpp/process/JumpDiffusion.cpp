@@ -68,7 +68,13 @@ std::unique_ptr<JumpDiffusion> JumpDiffusion::fromXML(pugi::xml_node node, uint6
         return attr.as_ullong();
     }();
 
-    const auto updatePeriod = node.attribute("updatePeriod").as_ullong(1);
+    // Required and strictly positive — see FundamentalPrice::fromXML: a defaulted ~1ns
+    // period turns the per-step update loop into ~1e9 iterations and an OOM.
+    const auto updatePeriod = node.attribute("updatePeriod").as_ullong();
+    if (updatePeriod == 0) {
+        throw std::invalid_argument{
+            "JumpDiffusion::fromXML: attribute 'updatePeriod' must be present and > 0"};
+    }
     const float dt = updatePeriod / 86'400'000'000'000.0;
 
     return std::make_unique<JumpDiffusion>(JumpDiffusionDesc{

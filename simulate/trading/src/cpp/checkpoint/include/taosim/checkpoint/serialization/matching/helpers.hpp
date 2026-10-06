@@ -62,6 +62,6 @@ void unpackFeePolicy(const auto& o, taosim::matching::FeePolicy& feePolicy)
 
 //-------------------------------------------------------------------------
 
-}  // namespace taosim::matching::serialization
+}  // namespace taosim::checkpoint::serialization
 
 //-------------------------------------------------------------------------

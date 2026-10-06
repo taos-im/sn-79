@@ -20,8 +20,9 @@ _SRC = _REPORT.read_text(encoding="utf-8")
 
 
 def _declared_miner_labels() -> set[str]:
-    i = _SRC.index("self.prometheus_miners = Gauge(")
-    blob = _SRC[i:_SRC.index("registry=self.registry_miner", i)]
+    # a replace-mode snapshot collector since 30 September 2026 (the family was an eager Gauge before)
+    i = _SRC.index("self.prometheus_miners = _SnapshotCollector(")
+    blob = _SRC[i:_SRC.index("carry_forward=False)", i)]
     return set(re.findall(r"'([a-z0-9_]+)'", blob)) - {"miners"}
 
 

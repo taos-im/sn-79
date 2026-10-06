@@ -9,6 +9,8 @@
 #include <taosim/accounting/margin_utils.hpp>
 #include <taosim/matching/FeePolicy.hpp>
 
+#include <range/v3/algorithm/all_of.hpp>
+
 #include <bit>
 
 //-------------------------------------------------------------------------
@@ -117,22 +119,31 @@ OrderResult ClearingManager::handleOrder(const OrderDesc& orderDesc)
         );
     }
 
-    m_exchange->simulation()->logDebug("{} | AGENT #{} BOOK {} : MAKING RESERVATION {} {} WITH LEV {} FOR {} ORDER #{}", 
-        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
-        validationResult.amount, validationResult.direction == OrderDirection::BUY ? "QUOTE" : "BASE", validationResult.leverage, validationResult.direction == OrderDirection::BUY ? "BUY" : "SELL", orderId
-    );
+    const auto agentIdCanon = std::holds_alternative<LocalAgentId>(agentId)
+        ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId))
+        : std::get<AgentId>(agentId);
+    const auto bookIdCanon = m_exchange->simulation()->bookIdCanon(bookId);
+    const auto sideStr = validationResult.direction == OrderDirection::BUY ? "BUY" : "SELL";
+    const auto amountCcyStr = validationResult.direction == OrderDirection::BUY ? "QUOTE" : "BASE";
+
+    m_exchange->simulation()->logDebug(
+        "{} | AGENT #{} BOOK {} : MAKING RESERVATION {} {} WITH LEV {} FOR {} ORDER #{}",
+        m_exchange->simulation()->currentTimestamp(), agentIdCanon, bookIdCanon,
+        validationResult.amount, amountCcyStr, validationResult.leverage, sideStr, orderId);
     auto reserved = balances.makeReservation(orderId, price > 0_dec ? price : curPrice,
         m_exchange->books()[bookId]->bestBid(), m_exchange->books()[bookId]->bestAsk(),
         validationResult.amount, validationResult.leverage, validationResult.direction, m_exchange->simulation()->bookIdCanon(bookId));
 
     m_exchange->simulation()->logDebug(
-        "{} | AGENT #{} BOOK {} : RESERVATION OF {} BASE + {} QUOTE (={} {}) CREATED FOR {} ORDER #{} ({}x{}@{}) | BEST {} : {} | MAX LEV : {}", 
-        m_exchange->simulation()->currentTimestamp(), std::holds_alternative<LocalAgentId>(agentId) ? m_exchange->accounts().lookupLocalAgentId(std::get<LocalAgentId>(agentId)) : std::get<AgentId>(agentId), m_exchange->simulation()->bookIdCanon(bookId),
-        reserved.base, reserved.quote, validationResult.amount, validationResult.direction == OrderDirection::BUY ? "QUOTE" : "BASE",
-        validationResult.direction == OrderDirection::BUY ? "BUY" : "SELL", orderId, 
-        1_dec + validationResult.leverage, quantity, price > 0_dec ? fmt::format("{}", price) : "MARKET",
-        validationResult.direction == OrderDirection::BUY ? "ASK" : "BID", curPrice, m_exchange->getMaxLeverage()
-    );    
+        "{} | AGENT #{} BOOK {} : RESERVATION OF {} BASE + {} QUOTE (={} {}) CREATED FOR"
+        " {} ORDER #{} ({}x{}@{}) | BEST {} : {} | MAX LEV : {}",
+        m_exchange->simulation()->currentTimestamp(), agentIdCanon, bookIdCanon,
+        reserved.base, reserved.quote, validationResult.amount, amountCcyStr,
+        sideStr, orderId,
+        1_dec + validationResult.leverage, quantity,
+        price > 0_dec ? fmt::format("{}", price) : "MARKET",
+        validationResult.direction == OrderDirection::BUY ? "ASK" : "BID",
+        curPrice, m_exchange->getMaxLeverage());
 
     return {
         .ec = OrderErrorCode::VALID,
@@ -303,31 +314,35 @@ void ClearingManager::handleCancelOrder(const CancelOrderDesc& cancelDesc)
 
     if (balances.quote->getReserved() < 0_dec) {
         throw std::runtime_error(fmt::format(
-            "{} | AGENT #{} BOOK {} | {}: Reserved quote balance {} < 0 after cancelling order #{}", 
+            "{} | AGENT #{} BOOK {} | handleCancelOrder:"
+            " Reserved quote balance {} < 0 after cancelling order #{}",
             m_exchange->simulation()->currentTimestamp(),
             agentId,
-            m_exchange->simulation()->bookIdCanon(bookId), std::source_location::current().function_name(),
-            balances.quote->getReserved(), agentId, orderId));
+            m_exchange->simulation()->bookIdCanon(bookId),
+            balances.quote->getReserved(), orderId));
     }
-    if (account.activeOrders()[bookId].empty()) {
-
-        if (balances.quote->getReserved() > 0_dec){
-            for (const auto& res : balances.quote->getReservations()){
-                fmt::println("handleCancelOrder | Releasing Quote residual reservation {} with no corresponding active order #{} in book #{}", 
-                    res.second, res.first, m_exchange->simulation()->bookIdCanon(bookId));
-                // balances.releaseReservation(res.first, m_exchange->simulation()->bookIdCanon(bookId));
-            }
-        }
-
-        if (balances.base.getReserved() > 0_dec){
-            for (const auto& res : balances.base.getReservations()){
-                fmt::println("handleCancelOrder | Releasing Base residual reservation {} with no corresponding active order #{} in book #{}", 
-                    res.second, res.first, m_exchange->simulation()->bookIdCanon(bookId));
-                // balances.releaseReservation(res.first, m_exchange->simulation()->bookIdCanon(bookId));
-            }
+    // Residual-reservation diagnostic (debug-gated). The quote balance may be shared
+    // across the agent's books (multi-asset portfolio), so it is genuinely idle only when
+    // the agent has NO active orders in ANY of its books — a per-book check would flag the
+    // reserved amount that legitimately backs sibling-book orders. Base is always per-book.
+    const auto bookIdCanon = m_exchange->simulation()->bookIdCanon(bookId);
+    const bool quoteIdle = m_exchange->sharedQuoteBalances()
+        ? ranges::all_of(account.activeOrders(), [](const auto& orders) { return orders.empty(); })
+        : account.activeOrders()[bookId].empty();
+    if (quoteIdle && balances.quote->getReserved() > 0_dec) {
+        for (const auto& [resOrderId, resAmount] : balances.quote->getReservations()) {
+            m_exchange->simulation()->logDebug(
+                "handleCancelOrder | residual quote reservation {} for order #{}, no active orders in book #{}",
+                resAmount, resOrderId, bookIdCanon);
         }
     }
-
+    if (account.activeOrders()[bookId].empty() && balances.base.getReserved() > 0_dec) {
+        for (const auto& [resOrderId, resAmount] : balances.base.getReservations()) {
+            m_exchange->simulation()->logDebug(
+                "handleCancelOrder | residual base reservation {} for order #{}, no active orders in book #{}",
+                resAmount, resOrderId, bookIdCanon);
+        }
+    }
 }
 
 //-------------------------------------------------------------------------

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <optional>
 
 //-------------------------------------------------------------------------
@@ -53,11 +54,11 @@ void dumpJson(
 
 void serializeHelper(
     rapidjson::Document& json,
-    const std::string& key,
-    std::function<void(rapidjson::Document&)> serializer);
+    std::string_view key,
+    std::invocable<rapidjson::Document&> auto serializer);
 
 template<typename T>
-void setOptionalMember(rapidjson::Document& json, const std::string& key, std::optional<T> opt);
+void setOptionalMember(rapidjson::Document& json, std::string_view key, std::optional<T> opt);
 
 //-------------------------------------------------------------------------
 
@@ -68,20 +69,14 @@ rapidjson::Value packedDecimal2json(const auto& val, auto& allocator)
         arrJson.PushBack(
             [&] {
                 uint64_t left{};
-                std::memcpy(
-                    reinterpret_cast<uint8_t*>(&left),
-                    packed.data,
-                    sizeof(uint64_t));
+                std::memcpy(&left, packed.data, sizeof(left));
                 return left;
             }(),
             allocator);
         arrJson.PushBack(
             [&] {
                 uint64_t right{};
-                std::memcpy(
-                    reinterpret_cast<uint8_t*>(&right),
-                    packed.data + sizeof(uint64_t),
-                    sizeof(uint64_t));
+                std::memcpy(&right, packed.data + sizeof(right), sizeof(right));
                 return right;
             }(),
             allocator);
@@ -104,12 +99,12 @@ rapidjson::Value packedDecimal2json(const auto& val, auto& allocator)
 //-------------------------------------------------------------------------
 
 template<typename T>
-void setOptionalMember(rapidjson::Document& json, const std::string& key, std::optional<T> opt)
+void setOptionalMember(rapidjson::Document& json, std::string_view key, std::optional<T> opt)
 {
     auto& allocator = json.GetAllocator();
 
     json.AddMember(
-        rapidjson::Value{key.c_str(), allocator},
+        rapidjson::Value{key.data(), allocator},
         [&] {
             if (!opt.has_value()) {
                 return std::move(rapidjson::Value{}.SetNull());
@@ -127,11 +122,26 @@ void setOptionalMember(rapidjson::Document& json, const std::string& key, std::o
             }
             else if constexpr (std::same_as<T, PackedDecimal>) {
                 return std::move(packedDecimal2json(*opt, allocator));
-            } else {
+            }
+            else {
                 static_assert(false, "No conversion from T to rapidjson::Value exists");
             }
         }(),
         allocator);
+}
+
+//-------------------------------------------------------------------------
+
+void serializeHelper(
+    rapidjson::Document& json,
+    std::string_view key,
+    std::invocable<rapidjson::Document&> auto serializer)
+{
+    if (key.empty()) return serializer(json);
+    auto& allocator = json.GetAllocator();
+    rapidjson::Document subJson{&allocator};
+    serializer(subJson);
+    json.AddMember(rapidjson::Value{key.data(), allocator}, subJson, allocator);
 }
 
 //-------------------------------------------------------------------------

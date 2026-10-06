@@ -41,7 +41,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
     Attributes:
         version (int | None): Number indicating the version of the taos package which the validator sending the state update is running.
         timestamp (int): Simulation timestamp at which the state was recorded.
-        config (MarketSimulationConfig | str | None): Details of the simulation configuration run by the sending validator.
+        config (MultiAssetSimulationConfig | MarketSimulationConfig | str | None): Details of the simulation configuration run by the sending validator.
         books (dict[int, Book] | None): Mapping from orderbook IDs to Book objects containing state information.
         accounts (dict[int, dict[int, Account]] | None): Mapping from agent IDs to dictionaries associating orderbook IDs with agent account states.
         notices (dict[int, list[SimulationStartEvent | LimitOrderPlacementEvent | MarketOrderPlacementEvent | OrderCancellationsEvent | ClosePositionsEvent | TradeEvent | ResetAgentsEvent | SimulationEndEvent]] | None):
@@ -52,7 +52,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
     """
     version : int | None = None
     timestamp : int
-    config : MarketSimulationConfig | str | None = None
+    config : MultiAssetSimulationConfig | MarketSimulationConfig | str | None = None
     books : dict[int,Book] | None = None
     accounts : dict[int,dict[int, Account]] | None = None
     notices : dict[int, list[FinanceNotice]] | None = None

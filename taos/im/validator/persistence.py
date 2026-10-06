@@ -127,7 +127,7 @@ def _snap_hist2(h):
     return {k: dict(tsd) for k, tsd in (h or {}).items()}
 
 
-_DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist",
+_DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist",
                  "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist")
 _DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist")
 
@@ -142,6 +142,7 @@ def build_debeta_state(self) -> dict:
     spelled their own block, and the child's had none of these keys: every restart with the shadow on
     started the 24-hour making window from zero. Duck-typed: `self` is the Validator or the ShadowState."""
     out = {name: _snap_hist3(getattr(self, name, {})) for name in _DEBETA_HIST3}
+    out["debeta_cpc_hist"] = {int(c): _snap_hist3(h) for c, h in (getattr(self, "debeta_cpc_hist", {}) or {}).items()}
     out.update({name: _snap_hist2(getattr(self, name, {})) for name in _DEBETA_HIST2})
     out["debeta_inv"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv', {}) or {}).items()}
     out["debeta_plast"] = dict(getattr(self, 'debeta_plast', {}) or {})
@@ -595,6 +596,18 @@ _SAVE_STREAM_DEPTH = 2
 _SAVE_EVERY_INTERVALS = max(1, int(os.environ.get("SAVE_EVERY_INTERVALS", "2")))
 
 
+def _snapshot(obj):
+    """A container-only copy of `obj`: every dict, list or tuple is copied in one C-level step (no GIL switch
+    inside), so a worker thread packs a consistent document while the event loop keeps writing the live one.
+    Scalars are shared. Packs to the same bytes as the original would, since msgpack writes a tuple as an array
+    and a dict subclass as a map."""
+    if isinstance(obj, dict):
+        return {k: _snapshot(v) for k, v in dict(obj).items()}
+    if isinstance(obj, (list, tuple)):
+        return [_snapshot(v) for v in list(obj)]
+    return obj
+
+
 def _stream_pack(packer, write, obj, depth):
     """Write msgpack bytes for `obj` via `write(bytes)`, BYTE-IDENTICAL to
     packer.pack(obj) / msgpack.packb(obj, use_bin_type=True).
@@ -610,22 +623,26 @@ def _stream_pack(packer, write, obj, depth):
     """
     total = 0
     if depth > 0 and isinstance(obj, dict):
-        chunk = packer.pack_map_header(len(obj))
+        # dict(obj) copies in one C-level step: the event loop may be writing the live dict while a worker
+        # thread packs the report, and an iteration over the live object would raise or miscount the header.
+        items = list(dict(obj).items())
+        chunk = packer.pack_map_header(len(items))
         write(chunk)
         total += len(chunk)
-        for k, v in obj.items():
+        for k, v in items:
             chunk = packer.pack(k)
             write(chunk)
             total += len(chunk)
             total += _stream_pack(packer, write, v, depth - 1)
     elif depth > 0 and isinstance(obj, (list, tuple)):
-        chunk = packer.pack_array_header(len(obj))
+        seq = list(obj)
+        chunk = packer.pack_array_header(len(seq))
         write(chunk)
         total += len(chunk)
-        for item in obj:
-            total += _stream_pack(packer, write, item, depth - 1)
+        for v in seq:
+            total += _stream_pack(packer, write, v, depth - 1)
     else:
-        chunk = packer.pack(obj)
+        chunk = packer.pack(_snapshot(obj))
         write(chunk)
         total += len(chunk)
     return total
@@ -1281,9 +1298,13 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
 
     self.debeta_capbuy_hist = _load_hist3("debeta_capbuy_hist")
     self.debeta_capsell_hist = _load_hist3("debeta_capsell_hist")
+    # realized spread (2 Oct 2026); absent from a snapshot written before it, so it warms from empty
+    self.debeta_realbuy_hist = _load_hist3("debeta_realbuy_hist")
+    self.debeta_realsell_hist = _load_hist3("debeta_realsell_hist")
     self.debeta_mtm_hist = _load_hist3("debeta_mtm_hist")
     self.debeta_invsum_hist = _load_hist3("debeta_invsum_hist")
     self.debeta_cp_hist = _load_hist3("debeta_cp_hist")
+    self.debeta_cpc_hist, self.debeta_cpc = load_class_counterparty_rows(validator_state)
     # 0.6.2 skill-leg histories; absent from a snapshot written before them, so they warm from empty.
     self.debeta_heldn_hist = _load_hist3("debeta_heldn_hist")
     self.debeta_heldinv_hist = _load_hist3("debeta_heldinv_hist")
@@ -1294,6 +1315,8 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     # rebuild running sums from the histories
     self.capture_buy_sums = _dd2(sum_hist_2level(self.debeta_capbuy_hist))
     self.capture_sell_sums = _dd2(sum_hist_2level(self.debeta_capsell_hist))
+    self.realized_buy_sums = _dd2(sum_hist_2level(self.debeta_realbuy_hist))
+    self.realized_sell_sums = _dd2(sum_hist_2level(self.debeta_realsell_hist))
     self.debeta_mtm = _dd2(sum_hist_2level(self.debeta_mtm_hist))
     self.debeta_invsum = _dd2(sum_hist_2level(self.debeta_invsum_hist))
     self.debeta_heldn = _dd2(sum_hist_2level(self.debeta_heldn_hist))
@@ -1899,3 +1922,18 @@ def load_state(self: Validator) -> None:
         self.fundamental_price = {bookId: None for bookId in self.engine.book_ids}
 
     _load_validator_state(self)
+
+
+def load_class_counterparty_rows(validator_state) -> tuple:
+    """The per-class counterparty histories from a state file and their running rows: ``(hist, rows)``, both
+    keyed by class index; empty on a snapshot written before them or on a single market."""
+    hist = {}
+    for c, d1 in (validator_state.get("debeta_cpc_hist") or {}).items():
+        hist[int(c)] = {int(k1): {int(k2): {int(ts): float(v) for ts, v in (tsd or {}).items()}
+                              for k2, tsd in (d2 or {}).items()}
+                      for k1, d2 in (d1 or {}).items()}
+    rows = {c: sum_hist_2level(h) for c, h in hist.items()}
+    return hist, rows
+
+
+debeta_hist_snapshot = build_debeta_state

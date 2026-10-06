@@ -8,8 +8,9 @@ field. Two dials were added on 22 September and both had to be wired by hand, wh
 guards.
 
 Scope is deliberately what the SCORER reads off `config.scoring.debeta`, not every declared
-argument: `publish_book_gauges` is read only by the reporter, and `weight` travels to the child
-inside the shipped scoring_config dict rather than the duck. If this test starts failing on a name
+argument: `publish_book_gauges` is read only by the reporter. `weight` is included: the fallback that
+carries the previous de-beta map through a warming or failed cycle reads it off the de-beta namespace,
+so a duck without it made that fallback a no-op in the scoring child. If this test starts failing on a name
 that is genuinely carried elsewhere, add it to the exclusion with the reason, do not widen the
 regex.
 """
@@ -23,10 +24,9 @@ def _dials_the_scorer_reads():
     tracks the code rather than a list someone remembers to update."""
     src = open("taos/im/validator/reward.py", encoding="utf-8").read()
     names = set(re.findall(r"getattr\(dcfg,\s*'([a-z0-9_]+)'", src))
-    # `dcfg` names two objects in that file. These two reads are off the SCORING config, not the
-    # de-beta one, so they are not duck fields: 'debeta' is the de-beta namespace itself, and
-    # 'weight' reaches the child inside the shipped scoring_config dict.
-    return names - {"debeta", "weight"}
+    # `dcfg` names two objects in that file; 'debeta' is read off the scoring config to reach the de-beta
+    # namespace itself, so it is not a duck field.
+    return names - {"debeta"}
 
 
 class _NS:

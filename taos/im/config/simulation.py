@@ -44,7 +44,7 @@ def add_simulation_args(cls, parser):
         "--simulation.xml_config",
         type=str,
         help="Path to XML file containing simulation configuration.",
-        default="../../../simulate/trading/run/config/simulation_0.xml",
+        default="../../../simulate/trading/run/config/multiasset_simulation_0.xml",
     )
 
     parser.add_argument(

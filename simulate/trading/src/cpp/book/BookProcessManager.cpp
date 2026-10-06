@@ -86,8 +86,8 @@ std::unique_ptr<BookProcessManager> BookProcessManager::fromXML(
 
     const uint32_t bookCount = node.attribute("instanceCount").as_uint(1);
     const std::pair bookIdCanonRange{
-        simulation->blockIdx() * bookCount,
-        simulation->blockIdx() * bookCount + bookCount - 1
+        simulation->bookIdCanon(0),
+        simulation->bookIdCanon(bookCount - 1)
     };
 
     auto processFactory =
@@ -113,7 +113,7 @@ std::unique_ptr<BookProcessManager> BookProcessManager::fromXML(
         }();
         for (BookId bookId = 0; bookId < bookCount; ++bookId) {
             auto process = processFactory->createFromXML(
-                processNode, simulation->blockIdx() * bookCount + bookId);
+                processNode, simulation->bookIdCanon(bookId));
             if (replayCsv) {
                 const auto values = (*replayCsv).GetColumn<double>(
                     std::to_string(simulation->bookIdCanon(bookId)));

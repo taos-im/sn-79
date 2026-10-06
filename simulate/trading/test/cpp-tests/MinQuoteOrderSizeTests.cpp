@@ -53,6 +53,7 @@
 using namespace taosim;
 using namespace taosim::accounting;
 using namespace taosim::book;
+using namespace taosim::matching;
 using namespace taosim::literals;
 
 using namespace testing;

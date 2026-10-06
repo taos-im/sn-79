@@ -63,6 +63,7 @@ Simulation::Simulation(
     : IMessageable{this, "SIMULATION"},
       m_blockIdx{blockIdx},
       m_blockDim{blockDim},
+      m_bookIdBase{blockIdx * blockDim},
       m_baseLogDir{baseLogDir},
       m_localAgentManager{std::make_unique<LocalAgentManager>(this)},
       m_replayMode{replayMode},
@@ -324,7 +325,7 @@ void Simulation::configureAgents(pugi::xml_node node)
                             taosim::matching::TieredFeePolicy::fromXML(feePolicyNode, this);
                         logDebug("TIERED FEE POLICY - {}", agentBaseName);
                         int c = 0;
-                        if (auto* tiered = dynamic_cast<TieredFeePolicy*>((*feePolicy)[agentBaseName].get())) {
+                        if (auto* tiered = dynamic_cast<taosim::matching::TieredFeePolicy*>((*feePolicy)[agentBaseName].get())) {
                             for (auto& tier : tiered->tiers()) {
                                 logDebug("TIER {} : VOL >= {} | MAKER {} TAKER {}", c, 
                                     tier.volumeRequired, 
@@ -335,8 +336,8 @@ void Simulation::configureAgents(pugi::xml_node node)
                         }
                     } else {
                         if (feePolicy->isTiered()) {
-                            if (auto* tiered = dynamic_cast<TieredFeePolicy*>(feePolicy->defaultPolicy())) {
-                                (*feePolicy)[agentBaseName] = std::make_unique<TieredFeePolicy>(*tiered);
+                            if (auto* tiered = dynamic_cast<taosim::matching::TieredFeePolicy*>(feePolicy->defaultPolicy())) {
+                                (*feePolicy)[agentBaseName] = std::make_unique<taosim::matching::TieredFeePolicy>(*tiered);
                                 logDebug("DEFAULT TIERED FEE POLICY - {}", agentBaseName);
                             } else {
                                 throw std::runtime_error("Default policy is not TieredFeePolicy as expected");
@@ -347,9 +348,11 @@ void Simulation::configureAgents(pugi::xml_node node)
             }();
         });
 
-    static constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kSpecialAgents{{
-        {"EXCHANGE", "MultiBookExchangeAgent"},
-        {"DISTRIBUTED_PROXY_AGENT", "DistributedProxyAgent"}
+    // Only the exchange is mandatory. A DistributedProxyAgent is required exactly when
+    // remote play is configured (state publishing / messagepack / exchange service); a
+    // background-only simulation legitimately runs without one, and m_proxy stays null.
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kSpecialAgents{{
+        {"EXCHANGE", "MultiBookExchangeAgent"}
     }};
     for (const auto& [name, nodeName] : kSpecialAgents) {
         auto it = ranges::find_if(

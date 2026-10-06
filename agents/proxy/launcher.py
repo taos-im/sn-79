@@ -105,6 +105,8 @@ async def main(config_path: str, train: bool, sim_xml_override: str | None):
     if os.sep in taosim_bin:
         taosim_bin = str(_resolve(repo_root, taosim_bin))
     sim_delay = cfg.get("taosim", {}).get("delay", 5)
+    # Extra simulator argv (e.g. ["-d", "<log dir>"]), passed through verbatim.
+    taosim_args = [str(a) for a in cfg.get("taosim", {}).get("args", [])]
 
     endpoint = os.environ.get("GENTRX_CHAIN_ENDPOINT_OVERRIDE", "http://localhost:9000")
     access = os.environ.get("GENTRX_ACCESS_KEY", "minioadmin")
@@ -136,7 +138,7 @@ async def main(config_path: str, train: bool, sim_xml_override: str | None):
 
     async def _delayed_sim():
         await asyncio.sleep(sim_delay)
-        await _spawn("TAOSIM", [taosim_bin, "-f", sim_xml])
+        await _spawn("TAOSIM", [taosim_bin, "-f", sim_xml] + taosim_args)
     tasks.append(_delayed_sim())
 
     if train:

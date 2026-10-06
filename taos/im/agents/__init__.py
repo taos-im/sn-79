@@ -584,6 +584,47 @@ class FinanceAgentBase(SimulationAgent):
     # concrete event subclass, so the element type is intentionally untyped.
     events: list
 
+    # ── asset classes: how an agent tells the books of one update apart ─────────────────────────────
+    # A layout may carry several asset classes (a multi-asset simulation runs one background per class,
+    # each as one or more realizations); each class quotes on its own price and volume grid. These read
+    # the layout from the configuration that arrived with the state. A single market is one class, so
+    # the same lines run there.
+
+    def asset_classes(self):
+        """The classes of the current layout: name, book ids, grids and the governing configuration."""
+        return self.simulation_config.asset_classes()
+
+    def class_of(self, book_id) -> str:
+        """The name of the asset class a book belongs to."""
+        for cls in self.asset_classes():
+            if int(book_id) in cls.books:
+                return cls.name
+        raise KeyError(f"book id {book_id} belongs to no asset class of this layout")
+
+    def config_for(self, book_id):
+        """The market configuration governing a book (its grids, agents, limits)."""
+        return self.simulation_config.config_for_book(int(book_id))
+
+    def price_decimals(self, book_id) -> int:
+        """The price grid of a book."""
+        return int(self.config_for(book_id).priceDecimals)
+
+    def volume_decimals(self, book_id) -> int:
+        """The volume grid of a book."""
+        return int(self.config_for(book_id).volumeDecimals)
+
+    def min_order_size(self, book_id) -> float:
+        """The smallest order the engine accepts on a book, from its asset class's own configuration."""
+        return float(getattr(self.config_for(book_id), 'min_order_size', 0.0) or 0.0)
+
+    def round_price(self, book_id, price : float) -> float:
+        """A price rounded to the book's own grid."""
+        return round(float(price), self.price_decimals(book_id))
+
+    def round_volume(self, book_id, volume : float) -> float:
+        """A volume rounded to the book's own grid."""
+        return round(float(volume), self.volume_decimals(book_id))
+
     def __init__(self, uid : int, config : object, log_dir : str | None = None) -> None:
         """
         Initializer method that sets up the agent's unique ID and configuration, and initializes common objects for storing agent data.
@@ -744,7 +785,13 @@ class FinanceAgentBase(SimulationAgent):
         Method to handle a new event notification.
         """
         notification.acknowledged = True
-        if notification.event.type == 'EVENT_SIMULATION_END':
+        # BOTH SPELLINGS, like the state-update dispatch in handle().
+        #
+        # FinanceEvent.from_json ABBREVIATES the engine's type: an EVENT_SIMULATION_END message
+        # arrives here as an event whose `y` -- and therefore whose `type` property -- is 'ESE'.
+        # Matching the long form alone would never fire. The axon handler must also be registered
+        # under the synapse class the validator actually sends, or nothing reaches this line at all.
+        if notification.event.type in ('EVENT_SIMULATION_END', 'ESE'):
             self.onEnd(notification.event)
         return notification
     
@@ -1032,6 +1079,16 @@ class FinanceAgentBase(SimulationAgent):
         self.event_history[state.dendrite.hotkey].append(state)
         
         simulation_ended = False
+        # THE END EVENT ITSELF, not whatever the loops leave bound.
+        #
+        # `simulation_ended` is set inside the notice loop and acted on eighty lines below, where the
+        # call was `self.onEnd(event)` -- `event` being the loop variable, which Python leaks. Two
+        # loops iterate `self.events`, and the second rebinds `event` on EVERY iteration before its
+        # own `if hasattr(...)` runs, so by the time onEnd is called it holds the LAST notice in the
+        # list. That is never the end event: NoticePack packs a notice's `t` as its occurrence, and
+        # the end event is dispatched at the simulation's start with a delay of duration-1, so it
+        # carries the earliest timestamp of any notice and sorts to the front.
+        end_event = None
         update_text = ''
         update_text += "\n" + '-' * 50 + "\n"
         update_text += f'VALIDATOR : {state.dendrite.hotkey} | SIMULATION TIME : {duration_from_timestamp(state.timestamp)} (T={state.timestamp})' + "\n"
@@ -1060,12 +1117,13 @@ class FinanceAgentBase(SimulationAgent):
                             global_events = True
                         update_text += f"{event}" + "\n"
                         simulation_ended = True
+                        end_event = event
                     case _:
                         pass
             if global_events:                
                 update_text += '-' * 50 + "\n"
         debug_text = update_text
-        for book_id in range(self.simulation_config.book_count):
+        for book_id in self.simulation_config.book_ids:
             debug_text += f"BOOK {book_id}" + "\n"            
             debug_text += '-' * 50 + "\n"
             debug_text += 'EVENTS' + "\n"
@@ -1137,9 +1195,8 @@ class FinanceAgentBase(SimulationAgent):
                     debug_text += '-' * 50 + "\n"
                 debug_text += '-' * 50 + "\n"
         if simulation_ended:
-            update_text += f"{event}" + "\n"
             update_text += '-' * 50 + "\n"
-            self.onEnd(event)
+            self.onEnd(end_event)
         bt.logging.debug("." + debug_text)
         if bt.logging.current_state_value == 'Info':
             bt.logging.info("." + update_text)

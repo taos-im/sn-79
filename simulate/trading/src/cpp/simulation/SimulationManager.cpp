@@ -4,6 +4,7 @@
  */
 #include <taosim/checkpoint/CheckpointError.hpp>
 #include <taosim/checkpoint/helpers.hpp>
+#include <taosim/checkpoint/serialization/helpers.hpp>
 #include <taosim/filesystem/TempPath.hpp>
 #include <taosim/filesystem/utils.hpp>
 #include <taosim/message/MultiBookMessagePayloads.hpp>
@@ -73,6 +74,23 @@ bool stopRequested() noexcept
 
 //-------------------------------------------------------------------------
 
+
+//-------------------------------------------------------------------------
+// Single entry point of the SimulationOrchestrator interface; dispatches to the
+// concrete run based on how this manager was built.
+
+void SimulationManager::run()
+{
+    if (m_replayMode) {
+        if (m_replayManager->desc().bookId) {
+            runReplay();
+        } else {
+            runReplayAdvanced();
+        }
+    } else {
+        runSimulations();
+    }
+}
 
 //-------------------------------------------------------------------------
 
@@ -392,7 +410,7 @@ void SimulationManager::publishStateJson()
     const Timestamp now = reprSimu->currentTimestamp();
 
     for (const auto& response : resJson["responses"].GetArray()) {
-        const auto [msg, blockIdx] = decanonize(
+        const auto [msg, blockIdx, unrouted] = decanonize(
             Message::fromJsonResponse(response, now, reprSimu->proxy()->name()),
             m_blockInfo.dimension);
         if (!blockIdx) {
@@ -425,7 +443,10 @@ void SimulationManager::publishStateMessagePack()
     }
 
     taosim::serialization::HumanReadableStream stream{1uz << 27};
-    const serialization::ValidatorRequest req{.mngr = this};
+    const serialization::ValidatorRequest req{
+        .simulations = m_simulations,
+        .logDir = m_logDir
+    };
     msgpack::pack(stream, req);
 
     bipc::shared_memory_object shmReq{
@@ -656,7 +677,7 @@ void SimulationManager::publishStateMessagePack()
     }
 
     for (const auto& response : unpackedResponses) {
-        const auto [msg, blockIdx] = decanonize(response, m_blockInfo.dimension);
+        const auto [msg, blockIdx, unrouted] = decanonize(response, m_blockInfo.dimension);
         if (!blockIdx) {
             for (const auto& simulation : m_simulations) {
                 simulation->queueMessage(msg);
@@ -679,6 +700,17 @@ bool SimulationManager::online() const noexcept
 bool SimulationManager::warmingUp() const noexcept
 {
     return m_simulations.front()->currentTimestamp() < m_gracePeriod;
+}
+
+//-------------------------------------------------------------------------
+
+void SimulationManager::writeCommonCheckpoint(const std::filesystem::path& commonFile) const
+{
+    taosim::serialization::BinaryStream stream;
+    msgpack::packer packer{stream};
+    taosim::checkpoint::serialization::packCommon(packer, this);
+
+    checkpoint::atomicWrite(commonFile, {stream.data(), stream.size()});
 }
 
 //-------------------------------------------------------------------------
@@ -781,15 +813,18 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
     taosim::util::SLTPDebugger::enabled = node.attribute("sltpDebug").as_bool();
 
 
-    mngr->m_stepSignal.connect([&] {
-        for (auto& simulation : mngr->m_simulations) {
+    // Capture the manager by raw pointer, not the local unique_ptr by reference: the
+    // slot outlives this factory, and `mngr` is moved out on return (e.g. up-cast to
+    // unique_ptr<SimulationOrchestrator>), so a '[&]' capture would dangle.
+    mngr->m_stepSignal.connect([m = mngr.get()] {
+        for (auto& simulation : m->m_simulations) {
             simulation->exchange()->L3Record().clear();
         }
     });
 
     if (node.attribute("traceTime").as_bool()) {
-        mngr->m_stepSignal.connect([&] {
-            const auto& reprSimu = mngr->m_simulations.front();
+        mngr->m_stepSignal.connect([m = mngr.get()] {
+            const auto& reprSimu = m->m_simulations.front();
             uint64_t total, seconds, hours, minutes, nanos;
             total = reprSimu->time().current / 1'000'000'000;
             minutes = total / 60;
@@ -797,7 +832,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
             hours = minutes / 60;
             minutes = minutes % 60;
             nanos = reprSimu->time().current % 1'000'000'000;
-            fmt::println("TIME : {:02d}:{:02d}:{:02d}.{:09d}", hours, minutes, seconds, nanos); 
+            fmt::println("TIME : {:02d}:{:02d}:{:02d}.{:09d}", hours, minutes, seconds, nanos);
         });
     }
 
@@ -811,12 +846,15 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
     if (size_t ckptIntervalInSteps = node.attribute("ckptIntervalInSteps").as_ullong()) {
         mngr->m_checkpointManager =
             std::make_unique<checkpoint::CheckpointManager>(checkpoint::CheckpointingDesc{
-                .simuMngr = mngr.get(),
+                .source = mngr.get(),
                 .runDir = mngr->m_logDir,
                 .intervalInSteps = ckptIntervalInSteps,
                 .numLastFilesToKeep = (ptrdiff_t)node.attribute("ckptNumLastFilesToKeep").as_ullong(),
                 .measureWallClockTime = node.attribute("ckptMeasureWallClockTime").as_bool()
             });
+        // The runner owns the step trigger: drive checkpointing off the per-step signal.
+        mngr->m_stepSignal.connect(
+            [cm = mngr->m_checkpointManager.get()] { cm->saveCheckpoint(); });
     }
 
     mngr->m_measureStepWallClockTime = node.attribute("measureStepWallClockTime").as_bool();
@@ -981,8 +1019,8 @@ std::unique_ptr<SimulationManager> SimulationManager::fromReplay(const replay::R
         .as_ullong();
 
     if (node.attribute("traceTime").as_bool()) {
-        mngr->m_stepSignal.connect([&] {
-            const auto& reprSimu = mngr->m_simulations.front();
+        mngr->m_stepSignal.connect([m = mngr.get()] {
+            const auto& reprSimu = m->m_simulations.front();
             uint64_t total, seconds, hours, minutes, nanos;
             total = reprSimu->time().current / 1'000'000'000;
             minutes = total / 60;
@@ -1053,9 +1091,40 @@ rapidjson::Document SimulationManager::makeStateJson() const
                 { "RESPONSE_DISTRIBUTED_RESET_AGENT", 0 },
                 { "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT", 0 }
             };
+            std::set<std::string> lifecycleSeen;
             auto checkGlobalDuplicate = [&](Message::Ptr msg) -> bool {
                 const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                if (payload == nullptr) return false;
+                if (payload == nullptr) {
+                    // A LIFECYCLE NOTICE IS NOT A RESPONSE, AND DROPPING IT HERE BROKE THE ONE PATH
+                    // THAT WAS SUPPOSED TO CARRY IT.
+                    //
+                    // This guard exists so the reset-dedup below can cast safely. It also silently
+                    // removed every notice whose payload is not an agent response -- which is exactly
+                    // EVENT_SIMULATION_START (StartSimulationPayload) and EVENT_SIMULATION_END
+                    // (EmptyPayload). The consequence is that the fan-out further down, which goes to
+                    // the trouble of naming those two payload types and pushing them to EVERY agent,
+                    // could never receive one: it has been unreachable since it was written, and so
+                    // has NoticePack's EVENT_SIMULATION_END branch.
+                    //
+                    // Without this, the published state carries an empty notice list for every
+                    // agent and the end event reaches only the lifecycle HTTP, so an agent cannot be
+                    // told a simulation started or ended by the route every other event takes.
+                    //
+                    // Let exactly the two payload types the fan-out handles
+                    // through -- not everything, because packNotice throws on a payload that is
+                    // neither a response nor one of these two.
+                    const bool lifecycle =
+                        std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
+                        || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
+                    if (!lifecycle) return false;
+                    // ONE PER PUBLISH, NOT ONE PER REALIZATION. Every block's proxy queues its own
+                    // copy of a global event, so a multi-book wrapper would hand each agent one
+                    // identical start and end notice per realization. The agent dispatch calls
+                    // onStart inside its notice loop, so that would be one onStart call per block
+                    // for a single simulation starting. Deduplicated here, by the same counter this function
+                    // already uses for reset notices, which is the thing it is named for.
+                    return lifecycleSeen.emplace(msg->type).second;
+                }
                 auto relevantPayload = [&] {
                     const auto pld = payload->payload;
                     return std::dynamic_pointer_cast<ResetAgentsResponsePayload>(pld) != nullptr

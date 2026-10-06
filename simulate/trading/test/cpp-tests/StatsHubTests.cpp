@@ -18,6 +18,7 @@
 //-------------------------------------------------------------------------
 
 using namespace taosim::literals;
+using taosim::matching::LimitOrderDesc;
 
 namespace fs = std::filesystem;
 

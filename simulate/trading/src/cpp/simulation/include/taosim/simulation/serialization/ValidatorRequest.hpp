@@ -20,12 +20,22 @@
 
 //-------------------------------------------------------------------------
 
+class Simulation;
+
+//-------------------------------------------------------------------------
+
 namespace taosim::simulation::serialization
 {
 
+// A serializable view over a contiguous run of Simulations. Every book id on the wire is
+// canonical and each Simulation knows its own numbering (Simulation::bookIdCanon, from its
+// bookIdBase), so the view carries no arithmetic of its own: the single-config manager
+// passes all of its blocks, the multi-asset request composes one of these per realization
+// (a single-element span), and decanonize() on the way back reads the same bases.
 struct ValidatorRequest
 {
-    SimulationManager* mngr;
+    std::span<const std::unique_ptr<Simulation>> simulations;
+    std::filesystem::path logDir;
 };
 
 }  // taosim::simulation::serialization
@@ -53,9 +63,13 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
         static constexpr auto ctx = std::source_location::current().function_name();
 
-        const auto& representativeSimulation = v.mngr->simulations().front();
-        const auto& blockInfo = v.mngr->blockInfo();
-        const auto bookCount = blockInfo.count * blockInfo.dimension;
+        const auto& representativeSimulation = v.simulations.front();
+        const auto bookCount = static_cast<uint32_t>(ranges::accumulate(
+            v.simulations
+                | views::transform([](const auto& simulation) {
+                    return simulation->exchange()->books().size();
+                }),
+            size_t{}));
         const auto remoteAgentCount = ranges::count_if(
             views::keys(representativeSimulation->exchange()->accounts()),
             [](AgentId agentId) {
@@ -66,7 +80,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
         // Log directory.
         o.pack("logDir"s);
-        o.pack(v.mngr->logDir().string());
+        o.pack(v.logDir.string());
 
         // Timestamp.
         o.pack("timestamp"s);
@@ -79,10 +93,10 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
         // Books.
         o.pack("books"s);
         o.pack_map(bookCount);
-        for (const auto& [blockIdx, simulation] : views::enumerate(v.mngr->simulations())) {
+        for (const auto& simulation : v.simulations) {
             const auto exchange = simulation->exchange();
             for (const auto& book : exchange->books()) {
-                const BookId bookIdCanon = blockIdx * blockInfo.dimension + book->id();
+                const BookId bookIdCanon = simulation->bookIdCanon(book->id());
 
                 o.pack(bookIdCanon);
 
@@ -213,12 +227,12 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
             o.pack_map(bookCount);
 
-            for (const auto& [blockIdx, simulation] : views::enumerate(v.mngr->simulations())) {
+            for (const auto& simulation : v.simulations) {
                 const auto exchange = simulation->exchange();
                 const auto& account = exchange->accounts().at(agentId);
                 const auto feePolicy = exchange->clearingManager().feePolicy();
                 for (const auto& book : exchange->books()) {
-                    const BookId bookIdCanon = blockIdx * blockInfo.dimension + book->id();
+                    const BookId bookIdCanon = simulation->bookIdCanon(book->id());
 
                     o.pack(bookIdCanon);
 
@@ -355,9 +369,40 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 { "RESPONSE_DISTRIBUTED_RESET_AGENT", 0 },
                 { "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT", 0 }
             };
+            std::set<std::string> lifecycleSeen;
             auto checkGlobalDuplicate = [&](Message::Ptr msg) -> bool {
                 const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                if (payload == nullptr) return false;
+                if (payload == nullptr) {
+                    // A LIFECYCLE NOTICE IS NOT A RESPONSE, AND DROPPING IT HERE BROKE THE ONE PATH
+                    // THAT WAS SUPPOSED TO CARRY IT.
+                    //
+                    // This guard exists so the reset-dedup below can cast safely. It also silently
+                    // removed every notice whose payload is not an agent response -- which is exactly
+                    // EVENT_SIMULATION_START (StartSimulationPayload) and EVENT_SIMULATION_END
+                    // (EmptyPayload). The consequence is that the fan-out further down, which goes to
+                    // the trouble of naming those two payload types and pushing them to EVERY agent,
+                    // could never receive one: it has been unreachable since it was written, and so
+                    // has NoticePack's EVENT_SIMULATION_END branch.
+                    //
+                    // Without this, the published state carries an empty notice list for every
+                    // agent and the end event reaches only the lifecycle HTTP, so an agent cannot be
+                    // told a simulation started or ended by the route every other event takes.
+                    //
+                    // Let exactly the two payload types the fan-out handles
+                    // through -- not everything, because packNotice throws on a payload that is
+                    // neither a response nor one of these two.
+                    const bool lifecycle =
+                        std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
+                        || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
+                    if (!lifecycle) return false;
+                    // ONE PER PUBLISH, NOT ONE PER REALIZATION. Every block's proxy queues its own
+                    // copy of a global event, so a multi-book wrapper would hand each agent one
+                    // identical start and end notice per realization. The agent dispatch calls
+                    // onStart inside its notice loop, so that would be one onStart call per block
+                    // for a single simulation starting. Deduplicated here, by the same counter this function
+                    // already uses for reset notices, which is the thing it is named for.
+                    return lifecycleSeen.emplace(msg->type).second;
+                }
                 auto relevantPayload = [&] {
                     const auto pld = payload->payload;
                     return std::dynamic_pointer_cast<ResetAgentsResponsePayload>(pld) != nullptr
@@ -371,8 +416,14 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 return true;
             };
             std::vector<NoticeWithOffset> res;
-            for (const auto& [blockIdx, simulation] : views::enumerate(v.mngr->simulations())) {
-                const BookId bookIdOffset = blockIdx * blockInfo.dimension;
+            for (const auto& simulation : v.simulations) {
+                // The notice's source realization offsets its local book ids by its
+                // canonical base at pack time (NoticePack.hpp), so the buffered payload
+                // objects are never mutated.
+                const BookId bookIdOffset = simulation->bookIdBase();
+                // A background without a DistributedProxyAgent is a purely-local
+                // constituent: it publishes books/accounts but produces no notices.
+                if (simulation->proxy() == nullptr) continue;
                 for (const auto& msg : simulation->proxy()->messages()) {
                     if (!checkGlobalDuplicate(msg)) continue;
                     res.push_back({msg, bookIdOffset});
@@ -381,11 +432,24 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
             }
             return res;
         }();
+        // SORT ON WHAT THE AGENT IS TOLD, which for a scheduled lifecycle notice is its arrival
+        // rather than the moment it was queued. See NoticePack.hpp: the end event is queued at the
+        // simulation's start and arrives at its end, so ordering by occurrence put it first in the
+        // final update's notice list. Ordinary notices are unaffected -- their occurrence and arrival
+        // are the same timestamp -- so this only moves the two lifecycle events to where they belong.
+        auto effectiveTimestamp = [](const Message::Ptr& msg) {
+            const bool lifecycle =
+                std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
+                || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
+            return lifecycle ? msg->arrival : msg->occurrence;
+        };
         ranges::sort(
             collectiveRemoteResponses,
-            [](auto&& lhs, auto&& rhs) {
-                if (lhs.msg->occurrence != rhs.msg->occurrence) {
-                    return lhs.msg->occurrence < rhs.msg->occurrence;
+            [&](auto&& lhs, auto&& rhs) {
+                const auto lt = effectiveTimestamp(lhs.msg);
+                const auto rt = effectiveTimestamp(rhs.msg);
+                if (lt != rt) {
+                    return lt < rt;
                 }
                 return lhs.msg->arrival - lhs.msg->occurrence
                     > rhs.msg->arrival - rhs.msg->occurrence;
@@ -416,7 +480,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
             // Body lives in NoticePack.hpp so the exchange mechanism serializes notices with the very
             // same code. See that header for why.
             taosim::simulation::serialization::packNotice(
-                o, notice.msg, v.mngr->logDir().string(), std::string{ctx}, notice.bookIdOffset);
+                o, notice.msg, v.logDir.string(), std::string{ctx}, notice.bookIdOffset);
         };
 
         o.pack_map(remoteAgentCount);

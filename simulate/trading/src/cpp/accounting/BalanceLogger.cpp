@@ -16,7 +16,7 @@ namespace taosim::accounting
 
 BalanceLogger::BalanceLogger(
     const fs::path& filepath,
-    decltype(ExchangeSignals::L3)& signal,
+    decltype(matching::ExchangeSignals::L3)& signal,
     AccountRegistry* registry) noexcept
     : m_filepath{filepath}, m_registry{registry}
 {

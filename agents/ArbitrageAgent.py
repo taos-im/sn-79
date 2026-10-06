@@ -117,15 +117,16 @@ class ArbitrageAgent(GenTRXAgent):
         if self.resp_delay > 0.0:
             time.sleep(self.resp_delay)   # inflate response time (latency study only)
         cfg = self.simulation_config
-        price_dec = int(getattr(cfg, "priceDecimals", 8))
-        vol_dec = int(getattr(cfg, "volumeDecimals", 8))
         min_size = float(getattr(cfg, "min_order_size", 0.0) or 0.0)
-        min_qty = max(min_size, 10 ** -vol_dec)
         takes = 0
 
         for book_id, book in (state.books or {}).items():
             if takes >= self.max_books_per_round or book_id not in self.accounts:
                 continue
+            # the book's own grids: under a multi-asset layout each asset class quotes to its own decimals
+            price_dec = self.price_decimals(book_id)
+            vol_dec = self.volume_decimals(book_id)
+            min_qty = max(self.min_order_size(book_id), 10 ** -vol_dec)   # the book's own floor
             bidp, bidq = self._top(getattr(book, "bids", []) or [])
             askp, askq = self._top(getattr(book, "asks", []) or [])
             if not bidp or not askp or bidp <= 0 or askp <= 0:

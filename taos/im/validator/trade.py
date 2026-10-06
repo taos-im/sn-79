@@ -543,7 +543,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     _debeta_on = True
     if _debeta_on:
         # Running SUMS (what the score reads).
-        for _name in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum',
+        for _name in ('capture_buy_sums', 'capture_sell_sums', 'realized_buy_sums', 'realized_sell_sums', 'debeta_mtm', 'debeta_invsum',
                       'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional'):
             if not hasattr(self, _name):
                 setattr(self, _name, defaultdict(lambda: defaultdict(float)))
@@ -563,11 +563,15 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         _debeta_cfg = getattr(self.config.scoring, 'debeta', None)
         _mark_mode = str(getattr(_debeta_cfg, 'mark_mode', 'last') or 'last')
         _mark_window = int(getattr(_debeta_cfg, 'mark_window', 0) or 0)
+        # realized spread (2 Oct 2026): the horizon a fill is marked at, sim seconds; accumulated at every making_basis
+        _realized_ns = int(float(getattr(_debeta_cfg, 'making_horizon_s', 20.0) or 20.0) * 1e9)
         if not hasattr(self, 'debeta_cp'):
             self.debeta_cp = {}  # {maker_uid: {taker_uid: vol}} for P11 (running sum)
+            self.debeta_cpc = {}  # {class: {maker_uid: {taker_uid: vol}}}: the same rows per asset class
+            self.debeta_cpc_hist = {}  # {class: {maker_uid: {taker_uid: {ts: vol}}}}
         # Timestamped HISTORIES ({...:{sampled_ts: incr}}) so every sum can be live-pruned + shifted at a
         # sim boundary exactly like trade_volumes. Invariant: running == sum(history within window).
-        for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist',
+        for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist',
                       'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist',
                       'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
             if not hasattr(self, _name):
@@ -594,6 +598,9 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, CAPTURE_W,
                     buy_hist=self.debeta_capbuy_hist, sell_hist=self.debeta_capsell_hist,
                     ts=sampled_timestamp, mid_state=self.debeta_capture_mid,
+                    real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
+                    real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
+                    horizon_ns=_realized_ns,
                 )
                 accumulate_book_mtm(
                     self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
@@ -608,9 +615,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
                     notional_hist=self.debeta_notional_hist,
                 )
-                accumulate_counterparties(
-                    self.debeta_cp, bookId, de_trades, cp_hist=self.debeta_cp_hist, ts=sampled_timestamp
-                )  # P11
+                accumulate_counterparty_rows(self, bookId, de_trades, ts=sampled_timestamp)  # P11, pooled and per class
         if trades:
             if bookId not in self.recent_trades:
                 self.recent_trades[bookId] = []
@@ -636,7 +641,10 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     if _debeta_on and getattr(self, 'debeta_capture_mid', None):
         flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
                             CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
-                            sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp)
+                            sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp,
+                            real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
+                            real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
+                            horizon_ns=_realized_ns)
 
     # De-beta live prune. BOTH legs share ONE window, the kappa lookback. Pruning making on the
     # 24h volume-assessment window, each leg inheriting the retention of the legacy leg it
@@ -650,7 +658,11 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         _debeta_prune_threshold = timestamp - self.config.scoring.kappa.lookback
         prune_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_realbuy_hist, self.realized_buy_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_realsell_hist, self.realized_sell_sums, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, _debeta_prune_threshold)
+        for _c, _h in (getattr(self, 'debeta_cpc_hist', None) or {}).items():
+            prune_hist_2level(_h, self.debeta_cpc.setdefault(_c, {}), _debeta_prune_threshold)
         prune_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_heldn_hist, self.debeta_heldn, _debeta_prune_threshold)
@@ -822,7 +834,7 @@ def shift_simulation_histories(
     self, old_ts: int, new_ts: int, *,
     book_count: int, volume_decimals: int, lookback: int,
     volume_assessment_period: int, miner_wealth, effective_max_uids: int,
-    log=None,
+    log=None, book_ids=None,
 ):
     """Shift every history structure from the old simulation's time base to the
     new one on a simulation restart, pruning entries that fall outside the
@@ -835,16 +847,18 @@ def shift_simulation_histories(
 
     NOTE: simulation-restart only. It is NEVER invoked in exchange mode: the
     exchange engine inherits the no-op base on_start and a live chain has no sim
-    restarts, so the shadow's "sim_start" frame never fires there either. Its
-    range(book_count) loops are 0-based-correct in simulation (where book_ids ==
-    [0..book_count-1]) and are intentionally NOT converted to the exchange's
-    root-excluded [1..128] set.
+    restarts, so the shadow's "sim_start" frame never fires there either.
+    Book iteration runs over `book_ids` when given (multi-asset: sparse canonical
+    ids) and falls back to the dense 0-based range that is correct for
+    single-market simulation. Neither is the exchange's root-excluded [1..128]
+    set — this is never invoked in exchange mode.
 
     Args:
         old_ts: The previous simulation's time base.
         new_ts: The new simulation's time base.
     """
     _log = log or (lambda m: None)
+    book_ids = list(book_ids) if book_ids is not None else list(range(book_count))
     new_threshold = new_ts - lookback
     new_volume_threshold = new_ts - volume_assessment_period
 
@@ -859,7 +873,7 @@ def shift_simulation_histories(
     for uid in range(effective_max_uids):
         if uid in self.trade_volumes:
             shifted_trade_volumes[uid] = {}
-            for bookId in range(book_count):
+            for bookId in book_ids:
                 if bookId in self.trade_volumes[uid]:
                     shifted_trade_volumes[uid][bookId] = {}
                     for role in ['total', 'maker', 'taker', 'self']:
@@ -887,7 +901,7 @@ def shift_simulation_histories(
                 role: shifted_trade_volumes.get(uid, {}).get(bookId, {}).get(role, {})
                 for role in ['total', 'maker', 'taker', 'self']
             }
-            for bookId in range(book_count)
+            for bookId in book_ids
         }
         for uid in range(effective_max_uids)
     }
@@ -948,7 +962,7 @@ def shift_simulation_histories(
     for uid in range(effective_max_uids):
         if uid in self.roundtrip_volumes:
             shifted_rt_volumes[uid] = {}
-            for bookId in range(book_count):
+            for bookId in book_ids:
                 if bookId in self.roundtrip_volumes[uid]:
                     shifted_times = {}
                     for prev_time, volume in self.roundtrip_volumes[uid][bookId].items():
@@ -988,11 +1002,18 @@ def shift_simulation_histories(
         if getattr(self, 'debeta_capture_mid', None):
             flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
                                 CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
-                                sell_hist=self.debeta_capsell_hist, ts=old_ts, force=True)
+                                sell_hist=self.debeta_capsell_hist, ts=old_ts, force=True,
+                                real_buy_sums=getattr(self, 'realized_buy_sums', None), real_sell_sums=getattr(self, 'realized_sell_sums', None),
+                                real_buy_hist=getattr(self, 'debeta_realbuy_hist', None), real_sell_hist=getattr(self, 'debeta_realsell_hist', None))
             self.debeta_capture_mid = {}
         shift_hist_2level(self.debeta_capbuy_hist, self.capture_buy_sums, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, old_ts, new_ts, new_threshold)
+        if getattr(self, 'debeta_realbuy_hist', None) is not None:
+            shift_hist_2level(self.debeta_realbuy_hist, self.realized_buy_sums, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_realsell_hist, self.realized_sell_sums, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_threshold)
+        for _c, _h in (getattr(self, 'debeta_cpc_hist', None) or {}).items():
+            shift_hist_2level(_h, self.debeta_cpc.setdefault(_c, {}), old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_mtm_hist, self.debeta_mtm, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_invsum_hist, self.debeta_invsum, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_heldn_hist, self.debeta_heldn, old_ts, new_ts, new_threshold)
@@ -1014,12 +1035,12 @@ def shift_simulation_histories(
     self.initial_balances = {
         uid: {
             bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': miner_wealth}
-            for bookId in range(book_count)
+            for bookId in book_ids
         } for uid in range(effective_max_uids)
     }
-    self.recent_trades = {bookId: [] for bookId in range(book_count)}
+    self.recent_trades = {bookId: [] for bookId in book_ids}
     self.recent_miner_trades = {
-        uid: {bookId: [] for bookId in range(book_count)}
+        uid: {bookId: [] for bookId in book_ids}
         for uid in range(effective_max_uids)
     }
 
@@ -1058,7 +1079,7 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
     tolerance = 600_000_000_000
     limit = int(now) + tolerance
     two_level = ("debeta_mtm_hist", "debeta_invsum_hist", "debeta_capbuy_hist", "debeta_capsell_hist",
-                 "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
+                 "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
                  "debeta_notional_hist")
     one_level = ("debeta_invn_hist", "debeta_drift_hist")
     other = ("realized_pnl_history", "inventory_history", "trade_volumes", "roundtrip_volumes")
@@ -1073,7 +1094,9 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
         for v in d.values():
             yield from stamps(v)
 
+    _cpc_hist = getattr(self, "debeta_cpc_hist", None) or {}
     ahead = [ts for name in two_level + one_level + other for ts in stamps(getattr(self, name, None)) if ts > limit]
+    ahead += [ts for _h in _cpc_hist.values() for ts in stamps(_h) if ts > limit]
     if not ahead:
         return 0
     old_end = max(ahead)
@@ -1092,6 +1115,7 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
         return sum(shift(v) for v in d.values())
 
     moved = sum(shift(getattr(self, name, None)) for name in two_level + one_level + other)
+    moved += sum(shift(_h) for _h in _cpc_hist.values())
     # inventory entries are differences against initial balances the new run reset, and nothing prunes
     # this history by time, so a moved entry would become an account's first entry and the previous
     # run's final value its baseline
@@ -1121,12 +1145,24 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
                 del hist[k]
     running = (("debeta_mtm_hist", "debeta_mtm"), ("debeta_invsum_hist", "debeta_invsum"),
                ("debeta_capbuy_hist", "capture_buy_sums"), ("debeta_capsell_hist", "capture_sell_sums"),
+               ("debeta_realbuy_hist", "realized_buy_sums"), ("debeta_realsell_hist", "realized_sell_sums"),
                ("debeta_cp_hist", "debeta_cp"), ("debeta_heldn_hist", "debeta_heldn"),
                ("debeta_heldinv_hist", "debeta_heldinv"), ("debeta_helddrift_hist", "debeta_helddrift"),
                ("debeta_notional_hist", "debeta_notional"))
     for hist_name, sum_name in running:
         sums = sum_hist_2level(getattr(self, hist_name, None) or {})
         setattr(self, sum_name, defaultdict(lambda: defaultdict(float), {u: defaultdict(float, b) for u, b in sums.items()}))
+    for _c, _h in list(_cpc_hist.items()):
+        for k1 in list(_h):
+            for k2 in list(_h[k1]):
+                kept = {ts: v for ts, v in _h[k1][k2].items() if ts >= threshold}
+                if kept:
+                    _h[k1][k2] = kept
+                else:
+                    del _h[k1][k2]
+            if not _h[k1]:
+                del _h[k1]
+        self.debeta_cpc[_c] = sum_hist_2level(_h)
     for hist_name, sum_name in (("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift")):
         setattr(self, sum_name, defaultdict(float, sum_hist_1level(getattr(self, hist_name, None) or {})))
     inv = getattr(self, "debeta_inv", None)
@@ -1241,9 +1277,9 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     # counterparty accumulation. Clear this UID from every de-beta accumulator (only present when
     # de-beta is enabled; getattr guards the off/shadow case).
     # uid-keyed running sums + their timestamped histories (invn/drift are book-keyed, not per-uid).
-    for _n in ('capture_buy_sums', 'capture_sell_sums', 'debeta_mtm', 'debeta_invsum',
+    for _n in ('capture_buy_sums', 'capture_sell_sums', 'realized_buy_sums', 'realized_sell_sums', 'debeta_mtm', 'debeta_invsum',
                'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional',
-               'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist',
+               'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist',
                'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
         _d = getattr(self, _n, None)
         if _d is not None:
@@ -1252,12 +1288,7 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     if _inv is not None:
         for _b in list(_inv.keys()):
             _inv[_b].pop(uid, None)
-    for _n in ('debeta_cp', 'debeta_cp_hist'):    # UID as a maker AND as a counterparty of other makers
-        _cp = getattr(self, _n, None)
-        if _cp is not None:
-            _cp.pop(uid, None)
-            for _m in list(_cp.keys()):
-                _cp[_m].pop(uid, None)
+    clear_counterparty_rows(self, uid)    # UID as a maker AND as a counterparty of other makers, pooled and per class
     self.realized_pnl_history[uid] = {}
     if hasattr(self, 'agent_pnl_by_book'):
         self.agent_pnl_by_book.pop(uid, None)
@@ -1298,3 +1329,54 @@ def collect_reset_uids(state, validator_uid: int):
                 else:
                     failed.append(reset)
     return pending, failed
+
+
+def class_of_book(self, book_id):
+    """The asset class of a canonical book id on this layout, from the class map the scorer uses; None on a
+    single market. Cached against the simulation object, so the per-fill lookup costs a dict read."""
+    sim = getattr(self, 'simulation', None)
+    sc = getattr(self, 'simulation_config', None)
+    key = (id(sim), id(sc))
+    cache = getattr(self, '_debeta_class_map_cache', None)
+    if not cache or cache[0] != key:
+        from taos.im.validator.reward import class_map
+        try:
+            cmap = class_map(self)
+        except Exception:
+            cmap = {}
+        cache = (key, cmap)
+        self._debeta_class_map_cache = cache
+    return cache[1].get(int(book_id))
+
+
+def accumulate_counterparty_rows(self, book_id, trades, *, ts):
+    """One book's trade batch into the pooled counterparty rows (P11 as deployed on a single market, and the
+    tether everywhere) and into the book's class rows (P11 within the class under a multi-asset layout)."""
+    accumulate_counterparties(self.debeta_cp, book_id, trades, cp_hist=self.debeta_cp_hist, ts=ts)
+    cls = class_of_book(self, book_id)
+    if cls is None:
+        return
+    if not isinstance(getattr(self, 'debeta_cpc', None), dict):
+        self.debeta_cpc = {}
+    if not isinstance(getattr(self, 'debeta_cpc_hist', None), dict):
+        self.debeta_cpc_hist = {}
+    accumulate_counterparties(self.debeta_cpc.setdefault(cls, {}), book_id, trades,
+                              cp_hist=self.debeta_cpc_hist.setdefault(cls, {}), ts=ts)
+
+
+def clear_counterparty_rows(self, uid):
+    """Drop a uid from the counterparty rows as a maker and as a counterparty of every other maker, in the pooled
+    rows and in every class's rows, so a slot's new occupant inherits no concentration."""
+    for _n in ('debeta_cp', 'debeta_cp_hist'):
+        _cp = getattr(self, _n, None)
+        if _cp is not None:
+            _cp.pop(uid, None)
+            for _m in list(_cp.keys()):
+                _cp[_m].pop(uid, None)
+    for _n in ('debeta_cpc', 'debeta_cpc_hist'):
+        _by = getattr(self, _n, None)
+        if isinstance(_by, dict):
+            for _cp in _by.values():
+                _cp.pop(uid, None)
+                for _m in list(_cp.keys()):
+                    _cp[_m].pop(uid, None)

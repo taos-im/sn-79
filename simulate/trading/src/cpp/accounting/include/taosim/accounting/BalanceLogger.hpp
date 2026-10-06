@@ -10,8 +10,6 @@
 
 #include <spdlog/spdlog.h>
 
-using namespace taosim::matching;
-
 //-------------------------------------------------------------------------
 
 namespace taosim::accounting
@@ -24,7 +22,7 @@ class BalanceLogger
 public:
     BalanceLogger(
         const fs::path& filepath,
-        decltype(ExchangeSignals::L3)& signal,
+        decltype(matching::ExchangeSignals::L3)& signal,
         AccountRegistry* registry) noexcept;
 
     [[nodiscard]] const fs::path& filepath() const noexcept { return m_filepath; }

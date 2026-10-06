@@ -1,0 +1,36 @@
+{
+    "proxy": {
+        "port": 8000,
+        "simulation_xml": "../../simulate/trading/run/config/multiasset_simulation_0.xml",
+        "timeout": 5
+    },
+    "agents": {
+        "path": "..",
+        "start_port": 8888,
+        "RandomMakerAgent": [
+            {
+                "params": {
+                    "min_quantity": 1.0,
+                    "max_quantity": 2.0,
+                    "expiry_period": 200000000000,
+                    "lazy_load": 1
+                },
+                "count": 2
+            }
+        ],
+        "RandomTakerAgent": [
+            {
+                "params": {
+                    "min_quantity": 1.0,
+                    "max_quantity": 2.0,
+                    "lazy_load": 1
+                },
+                "count": 2
+            }
+        ]
+    },
+    "taosim": {
+        "bin": "../../simulate/trading/build/src/cpp/taosim",
+        "delay": 5
+    }
+}

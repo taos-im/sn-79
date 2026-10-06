@@ -65,7 +65,7 @@ For the τaos component: the mechanism is designed to promote intelligent, risk-
 
 **Two reward pools.** Miner rewards are split across two incentive pools that run in parallel:
 
-- **Trading pool** (~95% of rewards by default): scored on kappa and PnL from simulation trading. All miners registered on the simulation mechanism participate. Exchange trading is scored under its own mechanism with its own weights, not blended into this pool.
+- **Trading pool** (~95% of rewards by default): scored on simulation trading in two equal halves, making (the spread a miner's maker fills capture, judged from 0.6.3 by how much of it they still hold shortly afterwards) and skill (trading profit with the effect of market drift on held inventory removed). [FAQ question 2](FAQ.md) describes how each is measured. All miners registered on the simulation mechanism participate. Exchange trading is scored under its own mechanism with its own weights, not blended into this pool.
 - **GenTRX training pool** (~5% by default, set by `--scoring.gentrx.simulation_share` on the validator): scored on gradient quality, assessed each round against held-out order-book data. Scales with active participation; unused training rewards return to the trading pool. Opt-in for both validators and miners; zero impact on trading rewards when not in use.
 
 ### Owner Role <span id="mechanism-owner"><span>
@@ -91,7 +91,7 @@ Miners can also opt in to **GenTRX distributed training** by running an agent th
 ## Technical Operation <span id="technical"><span>
 The description below covers the τaos simulation and GenTRX training components. The Exchange shares the same matching engine and the same agent interface, and is described in [Exchange](#exchange).
 
-The subnet operates at technical level in the first implementation in quite familiar manner for the Bittensor ecosystem.  Validators construct requests containing the simulation state, which results from a series of computations by the simulator, and publishes these requests to miners at a pre-defined interval.  Miners must respond to validator requests within a reasonable timeframe in order for their instructions to be submitted to the simulation for execution.  Scores are calculated in general as a weighted sum of several risk-adjusted performance metrics; although, at least until others are required, only an intraday Kappa-3 ratio is evaluated.  Miners are also required to maintain a certain level of trading volume in order for their risk-adjusted performance score to be allocated in full - this prevents inactive miners from gaining incentives, and aligns with the objective of the project to encourage active automated trading rather than simple buy & hold or other very low-frequency strategies.
+The subnet operates at technical level in the first implementation in quite familiar manner for the Bittensor ecosystem.  Validators construct requests containing the simulation state, which results from a series of computations by the simulator, and publishes these requests to miners at a pre-defined interval.  Miners must respond to validator requests within a reasonable timeframe in order for their instructions to be submitted to the simulation for execution.  Scores are calculated from two halves, making and skill, described under [Incentive Mechanism](#mechanism) and in the [FAQ](FAQ.md); traded volume on its own earns nothing.  Miners are also required to maintain a certain level of trading volume in order for their risk-adjusted performance score to be allocated in full - this prevents inactive miners from gaining incentives, and aligns with the objective of the project to encourage active automated trading rather than simple buy & hold or other very low-frequency strategies.
 
 In the current approach, a new simulation configuration is intended to be deployed on approximately weekly basis, with each simulation being executed as an independent run where all miner agents begin with the same initial capital allocation.  Multiple runs of a particular configuration may be executed by validators before a new configuration is published, due to varying rate of progression resulting from differing resources deployed by validators. Miner scores are however calculated using a rolling window which is not cleared at the start of a new simulation, so that performance in previous races does still contribute to the miner's overall weighting.  Deregistrations are handled by resetting the account balance and positions of the agent associated with the UID which was newly registered to the configured starting values.
 
@@ -132,13 +132,13 @@ GenTRX adds a second incentive layer on top of τaos trading. Two processes work
 
 The gradient server can run on the same host as the validator (loopback, no API key needed) or on a dedicated GPU machine (`--bind 0.0.0.0`, shared API key). `run_gradients.sh` handles dependency installation, CUDA detection, pm2 lifecycle, and interactive credential setup. `run_validator.sh -G` orchestrates the full stack in one command.
 
-**Two-pool scoring**: miner weights are a blend of a trading-pool score (kappa + PnL, ~95%) and a training-pool score (gradient quality, ~5%). Each pool is computed independently and merged at weight-setting time. Validators not participating in GenTRX contribute 100% to the trading pool; the training allocation scales with active participation and returns to trading when unused. The pool split is controlled by `--scoring.gentrx.simulation_share` on the validator.
+**Two-pool scoring**: miner weights are a blend of a trading-pool score (making and skill, ~95%) and a training-pool score (gradient quality, ~5%). Each pool is computed independently and merged at weight-setting time. Validators not participating in GenTRX contribute 100% to the trading pool; the training allocation scales with active participation and returns to trading when unused. The pool split is controlled by `--scoring.gentrx.simulation_share` on the validator.
 
 ---
 <div style="page-break-after: always;"></div>
 
 ## Requirements <span id="requirements"><span>
-Requirements are subject to change as the subnet matures and evolves; this section describes the recommended resources to be available for the initial simulation conditions.  We currently manage 40 orderbooks in a simulation, each having around 1000 background agents, while the aim in the near- to mid-term is to reach 1,000+ simulated orderbooks in order to achieve a meaningful level of statistical significance in the evaluation of results.
+Requirements are subject to change as the subnet matures and evolves; this section describes the recommended resources to be available for the initial simulation conditions.  We currently run 128 orderbooks in a simulation, in eight markets of sixteen books, each market with its own population of background agents (the 0.6.3 default layout gives them two asset classes; mainnet runs the first class on all 128 until the second arrives at a run boundary), while the aim in the near- to mid-term is to reach 1,000+ simulated orderbooks in order to achieve a meaningful level of statistical significance in the evaluation of results.
 
 ### Validator <span id="requirements-validator"><span>
 Validators need to host the C++ simulator as well as the Python validator.  In the early days of the subnet, the number of orderbooks simulated as well as the count and type of background agents will be reduced so as to limit the requirements before the subnet matures and sufficient emissions are gained to justify the expense of hosting more powerful machinery.  Basic requirements:
@@ -160,11 +160,11 @@ There are no set requirements for miners except that the basic Bittensor package
 ---
 
 ## Agents <span id="agents"><span>
-In order to separate the basic network logic from the actual trading logic and allow to easily switch between different strategies, miners in this subnet define a separate class containing the agent logic which is referenced in the configuration of the miner and loaded for handling of simulation state updates.  Some simple example agents are provided in the `agents` directory of this repository, and are copied to a directory `~/.taos/agents` if using the miner install script to prepare your environment.  The objective in agent development is to produce logic which maximizes performance over all realizations in terms of the evaluation metrics applied by the validators.  Currently assessment is based on an intraday Kappa-3 ratio in conjunction with a requirement to maintain a certain level of cumulative round-trip volume; this will be continuously monitored and reviewed, and other relevant risk-adjusted performance measures incorporated if a need is observed.
+In order to separate the basic network logic from the actual trading logic and allow to easily switch between different strategies, miners in this subnet define a separate class containing the agent logic which is referenced in the configuration of the miner and loaded for handling of simulation state updates.  Some simple example agents are provided in the `agents` directory of this repository, and are copied to a directory `~/.taos/agents` if using the miner install script to prepare your environment.  The objective in agent development is to produce logic which maximizes performance over all realizations in terms of the evaluation metrics applied by the validators.  Assessment is the making and skill halves described in the [FAQ](FAQ.md) (question 2); it is monitored and reviewed, and other measures are incorporated if a need is observed.
 
 Only some basic agents are immediately included as examples, designed to illustrate the fundamentals of reading the state updates and creating instructions.  We expect miners to develop their own custom logic in order to compete in the subnet, but plan to release additional examples, tools and templates to facilitate implementation of certain common classes of trading strategies.  An overview of the information needed to begin developing strategies is provided [here](agents/README.md).  It is also possible to test agents offline against the background model on your local machine by following [these instructions](agents/proxy/README.md).
 
-Agents serve both the simulation and the exchange from one class. Subclass `FinanceAgent` (or `GenTRXAgent`) and implement `respond(state)`; it is called in both modes, and you can override `respond_exchange` only if you want the exchange to behave differently. If you already run an agent, [`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md) covers what changes in this release (nothing required) and what opting in to the exchange will involve.
+Agents serve both the simulation and the exchange from one class. Subclass `FinanceAgent` (or `GenTRXAgent`) and implement `respond(state)`; it is called in both modes, and you can override `respond_exchange` only if you want the exchange to behave differently. If you already run an agent, read [`agents/MIGRATION_0.6.3.md`](agents/MIGRATION_0.6.3.md): on the two-class layout books 96 to 127 have their own price level and minimum order, so read grids and minimums per book. [`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md) covers the exchange interface added in 0.6.0.
 
 Miners participating in GenTRX distributed training define their agent by subclassing `GenTRXAgent`, which adds data collection, gradient compression, and S3 upload alongside the standard trading loop.  Example GenTRX-capable agents (`HybridTrainingAgent`, `RandomMakerAgent`, `RandomTakerAgent`) are included in the `agents` directory as starting points.  A guide to overriding the training hooks (`collect_row`, `select_training_files`, `train`) is provided in [`doc/gentrx/integration.md`](doc/gentrx/integration.md).
 
@@ -177,7 +177,7 @@ Miners participating in GenTRX distributed training define their agent by subcla
 [mvtrx.ai](https://mvtrx.ai). It uses the same C++ matching engine as the τaos simulation, so
 an agent written against the simulation is written against the exchange too.
 
-**What this release gives you.** 0.6.0 ships the agent interface, the wire protocol and the documentation
+**What the exchange interface gives you.** Since 0.6.0 the repository ships the agent interface, the wire protocol and the documentation
 needed to **develop and test an exchange agent against a localnet exchange**. That is the supported scope
 today. Note that running the exchange-mode engine itself requires components which are not included in
 this repository.
@@ -187,9 +187,10 @@ weighted on chain, is **not part of this release**: netuid 79 currently declares
 there is nothing to register on. Mainnet exchange comes in a later release, with registration and scoring
 details announced before it does.
 
-**Your existing simulation agent is unaffected.** Nothing in 0.6.0 requires a change to an agent that
-trades the simulation, and no exchange payload can reach a mainnet miner. See
-[`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md).
+**The exchange interface needs no change to a simulation agent.** Nothing in it requires a change to an agent
+that trades the simulation, and no exchange payload can reach a mainnet miner. See
+[`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md); for the 0.6.3 simulation changes see
+[`agents/MIGRATION_0.6.3.md`](agents/MIGRATION_0.6.3.md).
 
 **What differs from the simulation.** The interface is shared, but the venue is real, and three differences
 cost people orders:
@@ -210,6 +211,7 @@ aliases of `BASE`/`QUOTE`).
 |---|---|
 | Writing an exchange agent | [agents/README.md](agents/README.md), section "Exchange venue behaviours that catch people out" |
 | Migrating an existing agent | [agents/MIGRATION_0.6.0.md](agents/MIGRATION_0.6.0.md) |
+| Agents on the two-class layout (0.6.3) | [agents/MIGRATION_0.6.3.md](agents/MIGRATION_0.6.3.md) |
 | Full agent guide | [agents/README.md](agents/README.md) |
 | Exchange UI | [mvtrx.ai](https://mvtrx.ai) |
 | Market data and terminal | [mvtrx.fi](https://mvtrx.fi) |

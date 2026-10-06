@@ -20,8 +20,10 @@ def _dd2():
 
 
 def _validator(**dials):
+    # skill_min_books stated: the duck declares six books but no layout, and from 0.6.3 an unset bar
+    # derives from the layout (an unknown one keeps the launch count of 20, which would zero this skill)
     cfg = dict(enabled=True, weight=0.5, w_make=0.30, centered_window=15, floor_scale=0.5, min_books=1,
-               presence_gate=1, presence_window=10)
+               presence_gate=1, presence_window=10, skill_min_books=4)
     cfg.update(dials)
     self = SimpleNamespace(config=SimpleNamespace(scoring=SimpleNamespace(
         debeta=SimpleNamespace(**cfg), kappa=SimpleNamespace(lookback=30))))

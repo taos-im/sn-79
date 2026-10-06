@@ -47,8 +47,8 @@ def test_the_old_name_is_the_same_class_not_a_copy():
         "the old name must BE the new class, not a subclass or a copy of it"
     )
     assert issubclass(FinanceAgent, FinanceSimulationAgent), (
-        "mvtrx/service tests/test_composer.py asserts issubclass(ComposedAgent, FinanceSimulationAgent); "
-        "breaking this breaks the composer"
+        "a composed agent must remain a FinanceSimulationAgent; breaking this breaks every "
+        "composer built on the pre-0.6.0 base class"
     )
 
 

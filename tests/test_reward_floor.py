@@ -59,9 +59,11 @@ def test_concentration_effect_on_farm_like_vector():
     r = honest + fleet
     out = apply_reward_floor(r, _cfg(percentile=50.0, softness=0.5))
     fleet_after = sum(out[60:])
-    top_after = sum(out[:60][-8:])                    # genuine top 8 untouched
     assert fleet_after == 0.0                          # fleet mass gutted to zero
-    assert top_after == sum(r[:60][-8:])
+    # Genuine top 8 untouched — compare element-wise (exact passthrough).  Comparing
+    # sums instead is brittle on Python >= 3.12: builtin sum() compensates (Neumaier)
+    # over plain floats but not over np.float64 elements, drifting the two by 1 ulp.
+    assert out[:60][-8:] == [float(x) for x in r[:60][-8:]]
 
 
 def test_edge_cases_noop():

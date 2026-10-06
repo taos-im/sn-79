@@ -4,6 +4,7 @@
     "dependencies": [
         "bde",
         "benchmark",
+        "bext-di",
         "boost-accumulators",
         "boost-asio",
         "boost-beast",

@@ -540,15 +540,19 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
             #
             # start_simulator.sh resumes when there is a checkpoint and opens a new simulation when
             # there is not, which is the decision this line was trying to express in the first place.
-            # ONLY WHERE THE WRAPPER EXISTS. start_simulator.sh is not part of the public release,
-            # so a deployed validator has the engine binary and nothing to wrap it. Registering the
-            # wrapper unconditionally would make every restart out there run a script that is not
-            # there, and the engine would simply never come back -- breaking the one path this
-            # function exists to serve. Fall back to the binary, which is what those hosts had all
-            # along.
+            # ONLY WHERE THE WRAPPER EXISTS. A host that has the engine binary and no wrapper falls
+            # back to the binary: registering the wrapper unconditionally would make every restart
+            # there run a script that is not there, and the engine would never come back.
+            #
+            # The wrapper is given the layout this validator runs. The launcher sets SIMULATION_CONFIG
+            # for itself, so under pm2 it may be absent; the validator's own simulator_config_file is
+            # then the authority. A layout name that does not ship would make the wrapper refuse to
+            # resume and start the engine on a missing file.
             _run_dir = (self.repo_path / 'simulate' / 'trading' / 'run')
             if (_run_dir / 'start_simulator.sh').exists():
-                _sim_cfg = os.environ.get('SIMULATION_CONFIG', 'simulation_0_acceptance')
+                from pathlib import Path as _Path
+                _sim_cfg = (os.environ.get('SIMULATION_CONFIG')
+                            or _Path(getattr(self, 'simulator_config_file', None) or 'multiasset_simulation_0').stem)
                 resume_cmd = [
                     "pm2", "start", "--no-autorestart", "--kill-timeout", "60000", "--name=simulator",
                     f"bash start_simulator.sh {_sim_cfg}"

@@ -9,8 +9,6 @@
 #include <taosim/book/Book.hpp>
 #include <Simulation.hpp>
 
-#include <iostream>
-#include <source_location>
 #include <stdexcept>
 
 //-------------------------------------------------------------------------
@@ -31,19 +29,17 @@ void ArbitrageTraderAgent::configure(const pugi::xml_node& node)
     Agent::configure(node);
 
     pugi::xml_attribute attr;
-    static constexpr auto ctx = std::source_location::current().function_name();
 
     if (attr = node.attribute("exchange"); attr.empty()) {
-        throw std::invalid_argument(fmt::format(
-            "{}: missing required attribute 'exchange'", ctx));
+        throw std::invalid_argument(
+            "ArbitrageTraderAgent::configure: missing required attribute 'exchange'");
     }
     m_exchange = attr.as_string();
 
     m_edge = node.attribute("edge").as_double(8e-4);
     m_cross = node.attribute("cross").as_double(2e-4);
     m_alpha = node.attribute("alpha").as_double(0.02);
-    m_latency = static_cast<Timestamp>(node.attribute("latency").as_ullong(1));
-    m_remoteAgentCount = node.attribute("remoteAgentCount").as_int(264);
+    m_latency = node.attribute("latency").as_ullong(1);
 }
 
 //-------------------------------------------------------------------------
@@ -60,8 +56,9 @@ void ArbitrageTraderAgent::receiveMessage(Message::Ptr msg)
         handleTrade(msg);
     }
     else if (msg->type == "EVENT_SIMULATION_END") {
-        std::cout << name() << ": ARB_SUMMARY miner_limit_events=" << m_eventsSeen
-                  << " takes=" << m_takes << " fills=" << m_fills << std::endl;
+        fmt::println(
+            "{}: ARB_SUMMARY miner_limit_events={} takes={} fills={}",
+            name(), m_eventsSeen, m_takes, m_fills);
     }
     // RESPONSE_PLACE_ORDER_LIMIT / ERROR_RESPONSE_PLACE_ORDER_LIMIT: fire-and-forget IOC.
 }
@@ -96,7 +93,7 @@ void ArbitrageTraderAgent::handleTrade(Message::Ptr msg)
     }
     const BookId bookId = payload->bookId;
     const auto& books = simulation()->exchange()->books();
-    if (bookId < 0 || static_cast<std::size_t>(bookId) >= books.size()) return;
+    if (bookId >= books.size()) return;
     const double mid = taosim::util::decimal2double(books[bookId]->midPrice());
     if (mid <= 0.0) return;
     auto it = m_fair.find(bookId);

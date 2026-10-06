@@ -318,7 +318,9 @@ PlaceOrderLimitPayload::Ptr PlaceOrderLimitPayload::fromJson(const rapidjson::Va
         getOptDec("takeProfit"),
         getOptDec("placeholder")
         );
-    payload->allowPartial = json.HasMember("allowPartial") && !json["allowPartial"].IsNull()
+    // IsBool, not just non-null: this parses validator-boundary input, and GetBool on
+    // a wrong-typed member is an assertion (UB under NDEBUG) rather than an exception.
+    payload->allowPartial = json.HasMember("allowPartial") && json["allowPartial"].IsBool()
         ? json["allowPartial"].GetBool()
         : true;
     return payload;
@@ -951,8 +953,12 @@ EventOrderMarketPayload::Ptr EventOrderMarketPayload::fromJson(const rapidjson::
             // Currency{json["currency"].GetUint()},
             taosim::json::getDecimal(json["volume"]),
             OrderDirection{json["direction"].GetUint()}});
-    if (json.HasMember("bookId")) payload->bookId = json["bookId"].GetUint();
-    if (json.HasMember("agentId")) payload->agentId = json["agentId"].GetInt();
+    if (json.HasMember("bookId") && json["bookId"].IsUint()) {
+        payload->bookId = json["bookId"].GetUint();
+    }
+    if (json.HasMember("agentId") && json["agentId"].IsInt()) {
+        payload->agentId = json["agentId"].GetInt();
+    }
     return payload;
 }
 
@@ -983,8 +989,12 @@ EventOrderLimitPayload::Ptr EventOrderLimitPayload::fromJson(const rapidjson::Va
             taosim::json::getDecimal(json["volume"]),
             OrderDirection{json["direction"].GetUint()},
             taosim::json::getDecimal(json["price"])});
-    if (json.HasMember("bookId")) payload->bookId = json["bookId"].GetUint();
-    if (json.HasMember("agentId")) payload->agentId = json["agentId"].GetInt();
+    if (json.HasMember("bookId") && json["bookId"].IsUint()) {
+        payload->bookId = json["bookId"].GetUint();
+    }
+    if (json.HasMember("agentId") && json["agentId"].IsInt()) {
+        payload->agentId = json["agentId"].GetInt();
+    }
     return payload;
 }
 

@@ -9,12 +9,14 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
 //-------------------------------------------------------------------------
 
 class MultiBookExchangeAgent;
+class Simulation;
 
 namespace taosim::simulation
 {
@@ -68,10 +70,38 @@ inline static const std::map<CheckpointToken, PathFactory> s_tokenToCkptDirFacto
 [[nodiscard]] std::vector<std::filesystem::path> ckptDirsSortedByWriteTime(
     const std::filesystem::path& path);
 
+// Atomically publish `data` to `path`: write to a sibling temp file, then rename it
+// over the target, so a crash mid-write leaves either the previous file or the
+// complete new one, never a truncated one. Throws CheckpointError on any failure.
+void atomicWrite(const std::filesystem::path& path, std::span<const char> data);
+
+class CheckpointManager;
+
 void setupUsingCkptData(
     taosim::simulation::SimulationManager* simuMngr,
     const msgpack::object& commonObj,
     std::span<msgpack::object_handle> blockObjHandles);
+
+void setupUsingCkptDataMultiAsset(
+    std::span<const std::unique_ptr<Simulation>> simulations,
+    CheckpointManager* checkpointManager,
+    const msgpack::object& commonObj,
+    std::span<msgpack::object_handle> blockObjHandles);
+
+// Re-link the shared-quote topology a msgpack restore severs: one quote Balance per
+// account and one order-id + trade-id counter across the exchange's books (each is
+// deserialized per book independently). No-op when quote is not shared.
+void reestablishSharedTopology(MultiBookExchangeAgent& exchange);
+
+// Common + numbered block files of a checkpoint directory, as msgpack object handles
+// (which own their buffers — keep the result alive while converting from it).
+struct LoadedCheckpoint
+{
+    msgpack::object_handle common;
+    std::vector<msgpack::object_handle> blocks;
+};
+
+[[nodiscard]] LoadedCheckpoint loadCheckpointObjects(const std::filesystem::path& ckptDir);
 
 }  // namespace taosim::checkpoint
 

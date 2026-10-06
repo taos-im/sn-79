@@ -38,14 +38,18 @@ KNOBS = {
     "config", "simulation", "step", "effective_max_uids", "_last_prune_timestamp", "pagerduty_alert",
     "engine", "kappa_cache", "deregistered_uids", "scoring_config", "simulation_config",
     "scoring_interval", "validator_uid",
+    # derived cache: the book-to-class map keyed by the simulation object's identity, rebuilt on first use in
+    # whichever process reads it (the ids differ in the child, so a snapshot of it could only be stale)
+    "_debeta_class_map_cache",
 }
 
 DEBETA_ATTRS = [
-    "capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
+    "capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
     "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
     "debeta_capture_mid", "debeta_cp",
-    "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
+    "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
     "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
+    "debeta_cpc", "debeta_cpc_hist",
 ]
 
 

@@ -1,0 +1,24 @@
+<!--
+  simulation_0 plus simulation_1 in the 96+32 shape: six realizations of simulation_0 (ids 0-95) and two of
+  simulation_1 (ids 96-127), sixteen books each, 128 books in all. Both quote on the same 2/4 grid.
+  The default layout of run_validator.sh; another layout is chosen with -g <name>.
+-->
+<MultiAssetSimulation
+    useMessagePack="1"
+    host="localhost"
+    port="8000"
+    generalMsgEndpoint="/account"
+    threads="8"
+    start="0"
+    step="1000000000"
+    duration="86400000000000"
+    gracePeriod="600000000000"
+    ckptIntervalInSteps="600"
+    ckptNumLastFilesToKeep="3"
+    ckptNumWorkers="4"
+    ckptMeasureWallClockTime="1">
+
+    <Background name="simulation_0" path="simulation_0.xml" instanceCount="6"/>
+    <Background name="simulation_1" path="simulation_1.xml" instanceCount="2"/>
+
+</MultiAssetSimulation>

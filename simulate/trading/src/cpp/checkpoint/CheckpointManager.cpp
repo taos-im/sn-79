@@ -4,76 +4,21 @@
  */
 #include <taosim/checkpoint/CheckpointManager.hpp>
 
+#include <Simulation.hpp>
 #include <taosim/checkpoint/CheckpointError.hpp>
-#include <taosim/checkpoint/SimulatorState.hpp>
-#include <taosim/checkpoint/serialization/SimulatorState.hpp>
 #include <taosim/checkpoint/helpers.hpp>
+#include <taosim/checkpoint/serialization/helpers.hpp>
+#include <taosim/message/serialization/MessageQueue.hpp>
+#include <taosim/serialization/msgpack/common.hpp>
 
+#include <boost/asio/post.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <fmt/chrono.h>
+#include <msgpack.hpp>
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <cstring>
+#include <atomic>
+#include <chrono>
 #include <latch>
-#include <stdexcept>
-
-//-------------------------------------------------------------------------
-
-namespace
-{
-
-// Write `size` bytes from `data` to `path` (create/truncate), close. Raw POSIX
-// with explicit error checks rather than std::ofstream so a failed write (e.g.
-// disk full) THROWS instead of silently setting failbit — atomicWrite relies on
-// this to avoid renaming a truncated temp file over a good checkpoint. No fsync:
-// we want atomicity (via rename below), not power-loss durability, and per-file
-// fsync cost multi-second stalls per checkpoint (esp. on WSL2).
-void writeFile(const std::filesystem::path& path, const char* data, std::size_t size)
-{
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        throw std::runtime_error{fmt::format(
-            "open({}) failed: {}", path.string(), std::strerror(errno))};
-    }
-    std::size_t written = 0;
-    while (written < size) {
-        const auto n = ::write(fd, data + written, size - written);
-        if (n < 0) {
-            const auto err = errno;
-            ::close(fd);
-            throw std::runtime_error{fmt::format(
-                "write({}) failed: {}", path.string(), std::strerror(err))};
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    ::close(fd);
-}
-
-// Atomically publish `size` bytes to `path`: write to a sibling temp file, then
-// rename it over the target. POSIX rename is atomic on the same filesystem, so a
-// process crash / restart mid-write leaves either the previous checkpoint or the
-// complete new one, never a truncated file. Throws on any failure (and removes
-// the temp) so the caller aborts rather than leaving a partial file at the real
-// path. Not fsync-backed: survives process crashes, not power loss (see A/B/C
-// tradeoff — atomicity was the goal, fsync's stall cost was not worth it).
-void atomicWrite(const std::filesystem::path& path, const char* data, std::size_t size)
-{
-    auto tmp = path;
-    tmp += ".tmp";
-    writeFile(tmp, data, size);
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        std::error_code rm_ec;
-        std::filesystem::remove(tmp, rm_ec);
-        throw std::runtime_error{fmt::format(
-            "rename({} -> {}) failed: {}", tmp.string(), path.string(), ec.message())};
-    }
-}
-
-}  // namespace
 
 //-------------------------------------------------------------------------
 
@@ -81,36 +26,62 @@ namespace taosim::checkpoint
 {
 
 //-------------------------------------------------------------------------
+// Hidden run state. The dir layout, retention bound, interval and the (local)
+// save-timing all live here; the run-mode state comes through m_source.
+
+struct Impl
+{
+    CheckpointSource* source;
+    std::filesystem::path dir;
+    size_t intervalInSteps;
+    ssize_t numLastFilesToKeep;
+    bool measureWallClockTime;
+    ssize_t stepCounter{-1};
+    std::filesystem::path latestCkptDir;
+};
+
+//-------------------------------------------------------------------------
 
 CheckpointManager::CheckpointManager(const CheckpointingDesc& desc)
-    : m_simuMngr{desc.simuMngr}
-    , m_intervalInSteps{desc.intervalInSteps}
-    , m_numLastFilesToKeep{desc.numLastFilesToKeep}
-    , m_measureWallClockTime{desc.measureWallClockTime}
+    : m_impl{std::make_unique<Impl>(Impl{
+        .source = desc.source,
+        .intervalInSteps = desc.intervalInSteps,
+        .numLastFilesToKeep = desc.numLastFilesToKeep,
+        .measureWallClockTime = desc.measureWallClockTime})}
 {
     if (desc.runDir.empty()) {
         throw CheckpointError{"'runDir' must be non-empty"};
     }
-    if (m_intervalInSteps == 0) {
+    if (m_impl->intervalInSteps == 0) {
         throw CheckpointError{"'intervalInSteps' must be non-zero"};
     }
 
-    m_dir = desc.runDir / s_storeDirName;
+    m_impl->dir = desc.runDir / s_storeDirName;
+}
 
-    m_simuMngr->stepSignal().connect([this] { saveCheckpoint(); });
+//-------------------------------------------------------------------------
+// Out-of-line so Impl is complete at the point of destruction (PIMPL).
+
+CheckpointManager::~CheckpointManager() = default;
+
+//-------------------------------------------------------------------------
+
+ssize_t& CheckpointManager::stepCounter() noexcept
+{
+    return m_impl->stepCounter;
 }
 
 //-------------------------------------------------------------------------
 
 void CheckpointManager::saveCheckpoint()
 {
-    if (m_simuMngr->warmingUp()) return;
-    if (++m_stepCounter == 0 || m_stepCounter % m_intervalInSteps != 0) return;
+    if (m_impl->source->warmingUp()) return;
+    if (++m_impl->stepCounter == 0 || m_impl->stepCounter % m_impl->intervalInSteps != 0) return;
 
     fmt::println("Saving checkpoint...");
 
     try {
-        if (m_measureWallClockTime) {
+        if (m_impl->measureWallClockTime) {
             saveCheckpointMeasured();
         } else {
             saveCheckpointImpl();
@@ -129,7 +100,7 @@ void CheckpointManager::saveCheckpointOnShutdown()
     // Warm-up has no meaningful state to resume into, and the interval save skips it for the same
     // reason. The step counter is deliberately NOT touched: this is out-of-band, and advancing it
     // would shift the phase of every later interval save on a resumed run.
-    if (m_simuMngr->warmingUp()) return;
+    if (m_impl->source->warmingUp()) return;
 
     fmt::println("Saving checkpoint on shutdown...");
 
@@ -150,24 +121,22 @@ void CheckpointManager::saveCheckpointOnShutdown()
 
 void CheckpointManager::saveCheckpointImpl()
 {
-    const auto simuTime = m_simuMngr->simulations().front()->currentTimestamp();
-    
-    m_latestCkptDir = m_dir / fmt::format("{}{}", simuTime, s_dirExtension);
-    std::filesystem::create_directories(m_latestCkptDir);
+    const auto blocks = m_impl->source->checkpointBlocks();
+    const auto simuTime = blocks.front()->currentTimestamp();
 
-    // Common.
-    taosim::serialization::BinaryStream stream;
-    msgpack::packer packer{stream};
-    taosim::checkpoint::serialization::packCommon(packer, m_simuMngr);
+    m_impl->latestCkptDir = m_impl->dir / fmt::format("{}{}", simuTime, s_dirExtension);
+    std::filesystem::create_directories(m_impl->latestCkptDir);
 
-    const auto commonCkptFile = m_latestCkptDir / fmt::format("common{}", s_fileExtension);
-    atomicWrite(commonCkptFile, stream.data(), stream.size());
+    // Common (run-mode specific) state.
+    m_impl->source->writeCommonCheckpoint(
+        m_impl->latestCkptDir / fmt::format("common{}", s_fileExtension));
 
-    // Blocks.
-    std::latch latch{m_simuMngr->blockInfo().count};
-    for (auto&& simulation : m_simuMngr->simulations()) {
+    // Blocks (generic), written in parallel on the source's executor.
+    std::atomic_flag blockWriteFailed;
+    std::latch latch{std::ssize(blocks)};
+    for (auto&& simulation : blocks) {
         boost::asio::post(
-            *m_simuMngr->threadPool(),
+            m_impl->source->checkpointExecutor(),
             [&] {
                 // atomicWrite throws on failure; catch here so a block-write
                 // error is logged rather than escaping the thread-pool task
@@ -179,18 +148,32 @@ void CheckpointManager::saveCheckpointImpl()
                     msgpack::packer packer{stream};
                     taosim::checkpoint::serialization::packBlock(packer, *simulation);
 
-                    const auto blockCkptFile =
-                        m_latestCkptDir / fmt::format("{}{}", simulation->blockIdx(), s_fileExtension);
-                    atomicWrite(blockCkptFile, stream.data(), stream.size());
+                    const auto blockCkptFile = m_impl->latestCkptDir
+                        / fmt::format("{}{}", simulation->blockIdx(), s_fileExtension);
+                    atomicWrite(blockCkptFile, {stream.data(), stream.size()});
                 }
                 catch (const std::exception& e) {
                     fmt::println("Error saving checkpoint block: {}", e.what());
+                    blockWriteFailed.test_and_set();
                 }
 
                 latch.count_down();
             });
     }
     latch.wait();
+
+    if (blockWriteFailed.test()) {
+        // A checkpoint missing a block file cannot be restored from; drop it and
+        // keep the older intact checkpoints instead of cleaning them up.
+        std::error_code ec;
+        fs::remove_all(m_impl->latestCkptDir, ec);
+        throw CheckpointError{ec
+            ? fmt::format(
+                "incomplete checkpoint '{}' could not be removed ({}) — restore may pick it",
+                m_impl->latestCkptDir.string(), ec.message())
+            : fmt::format(
+                "incomplete checkpoint '{}' discarded", m_impl->latestCkptDir.string())};
+    }
 
     cleanup();
 }
@@ -201,33 +184,27 @@ void CheckpointManager::saveCheckpointMeasured()
 {
     using namespace std::chrono;
 
-    auto& measurements = m_simuMngr->measurements();
-
-    measurements.t0ckptSave = std::make_optional(high_resolution_clock::now());
-
+    const auto t0 = high_resolution_clock::now();
     saveCheckpointImpl();
+    const auto t1 = high_resolution_clock::now();
 
-    measurements.t1ckptSave = std::make_optional(high_resolution_clock::now());
-
-    fmt::println(
-        "Took {:.4f}s",
-        duration<double>(*measurements.t1ckptSave - *measurements.t0ckptSave).count());
+    fmt::println("Took {:.4f}s", duration<double>(t1 - t0).count());
 }
 
 //-------------------------------------------------------------------------
 
 void CheckpointManager::cleanup()
 {
-    const auto dirs = ckptDirsSortedByWriteTime(m_dir);
+    const auto dirs = ckptDirsSortedByWriteTime(m_impl->dir);
 
     auto dirsToRemoveView = dirs
         | ranges::views::filter([&](auto&& f) {
             static const std::regex pattern{fmt::format("^\\d+\\{}$", s_dirExtension)};
             const auto name = f.filename();
             return std::regex_match(name.string(), pattern)
-                && name != m_latestCkptDir.filename();
+                && name != m_impl->latestCkptDir.filename();
         })
-        | ranges::views::take(std::max(0z, std::ssize(dirs) - m_numLastFilesToKeep));
+        | ranges::views::take(std::max(0z, std::ssize(dirs) - m_impl->numLastFilesToKeep));
 
     for (auto&& dir : dirsToRemoveView) {
         fs::remove_all(dir);

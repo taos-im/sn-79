@@ -1,0 +1,194 @@
+<Simulation start="0" step="1000000000" duration="86400000000000"
+    logWindow="3600000000000" timescale="ns"
+    traceTime="1" debug="0" error="1" blockCount="8"
+    host="localhost" port="8000" bookStateEndpoint="/orderbook"
+    generalMsgEndpoint="/account" useMessagePack="1" measureStepWallClockTime="1"
+    ckptIntervalInSteps="60" ckptNumLastFilesToKeep="3" ckptMeasureWallClockTime="1" ckptNumWorkers="8">
+    <Agents>
+        <MultiBookExchangeAgent name="EXCHANGE" remoteAgentCount="264" gracePeriod="600000000000"
+            priceDecimals="2" volumeDecimals="4" baseDecimals="4" quoteDecimals="10"
+            maxLeverage="4" maxLoan="10000" maintenanceMargin="0.10" maxOpenOrders="100"
+            initialPrice="29.57" minOrderSize="2.5364" maxPriceBand="0.10">
+		    <FeePolicy type="dynamic" historySlots="300"
+                makerFee="0.000" takerFee="0.00023" maxMakerRate="0.015" maxTakerRate="0.015"
+                targetMTR="0.4" shapeMakerFee="2" shapeMakerRebate="2"/>
+            <Books instanceCount="16" maxDepth="21" detailedDepth="5">
+                <Processes>
+                    <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.0277"
+                        lambda="0.000206" muJump="0.0" sigmaJump="0.025" updatePeriod="30000000000"
+                        Hurst="0.729" epsilon="0.07"/>
+                    <FuturesSignal name="external" lambda="0.001155" seedInterval="10000000000" updatePeriod="10000000000"/>
+                    <MagneticField name="magneticfield" numRows="32" beta="0.8" alpha="12.2" 
+                        updatePeriod="60000000000"/>
+                </Processes>
+            </Books>
+            <Balances
+                type="pareto"
+                scale="1.0"
+                shape="2.0"
+                seed="1337"
+                wealth="50000.0"
+                price="29.57">
+            </Balances>
+            <Logging startDate="2025-05-07 00:00:00">
+                <L2 depth="5" />
+                <L3 />
+                <FeeLog />
+            </Logging>
+        </MultiBookExchangeAgent>
+        <InitializationAgent
+            name="INITIALIZATION_AGENT"
+            instanceCount="500"
+            exchange="EXCHANGE"
+            tau="86400000000000">
+            <Balances>
+                <Base total="1014.5418" maxLeverage="0" maxLoan="0" />
+                <Quote total="30000.0" maxLeverage="0" maxLoan="0" />
+            </Balances>
+        </InitializationAgent>
+        <ALGOTraderAgent
+            name="ALGO_TRADER_AGENT"
+            instanceCount="1"
+            exchange="EXCHANGE"
+            MFLmean="100000000"
+            MFLstd="25000000"
+            volumeStatsPeriod="30000000000"
+            updateInterval="60000000000"
+            updateSTD="10000000000"
+            minOPLatency="90000000"
+            maxOPLatency="5000000000"
+            depth="21"
+            volumeDrawRayleighScale="20290.8353"
+            alpha="0.2"
+            beta="0.7"
+            gammaX="0.2"
+            omega="0.00000001"
+            activationMidpoint="0.025"
+            activationRate="100.0"
+            immediateBase="6087.2506"
+            wakeDeviationCoef="0.5"
+            wakeupTimeCoef="259200000000000"
+            >
+            <VolumeDistribution type="lognormal" mu="4.117022" sigma="0.9"/>
+              <Balances>
+                <Base total="1694284.7481" maxLeverage="1" maxLoan="10000"/>
+                <Quote total="50000000.0" maxLeverage="1" maxLoan="10000"/>
+            </Balances>
+        </ALGOTraderAgent>     
+        <HighFrequencyTraderAgent
+            name="HIGH_FREQUENCY_TRADER_AGENT"
+            instanceCount="20"
+            exchange="EXCHANGE"
+            debug="0"
+            minMFLatency="100000000"
+            minOPLatency="1000000"
+            maxOPLatency="50000000"
+            opLatencyScaleRay="0.235"
+            tau="2"
+            delta="750000000"
+            gHFT="0.13"
+            sigmaSqr="0.0021"
+            kappa="22"
+            spread="0.0015"
+            orderMean="4.98"
+            orderSTD="1"
+            noiseRay="0.41"
+            shiftPercentage="0.021"
+            sensitivityCoef="100.0"
+            spreadSensitivityExp="1.5"
+            spreadSensitivityBase="0.00015"
+            rateMax="0.0075"
+            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="16" minSpreadTicks="3" inventoryHorizon="0.45" undercutTicks="0" quoteSizeVolumeFrac="3.3" acdOmega="3.89" spreadRefPrice="300"
+            >
+            <Balances>
+                <Base total="5072.7088" maxLeverage="4" maxLoan="10000" />
+                <Quote total="150000.0" maxLeverage="4" maxLoan="10000" />
+            </Balances>
+        </HighFrequencyTraderAgent>
+        <NoiseTraderAgent
+			name="NOISE_TRADER_AGENT"
+			instanceCount="1024"
+			exchange="EXCHANGE"
+			debug="0"
+			MFLmean="1500000000"
+			MFLstd="167000000"
+			minOPLatency="90000000"
+			maxOPLatency="300000000"
+			meanVolume="2.3"
+            tau="1800000000000"
+            balanceCoef="0.7"
+            acdOmega="2.847"
+			acdAlpha="0.45"
+			acdBeta="0.45"
+            acdGamma="0.055"
+            sigmaExp="6.84e-08"
+            weight="0.053"
+            minDMD="30000000000"
+            maxDMD="600000000000"
+			>
+            <Balances
+                type="uniform-50"
+                wealthMin="10000.0"
+                wealthMax="68000.0"
+                price="29.57"
+            />
+		</NoiseTraderAgent>
+        <FuturesTraderAgent
+            name="FUTURES_TRADER_AGENT"
+            instanceCount="0"
+            exchange="EXCHANGE"
+            debug="0"
+            delayMean="5000000000"
+            delaySTD="500000000"
+            MFLmean="250000000"
+            MFLstd="50000000"
+            minOPLatency="90000000"
+            maxOPLatency="300000000"
+            sigmaN="0.7"
+            volume="8.0"
+            orderTypeProb="0.5"
+            sigmaEps="0.5">
+            <Balances>
+                <Base total="500" maxLeverage="1" maxLoan="10000" />
+                <Quote total="150000.0" maxLeverage="1" maxLoan="10000" />
+            </Balances>
+        </FuturesTraderAgent>
+        <StylizedTraderAgent
+            name="STYLIZED_TRADER_AGENT"
+            instanceCount="1000"
+            exchange="EXCHANGE"
+            debug="0"
+            MFLmean="250000000"
+            MFLstd="50000000"
+            minOPLatency="90000000"
+            maxOPLatency="300000000"
+            opLatencyScaleRay="0.235"
+            delayMean="10000000000"
+            delaySTD="1000000000"
+            sigmaN="0.7"
+            sigmaC="2.2"
+            sigmaF="2"
+            tau="60426427824"
+            tauHist="50"
+            tauF="2.9"
+            volGuard="0.000001"
+            sigmaEps="0.002"
+            r_aversion="8990"
+            HARA="2.0"
+            regimeChangeFlag="0"
+            acdOmega="5.05"
+            acdAlpha="0.15"
+			acdBeta="0.65"
+            minDMD="2000000000"
+            maxDMD="600000000000"
+            pO_alpha="0.0" volGuardSigma="0.002257211" volGuardBand="2.0">
+            <Balances
+                type="uniform-50"
+                wealthMin="20000.0"
+                wealthMax="158000.0"
+                price="29.57"
+            />
+        </StylizedTraderAgent>
+        <DistributedProxyAgent />
+    </Agents>
+</Simulation>

@@ -197,7 +197,7 @@ class RandomTakerAgent(GenTRXAgent):
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].base_loan == 0 else LoanSettlementOption.FIFO
                 # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity   = round(self.quantity() * (1 + self.leverage(response)), volume_decimals)
+                quantity   = round(max(self.quantity() * (1 + self.leverage(response)), self.min_order_size(book_id)), volume_decimals)
                 response.market_order(
                     book_id=book_id,
                     direction=self.direction[book_id],
@@ -219,7 +219,7 @@ class RandomTakerAgent(GenTRXAgent):
                 settlement = LoanSettlementOption.NONE if self.accounts[book_id].quote_loan == 0 else LoanSettlementOption.FIFO
                 # If placing unleveraged order, increase the quantity to better match the average total size of
                 # leveraged orders on the other side.  This avoids accumulating too much inventory in one currency.
-                quantity   = round(self.quantity() * (1 + self.leverage(response)), volume_decimals)
+                quantity   = round(max(self.quantity() * (1 + self.leverage(response)), self.min_order_size(book_id)), volume_decimals)
                 response.market_order(
                     book_id=book_id,
                     direction=self.direction[book_id],

@@ -1,4 +1,4 @@
-file(GLOB sources CONFIGURE_DEPENDS "*.cpp")
+file(GLOB sources CONFIGURE_DEPENDS "*.cpp" "multiasset/*.cpp")
 add_library(simulation STATIC ${sources})
 add_library(taosim::simulation ALIAS simulation)
 

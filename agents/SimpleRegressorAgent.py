@@ -204,8 +204,10 @@ Output Directory           : {self.output_dir}
         start = time.time()
 
         for book_id, book in state.books.items():
+            price_dec = self.price_decimals(book_id)   # the book's own grid: each asset class quotes to its own decimals
+            qty = self.round_volume(book_id, max(self.quantity, self.min_order_size(book_id)))   # the book's own floor
             bestBid = book.bids[0].price if book.bids else 0.0
-            bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-self.simulation_config.priceDecimals)
+            bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-price_dec)
             midquote = (bestBid + bestAsk) / 2            
 
             if state.dendrite.hotkey not in self.predictors:
@@ -267,16 +269,16 @@ Output Directory           : {self.output_dir}
                 response.limit_order(
                     book_id,
                     OrderDirection.BUY,
-                    self.quantity,
-                    round(bestBid + 10**(-self.simulation_config.priceDecimals), self.simulation_config.priceDecimals),
+                    qty,
+                    round(bestBid + 10**(-price_dec), price_dec),
                     timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period
                 )
                 # Place a sell order with distance from midquote proportional to the strength of the prediction
                 response.limit_order(
                     book_id,
                     OrderDirection.SELL,
-                    self.quantity,
-                    round(midquote*np.exp(signal),self.simulation_config.priceDecimals),
+                    qty,
+                    round(midquote*np.exp(signal),price_dec),
                     timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period
                 )
             elif signal < -1* self.signal_threshold:
@@ -284,16 +286,16 @@ Output Directory           : {self.output_dir}
                 response.limit_order(
                     book_id,
                     OrderDirection.SELL,
-                    self.quantity,
-                    round(bestAsk - 10**(self.simulation_config.priceDecimals),self.simulation_config.priceDecimals),
+                    qty,
+                    round(bestAsk - 10**(-price_dec), price_dec),   # one tick below the ask (the exponent was positive before: a hundred below)
                     timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period
                 )
                 # Place a buy order with distance from midquote proportional to the strength of the prediction
                 response.limit_order(
                     book_id,
                     OrderDirection.BUY,
-                    self.quantity,
-                    round(midquote*np.exp(signal),self.simulation_config.priceDecimals),
+                    qty,
+                    round(midquote*np.exp(signal),price_dec),
                     timeInForce=TimeInForce.GTT, expiryPeriod=self.expiry_period
                 )
 

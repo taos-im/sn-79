@@ -39,8 +39,8 @@ CLEARED = {
     "roundtrip_volumes", "roundtrip_volume_sums", "realized_pnl_history", "agent_pnl_by_book", "agent_pnl_total",
     "open_positions", "inventory_history", "initial_balances", "recent_miner_trades",
     "kappa_values", "kappa_cache", "activity_factors", "pnl_factors",
-    "capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_heldn", "debeta_heldinv",
-    "debeta_helddrift", "debeta_notional", "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist",
+    "capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_heldn", "debeta_heldinv",
+    "debeta_helddrift", "debeta_notional", "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist",
     "debeta_invsum_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
     "debeta_notional_hist", "debeta_cp", "debeta_cp_hist",
     # main-side smoothing and presence carried across rounds
@@ -49,17 +49,24 @@ CLEARED = {
 }
 # book-first per-uid state ({book: {uid: ...}})
 CLEARED_BOOK_FIRST = {"debeta_inv"}
+# class-first per-uid state ({asset class: {maker uid: {taker uid: ...}}}): the counterparty rows kept per class
+CLEARED_CLASS_FIRST = {"debeta_cpc", "debeta_cpc_hist"}
 EXEMPT = {
     # configuration, handles and scalars
     "config": "configuration", "engine": "engine handle", "device": "torch device", "simulation": "config",
+    "simulation_config": "the scoring child's copy of the simulation config (skill_bar reads its book count)",
     "simulation_timestamp": "clock", "effective_max_uids": "scalar", "reward_cores": "worker count",
     "subtensor": "chain handle", "metagraph": "chain view", "wallet": "wallet", "uid": "own uid",
-    "deregistered_uids": "the reset queue itself", "step": "counter", "block": "chain height",
+    "deregistered_uids": "the reset queue itself",
+    "step": "counter", "block": "chain height",
     "scores": "cleared by apply_resets (main-only bookkeeping); the moving average of pay",
     "unnormalized_scores": "cleared by apply_resets", "miner_stats": "cleared by apply_resets",
     # per-round outputs, rebuilt from the state above every round
     "debeta_detail": "per-round output", "debeta_alphas_by_book": "per-round output", "_debeta_last": "per-round",
     "debeta_floor": "per-round output", "debeta_w_make": "per-round output", "debeta_absent": "per-round, from presence",
+    "_debeta_class_shares": "per-round output (the class-mixed pool shares, rebuilt from the accumulators)",
+    "_debeta_class_summary": "per-round output (the per-class summary the report publishes)",
+    "_debeta_class_map_cache": "layout cache (book to asset class), keyed by the simulation object, not by uid",
     "debeta_presence_shares": "per-round, from presence", "_trading_score_ema_ts": "a timestamp",
     # keyed by book or by trade id, not by uid
     "debeta_invn": "book-keyed", "debeta_invn_hist": "book-keyed", "debeta_drift": "book-keyed",
@@ -112,6 +119,10 @@ def _book_first():
     return d
 
 
+def _class_first():
+    return {0: _filled(True), 1: _filled(True)}
+
+
 def _has(name, o, uid):
     if isinstance(o, tuple):
         return any(_has(name, x, uid) for x in o if isinstance(x, dict))
@@ -121,6 +132,8 @@ def _has(name, o, uid):
         return any(_has("", x, uid) for x in o.values())
     if name in CLEARED_BOOK_FIRST:
         return any(isinstance(x, dict) and uid in x and _has_sentinel(x[uid]) for x in o.values())
+    if name in CLEARED_CLASS_FIRST:
+        return any(_has("debeta_cp", x, uid) for x in o.values() if isinstance(x, dict))
     if uid in o and _has_sentinel(o[uid]):
         return True
     if name in COUNTERPARTY:
@@ -144,6 +157,8 @@ def _validator():
         setattr(v, n, _filled(n in COUNTERPARTY))
     for n in CLEARED_BOOK_FIRST:
         setattr(v, n, _book_first())
+    for n in CLEARED_CLASS_FIRST:
+        setattr(v, n, _class_first())
     v._debeta_pool_ema = {"term": _filled(), "share": _filled()}
     v.miner_presence = {GONE: collections.deque([S, S]), KEPT: collections.deque([S, S])}
     v._trading_score_ema_pre = (dict(_filled()), dict(_filled()), None)
@@ -153,7 +168,7 @@ def _validator():
 
 
 def test_every_attribute_the_pay_path_touches_is_classified():
-    unclassified = sorted(_discovered() - CLEARED - CLEARED_BOOK_FIRST - set(EXEMPT))
+    unclassified = sorted(_discovered() - CLEARED - CLEARED_BOOK_FIRST - CLEARED_CLASS_FIRST - set(EXEMPT))
     unclassified = [n for n in unclassified if not n.startswith("__") and n not in {"prometheus", "logger"}]
     assert not unclassified, (
         f"pay-path attributes with no reset classification: {unclassified}. Add each to CLEARED (a reset must "
@@ -164,7 +179,7 @@ def test_the_reset_path_leaves_nothing_of_the_departed_uid():
     v = _validator()
     vmod.Validator.handle_deregistration(v, GONE)
     trade.reset_agent_histories(v, GONE, BOOKS)
-    survived = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST if _has(n, getattr(v, n), GONE))
+    survived = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST if _has(n, getattr(v, n), GONE))
     assert not survived, f"the departed uid survives a reset in: {survived}"
 
 
@@ -172,5 +187,5 @@ def test_the_reset_leaves_other_uids_alone():
     v = _validator()
     vmod.Validator.handle_deregistration(v, GONE)
     trade.reset_agent_histories(v, GONE, BOOKS)
-    lost = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST if not _has(n, getattr(v, n), KEPT))
+    lost = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST if not _has(n, getattr(v, n), KEPT))
     assert not lost, f"a reset of one uid cleared another uid's state in: {lost}"

@@ -269,15 +269,25 @@ def test_shadow_score_matches_main_scoring():
 
 
 def test_frame_io_roundtrip():
+    import threading
+
     a, b = socket.socketpair()
     try:
         _send_frame(a, ("state", (123, b"\x00\x01payload")))
         kind, payload = _recv_frame(b)
         assert kind == "state" and payload == (123, b"\x00\x01payload")
-        # oversized-safe framing: 1MB payload
+        # oversized-safe framing: 1MB payload.  The send must run concurrently
+        # with the receive — a 1MB frame overflows the socketpair kernel buffer
+        # (~208KB default), so a same-thread sendall deadlocks before recv runs.
+        # In production sender and receiver are separate processes.
         big = b"x" * (1 << 20)
-        _send_frame(b, ("init_part", ("trade_volumes", big)))
-        kind, (name, blob) = _recv_frame(a)
+        sender = threading.Thread(
+            target=_send_frame, args=(b, ("init_part", ("trade_volumes", big))))
+        sender.start()
+        try:
+            kind, (name, blob) = _recv_frame(a)
+        finally:
+            sender.join(timeout=30)
         assert kind == "init_part" and name == "trade_volumes" and blob == big
     finally:
         a.close()
@@ -653,8 +663,9 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "trading_score_ema_n", "trade_volumes", "roundtrip_volumes",
         "volume_sums", "maker_volume_sums", "taker_volume_sums",
         "self_volume_sums", "roundtrip_volume_sums",
-        "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
+        "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
         "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
+        "debeta_cpc_hist",  # the per-asset-class counterparty rows (0.6.3), after the pooled histories
         "debeta_invn_hist", "debeta_drift_hist", "debeta_inv", "debeta_plast",
         "miner_stats",
         "miner_presence",

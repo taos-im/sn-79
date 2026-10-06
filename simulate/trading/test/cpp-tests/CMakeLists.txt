@@ -41,6 +41,8 @@ add_executable(taosim-tests
     WakeupCheckpointRoundTripTests.cpp
     FuturesTraderActivityTests.cpp
     ProcessLogLocationTests.cpp
+    MultiAssetSeedTests.cpp
+    LifecycleNoticeTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the
 # target always configures.

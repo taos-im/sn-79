@@ -19,6 +19,7 @@ trading score by --scoring.debeta.weight (default 0.0: legacy emissions with the
 fully published; 1.0: full replacement). The old --scoring.debeta.enabled boolean is deprecated
 and ignored.
 """
+import bisect
 import statistics
 from bisect import bisect_left, insort
 from collections import defaultdict, deque
@@ -207,7 +208,30 @@ def _uid(x):
     return -1 if x is None else int(x)
 
 
-def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts):
+def _mark_weight(t):
+    """A print's weight in the realized mark: its size when the background market is on at least one side, else 0,
+    so prints arranged between miners cannot move the price a fill is marked against."""
+    ma, ta = t.get("Ma", -1), t.get("Ta", -1)
+    bg = (ma is None or ma < 0) or (ta is None or ta < 0)
+    return float(t.get("q") or 0.0) if bg else 0.0
+
+
+def _weighted_mark(prices, weights):
+    """Size-weighted average over the background-sided prints of a window; the plain average when none is."""
+    tw = sum(weights)
+    if tw > 0:
+        return sum(p * w for p, w in zip(prices, weights)) / tw
+    return sum(prices) / len(prices)
+
+
+def centered_mark(prices, weights, W):
+    """The realized basis's mark at each print: _weighted_mark over the same symmetric window centered_mid uses."""
+    n = len(prices)
+    return [_weighted_mark(prices[max(0, i - W):min(n, i + W + 1)], weights[max(0, i - W):min(n, i + W + 1)])
+            for i in range(n)]
+
+
+def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts, maker_only=False):
     """Book one fill's capture against `mid`: buyer gets (mid-price)*q, seller the negation
     (zero-sum per fill under ANY mid, so a degraded mid can shift capture between counterparties
     but never mint it)."""
@@ -215,6 +239,13 @@ def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist
     ma = t.get("Ma", -1)
     ta = t.get("Ta", -1)
     buyer, seller = (ta, ma) if int(t["s"]) == 0 else (ma, ta)
+    if maker_only:
+        # Realized basis: only the liquidity the maker supplied is judged. A taker that trades with the next move
+        # marks positive at the horizon, and crediting it would pay taking out of the making pool.
+        if buyer != ma:
+            buyer = None
+        if seller != ma:
+            seller = None
     if buyer is not None and buyer >= 0:
         buy_sums[buyer][book_id] = buy_sums[buyer].get(book_id, 0.0) + buy_cap
         if buy_hist is not None:
@@ -226,6 +257,7 @@ def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist
 
 
 CAPTURE_FLUSH_NS = 60_000_000_000  # force-finalize a pending fill after 60 sim-s without W forward prints
+REALIZED_HORIZON_NS_DEFAULT = 20_000_000_000  # realized spread: a fill is marked against the mid this far after it (sim time)
 
 
 def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
@@ -246,15 +278,64 @@ def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts
         _attribute_capture(buy_sums, sell_sums, book_id, t, sum(window) / len(window),
                            buy_hist, sell_hist, ts)
         pend.pop(0)
-    new_base = max(base, (pend[0][0] if pend else n) - W)
+    _trim_window(st, W)
+
+
+def _trim_window(st, W):
+    """Drop the prints no pending fill can still need: everything before the oldest pending fill's own window,
+    on either queue (capture's `pend`, realized's `rpend`). With no realized queue the bound is the old one, at
+    most 2W+1 prices; with one, the horizon's prints more."""
+    prices, pend = st["prices"], st["pend"]
+    rpend = st.get("rpend") or []
+    base, n = st["base"], st["n"]
+    oldest = min((pend[0][0] if pend else n), (rpend[0][0] if rpend else n))
+    new_base = max(base, oldest - W)
     if new_base > base:
         del prices[:new_base - base]
+        times = st.get("times")
+        if times is not None:
+            del times[:new_base - base]
+        wts = st.get("wts")
+        if wts is not None:
+            del wts[:new_base - base]
         st["base"] = new_base
+
+
+def _finalize_realized_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
+                             now_ns, horizon_ns, flush_ns, force=False):
+    """Realized spread (2 October 2026): release every pending fill whose print stream has reached the fill's time
+    plus the horizon with a full forward window after that print, or that has waited horizon + flush_ns of sim
+    time on a quiet book, or everything when forced. The fill is booked against the centered window around the
+    first print at or after the horizon; a fill released stale or forced with no such print is marked against the
+    latest window the book has. Same attribution as capture (zero-sum per fill), into the realized sums."""
+    prices, times, rpend = st["prices"], st["times"], st["rpend"]
+    base, n = st["base"], st["n"]
+    while rpend:
+        idx, arrive_ns, t = rpend[0]
+        j = None
+        if arrive_ns is not None and arrive_ns >= 0:
+            k = bisect.bisect_left(times, arrive_ns + horizon_ns, max(0, idx - base))
+            if k < len(times):
+                j = k + base
+        ready = (force or (j is not None and n - 1 >= j + W)
+                 or (now_ns is not None and arrive_ns is not None and now_ns - arrive_ns >= horizon_ns + flush_ns))
+        if not ready:
+            break
+        if j is None:
+            j = n - 1
+        lo = max(0, j - W) - base
+        hi = min(n, j + W + 1) - base
+        wts = st.get("wts") or [0.0] * len(prices)
+        _attribute_capture(buy_sums, sell_sums, book_id, t, _weighted_mark(prices[lo:hi], wts[lo:hi]),
+                           buy_hist, sell_hist, ts, maker_only=True)
+        rpend.pop(0)
 
 
 def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
                             buy_hist=None, sell_hist=None, ts=None,
-                            mid_state=None, flush_ns=CAPTURE_FLUSH_NS):
+                            mid_state=None, flush_ns=CAPTURE_FLUSH_NS,
+                            real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
+                            horizon_ns=None):
     """Accumulate per-uid two-sided spread capture for ONE book's ordered trade batch into
     buy_sums / sell_sums ({uid: {book: cap}}), in place. Each `trade` is dict-like with keys
     p (price), q (quantity), s (side), Ma (maker uid), Ta (taker uid). side==0 => taker buys /
@@ -274,7 +355,16 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
     stream itself can.
 
     When buy_hist/sell_hist ({uid:{book:{ts:incr}}}) + ts are given, increments are also recorded
-    at ts so the sums can be windowed (pruned/shifted)."""
+    at ts so the sums can be windowed (pruned/shifted).
+
+    REALIZED SPREAD (2 October 2026, behind scoring.debeta.making_basis): when real_buy_sums/real_sell_sums are
+    given, every fill is also marked at the first print horizon_ns of sim time after it, against the size-weighted
+    average of the background-sided prints in the centered window there (centered_mark)
+    (REALIZED_HORIZON_NS_DEFAULT when None) and booked into those sums with the same attribution. Offline, the
+    horizon print is found in the batch by each trade's `ts`; live, the fill waits on a second pending queue
+    (`rpend`, with the print times kept in `times`) and is released by _finalize_realized_ready. With the realized
+    arguments absent nothing here changes."""
+    _h = int(horizon_ns) if horizon_ns else REALIZED_HORIZON_NS_DEFAULT
     if mid_state is None:
         prices = [float(t["p"]) for t in trades]
         mids = centered_mid(prices, W)
@@ -282,25 +372,61 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
             if t.get("Ma", -1) == t.get("Ta", -1):
                 continue
             _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts)
+        if real_buy_sums is not None:
+            times = [int(t.get("ts")) if t.get("ts") is not None else int(ts or 0) for t in trades]
+            marks = centered_mark(prices, [_mark_weight(t) for t in trades], W)
+            for i, t in enumerate(trades):
+                if t.get("Ma", -1) == t.get("Ta", -1):
+                    continue
+                k = min(len(times) - 1, bisect.bisect_left(times, times[i] + _h))
+                _attribute_capture(real_buy_sums, real_sell_sums, book_id, t, marks[k], real_buy_hist, real_sell_hist, ts,
+                                   maker_only=True)
         return
     st = mid_state.setdefault(book_id, {"prices": [], "pend": [], "base": 0, "n": 0})
+    st.setdefault("rpend", [])
+    times = st.setdefault("times", [])
+    if len(times) < len(st["prices"]):
+        # a print window carried from before the realized queue existed: pad so the lists stay parallel
+        times[:0] = [-1] * (len(st["prices"]) - len(times))
+    wts = st.setdefault("wts", [])
+    if len(wts) < len(st["prices"]):
+        # carried from before the weighted mark: those prints count as unweighted until they leave the window
+        wts[:0] = [0.0] * (len(st["prices"]) - len(wts))
     for t in trades:
         st["prices"].append(float(t["p"]))
+        times.append(int(ts) if ts is not None else -1)
+        wts.append(_mark_weight(t))
         if t.get("Ma", -1) != t.get("Ta", -1):
             st["pend"].append((st["n"], ts, t))
+            # only fills with a miner on either side can earn or pay realized spread; background-on-background
+            # prints shape the mid but never wait on the queue (it would otherwise hold the horizon's prints twice)
+            if real_buy_sums is not None and ((t.get("Ma") or -1) >= 0 or (t.get("Ta") or -1) >= 0):
+                st["rpend"].append((st["n"], ts, t))
         st["n"] += 1
     _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, ts, flush_ns)
+    if real_buy_sums is not None:
+        _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts, ts, _h, flush_ns)
+        _trim_window(st, W)
 
 
 def flush_capture_state(mid_state, buy_sums, sell_sums, W, *,
                         buy_hist=None, sell_hist=None, ts=None,
-                        flush_ns=CAPTURE_FLUSH_NS, force=False):
+                        flush_ns=CAPTURE_FLUSH_NS, force=False,
+                        real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
+                        horizon_ns=None):
     """Finalize stale pending fills on EVERY book (books with no new trades never reach
     accumulate_book_capture, so the live loop calls this each cycle; force=True drains everything,
-    for offline end-of-run and the sim-boundary re-base)."""
+    for offline end-of-run and the sim-boundary re-base). With the realized arguments, the realized
+    queue is drained on the same terms (stale after horizon + flush_ns, or forced)."""
+    _h = int(horizon_ns) if horizon_ns else REALIZED_HORIZON_NS_DEFAULT
     for book_id, st in mid_state.items():
         _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
                         ts, flush_ns, force=force)
+        if real_buy_sums is not None and st.get("rpend"):
+            st.setdefault("times", [])
+            _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts,
+                                     ts, _h, flush_ns, force=force)
+            _trim_window(st, W)
 
 
 def balanced_reward(caps):
@@ -328,6 +454,24 @@ def balanced_reward_per_book(capture_buy_sums, capture_sell_sums, uids):
             # relies on.
             tot += 2.0 * min(cb.get(b, 0.0), cs.get(b, 0.0))
         out[u] = max(0.0, tot)
+    return out
+
+
+def markout_quality(capture_buy_sums, capture_sell_sums, real_buy_sums, real_sell_sums, uids):
+    """The realized basis's quality factor per uid: the share of its captured spread a maker still holds at the
+    horizon, clamp(R / C, 0, 1), with R the uid's realized spread over its maker fills (the realized pair is booked
+    maker-side only) and C its captured spread over all its fills, both summed over every book. 0 when C <= 0.
+
+    The making pool keeps the captured basis's two-sided test and multiplies each uid's captured credit by this
+    factor, so it can only discount: a maker whose quotes the market runs over keeps none of its credit, one that
+    keeps 80 per cent of its spread keeps 80 per cent, and nobody is paid more than under captured. A single fill's
+    realized mark is mostly noise at the horizon; summing over all of a uid's fills before the ratio averages that
+    noise out, where a two-sided minimum of realized sums would be biased negative and empty the pool."""
+    out = {}
+    for u in uids:
+        c = sum((capture_buy_sums.get(u) or {}).values()) + sum((capture_sell_sums.get(u) or {}).values())
+        r = sum((real_buy_sums.get(u) or {}).values()) + sum((real_sell_sums.get(u) or {}).values())
+        out[u] = 0.0 if c <= 0.0 else min(1.0, max(0.0, r / c))
     return out
 
 
@@ -551,6 +695,46 @@ def p11_discount(own, cp, uids, strength, topk=2):
     return out
 
 
+def _bg_share_of(cp, uid):
+    """A maker's background (MARKET_FLOW) share of its fill volume on the given counterparty rows; None without rows."""
+    my = (cp or {}).get(uid) or {}
+    tot = float(sum(my.values()))
+    if tot <= 0:
+        return None
+    return float(my.get(MARKET_FLOW, 0.0)) / tot
+
+
+def tether_miner_sourced(own, cp, uids, k):
+    """S3': a maker earns making credit from other miners' flow only in proportion to the liquidity it supplies
+    to the open market. On the volume basis of the same counterparty rows P11 reads: with bg the maker's
+    MARKET_FLOW volume and miner the rest, credit *= (bg + min(miner, k * bg)) / (bg + miner). A maker served
+    by the market is untouched; one fed by miners keeps at most k times its open-market share; one with no
+    open-market flow keeps nothing. Applied after P11 and before ranking; k <= 0 disables.
+
+    Args:
+        own: The making magnitudes, returned scaled (not mutated).
+        cp: ``{maker_uid: {taker_uid: vol}}`` counterparty volumes.
+        uids: The uids to score.
+        k: The tether, in multiples of the open-market credit; 0 disables.
+
+    Returns:
+        ``{uid: tethered making magnitude}``.
+    """
+    if k <= 0:
+        return dict(own)
+    out = {}
+    for u in uids:
+        my = cp.get(u, {})
+        bg = float(my.get(MARKET_FLOW, 0.0))
+        miner = float(sum(v for t, v in my.items() if t != MARKET_FLOW))
+        tot = bg + miner
+        if tot <= 0:
+            out[u] = own.get(u, 0.0)
+            continue
+        out[u] = own.get(u, 0.0) * (bg + min(miner, k * bg)) / tot
+    return out
+
+
 SKILL_RANK_SCOPES = ("positives", "whole")
 
 
@@ -733,7 +917,8 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
                   cp=None, p11_strength=0.0, detail=None, making_floor_scale=0.0,
                   skill_rank_scope="positives", making_rank_scope="positives",
                   skill_values=None, skill_rank_scale=1.0, skill_max_inactive_books=0.0,
-                  skill_min_books=MIN_SKILL_BOOKS_DEFAULT, skill_p11_strength=0.0, p11_topk=2):
+                  skill_min_books=MIN_SKILL_BOOKS_DEFAULT, skill_p11_strength=0.0, p11_topk=2, s3_k=0.0,
+                  cp_tether=None):
     """Full per-uid de-beta score. making = per-uid two-sided spread capture, combined by RANK. Rank
     rather than magnitude-proportional, because proportional combining re-concentrates reward on the
     largest flow; and per-uid rather than netted across linked accounts, because grouping by identity is
@@ -741,7 +926,8 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
     bounding any one participant's share; the simulation free-capital residual is inherent to a
     spread-capture reward and is bounded by a modest w_make.
     P11: when cp (counterparty volumes) + p11_strength>0 are given, the making leg is discounted by
-    excess counterparty concentration (feeder-ring defence) BEFORE ranking.
+    excess counterparty concentration (feeder-ring defence) BEFORE ranking. S3' (s3_k > 0) then tethers
+    the miner-sourced part of the making leg to s3_k times the open-market part (tether_miner_sourced).
 
     capture_buy_sums/capture_sell_sums: {uid: {book: cap}}. book_alphas_by_uid: {uid: [per-book alpha]}.
 
@@ -797,6 +983,12 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
     pre_p11 = dict(own)
     if cp is not None and p11_strength > 0:
         own = p11_discount(own, cp, uids, p11_strength, topk=max(1, int(p11_topk)))
+    pre_s3 = dict(own)
+    # The tether reads the pooled rows (cp_tether) when a class run hands P11 its class's rows: liquidity
+    # supplied to the market in any class is service, while concentration is judged within the class.
+    _cp_t = cp_tether if cp_tether is not None else cp
+    if _cp_t is not None and s3_k > 0:
+        own = tether_miner_sourced(own, _cp_t, uids, float(s3_k))
     making = [own.get(u, 0.0) for u in uids]
     if skill_values is None:
         skill = [kappa_floored(book_alphas_by_uid.get(u, []), floor, skill_min_books) for u in uids]
@@ -869,7 +1061,11 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
                 "skill_p11_factor": skill_p11f[i],
                 "skill_net_alpha": net_alpha[i],
                 "skill_rank": rs[i],
-                "p11_factor": (making[i] / base) if base else 1.0,
+                "p11_factor": (pre_s3.get(u, 0.0) / base) if base else 1.0,
+                "making_s3_factor": (making[i] / pre_s3.get(u, 0.0)) if pre_s3.get(u, 0.0) else 1.0,
+                # The maker's background share of fill volume on the rows the tether read: what the tether
+                # keys on, and what tells a griefed honest maker (high share, low P11 factor) from a fed one.
+                "bg_share": _bg_share_of(_cp_t, u),
                 # Books whose |alpha| clears the floor: the de-beta coverage count. The kappa leg's
                 # num_scored_books is a penalty-floor artifact (a constant for idle miners) and must
                 # not stand in for this on any surface.

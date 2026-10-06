@@ -100,7 +100,7 @@ Training is **budget-driven**: the agent trains its assigned pages one at a time
 
 ### Page size and sim grace period
 
-The sim does not emit state immediately at startup. `simulation_0.xml` sets `gracePeriod="600000000000"` nanoseconds (10 minutes), during which the exchange accepts connections but publishes no state. First state messages arrive at `t = 10 minutes` of sim time.
+The sim does not emit state immediately at startup. The shipped layouts (`multiasset_simulation_0.xml` and the per-class `simulation_0.xml` and `simulation_1.xml`) set `gracePeriod="600000000000"` nanoseconds (10 minutes), during which the exchange accepts connections but publishes no state. First state messages arrive at `t = 10 minutes` of sim time.
 
 Data is then accumulated into fixed-row pages: a book flushes a parquet once it reaches `--max-pending-rows-per-book` rows (default 30 000). The gradient server cannot assign a book until its first page has flushed, so the first training round lands once an active book fills a page, which depends on the order rate rather than a fixed window. A quiet book that never fills a page is tail-flushed on the `--parquet-interval-ns` sim-time fallback.
 

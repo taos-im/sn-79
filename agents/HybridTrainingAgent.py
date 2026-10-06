@@ -127,16 +127,14 @@ class HybridTrainingAgent(GenTRXAgent):
             self._initial_base[book_id] = current
         return current - self._initial_base[book_id]
 
-    def _rand_size(self, mean: float) -> float:
-        """Log-normal size around `mean` — keeps volumes varied per order."""
+    def _rand_size(self, mean: float, book_id: int) -> float:
+        """Log-normal size around `mean`, so volumes vary per order, never below the book's own minimum order and
+        rounded on the book's own grid (each asset class has its own floor)."""
         if mean <= 0:
             return 0.0
         sigma = 0.5
         mu = math.log(mean) - 0.5 * sigma * sigma
-        return round(
-            self._rng.lognormvariate(mu, sigma),
-            self.simulation_config.volumeDecimals,
-        )
+        return self.round_volume(book_id, max(self._rng.lognormvariate(mu, sigma), self.min_order_size(book_id)))
 
     # ------------------------------------------------------------------
     # Signal
@@ -222,18 +220,12 @@ class HybridTrainingAgent(GenTRXAgent):
         # Skew away from pressure side: signal>0 (buy pressure) → tighter sell,
         # wider buy.
         skew = 0.25 * signal
-        bid_px = round(
-            mid - spread * (offset + skew),
-            self.simulation_config.priceDecimals,
-        )
-        ask_px = round(
-            mid + spread * (offset - skew),
-            self.simulation_config.priceDecimals,
-        )
+        bid_px = self.round_price(book_id, mid - spread * (offset + skew))
+        ask_px = self.round_price(book_id, mid + spread * (offset - skew))
         if bid_px <= 0 or bid_px >= ask_px:
             return
 
-        size = self._rand_size(self.base_quote_size)
+        size = self._rand_size(self.base_quote_size, book_id)
         if size <= 0:
             return
 
@@ -269,7 +261,7 @@ class HybridTrainingAgent(GenTRXAgent):
         """Single market order sized by |signal|, in signal direction."""
         direction = OrderDirection.BUY if signal > 0 else OrderDirection.SELL
         mag = min(abs(signal), 1.0)
-        size = self._rand_size(self.base_quote_size * self.enter_size_mult * mag)
+        size = self._rand_size(self.base_quote_size * self.enter_size_mult * mag, book_id)
         if size <= 0:
             return
 
@@ -299,7 +291,7 @@ class HybridTrainingAgent(GenTRXAgent):
         """Non-flat inventory: stop-loss if adverse, else closing limit."""
         mid = 0.5 * (book.bids[0].price + book.asks[0].price)
         entry = self._entry_mid.get(book_id, mid)
-        qty = round(abs(pos), self.simulation_config.volumeDecimals)
+        qty = self.round_volume(book_id, abs(pos))
         if qty <= 0:
             return
 

@@ -35,8 +35,8 @@ BookProcessLogger::BookProcessLogger(
         "{},0",
         fmt::join(
             views::iota(
-                simulation->blockIdx() * X0s.size(),
-                simulation->blockIdx() * X0s.size() + X0s.size()),
+                static_cast<size_t>(simulation->bookIdCanon(0)),
+                simulation->bookIdCanon(0) + X0s.size()),
             ","),
         fmt::join(X0s, ",")
     );

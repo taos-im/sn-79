@@ -8,7 +8,9 @@ enumerations, account structures, and the market simulation configuration.
 # them, so `from taos.im.protocol.models import *` and every named import keep working unchanged.
 # Order matters: each module imports from the ones above it.
 import numpy as np
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from xml.etree.ElementTree import Element
 from pydantic import Field
 from ypyjson import YpyObject

@@ -1718,7 +1718,7 @@ class RevengAgent(GenTRXAgent):
             Median rolling-quote P&L across all books with at least two fills,
             or ``0.0`` if no such books exist.
         """
-        # TODO: Add more than rolling quote, such as score, and vol cap estimate
+        # A richer signal could fold in score and a volume-cap estimate alongside the rolling quote.
         # NOTE: study uses maximize
         buffer = self.buffers.get(validator)
         if not buffer:
@@ -1765,7 +1765,7 @@ class RevengAgent(GenTRXAgent):
         sp.trial_cache[next_trial.number] = next_trial
         bt.logging.info(f"ID {trial_id} ended with {gain} -- Change to {hp}", prefix="[TRIAL]")
 
-        # TODO: consider checking against others
+        # A stricter variant would cross-check this against the other miners' quotes.
         try:
             val = {
                 "best_value": sp.study.best_value,

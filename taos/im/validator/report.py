@@ -30,6 +30,7 @@ from taos.im.utils import duration_from_timestamp
 from taos.im.validator.ingest_payload import kappa_maps, debeta_maps, scoring_params
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import GaugeMetricFamily
+from taos.im.validator.exposition import Exposition, SNAPSHOT_ENABLED
 from fastapi import FastAPI
 from fastapi.responses import Response
 import uvicorn
@@ -195,70 +196,62 @@ class ReportingService:
                 return None
             return Response(content=b"# metrics warming up\n", status_code=200, media_type=CONTENT_TYPE_LATEST)
 
-        @app.get("/metrics")
-        def all_metrics():
-            """All metrics combined (backwards compatibility)"""
+        def _body(name=None):
+            # The frozen cycle, rendered once and sliced per registry; before the first cycle, or with
+            # the snapshot switched off, the live render the child served until 30 September 2026.
+            if SNAPSHOT_ENABLED:
+                served = self.exposition.serve(name)
+                if served is not None:
+                    return served
+            if name is None:
+                return b''.join([generate_latest(r) for r in self.registries.values()])
+            return generate_latest(self.registries[name])
+
+        def _endpoint(name=None):
             warming = _warmup_response()
             if warming is not None:
                 return warming
-            output = b''.join([generate_latest(r) for r in self.registries.values()])
-            return Response(content=output, media_type=CONTENT_TYPE_LATEST)
+            return Response(content=_body(name), media_type=CONTENT_TYPE_LATEST)
+
+        @app.get("/metrics")
+        def all_metrics():
+            """All metrics combined (MVTRX_METRICS_MAIN=board leaves agent and trades to their own endpoints)"""
+            return _endpoint()
 
         @app.get("/metrics/validator")
         def validator_metrics():
             """Validator-specific metrics: counters, validator_gauges, neuron_info"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_validator), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('validator')
 
         @app.get("/metrics/simulation")
         def simulation_metrics():
             """Simulation metrics: simulation_gauges"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_simulation), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('simulation')
 
         @app.get("/metrics/miner")
         def miner_metrics():
-            """Miner metrics: miner_gauges, miners"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_miner), media_type=CONTENT_TYPE_LATEST)
+            """Miner metrics: miner_gauges, miners, miner_identity"""
+            return _endpoint('miner')
 
         @app.get("/metrics/agent")
         def agent_metrics():
             """Miner metrics: agent_gauges"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_agent), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('agent')
 
         @app.get("/metrics/books")
         def book_metrics():
             """Book metrics: book_gauges, books"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_books), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('books')
 
         @app.get("/metrics/trades")
         def trade_metrics():
             """Trade metrics: trades, miner_trades"""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_trades), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('trades')
 
         @app.get("/metrics/gentrx")
         def gentrx_metrics():
             """GenTRX distributed-training metrics: pool allocation, per-miner EMA scores."""
-            warming = _warmup_response()
-            if warming is not None:
-                return warming
-            return Response(content=generate_latest(self.registry_gentrx), media_type=CONTENT_TYPE_LATEST)
+            return _endpoint('gentrx')
 
         def run_server():
             """Serve the metrics endpoint until the process is stopped."""
@@ -298,6 +291,9 @@ class ReportingService:
             'trades': self.registry_trades,
             'gentrx': self.registry_gentrx,
         }
+        # One scrape, one cycle: report() publishes a frozen snapshot of every family at the end of each
+        # cycle and the endpoints serve slices of its one render (exposition.py).
+        self.exposition = Exposition(self.registries)
 
         # Child-handle / last-value cache for the persistent gauge families
         # (agent_gauges, miner_gauges, book_gauges, simulation_gauges). Keyed by
@@ -318,10 +314,20 @@ class ReportingService:
         self._debeta_book_gauges = bool(getattr(getattr(_sc, 'debeta', None), 'publish_book_gauges', False))
 
         self.prometheus_counters = Counter('counters', 'Counter summaries for the running validator.', ['wallet', 'netuid', 'sim_id', 'timestamp', 'counter_name'], registry=self.registry_validator)
-        self.prometheus_simulation_gauges = Gauge('simulation_gauges', 'Gauge summaries for global simulation metrics.', ['wallet', 'netuid', 'sim_id', 'simulation_gauge_name'], registry=self.registry_simulation)
+        # simulation_gauges, miner_gauges and book_gauges are snapshot-backed since 30 September 2026 (carry
+        # forward, as the eager Gauges did) so that a scrape is one frozen cycle; see exposition.py.
+        self.prometheus_simulation_gauges = _SnapshotCollector('simulation_gauges', 'Gauge summaries for global simulation metrics.', ['wallet', 'netuid', 'sim_id', 'simulation_gauge_name'])
+        self.registry_simulation.register(self.prometheus_simulation_gauges)
+        # Per asset class under a multi-asset layout (0.6.3): weight, bar, books, makers, skilled uids, credit and the
+        # weight a class effectively carries after a quiet class hands its weight back. Empty on a single market.
+        self.prometheus_class_gauges = _SnapshotCollector('class_gauges', 'Gauge summaries per asset class.',
+                                                           ['wallet', 'netuid', 'sim_id', 'asset_class', 'class_gauge_name'])
+        self.registry_simulation.register(self.prometheus_class_gauges)
         self.prometheus_validator_gauges = Gauge('validator_gauges', 'Gauge summaries for validator-related metrics.', ['wallet', 'netuid', 'sim_id', 'validator_gauge_name'], registry=self.registry_validator)
-        self.prometheus_miner_gauges = Gauge('miner_gauges', 'Gauge summaries for miner-related metrics.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'miner_gauge_name'], registry=self.registry_miner)
-        self.prometheus_book_gauges = Gauge('book_gauges', 'Gauge summaries for book-related metrics.', ['wallet', 'netuid', 'sim_id', 'book_id', 'level', 'book_gauge_name'], registry=self.registry_books)
+        self.prometheus_miner_gauges = _SnapshotCollector('miner_gauges', 'Gauge summaries for miner-related metrics.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'miner_gauge_name'])
+        self.registry_miner.register(self.prometheus_miner_gauges)
+        self.prometheus_book_gauges = _SnapshotCollector('book_gauges', 'Gauge summaries for book-related metrics.', ['wallet', 'netuid', 'sim_id', 'book_id', 'level', 'book_gauge_name'])
+        self.registry_books.register(self.prometheus_book_gauges)
         # agent_gauges is the high-cardinality family (~1.8M series/cycle). It is
         # served via a snapshot collector instead of an eager Gauge so the per-cycle
         # apply cost (gauge.labels()+locked .set() x1.8M) collapses to a dict swap.
@@ -353,7 +359,10 @@ class ReportingService:
             'book_gauge_name'
         ], carry_forward=False)
         self.registry_books.register(self.prometheus_books)
-        self.prometheus_miners = Gauge('miners', 'Gauge summaries for miner metrics.', [
+        # miners and miner_identity are rebuilt in full every cycle: replace-mode snapshot collectors since
+        # 30 September 2026, so no scrape can see them half rebuilt (three of 206 mainnet board reads in the
+        # week before lost some or all coldkeys that way).
+        self.prometheus_miners = _SnapshotCollector('miners', 'Gauge summaries for miner metrics.', [
             'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port', 'axon',
             'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
             'inventory_value', 'inventory_value_change', 'pnl', 'pnl_change', 'total_realized_pnl',
@@ -364,13 +373,25 @@ class ReportingService:
             'pnl_score', 'combined_score', 'gentrx_score',
             'unnormalized_score', 'score',
             'debeta_score', 'debeta_making_rank', 'debeta_skill_rank', 'debeta_p11_factor',
+            'debeta_s3_factor', 'debeta_bg_share',
+            'debeta_making_realized', 'debeta_making_captured', 'debeta_making_basis',
             'debeta_making_share', 'debeta_ladder_input',
             'debeta_present', 'debeta_coverage_books', 'debeta_skill_coverage_factor',
             'num_scored_books', 'scorable',
             'miner_gauge_name'
-        ], registry=self.registry_miner)
-        self.prometheus_miner_identity = Gauge('miner_identity', 'Per-miner identity (hotkey/coldkey/axon) for historical attribution; value always 1.0, re-series on re-registration or axon change.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port'], registry=self.registry_miner)
+        ], carry_forward=False)
+        self.registry_miner.register(self.prometheus_miners)
+        self.prometheus_miner_identity = _SnapshotCollector('miner_identity', 'Per-miner identity (hotkey/coldkey/axon) for historical attribution; value always 1.0, re-series on re-registration or axon change.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port'], carry_forward=False)
+        self.registry_miner.register(self.prometheus_miner_identity)
         self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid', 'sim_id'], registry=self.registry_validator)
+        # One info row per asset class (0.6.3): the class's own market configuration with its book range, so the
+        # dashboard's Simulation Config table shows every class. A single market is one row named "market".
+        self.prometheus_simconfig_info = Info('simulation_config', 'Market configuration per asset class.',
+                                              ['wallet', 'netuid', 'sim_id', 'asset_class'], registry=self.registry_validator)
+        # book -> asset class, one series per book, so a dashboard can filter any per-book panel by class
+        self.prometheus_book_class = Gauge('book_asset_class', 'The asset class each book belongs to (value 1).',
+                                           ['wallet', 'netuid', 'sim_id', 'book_id', 'asset_class'],
+                                           registry=self.registry_validator)
         self.prometheus_gentrx_gauges = Gauge('gentrx_gauges', 'GenTRX distributed-training validator metrics.', ['wallet', 'netuid', 'sim_id', 'gentrx_gauge_name'], registry=self.registry_gentrx)
         self.prometheus_gentrx_miner_scores = Gauge('gentrx_miner_scores', 'Per-miner GenTRX EMA score (validator-smoothed).', ['wallet', 'netuid', 'sim_id', 'uid'], registry=self.registry_gentrx)
         self.prometheus_gentrx_training = Gauge('gentrx_training', 'GenTRX model training statistics (loss, acceptance, timing).', ['wallet', 'netuid', 'sim_id', 'stat'], registry=self.registry_gentrx)
@@ -410,6 +431,10 @@ class ReportingService:
             # Cached children now point at removed series — drop the cache so the
             # next cycle re-resolves fresh handles.
             self._child_cache.clear()
+            # a scrape between the changeover and the next cycle sees the cleared families, as it did
+            self.exposition.publish(step=getattr(self, 'step', None),
+                                    sim_timestamp=getattr(self, 'simulation_timestamp', None),
+                                    sim_id=getattr(getattr(self, 'simulation', None), 'simulation_id', None))
             bt.logging.success(f"All metrics cleared ({time.time()-start:.4f}s)")
         except Exception as e:
             bt.logging.error(f"Error clearing metrics: {e}")
@@ -428,9 +453,19 @@ class ReportingService:
         agent_collector = self.prometheus_agent_gauges
         snapshots = {
             agent_collector: {},
+            self.prometheus_class_gauges: {},
             self.prometheus_trades: {},
             self.prometheus_miner_trades: {},
             self.prometheus_books: {},
+            # since 30 September 2026 every bulk family is snapshot-backed, so a scrape is one frozen
+            # cycle: these three carry forward as their eager Gauges did, miners and miner_identity are
+            # rebuilt in full every cycle (replace) as their clear-and-rebuild did, without the window
+            # in which a scrape saw the family half rebuilt
+            self.prometheus_simulation_gauges: {},
+            self.prometheus_miner_gauges: {},
+            self.prometheus_book_gauges: {},
+            self.prometheus_miners: {},
+            self.prometheus_miner_identity: {},
         }
         remaining = []
         for update in updates:
@@ -440,13 +475,16 @@ class ReportingService:
             else:
                 remaining.append(update)
         for collector, snap in snapshots.items():
+            # rows written by set(**labels) during the cycle (miners, miner_identity) join the swap
+            snap.update(collector.take_pending())
+        for collector, snap in snapshots.items():
             # Fidelity with the old clear-and-rebuild: the eager path only
             # clear()'d a family when it had >=1 update this cycle, so a cycle
             # emitting none (e.g. no new trades) LEFT the prior series in place.
             # Skip the empty swap for replace families so trades/miner_trades
-            # don't blank out during quiet cycles. agent_gauges (carry-forward)
-            # always updates: an empty merge is a no-op that retains its series.
-            if snap or collector is agent_collector:
+            # don't blank out during quiet cycles. Carry-forward families
+            # always update: an empty merge is a no-op that retains their series.
+            if snap or collector._carry_forward:
                 collector.update(snap)
         cleared_count = (
             len(snapshots[self.prometheus_trades])
@@ -646,6 +684,7 @@ class ReportingService:
                     'current_block', 'uid', 'metagraph_data', 'validator_config']:
             setattr(self, key, data[key])
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
+        self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
         self.scoring_shadow_health = data.get('scoring_shadow')
         self.history_clock = data.get('history_clock')
 
@@ -833,6 +872,44 @@ class ReportingService:
         self.request_shm.close_fd()
         self.thread_pool.shutdown(wait=True)
         self.report_executor.shutdown(wait=True)
+
+def simulation_config_rows(simulation):
+    """One row per asset class: book range, realizations and the class's market configuration fields, as strings.
+    A single market is one row named "market"; the exchange mechanism one row named "exchange"."""
+    try:
+        classes = simulation.asset_classes()
+    except Exception:
+        classes = []
+    rows = {}
+    for cls in classes or []:
+        books = sorted(int(b) for b in (getattr(cls, 'books', None) or []))
+        cfg = getattr(cls, 'config', None)
+        dump = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+        row = {'books': (f"{books[0]}-{books[-1]}" if books else ""), 'n_books': str(len(books))}
+        row |= {f"simulation_{k}": str(v) for k, v in dump.items() if k not in ('logDir', 'fee_policy')}
+        row['_book_ids'] = books
+        rows[str(getattr(cls, 'name', 'market'))] = row
+    return rows
+
+
+def publish_simulation_config_info(self):
+    """Publish simulation_config_info, one series per asset class (see simulation_config_rows)."""
+    info = getattr(self, 'prometheus_simconfig_info', None)
+    if info is None:
+        return
+    info.clear()
+    book_class = getattr(self, 'prometheus_book_class', None)
+    if book_class is not None:
+        book_class.clear()
+    for name, row in simulation_config_rows(self.simulation).items():
+        books = row.pop('_book_ids', [])
+        info.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                    sim_id=self.simulation.simulation_id, asset_class=name).info(row)
+        if book_class is not None:
+            for b in books:
+                book_class.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                                  sim_id=self.simulation.simulation_id, book_id=str(b), asset_class=name).set(1)
+
 
 def publish_validator_gauges(self: ReportingService):
     """
@@ -1035,6 +1112,7 @@ def publish_info(self: ReportingService) -> None:
          f"simulation_{name}" : str(value) for name, value in self.simulation.model_dump().items() if name != 'logDir' and name != 'fee_policy'
     } | (self.simulation.fee_policy.to_prom_info() if getattr(self.simulation, 'fee_policy', None) else {})
     self.prometheus_info.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id ).info (prometheus_info)
+    publish_simulation_config_info(self)
     publish_validator_gauges(self)
     publish_gentrx_gauges(self)
 
@@ -1060,6 +1138,9 @@ class _SnapshotCollector:
         self._labelnames = list(labelnames)
         self._snapshot = {}
         self._pending_evict = set()
+        # rows staged by set(**labels) during the cycle (the miners and miner_identity families are
+        # written that way, one row per uid); folded into the cycle's snapshot by the apply router
+        self._pending = {}
         # carry_forward=True (agent_gauges): a series persists at its last value
         # until explicitly evicted, mirroring an eager Gauge that keeps a child
         # once set. carry_forward=False (the former clear-and-rebuild families
@@ -1103,6 +1184,17 @@ class _SnapshotCollector:
         """Drop every stored series."""
         self._snapshot = {}
         self._pending_evict = set()
+        self._pending = {}
+
+    def set(self, value, **labels):
+        """Stage one series for this cycle by keyword labels (the Gauge.labels(**labels).set(value)
+        shape); it reaches the exposition when the cycle's snapshot is swapped in."""
+        self._pending[tuple(labels.get(name) for name in self._labelnames)] = value
+
+    def take_pending(self):
+        """The rows staged by set() since the last take, cleared."""
+        pending, self._pending = self._pending, {}
+        return pending
 
     def collect(self):
         # add_metric stores values unchecked and prometheus_client calls float() at serialisation
@@ -1212,6 +1304,10 @@ def _set_if_changed_metric(gauge, value, **labels):
     Returns:
         None
     """
+    # duck-typed rather than isinstance: a test that reloads this module holds another class object
+    if hasattr(gauge, 'take_pending'):
+        gauge.set(value, **labels)
+        return
     # Single labels() lookup reused for read + write (see _set_if_changed).
     child = gauge.labels(**labels)
     if child._value.get() != value:
@@ -1446,6 +1542,8 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'skill_raw': kappa_values.get('skill_raw') if kappa_values else None,
                 'skill_rank': kappa_values.get('skill_rank') if kappa_values else None,
                 'p11_factor': kappa_values.get('p11_factor') if kappa_values else None,
+                's3_factor': kappa_values.get('s3_factor') if kappa_values else None,
+                'bg_share': kappa_values.get('bg_share') if kappa_values else None,
                 'present': kappa_values.get('present') if kappa_values else None,
                 'debeta_w_make': kappa_values.get('debeta_w_make') if kappa_values else None,
                 'debeta_weight': kappa_values.get('debeta_weight') if kappa_values else None,
@@ -1525,6 +1623,9 @@ async def report(self: ReportingService) -> None:
             simid,
             "step_rate"
         ))
+        for _cls, _summary in (getattr(self, 'debeta_class_summary', None) or {}).items():
+            for _name, _value in _summary.items():
+                updates.append((self.prometheus_class_gauges, float(_value), wallet_addr, netuid, simid, str(_cls), _name))
         bt.logging.debug(f"Simulation metrics collected ({time.time()-start:.4f}s).")
 
         has_new_trades = False
@@ -2002,6 +2103,11 @@ async def report(self: ReportingService) -> None:
                            ('skill_raw', 'debeta_skill'),
                            ('skill_rank', 'debeta_skill_rank'),
                            ('p11_factor', 'debeta_p11_factor'),
+                           ('s3_factor', 'debeta_s3_factor'),
+                           ('bg_share', 'debeta_bg_share'),
+                           ('making_realized', 'debeta_making_realized'),
+                           ('making_captured', 'debeta_making_captured'),
+                           ('making_basis', 'debeta_making_basis'),
                            ('present', 'debeta_present'),
                            ('debeta_weight', 'debeta_weight'),
                            ('debeta_w_make', 'debeta_w_make'),
@@ -2106,6 +2212,11 @@ async def report(self: ReportingService) -> None:
                 debeta_making_rank=(m['making_rank'] if m.get('making_rank') is not None else 0.0),
                 debeta_skill_rank=(m['skill_rank'] if m.get('skill_rank') is not None else 0.0),
                 debeta_p11_factor=(m['p11_factor'] if m.get('p11_factor') is not None else 0.0),
+                debeta_s3_factor=(m['s3_factor'] if m.get('s3_factor') is not None else 1.0),
+                debeta_bg_share=(m['bg_share'] if m.get('bg_share') is not None else -1.0),
+                debeta_making_realized=(m['making_realized'] if m.get('making_realized') is not None else 0.0),
+                debeta_making_captured=(m['making_captured'] if m.get('making_captured') is not None else 0.0),
+                debeta_making_basis=(m['making_basis'] if m.get('making_basis') is not None else 0.0),
                 # EVERY DECLARED LABEL MUST BE SUPPLIED. prometheus_client rejects the whole call
                 # when one is missing -- "Incorrect label names" -- so a label added to the gauge
                 # without a matching argument here stops the entire miner gauge publishing, not just
@@ -2166,7 +2277,9 @@ async def report(self: ReportingService) -> None:
             f"({agent_count} agent_gauges + {cleared_count} trades/books/miner_trades "
             f"via snapshot collectors)"
         )
-        
+        # THE ONE POINT A SCRAPE MAY SEE: every family has this cycle's values and none has the next's.
+        self.exposition.publish(step=report_step, sim_timestamp=self.simulation_timestamp, sim_id=simid)
+
         bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
     except Exception as ex:
         self.pagerduty_alert(f"Unable to publish metrics : {ex}", details={"traceback": traceback.format_exc()})

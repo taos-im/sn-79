@@ -3,9 +3,12 @@
 This document aims to provide some clarification and guidelines to assist miners in development of trading strategies for deployment in the subnet.  This is not intended as a comprehensive set of instructions, but rather provides an overview of the basic understanding and tools needed to begin the design and implementation of agent logic in the context of the τaos market simulation and exchange.
 
 > **Already running an agent?** 0.6.0 introduces a second, exchange mechanism (localnet only for now;
-> mainnet still runs the simulation mechanism). Your existing agent keeps working in the simulation with
-> no changes. See [MIGRATION_0.6.0.md](MIGRATION_0.6.0.md) for why, and for the steps to trade the
+> mainnet still runs the simulation mechanism). Your existing agent needs no exchange-related changes to keep
+> working in the simulation. See [MIGRATION_0.6.0.md](MIGRATION_0.6.0.md) for why, and for the steps to trade the
 > exchange as well.
+>
+> **On 0.6.3?** The simulation carries two asset classes, and books 96 to 127 have their own price level and
+> minimum order. Read grids and minimums per book; see [MIGRATION_0.6.3.md](MIGRATION_0.6.3.md).
 
 ---
 
@@ -107,6 +110,8 @@ The `notices` field of the state update contains a dictionary mapping UIDs to a 
 - `onOrderCancellationFailed(self, event : OrderCancellationEvent)` : Triggered when an agent's order fails to be cancelled in the simulator.
 - `onTrade(self, event : TradeEvent)` : Triggered when an agent's order is involved in the trade.
 - `onEnd(self, event : SimulationEndEvent)` : Triggered when a simulation ends.
+
+From 0.6.3 the event notifications the validator sends outside the state update are delivered to `process(self, notification)`. Simulation start and end still arrive in the state update and fire `onStart` and `onEnd` above. Override `process` only if you need the other notifications; validators neither require nor accept a response.
 
 To specify logic to be executed when a particular type of notice is received, simply define the handler function in your agent class:
 
@@ -312,9 +317,12 @@ Returning it from one helper rather than at each call site also keeps any
 class, so parameters belong there rather than hard-coded. `bin/agent_params.sh` lists the
 parameters each shipped example expects.
 
-Fields your agent reads off `self.simulation` (book count, price and volume decimals, initial price,
-maximum open orders, publish interval) come from the exchange itself, so they are correct for the book
-you are trading without you configuring anything.
+On the exchange, the fields your agent reads off `self.simulation_config` (book ids, price and volume
+decimals, maximum open orders, publish interval) come from the exchange itself, so they are correct
+without you configuring anything. On a multi-asset simulation the top-level price, volume, initial-price
+and minimum-order fields describe the first asset class only; read them for the book in hand with
+`self.config_for(book_id)`, `self.price_decimals(book_id)`, `self.volume_decimals(book_id)` and
+`self.min_order_size(book_id)`.
 
 ## Response
 
@@ -334,17 +342,18 @@ Every book enforces a minimum order quantity. An order whose `quantity` falls be
 by the engine rather than partially accepted, and the rejection arrives as an order-rejected notice
 rather than a fill.
 
-The active value is on the state you already receive, so read it instead of assuming a number:
+The active value travels with every state update; read it for the book in hand instead of assuming a number:
 
 ```python
-min_size = float(getattr(state.config, "min_order_size", 0.0) or 0.0)
+min_size = self.min_order_size(book_id)
 if quantity < min_size:
     return  # too small to be accepted
 ```
 
-`min_order_size` is `0.0` only when a book sets no minimum. Shipped configurations set values as
-large as `0.25`, so an agent that hardcodes a small fixed quantity can have every order rejected on
-one book while trading normally on another. Size against the value on the state, per book.
+`min_order_size` is `0.0` only when a book sets no minimum. Shipped configurations set it per asset
+class, 0.25 on `simulation_0` and 2.5364 on `simulation_1`, so an agent that hardcodes a small fixed
+quantity, or reads the top-level `state.config.min_order_size`, can have every order rejected on one
+class while trading normally on the other. Size against the value for the book in hand.
 
 ---
 
@@ -674,19 +683,21 @@ This allows to attempt to take advantage of movements in price during the period
 
 ### Trading Volume
 
-Trading volume plays an important role in determining the rewards assigned to a miner agent.  The trading volume of an agent is defined as the total value in QUOTE of the quantity of orders submitted by the agent which are matched by the simulator.  For example, if a miner submits an instruction to place an order with a quantity of `2.0`, and this order is matched at price `300.00`, their trading volume is increased by `600.00`.  This is true regardless of the role of the agent's order in the trade as either maker or taker.
+Trading volume is tracked per book for the volume limit below; it earns nothing in scoring by itself.  The trading volume of an agent is defined as the total value in QUOTE of the quantity of orders submitted by the agent which are matched by the simulator.  For example, if a miner submits an instruction to place an order with a quantity of `2.0`, and this order is matched at price `300.00`, their trading volume is increased by `600.00`.  This is true regardless of the role of the agent's order in the trade as either maker or taker.
 
 #### Contribution to Reward
 
-The primary component of incentive mechanism of the subnet is the risk-adjusted performance of the strategy, which is calculated using an intra-day Kappa-3 ratio where the returns are obtained as the difference in total inventory value held by the agent between subsequent state updates (see [rewarding logic](../taos/im/validator/reward.py)).  
+The trading pool is paid in two equal halves.
 
-In order to avoid rewarding miners who do not participate in active trading, as well as to incentivize the creation of volume in the simulated market, the calculated Kappa-3 values are then scaled by a factor derived using the agent's total traded volume over a [configured period](../taos/im/config/__init__.py) (see `scoring.activity.trade_volume_assessment_period`) of simulation time.  It should further be noted that, although any amount of traded volume within each `scoring.activity.trade_volume_sampling_interval` will trigger the volume factor to be assigned a value based on the traded volume during the assessment period, if no trades occur in the previous sampling interval then the volume factor will start to decay.  This is designed to prevent miners from producing a burst of trading activity once within the assessment period, and then stopping trading activity to benefit from the volume factor without maintaining consistent active trading. 
+**Making** pays for liquidity. Each maker fill earns the spread it captured against the centred mid, and the credit on a book is twice the smaller of its buy and sell sides, so only two-sided making counts. From 0.6.3 that credit is scaled by markout quality, the share of the spread the fills still hold 20 simulation seconds later, so quotes the market runs over earn nothing. Credit concentrated on a few counterparties is discounted, and from 0.6.3 a maker's credit is scaled down when its fills against other miners exceed four times its fills against the background market. The half is paid in proportion to each miner's credit.
 
-The inclusion of this factor in the scoring has the effect of magnifying the Kappa-3 ratios for miners which have executed more volume during the assessment period.  If the agent achieves a good Kappa-3 ratio while also trading significant volume, they will be rewarded more highly than a miner with the same performance at a lower traded volume.  Similarly, if a miner has high volume and poor Kappa-3 ratio, they will receive a worse score than a miner with the same performance and lower volume.  This discourages maximization of volume without sufficient regard for the performance, while also incentivizing the deployment of strategies which are both optimally risk-managed and highly active.
+**Skill** pays for trading profit the market's drift does not explain. On each book the agent's mark-to-market P&L is reduced by its average inventory times the book's price move; what remains is its alpha, and a book counts once its alpha clears a small hurdle relative to the notional traded there. An agent qualifies when its alpha is consistently positive across books, measured by a downside-adjusted consistency ratio, on at least the required number of books (a share of the books scored: 20 of 128 on a single market; from 0.6.3, 15 of the 96 `simulation_0` books and 5 of the 32 `simulation_1` books). Qualifying agents share the half in proportion to their net alpha, after the same counterparty discount.
+
+The trading score is smoothed over a track record of about three simulated hours, an agent that stops answering validators is not scored until it answers again, and from 0.6.3 each asset class is paid through its own share. The rules are stated in the dial help of the [validator config](../taos/im/config/__init__.py) and implemented in the [rewarding logic](../taos/im/validator/reward.py) and the [de-beta module](../taos/im/validator/debeta.py).
 
 #### Trading Limitation
 
-The validator logic also implements a cap on the maximum amount that can be traded within the assessment window.  This is intended to limit attempts to attain high volume-weighted scores during periods of good performance by recklessly trading purely for the sake of volume creation.  The limit is configured as a multiplier on the value of the initial capital allocated to miner agents; the multiplier is configured by validators using the `scoring.activity.capital_turnover_cap` parameter, where the value of initial capital allocated is configured in the simulator and can be read from the state update `config` field `miner_wealth`.  
+The validator logic also implements a cap on the maximum amount that can be traded within the assessment window.  It keeps traded volume tied to the capital behind it, so that volume cannot outrun capital; volume on its own earns nothing in scoring.  The limit is configured as a multiplier on the value of the initial capital allocated to miner agents; the multiplier is configured by validators using the `scoring.activity.capital_turnover_cap` parameter, where the value of initial capital allocated is configured in the simulator and can be read from the state update `config` field `miner_wealth`.  
 
 Explicitly, if a miner has traded more than `scoring.activity.capital_turnover_cap * state.config.miner_wealth` in volume on a particular book over the `scoring.activity.trade_volume_assessment_period`, they will not be able to submit any more instructions to that book (other than cancellations) until their total volume over the preceding assessment period drops below this limit.
 
@@ -805,6 +816,9 @@ Training is **enabled by default** (`gtx_training_enabled=true`). To opt out, pa
   - `config.quoteDecimals` : Decimal precision of QUOTE currency values
   - `config.priceDecimals` : Decimal precision of prices (important when setting limit order price - input value will be rounded to this many decimals if specified to higher precision)
   - `config.volumeDecimals` : Decimal precision of volumes (important when setting order quantities - input value will be rounded to this many decimals if specified to higher precision)
+
+  On a multi-asset layout these top-level fields describe the first asset class only. Use `self.price_decimals(book_id)`, `self.volume_decimals(book_id)` and `self.min_order_size(book_id)` for the book in hand; see [MIGRATION_0.6.3.md](MIGRATION_0.6.3.md).
+
   - `config.fee_policy` : The fee policy applied in the simulation
   - `config.max_open_orders` : The maximum number of orders that any agent in the simulation can simultaneously have open on the book.
   - `config.miner_wealth` : The total QUOTE value of the initial capital allocated to miners at start of simulation; this is used in determining the trading volume cap (see [Volume Limit](#volume-limit)).

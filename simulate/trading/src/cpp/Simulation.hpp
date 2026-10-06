@@ -130,6 +130,11 @@ public:
     [[nodiscard]] const std::unique_ptr<LocalAgentManager>& localAgentManager() const noexcept { return m_localAgentManager; }
     [[nodiscard]] auto&& time(this auto&& self) noexcept { return self.m_time; }
     [[nodiscard]] uint32_t blockIdx() const noexcept { return m_blockIdx; }
+    // The canonical id of this Simulation's local book 0. Uniform blocks number from
+    // blockIdx * blockDim; a multi-asset realization is numbered from the sum of the book
+    // counts before it, which the orchestrator sets before configure().
+    [[nodiscard]] BookId bookIdBase() const noexcept { return m_bookIdBase; }
+    void setBookIdBase(BookId base) noexcept { m_bookIdBase = base; }
     [[nodiscard]] auto&& logWindow(this auto&& self) noexcept { return self.m_logWindow; }
 
     // Wall-clock nanoseconds of the chain block being processed, or 0 when there is no chain.
@@ -166,7 +171,7 @@ public:
 
     [[nodiscard]] BookId bookIdCanon(BookId bookId) const noexcept
     {
-        return m_blockIdx * m_blockDim + bookId;
+        return m_bookIdBase + bookId;
     }
     
     virtual const fs::path& logDir() const noexcept override { return m_logDir; }
@@ -209,6 +214,10 @@ public:
     const std::valarray<double>& getOrComputeGbmPath(
         uint64_t seed, double S0, double mu, double sigma, uint32_t N);
 
+    // Lifecycle, driven by the owning runner (a SimulationManager block task or a
+    // multi-asset worker cohort): start() (idempotent via state) -> step()* -> stop().
+    void start();
+    void stop();
     void step();
     void clearFilledOrders() noexcept;
     void deliverMessage(const Message::Ptr& msg);
@@ -221,8 +230,6 @@ private:
 
     void configureAgents(pugi::xml_node node);
     void configureLogging(pugi::xml_node node);
-    void start();
-    void stop();
 
     void updateTime(Timestamp newTime)
     {
@@ -237,7 +244,7 @@ private:
     mutable taosim::simulation::SimulationSignals m_signals;
     std::unique_ptr<LocalAgentManager> m_localAgentManager;
     MultiBookExchangeAgent* m_exchange{};
-    taosim::agent::DistributedProxyAgent* m_proxy;
+    taosim::agent::DistributedProxyAgent* m_proxy{};
     mutable std::mt19937 m_rng;
     std::string m_id;
     std::string m_config;
@@ -247,6 +254,7 @@ private:
     taosim::simulation::SimulationConfig m_config2;
     uint32_t m_blockIdx{};
     uint32_t m_blockDim{};
+    BookId m_bookIdBase{};
     fs::path m_baseLogDir;
     Timestamp m_logWindow{};
     Timestamp m_blockTimestamp{};

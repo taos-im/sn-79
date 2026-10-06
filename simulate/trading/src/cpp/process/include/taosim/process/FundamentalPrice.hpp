@@ -45,7 +45,10 @@ struct FundamentalPriceDesc
     int ownRng{0};
     Timestamp gracePeriod{};   // suppress seed-update warnings before this t
     ProcessDesc proc;
-    const Eigen::MatrixXd* L{};
+    // float, not double: the Cholesky factor is large and read-only here, and SIMU003TASK004's
+    // multi-asset work halved its footprint. Accumulations widen to double at the two dot
+    // products in cholesky_step().
+    const Eigen::MatrixXf* L{};
 };
 
 struct FundamentalPriceState
@@ -95,7 +98,7 @@ public:
         pugi::xml_node node,
         uint64_t bookId,
         double X0,
-        const Eigen::MatrixXd* L);
+        const Eigen::MatrixXf* L);
 
 private:
     void cholesky_step(int64_t i);
@@ -109,7 +112,7 @@ private:
     std::string m_seedfile;
     double m_X0, m_mu, m_sigma, m_dt;
     FundamentalPriceState m_state;
-    const Eigen::MatrixXd* m_L;
+    const Eigen::MatrixXf* m_L;
     std::normal_distribution<double> m_gaussian;
     double m_epsilon;
     double m_hurst;

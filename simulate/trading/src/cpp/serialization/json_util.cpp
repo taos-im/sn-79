@@ -135,20 +135,6 @@ decimal_t getDecimal(const rapidjson::Value& json)
 
 //-------------------------------------------------------------------------
 
-void serializeHelper(
-    rapidjson::Document& json,
-    const std::string& key,
-    std::function<void(rapidjson::Document&)> serializer)
-{
-    if (key.empty()) return serializer(json);
-    auto& allocator = json.GetAllocator();
-    rapidjson::Document subJson{&allocator};
-    serializer(subJson);
-    json.AddMember(rapidjson::Value{key.c_str(), allocator}, subJson, allocator);
-}
-
-//-------------------------------------------------------------------------
-
 }  // namespace taosim::json
 
 //-------------------------------------------------------------------------

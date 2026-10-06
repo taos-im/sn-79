@@ -45,15 +45,19 @@ struct convert<taosim::book::BookProcessManager>
                 auto& bookId2Process = v.container().at(key);
 
                 for (size_t bookId{}; bookId < arr.size; ++bookId) {
-                    auto p = bookId2Process.at(bookId).get();
-                    if (key == "fundamental") {
-                        arr.ptr[bookId].convert(*dynamic_cast<taosim::process::FundamentalPrice*>(p));
+                    auto* const p = bookId2Process.at(bookId).get();
+                    const auto& obj = arr.ptr[bookId];
+                    // Nil = packed without an adaptor; keep the constructed state.
+                    // Type-dispatched to mirror the pack side (see there).
+                    if (obj.is_nil()) continue;
+                    if (auto* fp = dynamic_cast<taosim::process::FundamentalPrice*>(p)) {
+                        obj.convert(*fp);
                     }
-                    else if (key == "external") {
-                        arr.ptr[bookId].convert(*dynamic_cast<taosim::process::FuturesSignal*>(p));
+                    else if (auto* fs = dynamic_cast<taosim::process::FuturesSignal*>(p)) {
+                        obj.convert(*fs);
                     }
-                    else if (key == "magneticfield") {
-                        arr.ptr[bookId].convert(*dynamic_cast<taosim::process::MagneticField*>(p));
+                    else if (auto* mf = dynamic_cast<taosim::process::MagneticField*>(p)) {
+                        obj.convert(*mf);
                     }
                 }
             }
@@ -92,16 +96,25 @@ struct pack<taosim::book::BookProcessManager>
             o.pack_array(bookId2Process.size());
 
             for (const auto& process : bookId2Process) {
-                const auto proc = process.get();
+                auto* const proc = process.get();
 
-                if (name == "fundamental") {
-                    o.pack(*dynamic_cast<taosim::process::FundamentalPrice*>(proc));
+                // Dispatch on the DYNAMIC type, never the configured name: any process
+                // type can be registered under any name (e.g. a JumpDiffusion named
+                // "fundamental"), and a name-assumed cast dereferences null.
+                if (auto* fp = dynamic_cast<taosim::process::FundamentalPrice*>(proc)) {
+                    o.pack(*fp);
                 }
-                else if (name == "external") {
-                    o.pack(*dynamic_cast<taosim::process::FuturesSignal*>(proc));
+                else if (auto* fs = dynamic_cast<taosim::process::FuturesSignal*>(proc)) {
+                    o.pack(*fs);
                 }
-                else if (name == "magneticfield") {
-                    o.pack(*dynamic_cast<taosim::process::MagneticField*>(proc));
+                else if (auto* mf = dynamic_cast<taosim::process::MagneticField*>(proc)) {
+                    o.pack(*mf);
+                }
+                else {
+                    // No checkpoint adaptor for this process type (e.g. JumpDiffusion):
+                    // pack nil so the checkpoint stays loadable; restore then keeps the
+                    // freshly-constructed process state for it.
+                    o.pack_nil();
                 }
             }
         }

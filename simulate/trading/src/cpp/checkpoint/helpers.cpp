@@ -34,6 +34,7 @@
 #include <fmt/format.h>
 
 #include <cstdio>
+#include <fstream>
 #include <latch>
 
 //-------------------------------------------------------------------------
@@ -216,15 +217,49 @@ fs::path ckptDirFromToken(const CheckpointToken& token)
 std::vector<fs::path> ckptDirsSortedByWriteTime(const fs::path& path)
 {
     return ranges::subrange(fs::directory_iterator{path}, fs::directory_iterator{})
-        | views::filter([](auto&& e) {
+        | ranges::views::filter([](auto&& e) {
             return fs::is_directory(e)
                 && e.path().extension() == CheckpointManager::s_dirExtension;
         })
-        | views::transform([](auto&& p) { return p.path(); })
+        | ranges::views::transform(&fs::directory_entry::path)
         | ranges::to<std::vector>
         | ranges::actions::sort([](auto&& lhs, auto&& rhs) {
             return fs::last_write_time(lhs) < fs::last_write_time(rhs);
         });
+}
+
+//-------------------------------------------------------------------------
+// Stream exceptions are enabled so a failed write (e.g. disk full) throws instead
+// of silently setting failbit — atomicWrite must not rename a truncated temp file
+// over a good checkpoint. The explicit close() surfaces final-flush errors the
+// destructor would swallow. No fsync: the goal is atomicity via the rename, not
+// power-loss durability; per-file fsync costs multi-second stalls per checkpoint.
+
+void atomicWrite(const fs::path& path, std::span<const char> data)
+{
+    const auto tmp = fs::path{path.native() + ".tmp"};
+
+    try {
+        std::ofstream ofs;
+        ofs.exceptions(std::ios::failbit | std::ios::badbit);
+        ofs.open(tmp, std::ios::binary | std::ios::trunc);
+        ofs.write(data.data(), std::ssize(data));
+        ofs.close();
+    }
+    catch (const std::exception& e) {
+        std::error_code removeEc;
+        fs::remove(tmp, removeEc);
+        throw CheckpointError{fmt::format("writing {} failed: {}", tmp.string(), e.what())};
+    }
+
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code removeEc;
+        fs::remove(tmp, removeEc);
+        throw CheckpointError{fmt::format(
+            "rename({} -> {}) failed: {}", tmp.string(), path.string(), ec.message())};
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -270,6 +305,57 @@ static void setupAgents(const msgpack::object& o, Simulation& simu, size_t block
             auto agent = dynamic_cast<taosim::agent::StylizedTraderAgent*>(agentIt->get());
             val.convert(*agent);
         }
+    }
+}
+
+//-------------------------------------------------------------------------
+// In the shared-quote portfolio model (multi-asset, and any single-config run with
+// sharedQuoteBalances) the books of one exchange share, by shared_ptr, three things:
+// one quote Balance per account, and one order-id and one trade-id counter for the
+// whole portfolio (so ids are unique across its books). A restore deserializes each of
+// these per book independently, severing the sharing — every book gets its own quote
+// and its own counters reset to the (identical) checkpointed value. On resume the
+// un-shared counters then hand out colliding ids and corrupt the shared quote's
+// reservation map. Re-link every book to the first book's shared objects; pre-checkpoint
+// they were one object each, so the first is canonical. No-op when quote is not shared.
+
+void reestablishSharedTopology(MultiBookExchangeAgent& exchange)
+{
+    if (!exchange.sharedQuoteBalances()) return;
+
+    // One order-id and trade-id counter shared across the portfolio's books.
+    auto&& books = exchange.books();
+    if (!books.empty()) {
+        const auto orderIdCounter = books.front()->orderIdCounter();
+        const auto tradeIdCounter = books.front()->tradeIdCounter();
+        for (auto&& book : books | views::drop(1)) {
+            book->orderIdCounter() = orderIdCounter;
+            book->tradeIdCounter() = tradeIdCounter;
+        }
+    }
+
+    // One quote Balance shared across each account's books.
+    size_t discarded = 0;
+    for (auto&& [agentId, account] : exchange.accounts()) {
+        auto&& holdings = account.holdings();
+        if (holdings.empty()) continue;
+        const auto quote = holdings.front().quote;
+        for (auto&& balances : holdings | views::drop(1)) {
+            // A reservation here that the canonical (front) quote lacks means the
+            // pre-checkpoint account did NOT actually share its quote — re-linking
+            // discards that state, so make the loss loud rather than silent.
+            for (const auto& [orderId, amount] : balances.quote->getReservations()) {
+                if (!quote->getReservation(orderId).has_value()) ++discarded;
+            }
+            balances.quote = quote;
+        }
+    }
+    if (discarded > 0) {
+        fmt::println(
+            "reestablishSharedTopology: WARNING — discarded {} quote reservation(s) found"
+            " only on non-canonical books; the checkpointed account topology was not"
+            " actually shared (pre-fix checkpoint?)",
+            discarded);
     }
 }
 
@@ -360,6 +446,11 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
         }
     }
 
+    // Books and accounts are now restored, but their per-book shared_ptrs (quote and
+    // the id counters) were deserialized independently; re-link them where the exchange
+    // shares quote across its books.
+    reestablishSharedTopology(*simu.exchange());
+
     for (const auto& book : simu.exchange()->books()) {
         auto setupActiveOrders = [&](const auto& side) {
             for (const auto& level : side) {
@@ -367,6 +458,10 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
                     book->orderIdMap().insert({
                         order->id(), std::dynamic_pointer_cast<LimitOrder>(order)
                     });
+                    // Ghosts (zero-volume fills kept in-book for reconciliation) keep
+                    // their id-map identity but are no longer active — fill time already
+                    // removed them from activeOrders and released their reservations.
+                    if (order->totalVolume() == 0_dec) { continue; }
                     const auto owningAgentId = book->orderToClientInfo().at(order->id()).agentId;
                     simu.exchange()->accounts()
                         .at(owningAgentId)
@@ -391,8 +486,8 @@ static void setupMessageQueue(const msgpack::object& o, Simulation& simu)
 //-------------------------------------------------------------------------
 
 static void setupBlocks(
-    std::span<msgpack::object_handle> blockObjHandles,
-    taosim::simulation::SimulationManager* simuMngr)
+    std::span<const std::unique_ptr<Simulation>> simulations,
+    std::span<msgpack::object_handle> blockObjHandles)
 {
     using taosim::serialization::msgpackMapKeysToString;
 
@@ -405,7 +500,7 @@ static void setupBlocks(
             throw taosim::checkpoint::CheckpointError{};
         }
 
-        auto& simu = *simuMngr->simulations().at(blockIdx);
+        auto& simu = *simulations[blockIdx];
 
         auto agentsObj = taosim::serialization::msgpackFindMapObj(obj, "agents");
         if (!agentsObj) {
@@ -436,15 +531,14 @@ static void setupBlocks(
 
 //-------------------------------------------------------------------------
 
-static void setupLogFiles(
-    const msgpack::object& o, const taosim::simulation::SimulationManager& simuMngr)
+static void setupLogFiles(const msgpack::object& o, const fs::path& logDir)
 {
     if (o.type != msgpack::type::MAP) {
         throw taosim::checkpoint::CheckpointError{};
     }
 
     for (const auto& [key, val] : o.via.map) {
-        fs::resize_file(simuMngr.logDir() / key.as<std::string>(), val.as<size_t>());
+        fs::resize_file(logDir / key.as<std::string>(), val.as<size_t>());
     }
 }
 
@@ -457,13 +551,13 @@ void setupUsingCkptData(
 {
     using taosim::serialization::msgpackMapKeysToString;
 
-    setupBlocks(blockObjHandles, simuMngr);
+    setupBlocks(simuMngr->simulations(), blockObjHandles);
 
     auto logFileSizesObj = taosim::serialization::msgpackFindMapObj(commonObj, "logFileSizes");
     if (!logFileSizesObj) {
         throw taosim::checkpoint::CheckpointError{msgpackMapKeysToString(commonObj)};
     }
-    setupLogFiles(*logFileSizesObj, *simuMngr);
+    setupLogFiles(*logFileSizesObj, simuMngr->logDir());
 
     for (auto&& simu : simuMngr->simulations()) {
         simu->state() = taosim::simulation::SimulationState::STARTED;
@@ -472,6 +566,74 @@ void setupUsingCkptData(
     if (auto& ckptMngr = simuMngr->checkpointManager()) {
         ckptMngr->stepCounter() = {};
     }
+}
+
+//-------------------------------------------------------------------------
+// Multi-asset counterpart: the "common" carries a per-realization array of log file
+// sizes (each realization owns a subdirectory of the run root), and the realizations
+// are matched to block files by flat index. Block restore re-establishes the
+// shared-quote topology (see setupExchange / reestablishSharedTopology).
+
+void setupUsingCkptDataMultiAsset(
+    std::span<const std::unique_ptr<Simulation>> simulations,
+    CheckpointManager* checkpointManager,
+    const msgpack::object& commonObj,
+    std::span<msgpack::object_handle> blockObjHandles)
+{
+    using taosim::serialization::msgpackMapKeysToString;
+
+    setupBlocks(simulations, blockObjHandles);
+
+    auto logFileSizesObj = taosim::serialization::msgpackFindMapObj(commonObj, "logFileSizes");
+    if (!logFileSizesObj || logFileSizesObj->get().type != msgpack::type::ARRAY) {
+        throw taosim::checkpoint::CheckpointError{msgpackMapKeysToString(commonObj)};
+    }
+    const auto& perRealization = logFileSizesObj->get().via.array;
+    for (size_t idx = 0; idx < simulations.size() && idx < perRealization.size; ++idx) {
+        setupLogFiles(perRealization.ptr[idx], simulations[idx]->logDir());
+    }
+
+    for (auto&& simu : simulations) {
+        simu->state() = taosim::simulation::SimulationState::STARTED;
+    }
+
+    if (checkpointManager) {
+        checkpointManager->stepCounter() = {};
+    }
+}
+
+//-------------------------------------------------------------------------
+// Read a checkpoint directory's common file and its numbered block files into msgpack
+// object handles (which own their backing buffers). Shared by both restore paths.
+
+LoadedCheckpoint loadCheckpointObjects(const fs::path& ckptDir)
+{
+    auto readObject = [](const fs::path& file) {
+        const size_t byteSize = fs::file_size(file);
+        std::vector<char> buffer(byteSize);
+        std::ifstream ifs{file, std::ios::binary};
+        ifs.read(buffer.data(), byteSize);
+        return msgpack::unpack(buffer.data(), byteSize);
+    };
+
+    LoadedCheckpoint loaded{
+        .common = readObject(
+            ckptDir / fmt::format("common{}", CheckpointManager::s_fileExtension))
+    };
+
+    static const std::regex blockCkptPattern{
+        fmt::format("^\\d+\\{}$", CheckpointManager::s_fileExtension)};
+    const auto blockCkptFilesSorted = filesystem::collectMatchingPaths(
+        ckptDir,
+        [&](auto&& p) { return std::regex_match(p.filename().string(), blockCkptPattern); })
+        | ranges::actions::sort([](auto&& lhs, auto&& rhs) {
+            return std::stoul(lhs.stem().string()) < std::stoul(rhs.stem().string());
+        });
+    for (const auto& ckptFile : blockCkptFilesSorted) {
+        loaded.blocks.push_back(readObject(ckptFile));
+    }
+
+    return loaded;
 }
 
 //-------------------------------------------------------------------------

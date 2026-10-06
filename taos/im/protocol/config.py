@@ -4,8 +4,11 @@
 
 Split out of taos.im.protocol.models, which re-exports every name here; import from either.
 """
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from xml.etree.ElementTree import Element
-from pydantic import Field
+from pydantic import Field, model_validator
+from taos.im.protocol.exchange_config import ExchangeConfig
 from taos.common.protocol import BaseModel
 from taos.im.protocol.orders import Order
 
@@ -269,6 +272,10 @@ class MarketSimulationConfig(BaseModel):
 
     books_per_block : int
     book_count : int
+    # The layout's asset classes, each one contiguous range of book ids. On the base class so they survive
+    # serialisation through a field typed as it (pydantic serialises a subclass by the field's type). None on
+    # a single market: one class over every book.
+    classes : list["AssetClass"] | None = None
     book_levels : int
     detailed_book_levels : int = 5
 
@@ -377,6 +384,25 @@ class MarketSimulationConfig(BaseModel):
         """The book ids of this simulation, dense: the same surface ExchangeConfig exposes, so the validator's
         query, report and scoring loops iterate one attribute whichever config class the run carries."""
         return list(range(self.book_count))
+
+    def asset_classes(self) -> list["AssetClass"]:
+        """The layout as asset classes, each one contiguous range of book ids in document order. A single
+        market is one class over every book, on its own grid, so an agent written against this surface runs
+        unchanged when a layout has several."""
+        if self.classes:
+            return list(self.classes)
+        return [AssetClass(name="market", books=self.book_ids, priceDecimals=self.priceDecimals,
+                           volumeDecimals=self.volumeDecimals, config=self)]
+
+    def config_for_book(self, book_id : int) -> "MarketSimulationConfig":
+        """The configuration governing a book: its class's when the layout carries classes, else this one."""
+        book_id = int(book_id)
+        if book_id not in range(self.book_count):
+            raise KeyError(f"book id {book_id} names no book of this {self.book_count}-book simulation")
+        for cls in self.classes or []:
+            if cls.books and cls.books[0] <= book_id <= cls.books[-1]:
+                return cls.config
+        return self
 
     @classmethod
     def from_xml(cls, xml : Element):
@@ -583,3 +609,186 @@ class MarketSimulationConfig(BaseModel):
             f"wn{self.sta_agent_noise_weight}_wc{self.sta_agent_chartist_weight}_wf{self.sta_agent_fundamentalist_weight}_" + \
             f"hft_{self.hft_agent_count}_{self.hft_agent_capital_type}_{self.hft_agent_wealth}_" + \
             f"ta{self.hft_agent_tau}_de{self.hft_agent_delta}_ps{self.hft_agent_psi}"
+
+
+# ── multi-asset ────────────────────────────────────────────────────────────────────────────────
+# A <MultiAssetSimulation> wrapper runs N single-market backgrounds, each instanceCount times, on one
+# clock with per-book quote balances, as in a single market. Book ids run consecutively across the
+# realizations (a realization's first book follows the last book of the one before it), so every
+# layout is 0..book_count-1 and each asset class is one contiguous range. Moved here with the 0.6.2
+# module split; re-exported by taos.im.protocol.models like everything else in this file.
+
+class AssetClass(BaseModel):
+    """
+    One asset class of a layout as an agent sees it: a name, the canonical ids of its books and the price and
+    volume grids they quote on, plus the market configuration governing them. A single market is one class.
+
+    Attributes:
+        name (str): The class name (a background's name; "market" for a single-market simulation).
+        books (list[int]): Canonical book ids belonging to the class.
+        priceDecimals (int): Price grid of the class's books.
+        volumeDecimals (int): Volume grid of the class's books.
+        config (MarketSimulationConfig | ExchangeConfig): The configuration governing the class's books.
+    """
+    name : str
+    books : list[int]
+    priceDecimals : int
+    volumeDecimals : int
+    config : "MarketSimulationConfig | ExchangeConfig"
+
+MarketSimulationConfig.model_rebuild()
+
+class BackgroundConfig(BaseModel):
+    """
+    One `<Background>` entry of a multi-asset simulation: a standalone single-market
+    configuration run as `instance_count` independently-seeded realizations.
+
+    Attributes:
+        bg (int): Positional index of the background in the multi-asset config.
+        name (str): Human-readable background name (also the realization log-dir prefix).
+        path (str): Resolved path of the background's own simulation XML.
+        instance_count (int): Number of independently-seeded realizations of this background.
+        config (MarketSimulationConfig): The background's parsed single-market configuration.
+    """
+    bg : int
+    name : str
+    path : str
+    instance_count : int = 1
+    config : MarketSimulationConfig
+
+class MultiAssetSimulationConfig(MarketSimulationConfig):
+    """
+    Configuration of a multi-asset simulation: an ordered set of background market
+    configurations, each run as one or more independently-seeded realizations on a
+    shared time grid.
+
+    The scalar surface inherited from MarketSimulationConfig is populated from the
+    FIRST background as a representative (decimals, agent populations, ...), with the
+    run-level grid attributes (duration, publish interval, grace period) stamped from
+    the multi-asset wrapper — mirroring what the simulator itself does. Anything
+    per-market should be looked up via config_for_book().
+
+    Book ids run consecutively across the realizations, in the simulator's order (backgrounds
+    in document order, each expanded instance_count times): a realization's first book is the
+    sum of the book counts before it, so the ids are 0..book_count-1 whatever the realization
+    sizes and each background's books form one contiguous range, its asset class.
+
+    Attributes:
+        backgrounds (list[BackgroundConfig]): The background configurations, in document order.
+    """
+    backgrounds : list[BackgroundConfig]
+
+    @model_validator(mode="after")
+    def _classes_from_backgrounds(self):
+        """One class per background, in document order, over the ids of all its realizations."""
+        if self.classes is None:
+            classes, first = [], 0
+            for bg in self.backgrounds:
+                n = bg.config.book_count * bg.instance_count
+                classes.append(AssetClass(name=bg.name, books=list(range(first, first + n)),
+                                          priceDecimals=bg.config.priceDecimals,
+                                          volumeDecimals=bg.config.volumeDecimals, config=bg.config))
+                first += n
+            object.__setattr__(self, "classes", classes)
+        return self
+
+    @classmethod
+    def from_multiasset_xml(cls, xml : Element, config_dir : str | Path):
+        """
+        Constructs an instance from a `<MultiAssetSimulation>` XML root; background
+        `path` attributes are resolved relative to `config_dir`.
+        """
+        config_dir = Path(config_dir)
+        backgrounds = []
+        for bg_idx, bg_node in enumerate(xml.findall("Background")):
+            path = Path(bg_node.attrib["path"])
+            resolved = path if path.is_absolute() else config_dir / path
+            bg_xml = ET.parse(resolved).getroot()
+            bg_config = MarketSimulationConfig.from_xml(bg_xml)
+            # A realization is ONE Simulation over the background's book portfolio:
+            # its book count is the <Books instanceCount> alone. The single-market
+            # blockCount (block-parallel execution of the standalone config) does not
+            # apply under the orchestrator, which parallelizes over realizations.
+            bg_config.book_count = bg_config.books_per_block
+            bg_config.block_count = 1
+            backgrounds.append(BackgroundConfig(
+                bg=bg_idx,
+                name=bg_node.attrib.get("name", f"bg{bg_idx}"),
+                path=str(resolved),
+                instance_count=int(bg_node.attrib.get("instanceCount", 1)),
+                config=bg_config,
+            ))
+        if not backgrounds:
+            raise ValueError("multi-asset config declares no <Background> assets")
+
+        # The wrapper owns the global time grid and stamps it onto every background,
+        # overriding whatever each background config declares (simulator behavior).
+        duration = int(xml.attrib.get("duration", backgrounds[0].config.duration))
+        step = int(xml.attrib.get("step", backgrounds[0].config.publish_interval))
+        grace = int(xml.attrib.get("gracePeriod", backgrounds[0].config.grace_period))
+        for bg in backgrounds:
+            bg.config.duration = duration
+            bg.config.publish_interval = step
+            bg.config.grace_period = grace
+
+        total_books = sum(bg.config.book_count * bg.instance_count for bg in backgrounds)
+
+        representative = backgrounds[0].config.model_dump()
+        representative.update(
+            duration=duration,
+            publish_interval=step,
+            grace_period=grace,
+            book_count=total_books,
+        )
+        return cls(**representative, backgrounds=backgrounds)
+
+    def realizations(self) -> list[tuple[int, str, int, MarketSimulationConfig]]:
+        """
+        The flat realization layout: (flat_index, background_name, instance_index,
+        background_config), in the simulator's canonical order (backgrounds in
+        document order, each expanded instance_count times).
+        """
+        out = []
+        flat_idx = 0
+        for bg in self.backgrounds:
+            for instance in range(bg.instance_count):
+                out.append((flat_idx, bg.name, instance, bg.config))
+                flat_idx += 1
+        return out
+
+    @property
+    def book_offsets(self) -> list[int]:
+        """The first canonical book id of each realization, aligned with realizations(): the running sum of
+        the book counts before it."""
+        out, first = [], 0
+        for _flat_idx, _name, _instance, config in self.realizations():
+            out.append(first)
+            first += config.book_count
+        return out
+
+    def config_for_book(self, book_id : int) -> MarketSimulationConfig:
+        """The background configuration governing a canonical book id: the realization whose range holds it."""
+        book_id = int(book_id)
+        for (_flat_idx, _name, _instance, config), first in zip(self.realizations(), self.book_offsets):
+            if first <= book_id < first + config.book_count:
+                return config
+        raise KeyError(f"canonical book id {book_id} names no book of this {self.book_count}-book layout")
+
+    def realization_log_dir(self, flat_idx : int) -> str | None:
+        """
+        The realization's log directory under the run root (`<logDir>/<name>-<instance>`),
+        or None while no run root is known.
+        """
+        if not self.logDir:
+            return None
+        for cur, name, instance, _config in self.realizations():
+            if cur == flat_idx:
+                return str(Path(self.logDir) / f"{name}-{instance}")
+        return None
+
+    def label(self) -> str:
+        """Multi-asset variant of the single-market label; unique per composition."""
+        bg_part = "_".join(
+            f"{bg.name}x{bg.instance_count}bo{bg.config.book_count}" for bg in self.backgrounds
+        )
+        return f"ma-du{self.duration}{self.time_unit}_gr{self.grace_period}-{bg_part}"

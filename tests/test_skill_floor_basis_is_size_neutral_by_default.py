@@ -39,7 +39,9 @@ def test_the_previous_basis_is_one_flag_away():
 def test_the_rest_of_the_skill_leg_defaults_are_unchanged():
     known = _defaults()
     assert getattr(known, "scoring.debeta.making_pool") == "proportional_both"
-    assert getattr(known, "scoring.debeta.skill_min_books") == 20
+    # 0.6.3: the count derives from a share of the layout (0.15625 of 128 is the launch bar of 20)
+    assert getattr(known, "scoring.debeta.skill_min_books") == 0
+    assert getattr(known, "scoring.debeta.skill_min_books_share") == 0.15625
     assert getattr(known, "scoring.debeta.min_books") == 4
     assert getattr(known, "scoring.debeta.w_make") == 0.5
     assert getattr(known, "scoring.debeta.weight") == 1.0

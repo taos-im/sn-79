@@ -524,12 +524,13 @@ bool Book::restoreRestingOrderVolume(OrderID orderId, taosim::decimal_t deltaVol
 {
     if (deltaVolume <= 0_dec) { return false; }
 
-    auto it = m_orderIdMap.find(orderId);
+    const auto it = m_orderIdMap.find(orderId);
     if (it == m_orderIdMap.end()) { return false; }
 
     const auto& order = it->second;
     auto& orderSideLevels = order->direction() == OrderDirection::BUY ? m_buyQueue : m_sellQueue;
-    auto levelIt = std::lower_bound(orderSideLevels.begin(), orderSideLevels.end(), order->price());
+    const auto levelIt =
+        std::lower_bound(orderSideLevels.begin(), orderSideLevels.end(), order->price());
     if (levelIt == orderSideLevels.end() || levelIt->price() != order->price()) { return false; }
 
     const auto totalVolumeBefore = order->totalVolume();
@@ -685,6 +686,22 @@ taosim::decimal_t Book::processAgainstTheBuyQueue(const Order::Ptr& order, taosi
             bestBuyDeque = preventSelfTrade(bestBuyDeque, iop, order, actingAgentId);
             if (bestBuyDeque == nullptr)
                 break;
+            continue;
+        }
+
+        // A resting order whose backing reservation is exhausted must not trade:
+        // commit rounding across partial fills can consume the reservation while a
+        // dust remainder stays on the level, and a fill against it would abort in
+        // ClearingManager::handleTrade ("No reservation for resting..."). Ghost it
+        // here — the post-fill twin of this guard below only protects LATER matches.
+        if (m_simulation->exchange()->accounts()[iopAgentId][m_id]
+                .getReservationInBase(iop->id(), 1_dec) == 0_dec) {
+            m_simulation->logDebug(
+                "BOOK {} : ORDER #{} REMAINDER {} WITHOUT RESERVATION (GHOSTED)",
+                m_id, iop->id(), iop->totalVolume());
+            bestBuyDeque->updateVolume(-iop->totalVolume());
+            iop->setVolume(0_dec);
+            m_topOfBook.invalidate();
             continue;
         }
 
@@ -882,6 +899,19 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
             continue;
         }
 
+        // Twin of the buy-queue pre-fill guard: never trade against a resting order
+        // whose backing reservation is already exhausted (see there).
+        if (m_simulation->exchange()->accounts()[iopAgentId][m_id]
+                .getReservationInBase(iop->id(), 1_dec) == 0_dec) {
+            m_simulation->logDebug(
+                "BOOK {} : ORDER #{} REMAINDER {} WITHOUT RESERVATION (GHOSTED)",
+                m_id, iop->id(), iop->totalVolume());
+            bestSellDeque->updateVolume(-iop->totalVolume());
+            iop->setVolume(0_dec);
+            m_topOfBook.invalidate();
+            continue;
+        }
+
         const taosim::decimal_t usedVolume = std::min(iop->totalVolume(), order->totalVolume());
 
         OrderClientContext aggCtx, restCtx;
@@ -969,7 +999,10 @@ taosim::decimal_t Book::processAgainstTheSellQueue(const Order::Ptr& order, taos
 //-------------------------------------------------------------------------
 
 taosim::book::TickContainer* Book::preventSelfTrade(
-    taosim::book::TickContainer* queue, const LimitOrder::Ptr& iop, const Order::Ptr& order, AgentId agentId)
+    taosim::book::TickContainer* queue,
+    const LimitOrder::Ptr& iop,
+    const Order::Ptr& order,
+    AgentId agentId)
 {
     auto stpFlag = order->stpFlag();
     auto now = m_simulation->currentTimestamp();

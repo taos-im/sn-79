@@ -103,6 +103,29 @@ if __name__ != "__mp_main__":
         )
         return True
 
+    # WHAT THE NOTICE CHANNEL CONSUMES RATHER THAN FORWARDS.
+    #
+    # The engine announces a simulation's start and end twice, to two different consumers: the
+    # lifecycle HTTP post this handler receives, which exists so the VALIDATOR can run its own
+    # on_start / on_end, and the proxy's notice queue, which rides the state update out to every
+    # AGENT. Forwarding the HTTP copy to miners as well would deliver the same event twice -- once
+    # through FinanceAgentBase.update, once through FinanceAgentBase.process -- so each agent's
+    # onEnd would fire twice per simulation.
+    #
+    # The engine delivers both lifecycle events on the state-update route, so re-broadcasting the
+    # HTTP copy would be redundant as well as duplicative.
+    #
+    # The channel itself stays live: an unrecognised type still falls through and is forwarded, so
+    # whatever we choose to send over it next needs no change here.
+    _NOTICES_CONSUMED_NOT_FORWARDED = frozenset({
+        "EVENT_SIMULATION_START",
+        "EVENT_SIMULATION_END",
+    })
+
+    def _notice_is_forwarded_to_miners(message_type: str) -> bool:
+        """Whether a notice this validator received should also be pushed to miners."""
+        return message_type not in _NOTICES_CONSUMED_NOT_FORWARDED
+
     async def _push_fill_notifications(trade_events: list, url: str) -> None:
         """Fire-and-forget: push fill notifications directly to the data service
         immediately after on-chain execution, bypassing the heavy ingest pipeline."""
@@ -927,7 +950,7 @@ if __name__ != "__mp_main__":
                     self._scoring_proc_cutover = cutover_enabled()
                     if self._scoring_proc_cutover or shadow_enabled():
                         self._shadow_digest_fn = compute_parity_components
-                        from taos.im.validator.scoring_shadow import pnl_len_vector as _plv
+                        from taos.im.validator.scoring_shadow import parity_vectors as _plv
                         self._shadow_pnl_vec_fn = _plv
                         # Cutover: the child scores authoritatively — give it the
                         # reward core slice (main's loky only runs on fallback/
@@ -2142,6 +2165,7 @@ if __name__ != "__mp_main__":
                 'realized_pnl_by_book': realized_pnl_by_book,
                 'book_count': book_count,
                 'activity_factors': self.activity_factors,
+                'debeta_class_summary': getattr(self, '_debeta_class_summary', None) or {},
                 'pnl_factors': self.pnl_factors,
                 'kappa_values': self.kappa_values,
                 'unnormalized_scores': self.unnormalized_scores,
@@ -2210,6 +2234,13 @@ if __name__ != "__mp_main__":
                         'debeta_p11_strength': getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0),
                         'debeta_min_books': getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 0),
                         'debeta_centered_window': getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 0),
+                        # 0.6.3: the dials that decide pay on this release, so the Scoring Config table can show them
+                        'debeta_making_basis': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_basis', 'captured') or 'captured'),
+                        'debeta_making_horizon_s': getattr(getattr(self.config.scoring, 'debeta', None), 'making_horizon_s', 0.0),
+                        'debeta_s3_k': getattr(getattr(self.config.scoring, 'debeta', None), 's3_k', 0.0),
+                        'debeta_class_weights': str(getattr(getattr(self.config.scoring, 'debeta', None), 'class_weights', '') or ''),
+                        'debeta_skill_min_books_share': getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books_share', 0.0),
+                        'debeta_skill_hurdle_bps': getattr(getattr(self.config.scoring, 'debeta', None), 'skill_hurdle_bps', 0.0),
                     }
                 }
             }
@@ -3796,7 +3827,6 @@ if __name__ != "__mp_main__":
             for message in batch['messages']:
                 if message['type'] == 'EVENT_SIMULATION_START':
                     self.engine.on_start(message['timestamp'], FinanceEventNotification.from_json(message).event)
-                    continue
                 elif message['type'] == 'EVENT_SIMULATION_END':
                     ended = True
                 elif message['type'] == 'RESPONSES_ERROR_REPORT':
@@ -3813,6 +3843,11 @@ if __name__ != "__mp_main__":
                     else:
                         self.pagerduty_alert(f"{self.msgpack_error_counter} msgpack deserialization errors encountered in simulator - terminating simulation.", details=message)
                         return { "continue": False }
+                # ONE PLACE DECIDES WHAT REACHES MINERS. The start event used to `continue` here
+                # and the end event used to fall through, so the two halves of the same question were
+                # answered in different ways in the same loop and only one of them was visible.
+                if not _notice_is_forwarded_to_miners(message['type']):
+                    continue
                 notice = FinanceEventNotification.from_json(message)
                 if not notice:
                     bt.logging.error(f"Unrecognized notification : {message}")
@@ -3878,16 +3913,9 @@ from taos.im.validator.persistence import (
 if __name__ == "__main__":
     # Make an unlocatable warning locatable.
     #
-    # A Pydantic serializer warning fires ~299 times per day complaining that field `i` (the trade id,
-    # declared int) received a string of the form x:0x<extrinsic_hash>:<uid>:<index>:<p|f>. That is a
-    # real identity defect: no such id is ever recorded on the tape, so a consumer handed one cannot
-    # join it to anything. But the warning carries no stack, static search across taos/ and
-    # mvtrx/service did not find the assembly site, and the surrounding frames are stdlib
-    # (the log-queue monitor) or a subprocess, so the warning may not even originate in this process.
-    #
-    # Rather than guess a fix, capture the stack the next time it fires. `warnings` gives the full
-    # traceback when asked, so one run reproduces it (the shape includes :171: as well as :248:, so
-    # the acceptance miner exercises it) and the fix lands with evidence instead of a hypothesis.
+    # A Pydantic serializer warning carries no stack, so when one fires there is nothing to point at.
+    # This prints the full traceback for the first such warning of a run, once, and then restores the
+    # default handler.
     import traceback
     import warnings as _warnings
 

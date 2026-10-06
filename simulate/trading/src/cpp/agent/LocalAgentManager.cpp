@@ -77,10 +77,7 @@ void LocalAgentManager::createAgentsInstanced(
         creationCallback(child);
     }
 
-    std::sort(
-        m_agents.begin(), m_agents.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs->name() < rhs->name();
-        });
+    ranges::sort(m_agents, [](auto&& lhs, auto&& rhs) { return lhs->name() < rhs->name(); });
 
     m_byName.reserve(m_agents.size());
     for (const auto& agent : m_agents) {

@@ -20,6 +20,8 @@
 namespace taosim::filesystem
 {
 
+//-------------------------------------------------------------------------
+
 [[nodiscard]] std::vector<std::filesystem::path> collectMatchingPaths(
     const std::filesystem::path& dir, std::predicate<const std::filesystem::path&> auto criterion);
 

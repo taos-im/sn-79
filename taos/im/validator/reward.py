@@ -29,9 +29,9 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from taos.im.validator.debeta import (absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
+from taos.im.validator.debeta import (markout_quality, absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
                                       book_alphas_held_by_book, hurdle_filter, hurdle_skill, kappa_floored, median_abs_floor,
-                                      presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas,
+                                      presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas, balanced_reward_per_book,
                                       debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
@@ -931,6 +931,11 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['skill_raw'] = _d['skill_raw'] if _d else None
         uid_kappa['skill_rank'] = _d['skill_rank'] if _d else None
         uid_kappa['p11_factor'] = _d['p11_factor'] if _d else None
+        uid_kappa['s3_factor'] = _d.get('making_s3_factor') if _d else None
+        uid_kappa['bg_share'] = _d.get('bg_share') if _d else None
+        uid_kappa['making_realized'] = _d.get('making_realized') if _d else None
+        uid_kappa['making_captured'] = _d.get('making_captured') if _d else None
+        uid_kappa['making_basis'] = _d.get('making_basis') if _d else None
         uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
         # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
         for _k in ('skill_other', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
@@ -1271,8 +1276,188 @@ def allocate_trading(ladder_scores, making_share, pool, all_uids, config, skill_
     return (1.0 - pool) * lad + pool * (sh / _s2)
 
 
+SKILL_MIN_BOOKS_FLOOR = 4      # kappa_floored's own minimum sample
+SKILL_MIN_BOOKS_LAUNCH = 20    # the 0.6.2 launch bar, on 128 books
+SKILL_MIN_BOOKS_SHARE = 20 / 128
+
+
+def resolve_skill_min_books(explicit, share, n_books) -> int:
+    """The skill bar as a count, from a share of the books being scored.
+
+    Twenty books is 16 per cent of mainnet's 128 and 71 per cent of a 28-book multi-asset layout, and a
+    four-book asset class could never clear it alone, so the bar is a share of the layout. An explicit
+    count still overrides it; a layout the caller cannot size, or an unset share, keeps the launch value
+    rather than dropping to the mechanism's floor.
+
+    Args:
+        explicit: ``scoring.debeta.skill_min_books``; a positive count overrides the share.
+        share: ``scoring.debeta.skill_min_books_share``.
+        n_books: Books the validator scores (the canonical ids under multi-asset).
+
+    Returns:
+        The bar, never below the four-book floor.
+    """
+    count = int(explicit or 0)
+    if count > 0:
+        return max(SKILL_MIN_BOOKS_FLOOR, count)
+    n = int(n_books or 0)
+    s = float(share or 0.0)
+    if n <= 0 or s <= 0.0:
+        return SKILL_MIN_BOOKS_LAUNCH
+    return max(SKILL_MIN_BOOKS_FLOOR, -(-int(round(s * n * 1e9)) // 10**9))
+
+
+def class_weights_from(spec) -> list:
+    """``scoring.debeta.class_weights`` as normalised weights per background, in document order; an
+    empty spec is the flat rule (each class weighs what it captures)."""
+    if spec is None:
+        return []
+    parts = [p for p in str(spec).split(',')] if isinstance(spec, str) else list(spec)
+    parts = [p for p in parts if str(p).strip() != '']
+    if not parts:
+        return []
+    weights = [float(p) for p in parts]
+    if any(w < 0.0 for w in weights) or sum(weights) <= 0.0:
+        raise ValueError(f"class_weights must be non-negative and sum above zero: {spec!r}")
+    tot = sum(weights)
+    return [w / tot for w in weights]
+
+
+def class_weights_for_layout(spec, cmap: dict) -> list:
+    """The class dial as the layout can use it: the normalised weights when the layout has as many classes as the
+    dial has entries, else the flat rule (empty). A single market has no class map and no dial; a default that fits
+    the production two-background wrapper must not index a class on a layout with another count."""
+    weights = class_weights_from(spec)
+    n_classes = len(set((cmap or {}).values()))
+    if len(weights) < 2 or not cmap:
+        return []
+    if len(weights) != n_classes:
+        bt.logging.warning(
+            f"scoring.debeta.class_weights has {len(weights)} entries but the layout has {n_classes} classes: "
+            f"using the flat rule for this round"
+        )
+        return []
+    return weights
+
+
+def class_summary(details_by_class, weights, bars, n_books) -> dict:
+    """What the two-class layout needs observed, per class: the dial weight, the skill bar, the book count, how
+    many uids carry making credit and skill, the class's credit in each half, and the weight it effectively
+    carries after a quiet class hands its weight back (class_pool_shares' renormalisation)."""
+    out = {}
+    # credit is the positive part: a drift-stripped skill value can be negative, and a class's standing in the
+    # pool is what its uids earn, not what they lose
+    making_credit = {c: float(sum(max(0.0, float(d.get("making_raw") or 0.0)) for d in det.values())) for c, det in details_by_class.items()}
+    skill_credit = {c: float(sum(max(0.0, float(d.get("skill_raw") or 0.0)) for d in det.values())) for c, det in details_by_class.items()}
+
+    def effective(credit):
+        live = {c: weights[c] for c in credit if credit[c] > 0.0 and c < len(weights)}
+        tot = sum(live.values())
+        return {c: (live[c] / tot if c in live and tot > 0 else 0.0) for c in credit}
+
+    eff_m, eff_s = effective(making_credit), effective(skill_credit)
+    for c, det in details_by_class.items():
+        out[int(c)] = {
+            "weight": float(weights[c]) if c < len(weights) else 0.0,
+            "bar": int(bars.get(c, 0) or 0),
+            "n_books": int(n_books.get(c, 0) or 0),
+            "n_makers": sum(1 for d in det.values() if float(d.get("making_raw") or 0.0) > 0.0),
+            "n_skilled": sum(1 for d in det.values() if float(d.get("skill_raw") or 0.0) > 0.0),
+            "making_credit": making_credit[c],
+            "skill_credit": skill_credit[c],
+            "making_weight_effective": float(eff_m.get(c, 0.0)),
+            "skill_weight_effective": float(eff_s.get(c, 0.0)),
+        }
+    return out
+
+
+def class_map(self) -> dict:
+    """``{canonical book id: background index}`` for a multi-asset layout: from the validator's own
+    MultiAssetSimulationConfig, or from the simulation config main ships the scoring child; empty on a
+    single market, which has one class and no dial."""
+    sim = getattr(self, 'simulation', None)
+    if hasattr(sim, 'realizations') and getattr(sim, 'backgrounds', None):
+        out = {}
+        names = {bg.name: i for i, bg in enumerate(sim.backgrounds)}
+        for (_flat_idx, name, _instance, config), first in zip(sim.realizations(), sim.book_offsets):
+            for book in range(first, first + config.book_count):
+                out[book] = names[name]
+        return out
+    sc = getattr(self, 'simulation_config', None)
+    if isinstance(sc, dict) and sc.get('class_of_book'):
+        return {int(k): int(v) for k, v in sc['class_of_book'].items()}
+    return {}
+
+
+def split_by_class(capture_buy_sums, capture_sell_sums, pool_by_book, class_of_book) -> dict:
+    """The scorer's per-uid per-book inputs restricted to each class's books, keyed by class:
+    ``{class: {'capture_buy', 'capture_sell', 'pool', 'n_books'}}``."""
+    out = {}
+    for c in sorted(set(class_of_book.values())):
+        books = {b for b, k in class_of_book.items() if k == c}
+        part = {'n_books': len(books), 'capture_buy': {}, 'capture_sell': {}, 'pool': {}}
+        for key, src in (('capture_buy', capture_buy_sums), ('capture_sell', capture_sell_sums), ('pool', pool_by_book)):
+            for uid, by_book in (src or {}).items():
+                kept = {b: v for b, v in by_book.items() if b in books}
+                if kept:
+                    part[key][uid] = kept
+        out[c] = part
+    return out
+
+
+def class_pool_shares(details_by_class, weights, all_uids, bars) -> tuple:
+    """The pool's making and skill share vectors under a per-class emission weight.
+
+    Under the flat rule a class weighs whatever share of the field's capture and alpha it produces, so
+    a new class the size of the old one takes about half the pool on its first day. Here each class's
+    share vector is normalised within the class (the same rule as making_pool_inputs and
+    skill_pool_share, on that class's books and bar) and the classes are mixed at the dial, so a new
+    class can start at five per cent and be stepped up once observed. A class with no credit in a half
+    contributes nothing and the other classes' weights are renormalised for that half, as the flat
+    rule already hands the whole vector to the ladder when nothing was captured.
+
+    Args:
+        details_by_class: ``{class: detail}`` from one debeta_scores run per class.
+        weights: Normalised weights per class (class_weights_from), indexed by class.
+        all_uids: Uids in emission order.
+        bars: ``{class: skill bar}`` (resolve_skill_min_books on the class's book count).
+
+    Returns:
+        ``(making_share, skill_share)``, each ``{uid: share}`` summing to 1 (or all zero).
+    """
+    making_by, skill_by = {}, {}
+    for c, detail in details_by_class.items():
+        raw = {u: (max(0.0, float((detail.get(u) or {}).get('making_raw') or 0.0))
+                   if (detail.get(u) or {}).get('present', True) else 0.0) for u in all_uids}
+        tot = sum(raw.values())
+        making_by[c] = {u: (raw[u] / tot if tot > 0 else 0.0) for u in all_uids}
+        skill_by[c] = skill_pool_share(detail, all_uids, int(bars.get(c, SKILL_MIN_BOOKS_FLOOR)))
+    mixed = []
+    for by in (making_by, skill_by):
+        live = {c: w for c, w in enumerate(weights) if c in by and sum(by[c].values()) > 0.0}
+        wt = sum(live.values())
+        mixed.append({u: (sum(live[c] / wt * by[c][u] for c in live) if wt > 0 else 0.0) for u in all_uids})
+    return mixed[0], mixed[1]
+
+
+def skill_bar(self) -> int:
+    """The resolved skill bar for this validator (main or the scoring child): the engine's canonical ids
+    when it publishes them, else the child's simulation config, else the simulation's book count."""
+    dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+    ids = getattr(getattr(self, 'engine', None), 'book_ids', None)
+    n = len(ids) if ids else 0
+    if not n:
+        sc = getattr(self, 'simulation_config', None)
+        if isinstance(sc, dict):
+            n = len(sc.get('book_ids') or []) or int(sc.get('book_count') or 0)
+    if not n:
+        n = int(getattr(getattr(self, 'simulation', None), 'book_count', 0) or 0)
+    return resolve_skill_min_books(getattr(dcfg, 'skill_min_books', 0),
+                                   getattr(dcfg, 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE), n)
+
+
 def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_scores, making_share, config,
-                    skill_min_books) -> torch.FloatTensor:
+                    skill_min_books, class_shares=None) -> torch.FloatTensor:
     """The trading emission vector for a making_pool setting. ONE implementation for main (get_rewards) and the
     scoring child (scoring_shadow.shadow_score): the child had its own copy that knew only 'proportional', so
     under 'proportional_both' it paid the Pareto ladder and main adopted it after every restart.
@@ -1287,14 +1472,41 @@ def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_sc
         making_share: Per-uid smoothed share of captured spread.
         config: Validator config (reward floor and Pareto parameters).
         skill_min_books: ``scoring.debeta.skill_min_books``.
+        class_shares: ``(making_share, skill_share)`` mixed across asset classes at the dial
+            (class_pool_shares), or None for the flat rule. The making vector is the one the caller
+            smoothed and passes as ``making_share``; the skill half is taken from here.
     """
     if pool_mode in ("proportional", "proportional_blended", "proportional_both") and pool > 0.0:
-        skill_share = skill_pool_share(detail or {}, all_uids, int(skill_min_books or 4)) \
-            if pool_mode == "proportional_both" else None
+        if pool_mode != "proportional_both":
+            skill_share = None
+        elif class_shares:
+            skill_share = {uid: float(class_shares[1].get(uid, 0.0)) for uid in all_uids}
+        else:
+            skill_share = skill_pool_share(detail or {}, all_uids, int(skill_min_books or 4))
         return allocate_trading(pool_ladder_input(pool_mode, ladder_scores, trading_scores, all_uids),
                                 making_share, pool, all_uids, config, skill_share=skill_share)
     floored = apply_reward_floor([trading_scores[uid] for uid in all_uids], config)
     return distribute_rewards(floored, config)
+
+
+def making_basis_sums(self):
+    """The capture pair the making pool reads (2 October 2026): realized_buy_sums / realized_sell_sums when
+    scoring.debeta.making_basis is 'realized' (each fill marked against the centered mid making_horizon_s of
+    simulation time after it), else capture_buy_sums / capture_sell_sums. Anything but 'realized' reads as
+    captured, so a misspelt value cannot select a third behaviour. Both pairs are accumulated and published
+    whatever the dial says."""
+    dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+    basis = str(getattr(dcfg, 'making_basis', None) or 'captured')
+    cb = getattr(self, 'capture_buy_sums', {}) or {}
+    cs = getattr(self, 'capture_sell_sums', {}) or {}
+    if basis == 'realized':
+        # captured credit scaled by each uid's markout quality (debeta.markout_quality): two-sided on the stable
+        # captured sums, judged by the share of spread kept at the horizon; scaling both sides scales the credit
+        q = markout_quality(cb, cs, getattr(self, 'realized_buy_sums', {}) or {},
+                            getattr(self, 'realized_sell_sums', {}) or {}, sorted(set(cb) | set(cs)))
+        return ({u: {b: v * q.get(u, 0.0) for b, v in books.items()} for u, books in cb.items()},
+                {u: {b: v * q.get(u, 0.0) for b, v in books.items()} for u, books in cs.items()})
+    return (cb, cs)
 
 
 def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
@@ -1313,6 +1525,9 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     if dcfg is None:
         self.debeta_detail = {}
         return {}
+    _bar = skill_bar(self)
+    self._debeta_class_shares = None
+    self._debeta_class_summary = None
     try:
         # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
         # full-run p_last-p_first. Equals book_alphas_from_mtm over a non-pruned run (asserted in tests).
@@ -1368,12 +1583,13 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             sub_k = sub3 if _k == 3 else book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k)
             skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor)
         elif _hurdle_bps > 0:
-            skill_values, _hurdle_books_by_uid = hurdle_skill(skill_pool, floor, int(getattr(dcfg, 'skill_min_books', 4) or 4))
+            skill_values, _hurdle_books_by_uid = hurdle_skill(skill_pool, floor, _bar)
         _pool_scaling = int(getattr(dcfg, 'skill_pool_scaling', 0) or 0)
         p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
         skill_p11_strength = float(getattr(dcfg, 'skill_p11_strength', 0.0) or 0.0)
         # getattr default 2: the shipped scope, so an older config duck reproduces 0.6.1 exactly.
         p11_topk = int(getattr(dcfg, 'p11_topk', 2) or 2)
+        s3_k = float(getattr(dcfg, 's3_k', 0.0) or 0.0)
         # The counterparty map feeds BOTH discounts. Building it only for the making one meant that
         # with p11_strength 0 the skill-leg factor could never receive a map and silently stayed at
         # 1.0, contradicting the dial's own help text (found by the deployment-conditions suite,
@@ -1385,9 +1601,10 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         # Dict[int, float] contract every caller relies on is unchanged. Cleared on every path
         # that returns {}, so a fallback cycle cannot publish the previous cycle's decomposition.
         _detail = {}
+        _mk_b, _mk_s = making_basis_sums(self)
         scores = debeta_scores(
-            {u: dict(b) for u, b in getattr(self, 'capture_buy_sums', {}).items()},
-            {u: dict(b) for u, b in getattr(self, 'capture_sell_sums', {}).items()},
+            {u: dict(b) for u, b in _mk_b.items()},
+            {u: dict(b) for u, b in _mk_s.items()},
             alphas,
             floor=floor,
             w_make=float(dcfg.w_make),
@@ -1404,10 +1621,24 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             # getattr default 0.0: off reproduces the 0.6.1 leg exactly, and an older config duck
             # (the scoring child, a test) degrades to off rather than to an exception fallback.
             skill_max_inactive_books=float(getattr(dcfg, 'skill_max_inactive_books', 0.0) or 0.0),
-            skill_min_books=int(getattr(dcfg, 'skill_min_books', 4) or 4),
+            skill_min_books=_bar,
             skill_p11_strength=skill_p11_strength,
             p11_topk=p11_topk,
+            s3_k=s3_k,
         )
+        # Both making bases per uid, two-sided per book as the pool reads them, and which one pays (1.0 = realized),
+        # so a board shows what the other basis would pay before any dial moves (the 0.6.2 pattern for new forms).
+        _rb, _rs = getattr(self, 'realized_buy_sums', {}) or {}, getattr(self, 'realized_sell_sums', {}) or {}
+        _cb, _cs = getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {}
+        _cap_credit = balanced_reward_per_book(_cb, _cs, sorted(set(_cb) | set(_cs)))
+        _q = markout_quality(_cb, _cs, _rb, _rs, sorted(set(_cb) | set(_cs)))
+        _real_credit = {u: v * _q.get(u, 0.0) for u, v in _cap_credit.items()}
+        _basis_flag = 1.0 if str(getattr(dcfg, 'making_basis', None) or 'captured') == 'realized' else 0.0
+        for _u in set(_detail) | set(_real_credit) | set(_cap_credit):
+            _dd = _detail.setdefault(_u, {})
+            _dd['making_realized'] = float(_real_credit.get(_u, 0.0))
+            _dd['making_captured'] = float(_cap_credit.get(_u, 0.0))
+            _dd['making_basis'] = _basis_flag
         _notional = getattr(self, 'debeta_notional', {}) or {}
         for _u, _dd in _detail.items():
             # under the hurdle a qualifying book is one it kept; the pool's bar reads this count
@@ -1451,6 +1682,47 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         for _u, _dd in _detail.items():
             _dd['present'] = _u not in _absent
             _dd['presence_share'] = _shares.get(_u)
+        # Per-class shares for the pool when scoring.debeta.class_weights is set on a multi-asset
+        # layout: the same scorer over each class's books with that class's bar, each class's share
+        # vectors normalised within it, mixed at the dial (class_pool_shares). The flat detail above
+        # stays what the gauges publish. The counterparty map is per uid, not per book, so the P11
+        # factor a class run sees is the uid's whole-field factor.
+        _cmap = class_map(self)
+        _cw = class_weights_for_layout(getattr(dcfg, 'class_weights', None), _cmap)
+        if len(_cw) >= 2 and _cmap:
+            _by_class = split_by_class(
+                {u: dict(b) for u, b in _mk_b.items()},
+                {u: dict(b) for u, b in _mk_s.items()},
+                skill_pool, _cmap)
+            _details, _bars = {}, {}
+            for _c, _part in _by_class.items():
+                _bars[_c] = resolve_skill_min_books(
+                    getattr(dcfg, 'skill_min_books', 0),
+                    getattr(dcfg, 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE), _part['n_books'])
+                _cvals, _ckept = ((hurdle_skill(_part['pool'], floor, _bars[_c]))
+                                  if _hurdle_bps > 0 else (None, None))
+                _cd = {}
+                debeta_scores(
+                    _part['capture_buy'], _part['capture_sell'],
+                    {u: list(b.values()) for u, b in _part['pool'].items()},
+                    floor=floor, w_make=float(dcfg.w_make),
+                    cp=((getattr(self, 'debeta_cpc', None) or {}).get(_c) or cp), cp_tether=cp,
+                    p11_strength=p11_strength, detail=_cd,
+                    making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
+                    skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
+                    making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
+                    skill_values=_cvals, skill_rank_scale=1.0,
+                    skill_max_inactive_books=float(getattr(dcfg, 'skill_max_inactive_books', 0.0) or 0.0),
+                    skill_min_books=_bars[_c], skill_p11_strength=skill_p11_strength, p11_topk=p11_topk,
+                    s3_k=s3_k,
+                )
+                for _u, _dd in _cd.items():
+                    if _ckept is not None:
+                        _dd['skill_books'] = int(_ckept.get(_u, 0))
+                    _dd['present'] = _u not in _absent
+                _details[_c] = _cd
+            self._debeta_class_shares = class_pool_shares(_details, _cw, sorted(_detail), _bars)
+            self._debeta_class_summary = class_summary(_details, _cw, _bars, {c: p['n_books'] for c, p in _by_class.items()})
         warm = sum(1 for v in scores.values() if v > 0.0)
         if warm < int(dcfg.min_books):
             bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
@@ -1459,7 +1731,8 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         self.debeta_floor = float(floor)
         self.debeta_w_make = float(dcfg.w_make)
         self._debeta_last = {
-            'scores': dict(scores), 'detail': dict(_detail), 'floor': float(floor),
+            'scores': dict(scores), 'detail': dict(_detail), 'class_shares': self._debeta_class_shares,
+            'floor': float(floor),
             'w_make': float(dcfg.w_make), 'ts': time.time(),
         }
         return scores
@@ -1494,6 +1767,7 @@ def _debeta_fallback_map(self: 'Validator', dcfg, why: str) -> Dict[int, float]:
         age = time.time() - float(last.get('ts') or 0.0)
         if age <= _DEBETA_CARRY_MAX_S:
             self.debeta_detail = dict(last.get('detail') or {})
+            self._debeta_class_shares = last.get('class_shares')
             self.debeta_floor = last.get('floor')
             self.debeta_w_make = last.get('w_make')
             bt.logging.warning(
@@ -1550,8 +1824,13 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 'mark_mode': str(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_mode', 'last') or 'last'),
                 'mark_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_window', 200) or 200),
                 'making_pool': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_pool', 'rank') or 'rank'),
-                'skill_min_books': int(
-                    getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books', 4) or 4),
+                # resolved here so the scoring child and the pool read the same count as the legs
+                'skill_min_books': skill_bar(self),
+                'skill_min_books_share': float(
+                    getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE)
+                    or SKILL_MIN_BOOKS_SHARE),
+                'class_weights': class_weights_from(
+                    getattr(getattr(self.config.scoring, 'debeta', None), 'class_weights', None)),
             },
             'gentrx': {
                 'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
@@ -1607,6 +1886,9 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
             if getattr(self, 'engine', None) is not None
             else list(range(self.simulation.book_count))
         ),
+        # Canonical book id -> background index under a multi-asset layout (empty on a single
+        # market); the scoring child pays the per-class dial from this map, as main does.
+        'class_of_book': {str(k): int(v) for k, v in class_map(self).items()},
     }
 
 
@@ -1852,6 +2134,11 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     # re-warming. Only the allocation below depends on the dial.
     _ladder_scores, _make_term, _make_share = making_pool_inputs(
         validator_data.get('debeta_detail') or {}, all_uids, trading_uid_scores, _w_deb, _w_mk)
+    # Under a per-class dial the making vector smoothed and paid is the class-mixed one; the flat
+    # share stays in the detail for the gauges.
+    _class_shares = getattr(self, '_debeta_class_shares', None)
+    if _class_shares:
+        _make_share = {uid: float(_class_shares[0].get(uid, 0.0)) for uid in all_uids}
     if _ema_hl and _ema_hl > 0 and _pool > 0.0:
         _pool_ema = _pool_ema if isinstance(_pool_ema, dict) else {}
         for _k, _vec in (("term", _make_term), ("share", _make_share)):
@@ -1876,6 +2163,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     distributed_trading = pool_pay_vector(
         _pool_mode, _pool, validator_data.get('debeta_detail') or {}, all_uids, _ladder_scores,
         trading_uid_scores, _make_share, validator_data['config'], int(_dcfg.get('skill_min_books', 4) or 4),
+        class_shares=_class_shares,
     ).to(self.device)
     _prof_pareto = time.perf_counter()
     # INFO (not debug): this is one line per scoring round and must land in the

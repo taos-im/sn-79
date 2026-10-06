@@ -96,12 +96,12 @@ class VerifyScheduler:
 # (debeta_inv is {book: {uid: x}}) as two-level float defaultdicts; the rest plain dicts: the
 # reconstruction state, the capture-mid print windows, the P11 counterparty sums and the
 # timestamped histories every sum is pruned from.
-_DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
+_DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
                "debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional"]
 _DEBETA_PLAIN = [
     "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
-    "debeta_capture_mid", "debeta_cp",
-    "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
+    "debeta_capture_mid", "debeta_cp", "debeta_cpc", "debeta_cpc_hist",
+    "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
     "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
     "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
 ]
@@ -262,6 +262,8 @@ def compute_parity_components(s) -> dict:
         # not only in the scores it publishes.
         "debeta_cap": h(sum_books(getattr(s, "capture_buy_sums", {}) or {})
                         + sum_books(getattr(s, "capture_sell_sums", {}) or {})),
+        "debeta_real": h(sum_books(getattr(s, "realized_buy_sums", {}) or {})
+                         + sum_books(getattr(s, "realized_sell_sums", {}) or {})),
         "debeta_mtm": h(sum_books(getattr(s, "debeta_mtm", {}) or {})),
         "prune": h(getattr(s, "_last_prune_timestamp", None)),
     }
@@ -272,6 +274,53 @@ def pnl_len_vector(s) -> dict:
     breakdown behind the n_pnl component, shipped with parity frames so an
     n_pnl mismatch names WHICH uids diverge (and by how much)."""
     return {int(u): len(h) for u, h in s.realized_pnl_history.items() if h}
+
+
+def mtm_vector(s) -> dict:
+    """{uid: (books held, summed mark-to-market, summed inventory on those books)} for debeta_mtm, the uid-level breakdown behind the
+    debeta_mtm component. Since 1 October 2026 the local shadow diverged on that one structure within a
+    round of every INIT with only two hashes in the log; this names the uids so the cause can be read."""
+    inv = getattr(s, "debeta_inv", {}) or {}          # {book: {uid: inventory}}
+    out = {}
+    for u, b in (getattr(s, "debeta_mtm", {}) or {}).items():
+        vals = [float(x) for x in (b or {}).values()]
+        inv_sum = sum(float((inv.get(bk) or {}).get(u, 0.0)) for bk in (b or {}))
+        out[int(u)] = (len(vals), round(float(sum(sorted(vals))), 6), round(inv_sum, 6))
+    return out
+
+
+def mtm_books_vector(s) -> dict:
+    """Per uid and book, (mark-to-market, inventory), plus each book's last price and whether its rolling mark
+    state carries a previous mark: the three inputs the marking loop needs. Shipped with the parity frame so a
+    debeta_mtm mismatch shows WHICH input differs for the diverging uid."""
+    inv = getattr(s, "debeta_inv", {}) or {}
+    plast = getattr(s, "debeta_plast", {}) or {}
+    mark = getattr(s, "debeta_mark_state", {}) or {}
+    books = {}
+    for u, b in (getattr(s, "debeta_mtm", {}) or {}).items():
+        books[int(u)] = {int(bk): (round(float(v), 6), round(float((inv.get(bk) or {}).get(u, 0.0)), 6)) for bk, v in (b or {}).items()}
+    return {"books": books, "p_last": {int(bk): (None if v is None else round(float(v), 6)) for bk, v in plast.items()},
+            "mark_prev": {int(bk): (st or {}).get("prev") is not None for bk, st in mark.items()}}
+
+
+def parity_vectors(s) -> dict:
+    """The uid-level vectors that ride with a parity frame, one function for both sides."""
+    return {"n_pnl": pnl_len_vector(s), "debeta_mtm": mtm_vector(s), "mtm_books": mtm_books_vector(s)}
+
+
+def uid_level_diff(mine: dict, theirs: dict, limit: int = 8) -> dict:
+    """The uids whose vector entries differ, largest sum difference first and one-sided uids after, capped
+    at `limit`, plus the one-sided lists and the total count. Entries are (books, sum) pairs or ints."""
+    def _sum(e):
+        if e is None:
+            return None
+        return float(e[1]) if isinstance(e, (tuple, list)) else float(e)
+    diff = {u: (mine.get(u), theirs.get(u)) for u in set(mine) | set(theirs) if mine.get(u) != theirs.get(u)}
+    only_main = sorted(u for u, (a, b) in diff.items() if b is None)
+    only_shadow = sorted(u for u, (a, b) in diff.items() if a is None)
+    # largest difference first; a side with no entry counts as zero, so a uid one side never saw ranks by its size
+    ordered = sorted(diff, key=lambda u: -abs((_sum(diff[u][0]) or 0.0) - (_sum(diff[u][1]) or 0.0)))[:limit]
+    return {"uids": {u: diff[u] for u in ordered}, "only_main": only_main, "only_shadow": only_shadow, "n_diff": len(diff)}
 
 
 def compute_parity_digest(s) -> str:
@@ -405,6 +454,10 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     _ladder, _term, _share = making_pool_inputs(
         getattr(shadow, 'debeta_detail', {}) or {}, all_uids, trading_scores,
         float(_dcfg.get('weight', 0.0) or 0.0), float(_dcfg.get('w_make', 0.0) or 0.0))
+    # as in main: under a per-class dial the class-mixed making vector is the one smoothed and paid
+    _class_shares = getattr(shadow, '_debeta_class_shares', None)
+    if _class_shares:
+        _share = {uid: float(_class_shares[0].get(uid, 0.0)) for uid in all_uids}
     if _hl and _hl > 0 and _pool > 0.0:
         for _k, _vec in (("term", _term), ("share", _share)):
             _st = dict(_pema.get(_k) or {})
@@ -422,7 +475,7 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
             _kv['ladder_input'] = float(_ladder[uid])
     distributed = pool_pay_vector(
         _pool_mode, _pool, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _ladder, trading_scores, _share,
-        shadow.scoring_config, int(_dcfg.get('skill_min_books', 4) or 4))
+        shadow.scoring_config, int(_dcfg.get('skill_min_books', 4) or 4), class_shares=_class_shares)
     return {
         'trading': [float(x) for x in distributed.tolist()],
         'gentrx': [float(gentrx_scores_out[uid]) for uid in all_uids],
@@ -530,9 +583,14 @@ def apply_state_bytes(shadow: ShadowState, raw: bytes) -> int:
     accounting. Returns the state timestamp."""
     import msgpack
     from taos.im.protocol import MarketSimulationStateUpdate
+    from taos.im.validator.multiasset_state import flatten_multiasset_state
     from taos.im.validator.trade import update_trade_volumes
 
     d = msgpack.unpackb(raw, raw=False, use_list=True, strict_map_key=False)
+    # Main flattens a multi-asset request (backgrounds -> instances -> books) in the engine's receive path
+    # before it accounts for the round; the replica replays the bytes from before that step, so it must
+    # flatten too or it sees no books at all under the multi-asset layout (2 October 2026).
+    d, _ = flatten_multiasset_state(d)
     state = MarketSimulationStateUpdate.parse_dict(d)
     shadow.step += 1
     update_trade_volumes(shadow, state)
@@ -676,7 +734,7 @@ def _shadow_child_main(sock, cores, parity_ns):
             applied += 1
             last_applied_ts = ts
             if ts % parity_ns == 0:
-                _send_frame(sock, ("parity", (ts, compute_parity_components(shadow), pnl_len_vector(shadow), applied, time.time() - t0)))
+                _send_frame(sock, ("parity", (ts, compute_parity_components(shadow), parity_vectors(shadow), applied, time.time() - t0)))
             if shadow.scoring_interval and ts % shadow.scoring_interval == 0:
                 eager = pending_score_inputs.pop(ts, None)
                 if eager is not None:
@@ -754,6 +812,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         volume_assessment_period=shadow.config.scoring.activity.trade_volume_assessment_period,
                         miner_wealth=shadow.simulation.miner_wealth,
                         effective_max_uids=shadow.effective_max_uids,
+                        book_ids=shadow.simulation_config.get('book_ids'),
                     )
                     # New sim restarts near ts=0 — the old-run guard must not
                     # drop its frames, and any held boundary is void.
@@ -1324,15 +1383,38 @@ class ScoringShadow:
                     f"(applied={applied}, dropped={self._dropped}, reinits={self.reinits}) "
                     f"(main={ {k: mine.get(k) for k in _diff} } shadow={ {k: theirs.get(k) for k in _diff} })"
                 )
-                if 'n_pnl' in _diff and mine_vec is not None and theirs_vec is not None:
+                # The vectors: a dict of named uid vectors since 2 Oct 2026; a bare {uid: len} dict is the
+                # older n_pnl-only form, read the same way so the two sides can be a version apart.
+                def _vectors(v):
+                    if isinstance(v, dict) and ("n_pnl" in v or "debeta_mtm" in v):
+                        return v
+                    return {"n_pnl": v} if isinstance(v, dict) else {}
+                _mv, _tv = _vectors(mine_vec), _vectors(theirs_vec)
+                if 'n_pnl' in _diff and _mv.get("n_pnl") is not None and _tv.get("n_pnl") is not None:
                     _uid_diff = {
-                        u: (mine_vec.get(u, 0), theirs_vec.get(u, 0))
-                        for u in set(mine_vec) | set(theirs_vec)
-                        if mine_vec.get(u, 0) != theirs_vec.get(u, 0)
+                        u: (_mv["n_pnl"].get(u, 0), _tv["n_pnl"].get(u, 0))
+                        for u in set(_mv["n_pnl"]) | set(_tv["n_pnl"])
+                        if _mv["n_pnl"].get(u, 0) != _tv["n_pnl"].get(u, 0)
                     }
                     bt.logging.error(
                         f"[SHADOW-PARITY] ts={ts} n_pnl uid-level diff (main,shadow): {_uid_diff}"
                     )
+                if 'debeta_mtm' in _diff and _mv.get("debeta_mtm") is not None and _tv.get("debeta_mtm") is not None:
+                    _d = uid_level_diff(_mv["debeta_mtm"], _tv["debeta_mtm"])
+                    bt.logging.error(
+                        f"[SHADOW-PARITY] ts={ts} debeta_mtm uid-level diff, {_d['n_diff']} uid(s) differ; "
+                        f"only main {_d['only_main'][:8]}, only shadow {_d['only_shadow'][:8]}; "
+                        f"largest (main (books, mtm, inv), shadow (books, mtm, inv)): {_d['uids']}"
+                    )
+                    _mb, _tb = _mv.get("mtm_books") or {}, _tv.get("mtm_books") or {}
+                    if _d["uids"] and _mb and _tb:
+                        _top = next(iter(_d["uids"]))
+                        _bm, _bt = (_mb.get("books") or {}).get(_top, {}), (_tb.get("books") or {}).get(_top, {})
+                        _rows = {bk: {"main": _bm.get(bk), "shadow": _bt.get(bk),
+                                      "p_last": ((_mb.get("p_last") or {}).get(bk), (_tb.get("p_last") or {}).get(bk)),
+                                      "mark_prev": ((_mb.get("mark_prev") or {}).get(bk), (_tb.get("mark_prev") or {}).get(bk))}
+                                 for bk in sorted(set(_bm) | set(_bt))}
+                        bt.logging.error(f"[SHADOW-PARITY] ts={ts} debeta_mtm per-book for uid {_top} (mtm, inv) and (p_last main, shadow), (mark_prev main, shadow): {_rows}")
             else:
                 bt.logging.error(f"[SHADOW-PARITY] ts={ts} MISMATCH main={mine} shadow={theirs}")
             if self._consecutive_mismatches >= 2:
@@ -1521,12 +1603,17 @@ def _config_duck(config):
             # parameters the operator had not asked for and no log said so.
             debeta=SimpleNamespace(
                 enabled=bool(getattr(_d, 'enabled', False)),
+                # read by the fallback that carries the previous map through a warming or failed cycle at weight 1.0
+                weight=_num(getattr(_d, 'weight', None), 0.0, float),
                 w_make=_num(getattr(_d, 'w_make', None), 0.30, float),
                 floor_scale=_num(getattr(_d, 'floor_scale', None), 0.5, float),
                 centered_window=_num(getattr(_d, 'centered_window', None), 15, int),
                 min_books=_num(getattr(_d, 'min_books', None), 4, int),
                 p11_strength=_num(getattr(_d, 'p11_strength', None), 0.0, float),
                 p11_topk=_num(getattr(_d, 'p11_topk', None), 2, int),
+                s3_k=_num(getattr(_d, 's3_k', None), 0.0, float),
+                making_basis=str(getattr(_d, 'making_basis', None) or 'captured'),
+                making_horizon_s=_num(getattr(_d, 'making_horizon_s', None), 20.0, float),
                 making_floor_scale=_num(getattr(_d, 'making_floor_scale', None), 0.0, float),
                 skill_rank_scope=str(_d_scope if (_d_scope := getattr(_d, 'skill_rank_scope', None)) is not None
                                      else 'positives'),
@@ -1545,7 +1632,9 @@ def _config_duck(config):
                 skill_hurdle_books=_num(getattr(_d, 'skill_hurdle_books', None), 4, int),
                 skill_pool_scaling=_num(getattr(_d, 'skill_pool_scaling', None), 0, int),
                 skill_max_inactive_books=_num(getattr(_d, 'skill_max_inactive_books', None), 0.0, float),
-                skill_min_books=_num(getattr(_d, 'skill_min_books', None), 4, int),
+                skill_min_books=_num(getattr(_d, 'skill_min_books', None), 0, int),
+                skill_min_books_share=_num(getattr(_d, 'skill_min_books_share', None), 20 / 128, float),
+                class_weights=str(getattr(_d, 'class_weights', '') or ''),
                 skill_p11_strength=_num(getattr(_d, 'skill_p11_strength', None), 0.0, float),
                 presence_share_weighting=_num(getattr(_d, 'presence_share_weighting', None), 0, int),
                 presence_min_share=_num(getattr(_d, 'presence_min_share', None), 0.0, float),

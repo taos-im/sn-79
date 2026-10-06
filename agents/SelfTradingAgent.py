@@ -60,12 +60,13 @@ class SelfTradingAgent(GenTRXAgent):
                 # If the book is populated (it of course always should be)
                 if len(book.bids) > 0 and len(book.asks) > 0:
                     # Calculate placement prices for new orders to be a random distance between the current best bid and best ask
-                    bidprice = round(random.uniform(book.bids[0].price+10**(-1*self.simulation_config.priceDecimals),book.asks[0].price-10**(-1*self.simulation_config.priceDecimals)),self.simulation_config.priceDecimals)
-                    askprice = round(random.uniform(bidprice+10**(-1*self.simulation_config.priceDecimals),book.asks[0].price-10**(-1*self.simulation_config.priceDecimals)),self.simulation_config.priceDecimals)
+                    tick = 10 ** (-self.price_decimals(book_id))   # the book's own grid, per asset class
+                    bidprice = self.round_price(book_id, random.uniform(book.bids[0].price + tick, book.asks[0].price - tick))
+                    askprice = self.round_price(book_id, random.uniform(bidprice + tick, book.asks[0].price - tick))
                 else:
                     # Otherwise, place orders within 0.05 of the 100.0 price level
-                    bidprice = round(random.uniform(99.95,100.05),self.simulation_config.priceDecimals)
-                    askprice = round(random.uniform(bidprice,100.05),self.simulation_config.priceDecimals)
+                    bidprice = self.round_price(book_id, random.uniform(99.95,100.05))
+                    askprice = self.round_price(book_id, random.uniform(bidprice,100.05))
                 # Obtain a random quantity
                 quantity = self.quantity()
                 # Populate previous quantity and placement price values

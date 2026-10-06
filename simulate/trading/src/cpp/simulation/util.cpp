@@ -89,17 +89,16 @@ Message::Ptr canonize(Message::Ptr msg, uint32_t blockIdx, uint32_t blockDim)
 
 //-------------------------------------------------------------------------
 
-DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim)
+namespace
 {
-    const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
 
-    if (payload == nullptr) return {.msg = msg, .blockIdx = {}};
-
-    auto decanonizeBookId = [=](BookId& bookId) -> BookId {
-        return std::exchange(bookId, bookId % blockDim);
-    };
-
-    const auto bookIdCanon = [&] -> std::optional<BookId> {
+// Applies `decanonizeBookId` to the book id(s) a validator instruction names and hands
+// back the canonical id it carried, or nothing when the payload names no book.
+template<typename Rewrite>
+std::optional<BookId> rewriteBookId(
+    const std::shared_ptr<DistributedAgentResponsePayload>& payload, Rewrite&& decanonizeBookId)
+{
+    return [&] -> std::optional<BookId> {
         if (const auto pld = std::dynamic_pointer_cast<PlaceOrderMarketPayload>(payload->payload)) {
             return decanonizeBookId(pld->bookId);
         }
@@ -160,10 +159,65 @@ DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim)
         }
         return {};
     }();
-    
+}
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
+DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim)
+{
+    const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+
+    if (payload == nullptr) return {.msg = msg, .blockIdx = {}};
+
+    const auto bookIdCanon = rewriteBookId(payload, [=](BookId& bookId) -> BookId {
+        return std::exchange(bookId, bookId % blockDim);
+    });
+
     return {
         .msg = msg,
         .blockIdx = bookIdCanon.transform([&](BookId bookId) { return bookId / blockDim; })
+    };
+}
+
+//-------------------------------------------------------------------------
+
+std::optional<RealizationRoute> routeCanonicalBookId(
+    uint32_t canon, std::span<const uint32_t> bases, std::span<const uint32_t> counts)
+{
+    for (size_t i = bases.size(); i-- > 0;) {
+        if (canon < bases[i]) continue;
+        if (canon - bases[i] < counts[i]) {
+            return RealizationRoute{.idx = static_cast<uint32_t>(i), .local = canon - bases[i]};
+        }
+        return {};
+    }
+    return {};
+}
+
+//-------------------------------------------------------------------------
+
+DecanonizeResult decanonize(
+    Message::Ptr msg, std::span<const uint32_t> bases, std::span<const uint32_t> counts)
+{
+    const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+
+    if (payload == nullptr) return {.msg = msg, .blockIdx = {}};
+
+    std::optional<uint32_t> realization;
+    const auto bookIdCanon = rewriteBookId(payload, [&](BookId& bookId) -> BookId {
+        if (const auto route = routeCanonicalBookId(bookId, bases, counts)) {
+            realization = route->idx;
+            return std::exchange(bookId, route->local);
+        }
+        return bookId;
+    });
+
+    return {
+        .msg = msg,
+        .blockIdx = realization,
+        .unrouted = bookIdCanon.has_value() && !realization.has_value()
     };
 }
 

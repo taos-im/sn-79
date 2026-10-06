@@ -43,7 +43,8 @@ struct convert<taosim::matching::SLTPEntry>
             else if (key == "leverage")           v.leverage = val.as<taosim::decimal_t>();
             else if (key == "currency")           v.currency = val.as<Currency>();
             else if (key == "triggerPrice")       v.triggerPrice = val.as<taosim::decimal_t>();
-            else if (key == "cross")              v.cross = static_cast<taosim::matching::SLTPCross>(val.as<uint8_t>());
+            else if (key == "cross")
+                v.cross = static_cast<taosim::matching::SLTPCross>(val.as<uint8_t>());
             else if (key == "fillPrice")          v.fillPrice = val.as<taosim::decimal_t>();
             else if (key == "placeholder")        v.placeholder = val.as<taosim::decimal_t>();
             else if (key == "baseSl")             v.baseSl = val.as<taosim::decimal_t>();
@@ -311,10 +312,12 @@ struct pack<taosim::matching::SLTPPerBook>
                     o.pack_map(7);
                     o.pack("slAtEnd");   o.pack(slAtEnd);
                     o.pack("slPrice");   o.pack(slAtEnd ? taosim::decimal_t{0} : slot.slIter->first);
-                    o.pack("slOrderId"); o.pack(slAtEnd ? OrderID{} : slot.slIter->second.originatingOrderId);
+                    o.pack("slOrderId");
+                    o.pack(slAtEnd ? OrderID{} : slot.slIter->second.originatingOrderId);
                     o.pack("tpAtEnd");   o.pack(tpAtEnd);
                     o.pack("tpPrice");   o.pack(tpAtEnd ? taosim::decimal_t{0} : slot.tpIter->first);
-                    o.pack("tpOrderId"); o.pack(tpAtEnd ? OrderID{} : slot.tpIter->second.originatingOrderId);
+                    o.pack("tpOrderId");
+                    o.pack(tpAtEnd ? OrderID{} : slot.tpIter->second.originatingOrderId);
                     o.pack("volume");    o.pack(slot.volume);
                 }
             }

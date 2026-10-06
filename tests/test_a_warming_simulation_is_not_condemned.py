@@ -125,11 +125,11 @@ def test_the_restart_keeps_the_wrapper_and_the_kill_timeout():
 
 
 def test_the_public_release_falls_back_to_the_binary():
-    """start_simulator.sh is NOT in the public carve.
+    """A host without start_simulator.sh falls back to the engine binary.
 
-    Registering it unconditionally would make every restart on a deployed validator run a script
-    that is not there, and the engine would never come back -- breaking the exact path this
-    function exists to serve. The fallback is what those hosts had all along.
+    Registering the wrapper unconditionally would make every restart on such a host run a script
+    that is not there, and the engine would never come back. The fallback is what those hosts had
+    all along.
     """
     src = open(os.path.join(os.path.dirname(__file__), "..", "taos", "im", "validator", "update.py")).read()
     i = src.index("_run_dir = (self.repo_path")
@@ -162,3 +162,21 @@ def test_a_live_engine_mid_grace_is_still_healthy(tmp_path, monkeypatch):
     v = _V(tmp_path, 0)
     _write(tmp_path, "L2-0.log", 100)
     assert U._engine_log_is_growing(v) is True
+
+
+
+def test_the_wrapper_resumes_the_layout_this_validator_runs():
+    """The wrapper is given the layout the validator itself was started on.
+
+    The launcher sets SIMULATION_CONFIG for its own use, so a validator under pm2 may not have it in
+    its environment. The fallback must then be the validator's own simulator_config_file: a layout
+    name that does not ship makes start_simulator.sh refuse to resume and start an engine on a missing
+    file, so the run is lost instead of resumed.
+    """
+    src = open(os.path.join(os.path.dirname(__file__), "..", "taos", "im", "validator", "update.py")).read()
+    i = src.index("_run_dir = (self.repo_path")
+    block = src[i:i + 1200]
+    assert "simulation_0_acceptance" not in block, "the fallback names a layout that is not in the tree"
+    assert "simulator_config_file" in block, "the fallback is not the validator's own layout"
+    launcher = open(os.path.join(os.path.dirname(__file__), "..", "run_validator.sh")).read()
+    assert "export SIMULATION_CONFIG" in launcher, "the launcher does not pass its layout to the validator"

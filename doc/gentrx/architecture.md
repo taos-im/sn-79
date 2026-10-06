@@ -252,7 +252,7 @@ Scores flow into the validator's weight computation in two stages:
 
 The smoothed value flows into the validator's trading / training split in `prepare_weights`. Miner rewards split into two pools:
 
-- The **trading pool** combines kappa and pnl as `kappa_w · kappa + pnl_w · pnl` (weights sum to `1.0`) and runs through the Pareto sort-multiply and slow EMA.
+- The **trading pool** is the de-beta score: a making half and a skill half (`--scoring.debeta.w_make`, default `0.5`), each paid in proportion to the miner's making credit or net alpha, then the slow EMA. The kappa and PnL terms remain in the code at weight `0`.
 - The **training pool** distributes a configured share of rewards (`--scoring.gentrx.simulation_share`, default `0.05`) across active gradient submitters. The actual training allocation scales by `N_active / N_registered_miners`; whatever the training pool does not claim returns to the trading pool.
 
 Default split is 95% trading, 5% training. When GenTRX is not running, no gradients are submitted and 100% of rewards go to trading.

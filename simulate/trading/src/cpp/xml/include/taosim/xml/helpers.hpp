@@ -10,13 +10,30 @@
 #include <pugixml.hpp>
 
 #include <algorithm>
+#include <concepts>
+#include <filesystem>
 #include <functional>
+#include <stdexcept>
 #include <string_view>
 
 //-------------------------------------------------------------------------
 
 namespace taosim::xml
 {
+
+//-------------------------------------------------------------------------
+// Load and parse an XML document from `path`, throwing on parse failure.
+
+[[nodiscard]] inline pugi::xml_document loadDocument(const std::filesystem::path& path)
+{
+    pugi::xml_document doc;
+    if (const pugi::xml_parse_result result = doc.load_file(path.c_str()); !result) {
+        throw std::runtime_error{
+            "taosim::xml::loadDocument: failed to parse '" + path.string()
+            + "': " + result.description()};
+    }
+    return doc;
+}
 
 //-------------------------------------------------------------------------
 
@@ -41,13 +58,13 @@ void setAttribute(pugi::xml_node node, std::string_view name, const T& value)
 }
 
 //-------------------------------------------------------------------------
-
 // The document's root, under either accepted name.
 //
 // Exchange-mode configs are rooted at <Exchange> because calling an exchange deployment a "Simulation"
 // misdescribes it, while simulation configs stay at <Simulation>. BOTH must keep working, and not only
 // for the configs on disk: every checkpoint ever written carries the root name it was written under, so
 // a reader that accepted only the new name would fail to load existing checkpoints.
+
 [[nodiscard]] inline pugi::xml_node rootNode(pugi::xml_node doc)
 {
     if (auto node = doc.child("Simulation")) return node;
@@ -81,8 +98,7 @@ inline size_t warnOnUnknownAttributes(pugi::xml_node root, std::string_view orig
 size_t removeChildren(pugi::xml_node node, std::predicate<pugi::xml_node> auto criterion)
 {
     size_t removeCounter{};
-    auto child = node.first_child();
-    while (child) {
+    for (auto child = node.first_child(); child; ) {
         const auto nextChild = child.next_sibling();
         if (criterion(child)) {
             node.remove_child(child);
@@ -92,6 +108,10 @@ size_t removeChildren(pugi::xml_node node, std::predicate<pugi::xml_node> auto c
     }
     return removeCounter;
 }
+
+//-------------------------------------------------------------------------
+
+
 
 //-------------------------------------------------------------------------
 

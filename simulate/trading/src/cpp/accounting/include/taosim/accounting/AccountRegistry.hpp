@@ -6,6 +6,7 @@
 
 #include "CheckpointSerializable.hpp"
 #include <taosim/accounting/Account.hpp>
+#include <taosim/util/TransparentStringHash.hpp>
 #include "JsonSerializable.hpp"
 #include "common.hpp"
 
@@ -83,14 +84,9 @@ private:
     std::map<std::string, std::function<Account()>> m_agentTypeAccountTemplates;
     AgentIdBimap m_idBimap;
     AgentIdToBaseNameMap m_agentIdToBaseName;
-    struct StringHash {
-        using is_transparent = void;
-        std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
-        std::size_t operator()(const std::string& s) const noexcept { return std::hash<std::string_view>{}(s); }
-        std::size_t operator()(const char* s) const noexcept { return std::hash<std::string_view>{}(s); }
-    };
     // Mirrors m_idBimap.left; kept in lock-step in registerLocal + registerJson.
-    std::unordered_map<std::string, AgentId, StringHash, std::equal_to<>> m_idLookup;
+    std::unordered_map<std::string, AgentId, util::TransparentStringHash, std::equal_to<>>
+        m_idLookup;
 
     friend class Simulation;
 };

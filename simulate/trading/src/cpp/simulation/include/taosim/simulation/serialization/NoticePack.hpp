@@ -28,8 +28,8 @@ namespace taosim::simulation::serialization
 
 //-------------------------------------------------------------------------
 
-// bookIdOffset is the canonical-book-id offset of the notice's source block
-// (blockIdx * booksPerBlock); it is applied to the book ids as they are written,
+// bookIdOffset is the canonical id of the notice's source block's local book 0
+// (Simulation::bookIdBase); it is applied to the book ids as they are written,
 // leaving the buffered payload objects untouched.
 template<typename Packer>
 void packNotice(
@@ -83,7 +83,25 @@ void packNotice(
             o.pack(abbreviate(msg->type));
 
             o.pack("t"s);
-            o.pack(msg->occurrence);
+            // A SCHEDULED MESSAGE'S OCCURRENCE IS WHEN IT WAS QUEUED, NOT WHEN IT HAPPENS.
+            //
+            // Every ordinary notice is created at the moment it occurs (Book.cpp passes
+            // currentTimestamp as both occurrence and arrival), so for those the two are equal and
+            // this reads the same either way. The two lifecycle events are the exception: both are
+            // queued by Simulation::start() at the simulation's START, the end one with a delay of
+            // duration-1, so its occurrence is 0 and its arrival is when the simulation actually
+            // ends. Packing the occurrence gave an end event stamped with the start time, which then
+            // sorted to the FRONT of the agent's notice list -- an agent reading its final update saw
+            // "simulation ended" before the trades it had just done.
+            //
+            // Only the lifecycle pair is switched to arrival, deliberately: a fill notice's timestamp
+            // is a documented quantity and is not this change's business.
+            {
+                const bool lifecycle =
+                    std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
+                    || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
+                o.pack(lifecycle ? msg->arrival : msg->occurrence);
+            }
 
             o.pack("a"s);
             [&] {

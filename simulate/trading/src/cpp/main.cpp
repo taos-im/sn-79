@@ -6,6 +6,7 @@
 #include <taosim/replay/ReplayDesc.hpp>
 #include <taosim/replay/helpers.hpp>
 #include <taosim/simulation/SimulationManager.hpp>
+#include <taosim/simulation/multiasset/helpers.hpp>
 
 #include <CLI/CLI.hpp>
 #include <cstdio>
@@ -82,20 +83,19 @@ int main(int argc, char* argv[])
     fmt::println("{}", app.get_description());
 
     if (!configPath.empty()) {
-        auto mngr = taosim::simulation::SimulationManager::fromConfig(configPath, baseDir);
-        mngr->runSimulations();
+        // Same -f flag, routed by the config's root element (multi-asset wrapper
+        // vs single <Simulation>); both kinds run through the same interface.
+        auto orchestrator = taosim::simulation::multiasset::makeSimulationOrchestrator(configPath, baseDir);
+        orchestrator->run();
     }
     else if (!ckptToken.empty()) {
-        auto mngr = taosim::simulation::SimulationManager::fromCheckpoint(ckptToken);
-        mngr->runSimulations();
+        // Same -c flag for both run modes; routed by the persisted run-dir config root.
+        auto orchestrator = taosim::simulation::multiasset::makeOrchestratorFromCheckpoint(ckptToken);
+        orchestrator->run();
     }
     else if (!replayDesc.dir.empty()) {
-        auto mngr = taosim::simulation::SimulationManager::fromReplay(replayDesc);
-        if (replayDesc.bookId) {
-            mngr->runReplay();
-        } else {
-            mngr->runReplayAdvanced();
-        }
+        auto orchestrator = taosim::simulation::SimulationManager::fromReplay(replayDesc);
+        orchestrator->run();
     }
 
     fmt::println(" - all simulations finished, exiting");

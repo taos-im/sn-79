@@ -92,6 +92,9 @@ public:
     void setReturnPeriod(Timestamp period);
     
     [[nodiscard]] double estimatedVolatility() const noexcept;
+    // True once pushLevels has recorded at least one two-sided snapshot; the
+    // slope/volume accessors below throw (map::at) on an empty history.
+    [[nodiscard]] bool hasLevels() const noexcept { return !m_bookSlopes.empty(); }
     [[nodiscard]] double bidSlope() noexcept { return lastSlopes().bid; }
     [[nodiscard]] double askSlope() noexcept { return lastSlopes().ask; }
     [[nodiscard]] double bidVolume() const { return lastVolume().bid; }
@@ -162,7 +165,7 @@ private:
     double m_logRetSum{0.0};
     double m_logRetSumSq{0.0};
     bool m_incBuilt{false};
-    Timestamp m_lastSeq;
+    Timestamp m_lastSeq{};
     std::map<Timestamp, BookStat> m_bookSlopes; 
     std::map<Timestamp, BookStat> m_bookVolumes;
 };

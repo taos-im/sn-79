@@ -176,7 +176,17 @@ std::unique_ptr<FuturesSignal> FuturesSignal::fromXML(
         .lambda = node.attribute("lambda").as_double(0.001155),
         .staleIntervals = node.attribute("staleIntervals").as_ullong(3),
         .proc = {
-            .updatePeriod = node.attribute("updatePeriod").as_ullong(1)
+            // Required and strictly positive — see FundamentalPrice::fromXML: a
+            // defaulted ~1ns period means ~1e9 update iterations per step (OOM).
+            .updatePeriod = [&] {
+                const auto updatePeriod = node.attribute("updatePeriod").as_ullong();
+                if (updatePeriod == 0) {
+                    throw std::invalid_argument{
+                        "FuturesSignal::fromXML:"
+                        " attribute 'updatePeriod' must be present and > 0"};
+                }
+                return updatePeriod;
+            }()
         }
     });
 }

@@ -255,7 +255,7 @@ class MovingHurstAgent(GenTRXAgent):
         for book_id, book in state.books.items():
             try:
                 bestBid = book.bids[0].price if book.bids else 0.0
-                bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-self.simulation_config.priceDecimals)
+                bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-self.price_decimals(book_id))
                 midquote = (bestBid + bestAsk) / 2
 
                 if state.dendrite.hotkey not in self.predictors:

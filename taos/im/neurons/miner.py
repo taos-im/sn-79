@@ -41,7 +41,7 @@ if __name__ != "__mp_main__":
     import bittensor as bt
 
     from taos.common.neurons.miner import BaseMinerNeuron
-    from taos.im.protocol import MarketSimulationStateUpdate
+    from taos.im.protocol import FinanceEventNotification, MarketSimulationStateUpdate
     from taos.im.protocol.gentrx import GenTRXAssignment
 
     # taos.im.protocol.exchange ships in the public release from 0.6.0, but may be absent on older
@@ -385,6 +385,61 @@ if __name__ != "__mp_main__":
             
             Args:
                 synapse (taos.im.protocol.MarketSimulationStateUpdate): The synapse object containing the latest simulation state update.
+
+            Returns:
+                float: A priority score calculated using the standard priority function.
+            """
+            return self.priority(synapse)
+
+        async def update(
+            self, synapse: FinanceEventNotification
+        ) -> FinanceEventNotification:
+            """
+            Processes incoming event notification synapse by forwarding to the associated agent class for handling.
+
+            THE BASE CLASS ATTACHES THIS UNDER THE WRONG NAME FOR THIS SUBNET. BaseMinerNeuron attaches
+            `update` typed as `EventNotification`, and bittensor's axon routes a request by the synapse's
+            class NAME rather than by its class hierarchy. The validator sends FinanceEventNotification
+            (taos.im.validator.forward.notify), so every dispatch since the first commit has come back
+            UnknownSynapseError and no agent's `process` has ever been called. `forward` was overridden
+            here for exactly this reason when the state update was specialised to
+            MarketSimulationStateUpdate; `update` was left on the base type.
+
+            Validators do not require nor accept any response to event notification synapses; they are
+            used only to provide information to the agent.
+
+            Args:
+                synapse (taos.im.protocol.FinanceEventNotification): The synapse object containing the event data.
+
+            Returns:
+                taos.im.protocol.FinanceEventNotification: The synapse object with the 'acknowledged' field updated to true.
+            """
+            try:
+                return self.agent.process(synapse)
+            except Exception as e:
+                bt.logging.error(f"Agent process error: {e}\n{traceback.format_exc()}")
+                raise
+
+        def blacklist_update(
+            self, synapse: FinanceEventNotification
+        ) -> typing.Tuple[bool, str]:
+            """
+            Apply default blacklisting to all received event notification synapses.
+
+            Args:
+                synapse (taos.im.protocol.FinanceEventNotification): The synapse object containing the event data.
+
+            Returns:
+                (bool, str): Tuple containing [1] boolean indicating if the request was blacklisted [2] string containing the message indicating reason for blacklisting.
+            """
+            return self.blacklist(synapse)
+
+        def priority_update(self, synapse: FinanceEventNotification) -> float:
+            """
+            Apply default prioritization to all received event notification synapses.
+
+            Args:
+                synapse (taos.im.protocol.FinanceEventNotification): The synapse object containing the event data.
 
             Returns:
                 float: A priority score calculated using the standard priority function.

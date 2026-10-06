@@ -31,8 +31,10 @@ from taos import __spec_version__
 from taos.common.neurons import BaseNeuron
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import MarketSimulationStateUpdate, MarketSimulationConfig, FinanceAgentResponse, FinanceEventNotification
+from taos.im.protocol.models import MultiAssetSimulationConfig
 from taos.im.protocol.simulator import SimulatorResponseBatch
 from taos.im.protocol.events import SimulationStartEvent
+from taos.im.validator.engines.simulation import flatten_multiasset_state
 from taos.im.validator.reward import set_delays
 
 from ypyjson import YpyObject
@@ -46,6 +48,12 @@ logging.basicConfig(
 )
 
 _MVTRX_DATA_SERVICE_URL = os.environ.get("MVTRX_DATA_SERVICE_URL", "")
+
+
+def _ipc_name(base: str) -> str:
+    """Simulator IPC object name, honoring TAOSIM_IPC_SUFFIX like the simulator does
+    (lets several sim+proxy pairs coexist on one machine)."""
+    return f"/{base}{os.environ.get('TAOSIM_IPC_SUFFIX', '')}"
 
 async def _push_proxy_state_to_mvtrx(state, block: int) -> None:
     """Delegate to the optional data-service push module when present."""
@@ -133,7 +141,13 @@ class Proxy(Validator):
 
     def load_simulation_config(self):
         self.xml_config = ET.parse(self.simulator_config_file).getroot()
-        self.simulation = MarketSimulationConfig.from_xml(self.xml_config)
+        if self.xml_config.tag == "MultiAssetSimulation":
+            # Multi-asset wrapper: canonical (sparse) book ids over all realizations;
+            # the states arriving on the IPC are flattened to match (see _listen).
+            self.simulation = MultiAssetSimulationConfig.from_multiasset_xml(
+                self.xml_config, Path(self.simulator_config_file).parent)
+        else:
+            self.simulation = MarketSimulationConfig.from_xml(self.xml_config)
 
     def compress_outputs(self, start: bool = False) -> None:
         """No-op for the local proxy harness. The production validator's
@@ -276,7 +290,7 @@ class Proxy(Validator):
             receive_start = time.time()
             bt.logging.info("Received state update from simulator (msgpack)")
             byte_size_req = int.from_bytes(msg, byteorder="little")
-            shm_req = posix_ipc.SharedMemory("/state")
+            shm_req = posix_ipc.SharedMemory(_ipc_name("state"))
             start = time.time()
             packed_data = None
             for attempt in range(1, 6):
@@ -318,8 +332,8 @@ class Proxy(Validator):
             self.last_response = response
             packed_res = msgpack.packb(response, use_bin_type=True)
             byte_size_res = len(packed_res)
-            mq_res = posix_ipc.MessageQueue("/taosim-res", flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
-            shm_res = posix_ipc.SharedMemory("/responses", flags=posix_ipc.O_CREAT, size=byte_size_res)
+            mq_res = posix_ipc.MessageQueue(_ipc_name("taosim-res"), flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
+            shm_res = posix_ipc.SharedMemory(_ipc_name("responses"), flags=posix_ipc.O_CREAT, size=byte_size_res)
             with mmap.mmap(shm_res.fd, byte_size_res, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ) as mm:
                 shm_res.close_fd()
                 mm.write(packed_res)
@@ -328,9 +342,13 @@ class Proxy(Validator):
         while True:
             response = {"responses" : []}
             try:
-                mq_req = posix_ipc.MessageQueue("/taosim-req", flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
+                mq_req = posix_ipc.MessageQueue(_ipc_name("taosim-req"), flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
                 # This blocks until the queue can provide a message
                 message, receive_start = receive(mq_req)
+                # Multi-asset runs publish a composed request; flatten it to the
+                # single-market shape (canonical book ids are globally unique, so
+                # the merge is lossless). Single-market states pass through as-is.
+                message, _instance_metas = flatten_multiasset_state(message)
                 state = MarketSimulationStateUpdate.parse_dict(message)
                 response = await self.handle_state(message, state, receive_start)
             except Exception:

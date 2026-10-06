@@ -7,6 +7,8 @@
 #include "json_util.hpp"
 #include <taosim/mp/mp.hpp>
 
+#include <fmt/format.h>
+
 #include <optional>
 
 //-------------------------------------------------------------------------
@@ -61,5 +63,25 @@ concept IsJsonSerializable = IsJsonSerializableValue<T> || IsJsonSerializablePoi
 }
 
 }  // namespace taosim::json
+
+//-------------------------------------------------------------------------
+// Lazy fmt formatting for json-serializable pointers. Passing the pointer to a
+// formatting call (e.g. logDebug("{}", ptr)) defers the JSON serialization to
+// the moment the text is actually emitted, instead of building — and then
+// discarding — the string eagerly at the call site when logging is disabled.
+// Constrained to pointers so it never collides with value formatters.
+
+template<typename T>
+    requires (taosim::mp::IsPointer<T> && taosim::json::IsJsonSerializable<T>)
+struct fmt::formatter<T>
+{
+    constexpr auto parse(fmt::format_parse_context& ctx) const noexcept { return ctx.begin(); }
+
+    template<typename FormatContext>
+    auto format(const T& serializable, FormatContext& ctx) const
+    {
+        return fmt::format_to(ctx.out(), "{}", taosim::json::jsonSerializable2str(serializable));
+    }
+};
 
 //-------------------------------------------------------------------------

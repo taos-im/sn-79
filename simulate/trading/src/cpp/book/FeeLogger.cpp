@@ -19,7 +19,7 @@ namespace taosim::book
 FeeLogger::FeeLogger(
     const fs::path &filepath, 
     std::chrono::system_clock::time_point startTimePoint,
-    decltype(ExchangeSignals::feeLog)& signal,
+    decltype(matching::ExchangeSignals::feeLog)& signal,
     Simulation *simulation) noexcept
     : logging::RotatingLoggerBase(logging::RotatingLoggerBaseDesc{
         .name = "FeeLogger",

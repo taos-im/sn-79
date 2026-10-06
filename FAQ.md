@@ -15,11 +15,13 @@ Other finance-related subnets, at least to our knowledge at time of writing, foc
 
 #### 2. How are miners evaluated?
 
-While the exact details of the incentive mechanism are subject to change over time, the key objective for miners is always to maximize average _risk-adjusted_ performance over time across all simulated orderbooks.  The central metric applied in measuring performance is the Kappa-3 ratio, which measures risk-adjusted returns based on realized profits and losses from completed round-trip trades.  Kappa-3 is defined as K₃(τ) = (μ - τ) / [LPM₃(τ)]^(1/3), where μ is the mean return, τ is the target threshold (typically zero), and LPM₃ is the third lower partial moment measuring downside risk.  This metric emphasizes consistent profitability while heavily penalizing downside volatility, making it particularly suitable for evaluating trading strategies.
+The details of the incentive mechanism change over time; the objective stays the same: sustained, risk-aware trading performance across all simulated orderbooks. Most of a miner's reward comes from the trading pool, scored on the simulation; a share (5% by default) goes to [GenTRX](/doc/gentrx/overview.md) training. The trading pool is paid in two equal halves.
 
-The returns for the Kappa-3 calculation are based on actual realized P&L from closed positions (completed round-trip trades), and the measurement is taken over a rolling window of length defined in the [validator config](/taos/im/config/__init__.py) as `--scoring.kappa.lookback`.  Note that the actual simulation time period of the assessment is related to this through the `Simulation.step` in the [simulation config](/simulate/trading/run/config/simulation_0.xml) - a new observation is obtained every `Simulation.step` simulation nanoseconds.
+**Making** pays for liquidity supplied to the market. Each maker fill earns the spread it captured against the centred mid, and the credit on a book is twice the smaller of its buy and sell sides, so only two-sided making counts. From 0.6.3 that credit is scaled by markout quality, the share of the spread the fills still hold 20 simulation seconds later, so quotes the market runs over earn nothing. Credit concentrated on a few counterparties is discounted, and from 0.6.3 a maker's credit is scaled down when its fills against other miners exceed four times its fills against the background market. The half is paid in proportion to each miner's credit.
 
-There are then a few additional transformations applied to avoid manipulation and encourage active trading; miners' scores are scaled in proportion to their round-trip trading volume over the assessment window, with a decay factor being applied during any inactive periods.  A penalty is applied to miners scores in cases where significant outliers in terms of performance exist between the simulated books.  The full details of the implementation can be understood by studying the [reward logic](/taos/im/validator/reward.py).  The overall score of a miner is determined as an exponential moving average of the score calculated at each observation, with the period of the EMA being set via the `--neuron.moving_average_alpha` parameter which is applied in the [base validator logic](/taos/common/neurons/validator.py).
+**Skill** pays for trading profit the market's drift does not explain. On each book a miner's mark-to-market P&L is reduced by its average inventory times the book's price move; what remains is its alpha, and a book counts once its alpha clears a small hurdle relative to the notional traded there. A miner qualifies when its alpha is consistently positive across books, measured by a downside-adjusted consistency ratio, on at least the required number of books (20 of 128 on a single market; from 0.6.3, 15 of the 96 `simulation_0` books and 5 of the 32 `simulation_1` books). Qualifying miners share the half in proportion to their net alpha, after the same counterparty discount.
+
+The trading score is smoothed over a track record of about three simulated hours (`--scoring.score_ema_halflife`), a miner that stops answering validators is not scored until it answers again, and from 0.6.3 each asset class is paid through its own share. Validators set weights from a moving average of each miner's score (`--neuron.moving_average_alpha`, in the [base validator logic](/taos/common/neurons/validator.py)). The rules are stated in the dial help of the [validator config](/taos/im/config/__init__.py) and implemented in the [reward logic](/taos/im/validator/reward.py).
 
 #### 3. How do I get started mining in the subnet?
 
@@ -53,17 +55,17 @@ Being that our markets are synthetic and generated through a powerful C++ engine
 
 #### 8. My miner seems to be receiving requests and responding, but I don't see any activity and my score is not increasing.  What's going on?
 
-If you have just registered the miner, note that scores are not assigned until sufficient time has passed to allow calculating a meaningful Kappa-3 ratio with enough realized trades.  If the situation persists, you will need to check your UID at the [Agents Dashboard](https://taos.simulate.trading/d/edy6vxytuud4wd/agents) and confirm a few critical things:
+A new miner is scored from its first cycle, but its score builds over the three-hour track record, and the skill half pays nothing until the miner has qualifying alpha on enough books.  If the situation persists, you will need to check your UID at the [Agents Dashboard](https://taos.simulate.trading/d/edy6vxytuud4wd/agents) and confirm a few critical things:
 
-- Do you see recent trades for all book IDs?  Miners must trade on every book in order to receive score.
+- Do you see recent trades on many book IDs?  The skill half needs qualifying alpha on a set share of the books (20 of 128 on a single market; from 0.6.3, 15 of the 96 `simulation_0` books and 5 of the 32 `simulation_1` books) and is scaled down when more than about three eighths of the books carry none.
 - Under the Requests plot, do you see a large proportion of failures or timeouts?  If you are not seeing mostly success, usually this is due to taking too long to respond - validators allow a maximum of `--neuron.timeout` seconds (defined in the [base validator config](/taos/common/config/__init__.py)) for miners to respond.  This can be addressed by increasing resources, optimizing your strategy logic and ensuring sufficient network connectivity; you may also want to consider geolocating your miner nearby to the biggest validators for the best possible latency.
-- Pay attention to the Kappa-3 Score and Kappa Penalty, these are the primary metrics used in determining miner score.
+- Check De-beta Eligible, Scored Books, Making Share, Skill Rank and the counterparty and tether factors in the Agents table, and the de-beta panels on your Agent page.  Making credit needs fills on both sides of a book; skill needs qualifying alpha on enough books.
 
 #### 9. As a miner, I've hit the trading volume limit and can no longer submit instructions.  How is this limit enforced and what can I do now?
 
-In order to prevent miners from attempting to exploit the volume-weighting of scores and overloading the simulations with excessive careless trading activity, a "cap" is enforced on the total QUOTE volume allowed to be traded in a given period of simulation time.  Trading volume is calculated in QUOTE as the sum of price multiplied by quantity over all trades in which the miner is involved.  The period over which the trading volume limit is assessed is defined in the [validator config](/taos/im/config/__init__.py) as `--scoring.activity.trade_volume_assessment_period` (specified in simulation nanoseconds), where this is checked every `--scoring.activity.trade_volume_sampling_interval` (simulation nanoseconds) against the limit which is calculated as `--scoring.activity.capital_turnover_cap` multiplied by the initial wealth allocated to miners defined in the [simulation config](/simulate/trading/run/config/simulation_0.xml) as `Simulation.Agents.MultiBookExchangeAgent.Balances.wealth`.  
+To keep traded volume tied to the capital behind it, and to keep careless trading from overloading the simulations, a "cap" is enforced on the total QUOTE volume allowed to be traded in a given period of simulation time.  Trading volume is calculated in QUOTE as the sum of price multiplied by quantity over all trades in which the miner is involved.  The period over which the trading volume limit is assessed is defined in the [validator config](/taos/im/config/__init__.py) as `--scoring.activity.trade_volume_assessment_period` (specified in simulation nanoseconds), where this is checked every `--scoring.activity.trade_volume_sampling_interval` (simulation nanoseconds) against the limit which is calculated as `--scoring.activity.capital_turnover_cap` multiplied by the initial wealth allocated to miners defined in the [simulation config](/simulate/trading/run/config/simulation_0.xml) as `Simulation.Agents.MultiBookExchangeAgent.Balances.wealth` (from 0.6.3, in each asset class's own configuration).  
 
-If a miner trades more than `Simulation.Agents.MultiBookExchangeAgent.Balances.wealth` * `--scoring.activity.capital_turnover_cap` in a period of `--scoring.activity.trade_volume_assessment_period` simulation nanoseconds, no more instructions will be accepted on that book (except cancellations) until the total QUOTE volume traded in the most recent `trade_volume_assessment_period` drops below the limit.  Miners need to consider this limitation when designing and testing strategies in order to maximize volume and Kappa-3 ratio without exceeding the limit.  If the cap is hit early in the first 24 hours, there is a high risk of deregistration as no further actions will be possible until at least 24 simulation hours have elapsed.  Your current total traded volume is included in the state update for easy reference, accessible in code via `self.accounts[book_id]['traded_volume]`.
+If a miner trades more than `Simulation.Agents.MultiBookExchangeAgent.Balances.wealth` * `--scoring.activity.capital_turnover_cap` in a period of `--scoring.activity.trade_volume_assessment_period` simulation nanoseconds, no more instructions will be accepted on that book (except cancellations) until the total QUOTE volume traded in the most recent `trade_volume_assessment_period` drops below the limit.  Miners need to consider this limitation when designing and testing strategies; volume on its own earns nothing in scoring.  If the cap is hit early in the first 24 hours, there is a high risk of deregistration as no further actions will be possible until at least 24 simulation hours have elapsed.  Your current total traded volume is included in the state update for easy reference, accessible in code via `self.accounts[book_id].traded_volume`.
 
 Note also that the trading volumes used in the assessment are not reset when a new simulation begins; the trading volumes are determined based on a 24 hour period which may span multiple simulations.
 
@@ -75,60 +77,48 @@ While we have made changes to attempt to better align the weights assigned to mi
 
 No, we do not burn miner emissions and do not currently have any plans to implement this.  Though this seems it may make sense in some other subnets, we do not see that this would be the case for us.  If in future we see need to apply such, this will not be done without careful consideration and consultation with all participants.
 
-#### 12. Why does the current scoring system seem to favor passive market making over active trading?
+#### 12. Does the scoring favour passive market making over active trading?
 
-The transition from inventory-based Sharpe ratios to realized P&L-based Sharpe and then Kappa-3 ratios addresses this concern directly. Kappa-3 measures performance based on actual completed round-trip trades, which inherently accounts for all trading costs including fees, spreads, and slippage. Standing limit orders that never get filled do not contribute to the Kappa-3 calculation, eliminating the advantage previously seen by passive strategies with stable but inactive inventory positions.
-
-The Kappa-3 metric focuses on realized profitability rather than mark-to-market inventory changes, ensuring that scores reflect genuine trading skill and execution quality. Combined with round-trip volume weighting and activity decay mechanisms, this approach naturally rewards active, profitable trading while discouraging passive "standing still" behavior.
+Making is one of the two halves by design, because liquidity supplied to the market is what the simulation needs. It is not paid for passivity: a resting order earns nothing until it is filled, credit requires fills on both sides of a book, and from 0.6.3 a fill the market runs over within seconds keeps none of its credit. The skill half pays active trading, on profit with the market's drift removed.
 
 #### 13. How does the scoring system account for trading costs like fees and spreads?
 
-Kappa-3 is calculated from realized P&L values which explicitly include all trading costs. When positions are opened and closed (round-trip trades), the realized profit or loss incorporates maker/taker fees paid or rebates received, as well as the effective spread captured or paid during execution. This means trading costs directly impact the Kappa-3 calculation through the mean return in the numerator, and poor execution that incurs excessive costs will naturally reduce a miner's score. The [Dynamic Incentive Structure](https://simulate.trading/taos-im-dis-paper) (DIS) further amplifies the impact of execution quality by adjusting fees based on market conditions, encouraging miners to provide liquidity when needed and take liquidity appropriately.
+Fees and the spread paid are in the P&L the skill half measures, so poor execution lowers a miner's alpha. The making half measures the spread captured on maker fills. The [Dynamic Incentive Structure](https://simulate.trading/taos-im-dis-paper) (DIS) fee policy adjusts maker and taker rates to market conditions, rewarding liquidity where it is scarce.
 
 #### 14. Does the scoring system penalize order cancellations or repeated re-posting?
 
-Currently, the scoring framework does not directly penalize order cancellations or the repeated submission of identical orders. The system focuses on realized profitability and round-trip trading volume. However, we recognize that excessive cancellations or unchanging re-posts can place unnecessary load on the simulation and may represent inefficient behavior rather than legitimate market-making.
-
-Future refinements may apply operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new executions. We may also consider simpler guardrails at the agent level, for example raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
+Not directly. Each round accepts a limited number of instructions per book (`--scoring.max_instructions_per_book`) and the simulation limits open orders, so heavy churn mostly costs the miner its own capacity. If cancel and re-post cycles come to load the simulation, these operational limits may be tightened.
 
 #### 15. How does the scoring system encourage participation across all books?
 
-The current system enforces participation across all books through activity factors with associated decay mechanisms, and applies an outlier penalty that reduces a miner's score when Kappa-3 performance diverges significantly across books. Miners must actively trade and generate realized profits on all books to maintain high scores, as books with no round-trip trading activity contribute zero to the overall Kappa-3 assessment.
+The skill half needs qualifying alpha on a minimum number of books, and scales skill down when more than about three eighths of the books carry none (`--scoring.debeta.skill_max_inactive_books`). The making half is summed book by book, so each book with genuine two-sided making adds credit. A strategy confined to a few books earns little of either half.
 
-The round-trip volume weighting ensures that meaningful trading activity is rewarded, while the activity decay mechanism penalizes miners who abandon books or fail to maintain consistent profitable trading. The outlier penalty further discourages strategies that specialize in only a subset of books at the expense of others.
+#### 16. Is scoring based on execution or on inventory?
 
-#### 16. Will the scoring system move toward execution-based metrics rather than inventory-based metrics?
+On execution. The making half measures spread captured on actual fills, judged from 0.6.3 by where the price is shortly afterwards. The skill half measures mark-to-market profit from trading with the effect of the market's drift on held inventory removed, so holding a position through a trend is not counted as skill.
 
-The scoring system has already transitioned to execution-based metrics through the adoption of realized Sharpe and then Kappa-3 ratios calculated on realized P&L from completed round-trip trades. This shift addresses the limitations of inventory-delta approaches by explicitly rewarding actual trading profits after all costs, rather than unrealized mark-to-market changes.
+#### 17. Can a miner keep a high score with little trading?
 
-The Kappa-3 metric inherently emphasizes execution quality, as realized P&L captures the timing and pricing of trade execution. Future enhancements may incorporate additional execution-focused measures such as time-to-fill efficiency, more sophisticated downside-risk measures, and operational penalties based on cancel-to-fill ratios to further refine the assessment of trading quality.
-
-#### 17. Why are some miners able to maintain high scores with minimal trading activity?
-
-With the transition to Kappa-3 scoring based on realized P&L, minimal trading activity results in insufficient data to calculate meaningful scores. Miners must complete round-trip trades to generate the realized profits that feed into the Kappa-3 calculation. The system requires a minimum number of non-zero realized P&L observations (`--scoring.kappa.min_realized_observations`) before assigning scores, and applies activity decay to reduce scores during periods without recent round-trip trading activity.
-
-This execution-based approach naturally addresses the previous issue where stable inventory positions could generate strong scores without meaningful trading, as only actual completed trades contribute to performance measurement.
+No. Making credit needs fills on both sides of a book, skill needs qualifying alpha on enough books, and both are measured over the scoring window, so a miner that stops trading loses both. The track-record smoothing also means a single strong window raises a score only gradually.
 
 #### 18. Are identical re-posts treated as no-ops in the simulator?
 
-No. Identical re-posts are fully recorded as cancel/placement events. They do not generate new fills unless market conditions change, but they still consume simulator resources and count toward operational activity. Any future scoring penalties aimed at discouraging churn will rely on these recorded events. Excessive cancel/repost cycles often add load without improving liquidity or execution quality - future scoring revisions may apply modest penalties based on recorded operational counts (e.g., cancel-to-fill ratios, repeated identical reposts) to discourage wasteful operational behavior while still allowing legitimate quote updates.
+No. Identical re-posts are fully recorded as cancel and placement events. They do not generate new fills unless market conditions change, but they still consume simulator resources and count toward the instruction limit per book.
 
-#### 19. How will a cost-aware, execution-focused scoring model treat taker trades?
+#### 19. How are taker trades treated?
 
-The Kappa-3 scoring model already treats taker trades in a cost-aware manner, as realized P&L from any trade (maker or taker) includes all associated fees. Taker trades that pay fees are evaluated based on whether the resulting round-trip trade generates positive realized profit after costs. Strategic liquidity taking that creates net-positive round-trips improves Kappa-3 scores, while excessive taking that incurs costs without generating alpha will reduce scores. The DIS framework further guides appropriate liquidity-taking behavior by adjusting fee schedules based on market conditions.
+Taking never earns making credit: from 0.6.3 only the maker's side of a fill is judged. A taker's trades count in the skill half like any other: fees and the spread paid are in its P&L, and what counts is the alpha left after the market's drift is removed. The DIS fee policy adjusts taker rates to market conditions.
 
-#### 20. How will scoring handle time-weighted quoting quality (e.g., being near the top of book)?
+#### 20. How is quoting quality judged?
 
-While Kappa-3 scoring focuses on realized profitability from completed trades, we recognize that continuous provision of competitive quotes contributes to market quality even when fill rates are low. Future enhancements may explore time-weighted measures of quote quality, such as time spent quoting within a certain percentage of the best bid/ask, to complement execution-based metrics. These would serve as soft multipliers on round-trip volume or activity factors, ensuring that high-quality liquidity provision in quiet markets is appropriately valued without replacing the core realized-profitability focus.
+When quotes are filled. From 0.6.3 a maker's credit is scaled by how much of the spread its fills still hold 20 simulation seconds later, so quoting width, and how long a quote is left in front of flow, are what is priced. Resting time on its own is not paid.
 
-#### 21. How will the system ensure miners don't just optimize for scoring rather than real liquidity?
+#### 21. How does the system keep miners from optimizing for the score rather than for real liquidity?
 
-The Kappa-3 scoring system aligns incentives with genuine market quality by measuring actual realized profits from completed trades, which inherently requires providing competitive quotes that result in executions. Gaming through passive behavior or manipulation is naturally discouraged because:
+The rules pay what real liquidity and real skill produce, and discount what can be manufactured:
 
-1. Only completed round-trip trades contribute to scores
-2. All trading costs (fees, spreads) are fully reflected in realized P&L
-3. Round-trip volume weighting rewards active, profitable trading
-4. Activity decay penalizes strategies that abandon books or stop trading
-5. Outlier penalties discourage specialized strategies that ignore some books
-
-This execution-focused approach ensures that high scores require genuine trading skill and execution quality rather than optimization around scoring artifacts.
+1. Making credit comes only from fills, on both sides of a book.
+2. From 0.6.3, credit for fills the market runs over is removed, and the price a fill is judged against cannot be moved by trades arranged between miners.
+3. Credit concentrated on a few counterparties is discounted, and from 0.6.3 credit from other miners' flow is tied to what a maker supplies to the background market.
+4. Skill is measured after removing the market's drift on held inventory, so riding a trend is not skill.
+5. Pay follows performance, not volume or age: the same performance pays the same.

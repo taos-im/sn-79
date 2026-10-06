@@ -94,7 +94,10 @@ public:
     taosim::decimal_t processAgainstTheBuyQueue(const Order::Ptr& order, taosim::decimal_t minPrice);
     taosim::decimal_t processAgainstTheSellQueue(const Order::Ptr& order, taosim::decimal_t maxPrice);
     [[nodiscard]] taosim::book::TickContainer* preventSelfTrade(
-        taosim::book::TickContainer* queue, const LimitOrder::Ptr& iop, const Order::Ptr& order, AgentId agentId);
+        taosim::book::TickContainer* queue,
+        const LimitOrder::Ptr& iop,
+        const Order::Ptr& order,
+        AgentId agentId);
     void clearFilledOrders() noexcept;
     void printCSV(uint32_t depth) const;
 

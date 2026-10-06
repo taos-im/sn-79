@@ -254,36 +254,16 @@ def add_im_validator_args(cls, parser):
         type=str,
         choices=["rank", "proportional", "proportional_blended", "proportional_both"],
         default="proportional_both",
-        help="How the making leg's share of emission (debeta.weight * debeta.w_make) is paid. "
-             "'rank' (the behaviour shipped through 0.6.1): the making rank enters the blended score and "
-             "the whole score goes through the Pareto sort-multiply. 'proportional': the making leg "
-             "comes out of the ladder and its share is paid in proportion to each uid's captured "
-             "spread, with the ladder kept for the skill leg. The ladder pays rank POSITIONS with a "
-             "steep top, so an operator whose accounts occupy the top positions collects many "
-             "top-of-curve weights whatever its aggregate service; seen on a mainnet board where "
-             "2026, one coldkey with 35 per cent of the board's captured spread took 64 per cent of "
-             "emission. Proportional pay makes an operator's total equal its share of the liquidity "
-             "actually provided, so splitting a strategy across more uids gains nothing and no "
-             "identity rule is needed. 'proportional_blended': the same pool on the same shares, "
-             "but the ladder keeps ranking the full blended score, so an account with no maker "
-             "volume is capped by its making rank as it is under 'rank'. Plain 'proportional' leaves "
-             "the ladder on the skill leg alone, which at w_make 0.50 makes half of emission a pot "
-             "decided on skill only; on twelve mainnet boards of 22 September 2026 zero-maker "
-             "accounts took 42.1 per cent of emission under it, against 10.4 with the pool off and "
-             "5.2 under the blended setting. The blended setting's cost is that making is paid on "
-             "both surfaces, so the largest operator takes 59.5 per cent against 26.9 under plain "
-             "proportional, and cloning the same capture across 16 uids gains 1.18x against 1.04x "
-             "(4.00x under 'rank'). 'proportional_both' (default since 0.6.2): both halves additive. The making half as "
-             "under 'proportional'; the skill half in proportion to each uid's net alpha over the books "
-             "it filled, times its counterparty factor (skill_p11_strength), among uids with positive "
-             "skill on at least skill_min_books qualifying books. The skill ladder over kappa is a "
-             "tournament: kappa is magnitude-blind, so one predictor split sixteen ways gained 14.03x on "
-             "real alphas (22 September 2026); net alpha is additive, so this share is cloning-invariant "
-             "by construction (1.00x measured). Real markets pay traders on realised P&L and let "
-             "consistency decide who is allocated capital. Falls back to the ladder for the skill half "
-             "when nobody is eligible. All settings publish debeta_making_share and "
-             "debeta_ladder_input per uid, so the alternative is visible before it is enabled. "
-             "Switching is announced and dated on the scoring page.",
+        help="How the trading pool pays the two de-beta legs. 'proportional_both' (default since 0.6.2): both halves "
+             "are paid in proportion. The making half in proportion to each uid's making credit after its counterparty "
+             "factor and tether; the skill half in proportion to each uid's net alpha over the books it filled, times "
+             "its skill counterparty factor (skill_p11_strength), among uids with positive skill on at least the skill "
+             "bar of qualifying books. Proportional pay makes an operator's total equal its share of what it provides, "
+             "so splitting a strategy across more uids gains nothing. If no uid qualifies for the skill half, that "
+             "half is paid through the Pareto ladder. 'proportional': the making half as above, the skill half through "
+             "the ladder. 'proportional_blended': the making half as above, the ladder ranking the full blended score. "
+             "'rank': the blended rank score through the ladder, the rule through 0.6.1. Every setting publishes "
+             "debeta_making_share and debeta_ladder_input per uid."
     )
 
     parser.add_argument(
@@ -326,24 +306,58 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.p11_strength",
         type=float,
-        help="P11 counterparty-diversity discount strength on the making leg: making *= "
-             "(1 - strength*max(0,excess_concentration)). 0 disables. 1.0, the default, fully removes a "
-             "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
-             "sacrificial-feeder hole in the making metric.",
+        help="Counterparty-diversity discount on the making leg: making *= (1 - strength * max(0, "
+             "excess_concentration)), where excess_concentration is how much of a maker's fills come from its largest "
+             "takers beyond those takers' share of everyone else's flow. 0 disables; 1.0, the default, removes the "
+             "making credit of a maker served by a dedicated taker and leaves a maker served by the market at large "
+             "untouched.",
         default=1.0,
     )
 
     parser.add_argument(
         "--scoring.debeta.p11_topk",
         type=int,
-        help="How many of a maker's largest takers the P11 excess-concentration measure looks at, for "
-             "both the making discount and the skill-leg factor. 2, the default, is the shipped scorer "
-             "and catches a dedicated feeder. A ring that spreads the same feeding over ten or twenty "
-             "takers reads as diverse at 2 (each feeder a few per cent of the maker's fills) and is "
-             "exposed at 10 or more, because the measure subtracts the same takers' share of everyone "
-             "else's flow: common takers cancel, private feeders do not. On a later mainnet "
-             "2026 mainnet tape at 10: fed makers 0.25 to 0.68, honest makers 0.90 to 0.97.",
+        help="How many of a maker's largest takers the counterparty concentration measure reads, for both the making "
+             "discount and the skill-leg factor. 10, the default. The measure subtracts the same takers' share of "
+             "everyone else's flow, so takers common to the whole market cancel and only concentration particular to "
+             "the maker counts.",
         default=10,  # 0.6.2 launch value: a many-taker ring is exposed at 10 (2 caught only a dedicated feeder)
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.s3_k",
+        type=float,
+        help="Tether on miner-sourced making credit: on the counterparty volumes the P11 factor reads, a maker's "
+             "making credit is scaled by (background + min(miner-sourced, k x background)) / total, after the P11 "
+             "factor. 4, the default since 1 October 2026 (0.6.3), leaves every maker with at least a fifth of its "
+             "maker volume against the background market untouched; a maker served mostly by other miners keeps at "
+             "most k times its background share. 0 disables. Market analogue: liquidity programmes pay for liquidity "
+             "provided to public order flow, not for flow arranged among participants.",
+        default=4.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.making_basis",
+        type=str,
+        choices=["captured", "realized"],
+        help="Which basis the making pool pays on. captured: the two-sided spread of a uid's maker fills against the "
+             "centred mid at the moment of each fill. realized (default since 0.6.3): the same captured credit "
+             "multiplied by the uid's markout quality, the share of that spread its maker fills still hold "
+             "making_horizon_s of simulation time later, summed over all its fills and held between 0 and 1. Only the "
+             "maker's side of a fill is judged, so taking never earns making credit, and nobody is paid more than on "
+             "the captured basis. The mark at the horizon is the size-weighted average of the prints with the "
+             "background market on at least one side. Both bases are accumulated and published at every setting; this "
+             "dial selects which one pays. Market analogue: maker programmes graded on markout.",
+        default="realized",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.making_horizon_s",
+        type=float,
+        help="Simulation seconds after a fill at which its realized spread is read for markout quality (the market's "
+             "own clock; real time in exchange mode). 20, the default: past about 20 seconds the mark mostly measures "
+             "the trend, which the skill half already prices with the drift removed.",
+        default=20.0,
     )
 
     parser.add_argument(
@@ -464,46 +478,53 @@ def add_im_validator_args(cls, parser):
              "is maximised at its smallest admissible sample, and an agent whose magnitude floor "
              "leaves four survivors out of a hundred-odd traded books scores a consistency ratio on "
              "three per cent of its own evidence. Raising it is a statement about statistical "
-             "validity, not about size. Never falls below 4.",
-        default=20,  # 0.6.2 launch value (23 Sep 2026): the skill leg needs a real sample; 4 is the mechanism's own floor
+             "validity, not about size. Never falls below 4. From 0.6.3 the count is 0 by default and "
+             "derives from scoring.debeta.skill_min_books_share against the books being scored; a "
+             "positive value here is an explicit override.",
+        default=0,  # 0.6.2 launched at 20 on 128 books; 0.6.3 derives it from the share below (0.15625 x 128 = 20)
+    )
+    parser.add_argument(
+        "--scoring.debeta.class_weights",
+        type=str,
+        help="Per-asset-class emission weights under a multi-asset layout, one per background in document order, comma "
+             "separated; normalised to sum 1. Each class's making and skill shares are normalised within the class and "
+             "mixed at these weights, so a new class starts with a small share of each half. Empty is the flat rule: a "
+             "class weighs whatever share of the field's credit and alpha it produces. Ignored on a single market; on "
+             "a layout whose background count differs from the dial's length the scorer uses the flat rule for the "
+             "round and warns. '0.95,0.05', the default, is the setting for the shipped two-class layout "
+             "(simulation_0, simulation_1).",
+        default="0.95,0.05",
+    )
+    parser.add_argument(
+        "--scoring.debeta.skill_min_books_share",
+        type=float,
+        help="The skill bar as a share of the books the validator scores (the canonical ids under "
+             "multi-asset), rounded up and never below the four-book floor. 0.15625 is the 0.6.2 launch "
+             "bar of 20 on 128 books; the same count would be 71 per cent of a 28-book layout and "
+             "unreachable for a four-book asset class, which is why it is a share. An unknown layout "
+             "keeps the launch count of 20.",
+        default=20 / 128,
     )
 
     parser.add_argument(
         "--scoring.debeta.skill_max_inactive_books",
         type=float,
-        help="The skill leg's twin of scoring.max_inactive_books: the share of the field's books an "
-             "agent may carry no qualifying alpha on without penalty. Below that its skill is scaled "
-             "by coverage / (1 - this) * field books, before ranking. kappa is normalised by the "
-             "median absolute deviation of the per-book alphas, so it is maximised at its smallest "
-             "admissible sample and kappa_floored's four-book minimum is a floor to sit on rather "
-             "than a bar to clear. The kappa leg pads neglected books into its average as zero; that "
-             "shape cannot be reused here because padding a MAD-normalised ratio saturates it "
-             "instead of collapsing it, so the penalty is multiplicative. The counts are books the "
-             "agent FILLED, pre-floor, because the post-floor count falls with size per book rather "
-             "than with breadth. Presence in a book is cheap, so this bounds narrowness and not "
-             "activity; skill_min_books is the load-bearing constraint. 0 (default) disables and "
-             "reproduces the 0.6.1 leg exactly. debeta_skill_coverage_factor publishes the "
-             "multiplier per agent either way.",
+        help="The share of the field's books an agent may carry no qualifying alpha on without penalty: beyond it the "
+             "skill leg is scaled by min(1, books filled / ((1 - this) x field books)). 0.375, the default, mirrors "
+             "scoring.max_inactive_books; 0 disables. The skill bar (skill_min_books_share) remains the main "
+             "constraint; this bounds narrowness, not activity. debeta_skill_coverage_factor publishes the multiplier "
+             "per agent.",
         default=0.375,  # 0.6.2 launch value: coverage scaling below 62.5% of the field's books
     )
 
     parser.add_argument(
         "--scoring.debeta.skill_p11_strength",
         type=float,
-        help="The counterparty factor applied to the SKILL leg: skill *= max(0, 1 - strength * EC+), "
-             "with EC+ the same excess top-2 counterparty concentration p11_strength discounts making "
-             "by, taken at unit strength so this does not depend on the making discount being on. "
-             "Feeding a maker at chosen prices manufactures per-book alpha on the fed side, and on 22 "
-             "September 2026 that is where a same-operator feeding ring was paid: fed makers with making "
-             "ranks of 0.003 to 0.36 held skill ranks of 0.94 to 1.00 on four to nine books, 6.75 per "
-             "cent of incentive. Against real alphas the factor left every genuine skill account at "
-             "exactly 1.0 and moved no uid outside the pattern by more than 0.20 of rank; it is "
-             "cloning-invariant because it is a property of the flow, not the account count. Only partly "
-             "effective on the rank ladder (kappa 9.9 x 0.25 is still top-decile), fully effective under "
-             "making_pool=proportional_both, which is not to be enabled without it. Calibrated on the "
-             "simulation, where background agents make concentration visible; exchange mode needs its "
-             "own calibration as P11 on making did. 0 (default) disables. debeta_skill_p11_factor "
-             "publishes the multiplier per agent either way.",
+        help="The counterparty factor applied to the skill leg: skill *= max(0, 1 - strength x EC+), with EC+ the same "
+             "excess counterparty concentration p11_strength applies to making, taken at unit strength so it does not "
+             "depend on the making discount. Alpha earned against a concentrated counterparty is discounted as making "
+             "credit is; a uid whose fills come from the market at large keeps 1.0. 1.0, the default; 0 disables. "
+             "debeta_skill_p11_factor publishes the multiplier per agent.",
         default=1.0,  # 0.6.2 launch value: the counterparty factor reaches the skill leg at full strength
     )
 
@@ -587,13 +608,10 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.gentrx.simulation_share",
         type=float,
-        help="Share of miner rewards reserved for GenTRX gradient submitters. "
-             "The default 0.05 means rewards split 95%% to trading "
-             "(kappa+pnl) and up to 5%% to training, scaled by participation "
-             "(N_active / N_registered_miners). The unused training portion "
-             "returns to trading. When GenTRX is not running, no gradients "
-             "are submitted and 100%% of rewards go to trading regardless "
-             "of this setting.",
+        help="Share of miner rewards reserved for GenTRX gradient submitters. The default 0.05 means rewards split "
+             "95%% to trading (the de-beta trading score) and up to 5%% to training, scaled by participation (N_active "
+             "/ N_registered_miners). The unused training portion returns to trading. When GenTRX is not running, no "
+             "gradients are submitted and 100%% of rewards go to trading regardless of this setting.",
         default=0.05,
     )
 
@@ -761,7 +779,7 @@ def add_im_validator_args(cls, parser):
         "--rewarding.pareto.shape",
         type=float,
         help="Shape parameter for Pareto distribution used in allocating rewards. Lower "
-             "= steeper payout curve concentrated on top performers. 1.0 concentrated ~51% of "
+             "= steeper payout curve concentrated on top performers. 1.0 concentrated ~51%% of "
              "reward on the top-5 UIDs, over-amplifying whichever strategy currently tops Kappa; "
              "the default spreads that to about a third and restores mid-tier reward at negligible "
              "cost to the highest genuine earners. Sharpen it again once the top of the board is "

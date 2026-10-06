@@ -16,7 +16,6 @@
 #include <taosim/message/ExchangeAgentMessagePayloads.hpp>
 #include <taosim/matching/ExchangeSignals.hpp>
 #include <taosim/matching/SLTPContainer.hpp>
-#include "JsonSerializable.hpp"
 #include <taosim/book/L2Logger.hpp>
 #include <taosim/book/L3EventLogger.hpp>
 #include <taosim/book/FeeLogger.hpp>
@@ -43,9 +42,7 @@
 
 //-------------------------------------------------------------------------
 
-class MultiBookExchangeAgent
-    : public Agent,
-      public JsonSerializable
+class MultiBookExchangeAgent : public Agent
 {
 public:
     MultiBookExchangeAgent(Simulation* simulation) noexcept;
@@ -156,8 +153,6 @@ public:
 
     virtual void configure(const pugi::xml_node& node) override;
     virtual void receiveMessage(Message::Ptr msg) override;
-    virtual void jsonSerialize(
-        rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] const taosim::config::ExchangeAgentConfig& config() const noexcept { return m_config; }
 
@@ -219,7 +214,7 @@ private:
     // State.
     taosim::accounting::AccountRegistry m_accounts;
     std::vector<taosim::book::Book::Ptr> m_books;
-    std::map<BookId, std::unique_ptr<ExchangeSignals>> m_signals;
+    std::map<BookId, std::unique_ptr<taosim::matching::ExchangeSignals>> m_signals;
     std::unique_ptr<taosim::stats::StatsHub> m_statsHub;
     std::unique_ptr<taosim::book::BookProcessManager> m_bookProcessManager;
     std::unique_ptr<taosim::matching::ClearingManager> m_clearingManager;

@@ -351,6 +351,7 @@ class QueryService:
                 instructions_per_book = defaultdict(int)
                 invalid_agent_id = False
                 volume_cap_logged = False
+                uid_cap = volume_cap
                 
                 for instruction in synapse.response.instructions:
                     try:
@@ -363,7 +364,7 @@ class QueryService:
                             bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Invalid Book Id {instruction.bookId})")
                             continue
 
-                        if volume_cap > 0 and miner_volumes[instruction.bookId] >= volume_cap and instruction.type != "CANCEL_ORDERS":
+                        if volume_cap > 0 and miner_volumes[instruction.bookId] >= uid_cap and instruction.type != "CANCEL_ORDERS":
                             if not volume_cap_logged:
                                 # SAY WHAT THE CAP AND THE VOLUME ACTUALLY ARE. "hit volume cap on one
                                 # or more books" names neither the book, the accumulated volume, nor
@@ -373,8 +374,9 @@ class QueryService:
                                 # acceptance miner was being dropped here.
                                 bt.logging.info(
                                     f"Agent {uid} hit volume cap: book={instruction.bookId} "
-                                    f"volume={miner_volumes[instruction.bookId]:,.2f} >= cap={volume_cap:,.2f} "
-                                    f"(capital_turnover_cap x miner_wealth); instruction DROPPED")
+                                    f"volume={miner_volumes[instruction.bookId]:,.2f} >= cap={uid_cap:,.2f} "
+                                    f"(capital_turnover_cap x miner_wealth"
+                                    f"{', accrued for a new uid' if uid_cap != volume_cap else ''}); instruction DROPPED")
                                 volume_cap_logged = True
                             continue
 

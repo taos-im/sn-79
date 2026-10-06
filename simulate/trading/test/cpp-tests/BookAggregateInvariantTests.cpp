@@ -732,6 +732,34 @@ TEST_F(BookAggregateInvariantTest, SelfTradePreventionCancelsKeepAggregates)
 
 //-------------------------------------------------------------------------
 
+TEST_F(BookAggregateInvariantTest, GhostedRestingOrderDoesNotStopTheMatch)
+{
+    // A resting order whose reservation is gone is ghosted on contact instead of trading; the taker
+    // must carry on to the next active level rather than stop at the now ghost-only best level.
+    const auto bare = placeLimit(agent4, OrderDirection::SELL, DEC(1.0), 301_dec);
+    const auto backed = placeLimit(agent3, OrderDirection::SELL, DEC(1.0), 302_dec);
+    check();
+    exchange->accounts()[agent4][bookId].freeReservation(
+        bare->id(), bare->price(), book->bestBid(), book->bestAsk(), OrderDirection::SELL, bookId);
+
+    const auto taker = placeLimit(agent1, OrderDirection::BUY, DEC(1.0), 302_dec);
+    check();
+    EXPECT_EQ(taker->volume(), 0_dec) << "the taker must have filled at 302";
+    EXPECT_EQ(bare->volume(), 0_dec);
+    EXPECT_EQ(backed->volume(), 0_dec);
+    EXPECT_TRUE(bids().empty());
+    EXPECT_EQ(levelAt(asks(), 301_dec)->volume(), 0_dec);
+    EXPECT_EQ(levelAt(asks(), 302_dec)->volume(), 0_dec);
+    EXPECT_EQ(asks().volume(), 0_dec);
+    EXPECT_FALSE(book->bestSellLevel().has_value());
+
+    book->clearFilledOrders();
+    check();
+    EXPECT_TRUE(asks().empty());
+}
+
+//-------------------------------------------------------------------------
+
 TEST_F(BookAggregateInvariantTest, GhostOnlySideBehavesAsEmptyForNewOrders)
 {
     const auto ask = placeLimit(agent4, OrderDirection::SELL, DEC(1.0), 301_dec);

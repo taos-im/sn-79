@@ -30,7 +30,7 @@ double gamma_fn(int64_t k, double H) noexcept
 
 //-------------------------------------------------------------------------
 
-void precomputeFundamentalPriceL(Eigen::MatrixXd& L, double hurst)
+void precomputeFundamentalPriceL(Eigen::MatrixXf& L, double hurst)
 {
     const Eigen::Index n = L.rows();
     if (n == 0) return;
@@ -49,12 +49,12 @@ void precomputeFundamentalPriceL(Eigen::MatrixXd& L, double hurst)
         }
     }
 
-    // Eigen's blocked LLT (BLAS-3 panel factorisation + SIMD) computes the
-    // same Cholesky factor as the previous hand-rolled row-by-row loop, ~30-50x
-    // faster for n ~ 2.9k.  Final L differs by ULPs vs the old order — the
-    // sim uses L * z to generate fBm increments, so trajectories may shift
-    // bytes but remain statistically equivalent.
-    L = cov.selfadjointView<Eigen::Lower>().llt().matrixL();
+    // Factorise in double (Eigen's blocked LLT: BLAS-3 panel + SIMD) for accuracy,
+    // then store the factor as float to halve this n x n matrix's footprint. The sim
+    // uses L * z for fBm increments, so the narrower mantissa shifts trajectories by
+    // a small amount but they remain statistically equivalent.
+    const Eigen::MatrixXd factor = cov.selfadjointView<Eigen::Lower>().llt().matrixL();
+    L = factor.cast<float>();
 }
 
 //-------------------------------------------------------------------------
@@ -75,7 +75,7 @@ void initSharedResources(
     const double hurst = fpNode.attribute("Hurst").as_double(0.5);
     const auto n = duration / updatePeriod + 2;
 
-    shared.fundamentalPriceL = Eigen::MatrixXd::Zero(n, n);
+    shared.fundamentalPriceL = Eigen::MatrixXf::Zero(n, n);
     precomputeFundamentalPriceL(shared.fundamentalPriceL, hurst);
 }
 

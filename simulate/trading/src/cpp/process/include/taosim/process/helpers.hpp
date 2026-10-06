@@ -19,7 +19,7 @@ namespace taosim::process::helpers
 
 //-------------------------------------------------------------------------
 
-void precomputeFundamentalPriceL(Eigen::MatrixXd& L, double hurst);
+void precomputeFundamentalPriceL(Eigen::MatrixXf& L, double hurst);
 
 void initSharedResources(
     taosim::simulation::SharedResources& shared, pugi::xml_node simuNode);

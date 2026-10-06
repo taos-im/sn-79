@@ -4,17 +4,12 @@
  */
 #pragma once
 
+#include <taosim/checkpoint/CheckpointSource.hpp>
+
 #include <filesystem>
+#include <memory>
 #include <regex>
-
-//-------------------------------------------------------------------------
-
-namespace taosim::simulation
-{
-
-class SimulationManager;
-
-}  // namespace taosim::simulation
+#include <string_view>
 
 //-------------------------------------------------------------------------
 
@@ -25,7 +20,7 @@ namespace taosim::checkpoint
 
 struct CheckpointingDesc
 {
-    simulation::SimulationManager* simuMngr;
+    CheckpointSource* source;
     std::filesystem::path runDir;
     size_t intervalInSteps{};
     ptrdiff_t numLastFilesToKeep{};
@@ -33,13 +28,18 @@ struct CheckpointingDesc
 };
 
 //-------------------------------------------------------------------------
+// Owns the checkpoint store (directory layout, retention, interval gating, timing)
+// and drives a CheckpointSource to serialize the run-mode-specific state. Decoupled
+// from any concrete run mode via that interface. The owning runner connects
+// saveCheckpoint() to its per-step signal.
 
 class CheckpointManager
 {
 public:
     explicit CheckpointManager(const CheckpointingDesc& desc);
+    ~CheckpointManager();
 
-    [[nodiscard]] auto&& stepCounter(this auto&& self) noexcept { return self.m_stepCounter; }
+    [[nodiscard]] ssize_t& stepCounter() noexcept;
 
     void saveCheckpoint();
 
@@ -65,15 +65,7 @@ private:
     void saveCheckpointMeasured();
     void cleanup();
 
-    simulation::SimulationManager* m_simuMngr;
-    std::filesystem::path m_dir;
-    size_t m_intervalInSteps;
-    ptrdiff_t m_numLastFilesToKeep;
-    bool m_measureWallClockTime;
-    ptrdiff_t m_stepCounter{-1};
-    std::filesystem::path m_latestCkptDir;
-
-    friend class simulation::SimulationManager;
+    std::unique_ptr<struct Impl> m_impl;
 };
 
 //-------------------------------------------------------------------------

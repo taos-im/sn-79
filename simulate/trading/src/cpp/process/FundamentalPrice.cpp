@@ -59,7 +59,8 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
     }
 
     m_state.X(0) = m_state.V(0);
-    m_state.X(1) = m_L->row(1).head(2).dot(m_state.V.head(2));
+    // L is stored as float; widen the row to double so the accumulation matches V.
+    m_state.X(1) = m_L->row(1).head(2).cast<double>().dot(m_state.V.head(2));
 
     m_seedfile = (sim->logDir() / "fundamental_seed.csv").generic_string();
 }
@@ -204,7 +205,7 @@ double FundamentalPrice::valueAt(Timestamp now) const
 void FundamentalPrice::cholesky_step(int64_t i)
 {
     m_state.V(i + 1) = m_fractionalGaussian(m_ownRng ? m_processRng : *m_rng);
-    m_state.X(i) = m_L->row(i).head(i + 1).dot(m_state.V.head(i + 1));
+    m_state.X(i) = m_L->row(i).head(i + 1).cast<double>().dot(m_state.V.head(i + 1));
 }
 
 //-------------------------------------------------------------------------
@@ -214,7 +215,7 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
     pugi::xml_node node,
     uint64_t bookId,
     double X0,
-    const Eigen::MatrixXd* L)
+    const Eigen::MatrixXf* L)
 {
     static constexpr auto ctx = std::source_location::current().function_name();
 
@@ -228,7 +229,14 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
         }
     };
 
-    const auto updatePeriod = node.attribute("updatePeriod").as_ullong(1);
+    // Required and strictly positive: the per-step process-update loop strides by this,
+    // so a defaulted ~1ns period means ~1e9 updates per step (and an OOM-scale buffer
+    // of process values) instead of a config error.
+    const auto updatePeriod = node.attribute("updatePeriod").as_ullong();
+    if (updatePeriod == 0) {
+        throw std::invalid_argument{
+            "FundamentalPrice::fromXML: attribute 'updatePeriod' must be present and > 0"};
+    }
     const auto sim = dynamic_cast<Simulation*>(simulation);
     const float dt = (float) updatePeriod / sim->duration();
 
@@ -245,7 +253,10 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
     const double epsilon = node.attribute("epsilon").as_double(0.0);
     // 0 (default) = legacy staircase; 1 = jump-preserving reveal.
     const int interpolate = node.attribute("interpolate").as_int(0);
-    // D4b: 1 = private RNG for this process (agents' shared stream left intact).
+    // 1 = draw this process's randomness from a PRIVATE per-book generator instead of
+    // reseeding the SHARED simulation RNG every seedInterval. Legacy (0) reseeded the shared
+    // stream ~34,560 times per 12 h run from a ~400k-state pool, which restarted every agent's
+    // randomness and made nominally independent books share draws. 0 = legacy.
     const int ownRng = node.attribute("ownRng").as_int(0);
 
     // XML structure: <MultiBookExchangeAgent gracePeriod=...><Books><Processes><FundamentalPrice/>

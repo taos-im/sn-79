@@ -2,6 +2,7 @@
 * **SN-79**
   * [Overview](/README.md)
   * [Agent Development Guide](/agents/README.md)
+  * [Agents on the two-class layout (0.6.3)](/agents/MIGRATION_0.6.3.md)
   * [Proxy runner](/agents/proxy/README.md)
 
 * **Dashboard Guide**

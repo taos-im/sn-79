@@ -5,6 +5,7 @@
 #pragma once
 
 #include <taosim/agent/DistributedProxyAgent.hpp>
+#include <taosim/util/TransparentStringHash.hpp>
 #include "Agent.hpp"
 #include "LocalAgentRoster.hpp"
 #include "MultiBookExchangeAgent.hpp"
@@ -54,13 +55,8 @@ private:
     std::vector<std::unique_ptr<Agent>> m_agents;
     std::unique_ptr<LocalAgentRoster> m_roster;
     // O(1) by-name index, populated alongside the sort in createAgentsInstanced.
-    struct StringHash {
-        using is_transparent = void;
-        std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
-        std::size_t operator()(const std::string& s) const noexcept { return std::hash<std::string_view>{}(s); }
-        std::size_t operator()(const char* s) const noexcept { return std::hash<std::string_view>{}(s); }
-    };
-    std::unordered_map<std::string, Agent*, StringHash, std::equal_to<>> m_byName;
+    std::unordered_map<std::string, Agent*, taosim::util::TransparentStringHash, std::equal_to<>>
+        m_byName;
 };
 
 //-------------------------------------------------------------------------

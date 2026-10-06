@@ -55,6 +55,7 @@ from taos.im.validator.engines import (
 )
 
 from taos.im.protocol import MarketSimulationStateUpdate
+from taos.im.validator.multiasset_state import flatten_multiasset_state
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -258,6 +259,11 @@ class SimulationEngine(MarketEngine):
                 await asyncio.sleep(0.005 * (2 ** _attempt))
                 raw_bytes = await self._recv_bytes_shm_only(raw_bytes)
         _q4_t_unpack = time.time()
+        # Multi-asset runs publish a composed request; flatten it to the single-market
+        # shape (canonical book ids are globally unique, so the merge is lossless) and
+        # keep the per-realization metadata for log-dir-scoped consumers.
+        raw_dict, instance_metas = flatten_multiasset_state(raw_dict)
+        self._instance_metas = instance_metas
         state = self._parse_state(raw_dict)
         _q4_t_parse = time.time()
         normalized = self._normalize(state)
@@ -528,6 +534,14 @@ class SimulationEngine(MarketEngine):
             timestamp: The simulator's start timestamp.
             event: The start event payload.
         """
+        # A multi-asset run emits one SIMULATION_START per realization, all on the shared grid timestamp.
+        # The run change must be applied ONCE per episode, so duplicates of the same start are absorbed here.
+        if getattr(self, "_last_start_ts", None) == timestamp:
+            logger.info(
+                f"on_start: duplicate SIMULATION_START at t={timestamp} "
+                "(further realization of the same episode) — already handled")
+            return
+        self._last_start_ts = timestamp
         self._open_run(self.validator.simulation_timestamp, timestamp, event.logDir, reason="start event")
 
     def _open_run(self, old_simulation_timestamp, new_simulation_timestamp, log_dir, *, reason: str) -> None:
@@ -573,6 +587,7 @@ class SimulationEngine(MarketEngine):
             miner_wealth=v.simulation.miner_wealth,
             effective_max_uids=v.effective_max_uids,
             log=logger.info,
+            book_ids=getattr(self, "_book_ids", None) or None,
         )
 
         v.start_time = time.time()
@@ -587,10 +602,22 @@ class SimulationEngine(MarketEngine):
             v._shadow_applied_ts = new_simulation_timestamp
         v.last_state_time = None
         v.step_rates = []
-        if log_dir != v.simulation.logDir:
-            logger.info(f"Simulation log directory changed: {v.simulation.logDir} -> {log_dir}")
-            self._notify_seed_log_dir_change(log_dir)
-            v.simulation.logDir = log_dir
+        # In a multi-asset run every realization's start event names ITS OWN log dir
+        # (<run root>/<name>-<instance>); the config tracks the run root, from which
+        # realization dirs are re-derived (realization_log_dir / load_fundamental).
+        event_log_dir = log_dir
+        if getattr(v.simulation, 'backgrounds', None) and event_log_dir:
+            base = os.path.basename(os.path.normpath(event_log_dir))
+            instance_dirs = {
+                f"{name}-{instance}"
+                for _flat, name, instance, _cfg in v.simulation.realizations()
+            }
+            if base in instance_dirs:
+                event_log_dir = os.path.dirname(os.path.normpath(event_log_dir))
+        if event_log_dir != v.simulation.logDir:
+            logger.info(f"Simulation log directory changed: {v.simulation.logDir} -> {event_log_dir}")
+            self._notify_seed_log_dir_change(event_log_dir)
+            v.simulation.logDir = event_log_dir
         # simulation_id lifecycle. A genuine new episode resets the clock to ~0
         # (start="0"), so on_tick should re-derive the id from the new logDir.
         # But a restart/reconnect that resumes an in-progress run fires this same
@@ -661,8 +688,12 @@ class SimulationEngine(MarketEngine):
         # Clear the locked id on a clean end so a restart afterwards re-derives a
         # fresh id for the NEXT episode instead of restoring this (ended) run's id.
         v.simulation.simulation_id = None
+        # Forget the episode's start timestamp, or the NEXT episode's SIMULATION_START (every
+        # config starts at 0) is absorbed as "a further realization of the same episode" and the
+        # restart shift, the config reload and the fundamental load never run for it.
+        self._last_start_ts = None
         self._notify_seed_log_dir_change(None)
-        v.fundamental_price = {bookId: None for bookId in range(v.simulation.book_count)}
+        v.fundamental_price = {bookId: None for bookId in getattr(v.simulation, 'book_ids', None) or range(v.simulation.book_count)}
         v.pending_notices = {uid: [] for uid in range(v.effective_max_uids)}
         asyncio.run_coroutine_threadsafe(
             v._save_state_sync(), v.main_loop
@@ -765,7 +796,39 @@ class SimulationEngine(MarketEngine):
     def load_fundamental(self) -> None:
         """Load fundamental price data from simulation output files."""
         v = self.validator
-        if v.simulation.logDir:
+
+        def read_into(prices: dict, file: str, what: str) -> None:
+            try:
+                # Only the first line (book ids) and last non-empty line
+                # (latest price row) matter; tail-read them in O(1) instead
+                # of readlines() over the whole ever-growing file.
+                first_line, fp_line = _read_first_and_last_nonempty(file)
+                if first_line == '':
+                    return
+                book_ids = [int(col) for col in first_line.split(',') if col != "Timestamp\n"]
+                if fp_line is not None and book_ids:
+                    prices |= {book_ids[i]: float(price)
+                               for i, price in enumerate(fp_line.strip().split(',')[:-1])}
+            except FileNotFoundError:
+                logger.warning(f"load_fundamental: missing file {file} — skipping {what}")
+            except Exception as exc:
+                logger.warning(f"load_fundamental: error reading {what} fundamental: {exc}")
+
+        if v.simulation.logDir and getattr(v.simulation, 'backgrounds', None):
+            # Multi-asset: each realization writes its own fundamental files under
+            # <run root>/<name>-<instance>/; the CSV headers carry CANONICAL book
+            # ids, so glob per realization dir and let the headers do the mapping.
+            prices = {}
+            import glob
+            for flat_idx, name, instance, _config in v.simulation.realizations():
+                inst_dir = os.path.join(v.simulation.logDir, f"{name}-{instance}")
+                files = sorted(glob.glob(os.path.join(inst_dir, 'fundamental.*.csv')))
+                if not files:
+                    logger.warning(
+                        f"load_fundamental: no fundamental files under {inst_dir}")
+                for file in files:
+                    read_into(prices, file, f"realization {name}-{instance}")
+        elif v.simulation.logDir:
             prices = {}
             for block in range(v.simulation.block_count):
                 block_file = os.path.join(
@@ -773,22 +836,9 @@ class SimulationEngine(MarketEngine):
                     f'fundamental.{block * v.simulation.books_per_block}-'
                     f'{v.simulation.books_per_block * (block + 1) - 1}.csv'
                 )
-                try:
-                    # Only the first line (book ids) and last non-empty line
-                    # (latest price row) matter; tail-read them in O(1) instead
-                    # of readlines() over the whole ever-growing file.
-                    first_line, fp_line = _read_first_and_last_nonempty(block_file)
-                    if first_line == '':
-                        continue
-                    book_ids = [int(col) for col in first_line.split(',') if col != "Timestamp\n"]
-                    if fp_line is not None and book_ids:
-                        prices = prices | {book_ids[i]: float(price) for i, price in enumerate(fp_line.strip().split(',')[:-1])}
-                except FileNotFoundError:
-                    logger.warning(f"load_fundamental: missing file {block_file} — skipping block {block}")
-                except Exception as exc:
-                    logger.warning(f"load_fundamental: error reading block {block} fundamental: {exc}")
+                read_into(prices, block_file, f"block {block}")
         else:
-            prices = {bookId: None for bookId in range(v.simulation.book_count)}
+            prices = {bookId: None for bookId in getattr(v.simulation, 'book_ids', None) or range(v.simulation.book_count)}
         v.fundamental_price = prices
 
     def _compress_outputs(self, start: bool = False) -> None:
@@ -914,13 +964,23 @@ class SimulationEngine(MarketEngine):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _load_config(self) -> None:
-        """Load simulation XML config and set state file paths on the validator."""
+        """Load simulation XML config and set state file paths on the validator.
+
+        Accepts either a single-market <Simulation> config or a <MultiAssetSimulation>
+        wrapper; the latter yields a MultiAssetSimulationConfig whose canonical (sparse)
+        book_ids drive every book-keyed structure instead of range(book_count).
+        """
         v = self.validator
         import xml.etree.ElementTree as ET
-        from taos.im.protocol.models import MarketSimulationConfig
-        v.xml_config = ET.parse(v.config.simulation.xml_config).getroot()
-        v.simulation = MarketSimulationConfig.from_xml(v.xml_config)
-        v.simulator_config_file = str(Path(v.config.simulation.xml_config).resolve())
+        from taos.im.protocol.models import MarketSimulationConfig, MultiAssetSimulationConfig
+        config_path = Path(v.config.simulation.xml_config)
+        v.xml_config = ET.parse(config_path).getroot()
+        if v.xml_config.tag == "MultiAssetSimulation":
+            v.simulation = MultiAssetSimulationConfig.from_multiasset_xml(
+                v.xml_config, config_path.resolve().parent)
+        else:
+            v.simulation = MarketSimulationConfig.from_xml(v.xml_config)
+        v.simulator_config_file = str(config_path.resolve())
         network = _network_label(getattr(v.config.subtensor, 'network', 'local'))
         # LOB state: long parameter-list label (unchanged)
         v.simulation_state_file = v.config.neuron.full_path + f"/{v.simulation.label()}.mp"
@@ -939,7 +999,11 @@ class SimulationEngine(MarketEngine):
         else:
             v.validator_state_file = placeholder
         self._sim_config = v.simulation
-        self._book_ids = list(range(self._sim_config.book_count))
+        # Canonical ids when the config provides them (multi-asset: sparse), else the
+        # dense single-market range. Every book-keyed structure init iterates THIS.
+        self._book_ids = list(
+            getattr(self._sim_config, 'book_ids', None)
+            or range(self._sim_config.book_count))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Benchmark agent handling (moved from validator)
@@ -1108,11 +1172,13 @@ class SimulationEngine(MarketEngine):
     def initialize_structures(self) -> None:
         """Initialize all UID-indexed state structures on the validator."""
         v = self.validator
-        book_count = self._sim_config.book_count
+        # Canonical id set: dense range in single-market mode, sparse canonical ids in
+        # multi-asset mode. Never iterate range(book_count) for book-keyed structures.
+        book_ids = self._book_ids or list(range(self._sim_config.book_count))
         logger.info(
             f"Initializing structures for {v.effective_max_uids} UIDs "
             f"(network: {v.subnet_info.max_uids}, benchmarks: {len(v.benchmark_agents)}) "
-            f"with {book_count} books"
+            f"with {len(book_ids)} books"
         )
 
         v.simulation_timestamp = 0
@@ -1120,19 +1186,19 @@ class SimulationEngine(MarketEngine):
 
         if not hasattr(v, 'activity_factors') or len(v.activity_factors) < v.effective_max_uids:
             v.activity_factors = {
-                uid: {bookId: 0.0 for bookId in range(book_count)}
+                uid: {bookId: 0.0 for bookId in book_ids}
                 for uid in range(v.effective_max_uids)
             }
         if not hasattr(v, 'pnl_factors') or len(v.pnl_factors) < v.effective_max_uids:
             v.pnl_factors = {
-                uid: {bookId: 1.0 for bookId in range(book_count)}
+                uid: {bookId: 1.0 for bookId in book_ids}
                 for uid in range(v.effective_max_uids)
             }
         if not hasattr(v, 'kappa_values') or len(v.kappa_values) < v.effective_max_uids:
             v.kappa_values = {
                 uid: {
-                    'books': {bookId: None for bookId in range(book_count)},
-                    'books_weighted': {bookId: None for bookId in range(book_count)},
+                    'books': {bookId: None for bookId in book_ids},
+                    'books_weighted': {bookId: None for bookId in book_ids},
                     'total': None, 'average': None, 'median': None,
                     'normalized_average': 0.0, 'normalized_median': 0.0,
                     'normalized_total': 0.0,
@@ -1147,7 +1213,7 @@ class SimulationEngine(MarketEngine):
             v.trade_volumes = {
                 uid: {
                     bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
-                    for bookId in range(book_count)
+                    for bookId in book_ids
                 }
                 for uid in range(v.effective_max_uids)
             }
@@ -1155,13 +1221,13 @@ class SimulationEngine(MarketEngine):
             v.initial_balances = {
                 uid: {
                     bookId: {'BASE': None, 'QUOTE': None, 'WEALTH': None}
-                    for bookId in range(book_count)
+                    for bookId in book_ids
                 }
                 for uid in range(v.effective_max_uids)
             }
         if not hasattr(v, 'recent_miner_trades') or len(v.recent_miner_trades) < v.effective_max_uids:
             v.recent_miner_trades = {
-                uid: {bookId: [] for bookId in range(book_count)}
+                uid: {bookId: [] for bookId in book_ids}
                 for uid in range(v.effective_max_uids)
             }
         if not hasattr(v, 'miner_stats') or len(v.miner_stats) < v.effective_max_uids:
@@ -1170,9 +1236,9 @@ class SimulationEngine(MarketEngine):
                 for uid in range(v.effective_max_uids)
             }
         if not hasattr(v, 'recent_trades'):
-            v.recent_trades = {bookId: [] for bookId in range(book_count)}
+            v.recent_trades = {bookId: [] for bookId in book_ids}
         if not hasattr(v, 'fundamental_price'):
-            v.fundamental_price = {bookId: None for bookId in range(book_count)}
+            v.fundamental_price = {bookId: None for bookId in book_ids}
 
         from collections import defaultdict, deque
         if not hasattr(v, 'volume_sums'):

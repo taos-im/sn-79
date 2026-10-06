@@ -97,6 +97,14 @@ void printBalances(const taosim::accounting::Balances& balances, const AgentId a
 
 //-------------------------------------------------------------------------
 
+// The STP already-resting gate treats equal timestamps as "same instruction" and
+// stands down; real placements arrive at distinct times, so these tests' do too.
+Timestamp nextPlacementTimestamp() noexcept
+{
+    static Timestamp ts{};
+    return ++ts;
+}
+
 template<typename... Args>
 requires std::constructible_from<PlaceOrderMarketPayload, Args..., BookId>
 std::pair<MarketOrder::Ptr, OrderErrorCode> placeMarketOrder(
@@ -107,7 +115,7 @@ std::pair<MarketOrder::Ptr, OrderErrorCode> placeMarketOrder(
     const auto orderResult = exchange->clearingManager().handleOrder(MarketOrderDesc{.agentId = agentId, .payload = payload});
     auto marketOrderPtr = exchange->books()[bookId]->placeMarketOrder(
         OrderClientContext{agentId},
-        Timestamp{},
+        nextPlacementTimestamp(),
         orderResult.orderSize,
         payload->direction,
         payload->leverage,

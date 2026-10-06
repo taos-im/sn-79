@@ -35,6 +35,8 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <vector>
 
 //-------------------------------------------------------------------------
 
@@ -206,4 +208,49 @@ TEST(BlockBookIdTest, DiagnosticsNameBooksCanonicallyOnEveryBlock)
             << "a diagnostic on block " << kBlockIdx << " named book " << local
             << ", which belongs to block 0";
     }
+}
+
+//-------------------------------------------------------------------------
+
+// Under a multi-asset wrapper the realizations may hold different numbers of books, and the
+// canonical ids run consecutively across them: a realization numbers its books from the sum of
+// the book counts before it, not from a common block dimension. The base is settable so the
+// orchestrator can place a realization behind uneven predecessors.
+TEST(BlockBookIdTest, ARealizationNumbersItsBooksFromItsBase)
+{
+    pugi::xml_document doc;
+    auto simulation = configureBlock(1, doc);
+    // Built as block 1 of dimension 2 its base is 2; behind a five-book realization it is 5.
+    EXPECT_EQ(simulation->bookIdBase(), 2u);
+    simulation->setBookIdBase(5);
+    EXPECT_EQ(simulation->bookIdBase(), 5u);
+    for (BookId local{}; local < kBooksPerBlock; ++local) {
+        EXPECT_EQ(simulation->bookIdCanon(local), 5 + local);
+    }
+}
+
+//-------------------------------------------------------------------------
+
+// The inverse over uneven realizations, which is how the orchestrator routes a validator
+// instruction back to the realization that owns the book: realization i owns
+// [base_i, base_i + count_i), and an id past the last book belongs to nobody rather than to
+// the last realization.
+TEST(BlockBookIdTest, CanonicalIdsRouteByTheRealizationBases)
+{
+    const std::vector<BookId> bases{0, 5, 7};
+    const std::vector<uint32_t> counts{5, 2, 3};
+    const auto route = [&](BookId canon) {
+        return taosim::simulation::routeCanonicalBookId(canon, bases, counts);
+    };
+    for (const auto [canon, idx, local] : {
+             std::tuple{0u, 0u, 0u}, std::tuple{4u, 0u, 4u}, std::tuple{5u, 1u, 0u},
+             std::tuple{6u, 1u, 1u}, std::tuple{7u, 2u, 0u}, std::tuple{9u, 2u, 2u}}) {
+        const auto r = route(canon);
+        ASSERT_TRUE(r.has_value()) << "canonical " << canon << " routes nowhere";
+        EXPECT_EQ(r->idx, idx) << "canonical " << canon << " routes to the wrong realization";
+        EXPECT_EQ(r->local, local) << "canonical " << canon << " routes to the wrong book";
+    }
+    EXPECT_FALSE(route(10).has_value())
+        << "an id past the last book must not land on the last realization";
+    EXPECT_FALSE(route(42).has_value());
 }
