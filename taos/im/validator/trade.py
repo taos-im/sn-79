@@ -600,7 +600,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     ts=sampled_timestamp, mid_state=self.debeta_capture_mid,
                     real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
                     real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
-                    horizon_ns=_realized_ns,
+                    horizon_ns=_realized_ns, now_ns=timestamp,
                 )
                 accumulate_book_mtm(
                     self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
@@ -644,7 +644,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                             sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp,
                             real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
                             real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
-                            horizon_ns=_realized_ns)
+                            horizon_ns=_realized_ns, now_ns=timestamp)
 
     # De-beta live prune. BOTH legs share ONE window, the kappa lookback. Pruning making on the
     # 24h volume-assessment window, each leg inheriting the retention of the legacy leg it

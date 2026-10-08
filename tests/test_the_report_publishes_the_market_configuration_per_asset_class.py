@@ -38,7 +38,9 @@ def test_a_single_market_is_one_row_named_market():
     assert list(rows) == ["market"] and rows["market"]["books"] == "0-63"
 
 
-def test_log_dir_and_fee_policy_stay_out_of_the_row():
+def test_log_dir_and_the_raw_fee_policy_dump_stay_out_of_the_row():
+    """The log directory is a host path. The fee policy enters the row only through its own serializer, as the
+    simulation_fee_policy_* labels the Fee Policy table reads (8 October 2026); the raw dump key does not."""
     sim = SimpleNamespace(asset_classes=lambda: [_cls("market", [0, 1], book_count=2, logDir="/x", fee_policy={"a": 1})])
     row = simulation_config_rows(sim)["market"]
     assert "simulation_logDir" not in row and "simulation_fee_policy" not in row

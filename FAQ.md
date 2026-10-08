@@ -59,7 +59,7 @@ A new miner is scored from its first cycle, but its score builds over the three-
 
 - Do you see recent trades on many book IDs?  The skill half needs qualifying alpha on a set share of the books (20 of 128 on a single market; from 0.6.3, 15 of the 96 `simulation_0` books and 5 of the 32 `simulation_1` books) and is scaled down when more than about three eighths of the books carry none.
 - Under the Requests plot, do you see a large proportion of failures or timeouts?  If you are not seeing mostly success, usually this is due to taking too long to respond - validators allow a maximum of `--neuron.timeout` seconds (defined in the [base validator config](/taos/common/config/__init__.py)) for miners to respond.  This can be addressed by increasing resources, optimizing your strategy logic and ensuring sufficient network connectivity; you may also want to consider geolocating your miner nearby to the biggest validators for the best possible latency.
-- Check De-beta Eligible, Scored Books, Making Share, Skill Rank and the counterparty and tether factors in the Agents table, and the de-beta panels on your Agent page.  Making credit needs fills on both sides of a book; skill needs qualifying alpha on enough books.
+- Check De-beta Eligible, Scored Books, Making Rank, Making Share, Skill Rank and the counterparty and tether factors in the Agents table, and the de-beta panels on your Agent page.  Making credit needs fills on both sides of a book; skill needs qualifying alpha on enough books.
 
 #### 9. As a miner, I've hit the trading volume limit and can no longer submit instructions.  How is this limit enforced and what can I do now?
 

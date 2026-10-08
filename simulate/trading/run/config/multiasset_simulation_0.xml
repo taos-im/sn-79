@@ -4,6 +4,8 @@
   The default layout of run_validator.sh; another layout is chosen with -g <name>.
 -->
 <MultiAssetSimulation
+    traceTime="1"
+    measureStepWallClockTime="1"
     useMessagePack="1"
     host="localhost"
     port="8000"

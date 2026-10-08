@@ -29,23 +29,31 @@ def history(snapshot, events, volume_decimals):
     """
     history = {snapshot['timestamp']: copy.deepcopy(snapshot)}
     trades = {}
+    # The engine rests a leveraged order at quantity x (1 + leverage) and removes the same on its cancellation, so the
+    # replay keeps each order's leverage by id for the cancellation that follows (an order rested before the snapshot
+    # is unknown here and its cancellation is taken at its own quantity)
+    leverage_by_id = {}
     # Apply events in chronological order
     for event in sorted(events, key=lambda x: x['t']):
         match event:
             case o if event['y'] == 'o':
                 # Place new order
+                lev = float(o.get('l') or 0.0)
+                if lev > 0.0 and o.get('i') is not None:
+                    leverage_by_id[o['i']] = lev
+                rested = o['q'] * (1.0 + lev)
                 if o['s'] == 0:
                     if o['p'] not in snapshot['bids']:
                         snapshot['bids'][o['p']] = {'p':o['p'], 'q':0.0, 'o':None}
                     snapshot['bids'][o['p']]['q'] = round(
-                        snapshot['bids'][o['p']]['q'] + o['q'],
+                        snapshot['bids'][o['p']]['q'] + rested,
                         volume_decimals
                     )
                 else:
                     if o['p'] not in snapshot['asks']:
                         snapshot['asks'][o['p']] =  {'p':o['p'], 'q':0.0, 'o':None}
                     snapshot['asks'][o['p']]['q'] = round(
-                        snapshot['asks'][o['p']]['q'] + o['q'],
+                        snapshot['asks'][o['p']]['q'] + rested,
                         volume_decimals
                     )
 
@@ -70,11 +78,19 @@ def history(snapshot, events, volume_decimals):
                             del snapshot['bids'][t['p']]
 
             case c if event['y'] == 'c':
-                # Cancel existing order
-                if c['p'] >= min(snapshot['asks'].keys()):
+                # Cancel existing order: on the side the event names when it carries one, else the guess from the
+                # best ask (an engine that publishes no side behaves as before)
+                side = c.get('s')
+                if side is not None:
+                    on_ask = int(side) == 1
+                else:
+                    on_ask = bool(snapshot['asks']) and c['p'] >= min(snapshot['asks'].keys())
+                c_lev = c.get('l')
+                removed = c['q'] * (1.0 + (float(c_lev) if c_lev is not None else leverage_by_id.get(c.get('i'), 0.0)))
+                if on_ask:
                     if c['p'] in snapshot['asks']:
                         snapshot['asks'][c['p']]['q'] = round(
-                            snapshot['asks'][c['p']]['q'] - c['q'],
+                            snapshot['asks'][c['p']]['q'] - removed,
                             volume_decimals
                         )
                         if snapshot['asks'][c['p']]['q'] == 0.0:
@@ -82,7 +98,7 @@ def history(snapshot, events, volume_decimals):
                 else:
                     if c['p'] in snapshot['bids']:
                         snapshot['bids'][c['p']]['q'] = round(
-                            snapshot['bids'][c['p']]['q'] - c['q'],
+                            snapshot['bids'][c['p']]['q'] - removed,
                             volume_decimals
                         )
                         if snapshot['bids'][c['p']]['q'] == 0.0:
@@ -93,6 +109,14 @@ def history(snapshot, events, volume_decimals):
         history[event['t']] = copy.deepcopy(snapshot)
     return history, trades
     
+def decimals_for(volume_decimals, book_id):
+    """The volume decimals of one book: a mapping book id to decimals under a multi-asset layout (each class has
+    its own grid), or the one integer that applies to every book."""
+    if isinstance(volume_decimals, dict):
+        return volume_decimals[book_id]
+    return volume_decimals
+
+
 def history_batch(snapshots, events, volume_decimals):
     """
     Compute order-book histories for a batch of books sequentially.
@@ -100,13 +124,13 @@ def history_batch(snapshots, events, volume_decimals):
     Args:
         snapshots (dict): Mapping of book_id to initial LOB snapshot.
         events (dict): Mapping of book_id to list of event dicts.
-        volume_decimals (int): Decimal precision for volume rounding.
+        volume_decimals (int | dict): Decimal precision for volume rounding, one integer or a mapping per book.
 
     Returns:
         dict: Mapping of book_id to the (history_dict, trades_dict) tuple from `history`.
     """
     start = time.time()
-    result = {book_id : history(snapshot, events[book_id], volume_decimals) for book_id, snapshot in snapshots.items()}
+    result = {book_id : history(snapshot, events[book_id], decimals_for(volume_decimals, book_id)) for book_id, snapshot in snapshots.items()}
     print(f"Calculated histories for books {list(result.keys())[0]}-{list(result.keys())[-1]} ({time.time() - start}s)")
     return result
 

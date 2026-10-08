@@ -11,6 +11,14 @@ from taos.common.protocol import AgentInstruction, BaseModel
 from taos.im.protocol.models import OrderDirection, STP, TimeInForce, OrderCurrency, LoanSettlementOption
 
 UInt32 = Annotated[int, Field(ge=0, le=2**32 - 1)]
+# Every integer a miner fills is bounded so the wire can always encode it and the domain stays sensible: an
+# instruction delay is simulation time and one simulated day is more than any strategy needs; the other integers
+# take the widest value the message format carries.
+WIRE_INT_MAX = 2**63 - 1
+MAX_INSTRUCTION_DELAY = 86_400 * 1_000_000_000
+DelayInt = Annotated[int, Field(ge=0, le=MAX_INSTRUCTION_DELAY)]
+WireInt = Annotated[int, Field(ge=0, le=WIRE_INT_MAX)]
+WirePositiveInt = Annotated[int, Field(gt=0, le=WIRE_INT_MAX)]
 
 class FinanceAgentInstruction(AgentInstruction):
     """
@@ -25,7 +33,7 @@ class FinanceAgentInstruction(AgentInstruction):
             String identifier for the type of the submitted instruction in the simulator.
     """
     agentId: UInt32
-    delay: NonNegativeInt = 0
+    delay: DelayInt = 0
     type: Literal["PLACE_ORDER_MARKET", "PLACE_ORDER_LIMIT", "CANCEL_ORDERS", "CLOSE_POSITIONS", "RESET_AGENT"]
     
     def serialize(self) -> dict:
@@ -116,7 +124,7 @@ class PlaceOrderInstruction(FinanceAgentInstruction):
 
     currency: Literal[OrderCurrency.BASE, OrderCurrency.QUOTE] = OrderCurrency.BASE
     leverage: NonNegativeFloat = 0.0
-    settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | NonNegativeInt = LoanSettlementOption.NONE
+    settleFlag: Literal[LoanSettlementOption.NONE, LoanSettlementOption.FIFO] | WireInt = LoanSettlementOption.NONE
     delegate: str = ""
     max_slippage: float | None = None
 
@@ -189,7 +197,7 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
     price: PositiveFloat
     postOnly: bool = False
     timeInForce: Literal[TimeInForce.GTC, TimeInForce.GTT, TimeInForce.IOC, TimeInForce.FOK] = TimeInForce.GTC
-    expiryPeriod: PositiveInt | None = None
+    expiryPeriod: WirePositiveInt | None = None
     stop_loss:   float | None = None
     take_profit: float | None = None
 

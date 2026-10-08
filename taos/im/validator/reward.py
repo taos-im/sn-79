@@ -34,6 +34,7 @@ from taos.im.validator.debeta import (markout_quality, absent_uids, book_alphas_
                                       presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas, balanced_reward_per_book,
                                       debeta_scores)
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
+from taos.im.protocol.instructions import MAX_INSTRUCTION_DELAY
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
 
 if TYPE_CHECKING:
@@ -1528,6 +1529,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
     _bar = skill_bar(self)
     self._debeta_class_shares = None
     self._debeta_class_summary = None
+    self._debeta_class_details = None
     try:
         # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
         # full-run p_last-p_first. Equals book_alphas_from_mtm over a non-pruned run (asserted in tests).
@@ -1716,13 +1718,17 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                     skill_min_books=_bars[_c], skill_p11_strength=skill_p11_strength, p11_topk=p11_topk,
                     s3_k=s3_k,
                 )
+                _notional_all = getattr(self, 'debeta_notional', {}) or {}
                 for _u, _dd in _cd.items():
                     if _ckept is not None:
                         _dd['skill_books'] = int(_ckept.get(_u, 0))
                     _dd['present'] = _u not in _absent
+                    _dd['notional'] = float(sum(v for b, v in (_notional_all.get(_u) or {}).items() if _cmap.get(b) == _c))
                 _details[_c] = _cd
             self._debeta_class_shares = class_pool_shares(_details, _cw, sorted(_detail), _bars)
             self._debeta_class_summary = class_summary(_details, _cw, _bars, {c: p['n_books'] for c, p in _by_class.items()})
+            # the per-class per-uid detail the pools were built from, kept for the report (agent_class_gauges)
+            self._debeta_class_details = _details
         warm = sum(1 for v in scores.values() if v > 0.0)
         if warm < int(dcfg.min_books):
             bt.logging.info(f"De-beta warming ({warm} positive scores < {int(dcfg.min_books)}); legacy path this cycle")
@@ -2239,7 +2245,8 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
                     seen_books.add(book_id)
                 else:
                     instruction_delay = random.randint(min_instruction_delay, max_instruction_delay)
-                instruction.delay += base_delay + instruction_delay
+                # the model bounds what a miner sends; the validator's own addition must land inside the same bound
+                instruction.delay = min(instruction.delay + base_delay + instruction_delay, MAX_INSTRUCTION_DELAY)
             responses.append(response)
             log_messages.append(
                 f"UID {response.agent_id} responded with {len(response.instructions)} instructions "

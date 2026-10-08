@@ -1824,7 +1824,7 @@ class StateHistoryManager:
                         {book_id: snapshot.model_dump() for book_id, snapshot in snapshots.items()},
                         {book_id: [event.model_dump() for event in book.events] for book_id, book in state.books.items()},
                         batches,
-                        state.config.volumeDecimals
+                        {book_id: self._config_for(state, book_id).volumeDecimals for book_id in state.books}
                     )
                 else:
                     # Process sequentially
@@ -1832,7 +1832,7 @@ class StateHistoryManager:
                         book_id: history(
                             snapshot.model_dump(),
                             [event.model_dump() for event in state.books[book_id].events],
-                            state.config.volumeDecimals
+                            self._config_for(state, book_id).volumeDecimals
                         )
                         for book_id, snapshot in snapshots.items()
                     }
@@ -1843,7 +1843,7 @@ class StateHistoryManager:
                         {t: L2Snapshot.model_validate(snapshot).sort(self.depth) for t, snapshot in hist.items()},
                         {t: TradeInfo.model_validate(trade) for t, trade in trades.items()},
                         state.timestamp,
-                        state.config,
+                        self._config_for(state, book_id),
                         self.history_retention_mins,
                         self.depth
                     )
@@ -1876,6 +1876,16 @@ class StateHistoryManager:
         """
         if not self.updating:
             Thread(target=self.update, args=(state,), daemon=True, name=f'update_history_{state.timestamp}').start()
+
+    @staticmethod
+    def _config_for(state: MarketSimulationStateUpdate, book_id: int):
+        """The market configuration governing one book: its own class's under a multi-asset layout, the single
+        market's otherwise. The rebuild rounds to this configuration's volume decimals and the comparison reads
+        its tolerance from them, so a book is never judged on another class's grid."""
+        config = state.config
+        if hasattr(config, 'config_for_book'):
+            return config.config_for_book(book_id)
+        return config
 
     def _prepare_snapshot(self, state: MarketSimulationStateUpdate, book: Book) -> L2Snapshot | None:
         """

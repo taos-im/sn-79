@@ -221,6 +221,11 @@ class Cancellation(BaseModel):
     t: int | None = Field(alias='timestamp', default=None)
     p: float | None = Field(alias="price", default=None)
     q: float | None = Field(alias="quantity")
+    # the cancelled order's side (0 buy, 1 sell, as an order carries it); absent from engines that do not publish it
+    s: int | None = Field(alias="side", default=None)
+    # the cancelled order's leverage: the engine rests a leveraged order at quantity x (1 + leverage) and removes the
+    # same on cancellation, and the order's placement is usually in an earlier state update than its cancellation
+    l: float | None = Field(alias="leverage", default=None)
 
     @property
     def type(self) -> str:
@@ -252,7 +257,8 @@ class Cancellation(BaseModel):
         """
         Method to extract model data from simulation event in the format required by the MarketSimulationStateUpdate synapse.
         """
-        return Cancellation(orderId=event['orderId'], timestamp=event['timestamp'], price=event['price'], quantity=event['volume'])
+        return Cancellation(orderId=event['orderId'], timestamp=event['timestamp'], price=event['price'], quantity=event['volume'],
+                            side=event.get('direction'), leverage=event.get('leverage'))
 
     @classmethod
     def from_json(self, json : dict):
@@ -265,4 +271,4 @@ class Cancellation(BaseModel):
         Returns:
             The model in synapse format.
         """
-        return Cancellation.model_construct(i=json['i'], t=json['t'], p=json['p'], q=json['q'])
+        return Cancellation.model_construct(i=json['i'], t=json['t'], p=json['p'], q=json['q'], s=json.get('s'), l=json.get('l'))

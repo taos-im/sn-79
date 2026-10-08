@@ -506,7 +506,9 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
                     m_L3Record.at(bookId).push(taosim::event::CancellationEvent(
                         taosim::event::Cancellation(order->id(), volumeToCancel),
                         simulation()->currentTimestamp(),
-                        order->price()
+                        order->price(),
+                        order->direction(),
+                        order->leverage()
                     ));
                     // Debit canceled volume from the SL/TP side store; no-op
                     // for unflagged orders. Without this, fully-canceled

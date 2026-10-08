@@ -108,7 +108,11 @@ echo "GENTRX_PARAMS:   ${GENTRX_PARAMS:-(defaults)}"
 
 cd "$REPO_ROOT"
 git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
-pip install -e .
+# THE LOCKFILE ON EVERY START, not only at install. A host that already had an older package kept it as
+# long as it satisfied the unpinned requirement; 0.6.3 testnet validators then served HTTP 500 on every
+# metrics family with a prometheus_client older than the pin.
+_CONSTRAINTS=""; [ -f constraints.txt ] && _CONSTRAINTS="-c constraints.txt"
+pip install -e . $_CONSTRAINTS
 cd "$REPO_ROOT/taos/im/neurons"
 
 # ══════════════════════════════════════════════════════════════════════════════

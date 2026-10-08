@@ -195,3 +195,58 @@ TEST(L3FmtTests, HighPrecisionValuesRoundTrip)
 }
 
 //-------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------
+
+#include <taosim/event/serialization/CancellationEvent.hpp>
+#include <taosim/serialization/msgpack/common.hpp>
+
+#include <map>
+
+// A PUBLISHED CANCEL SAYS WHICH SIDE IT CANCELLED. It carried no side, so the miner library's book
+// replay guessed one from the price against the best ask (taos/im/protocol/book.py) and the data
+// service stored the missing value as 0: an ask placed with side=1 on book 4 (event 23996, 7 October)
+// was recorded cancelled with side=0, and a replay by side moves a cancel to the wrong side. The side is
+// the cancelled order's own, under "s" as an order event publishes it: 0 buy, 1 sell.
+TEST(CancellationEvent, PublishesTheSideOfTheOrderItCancels)
+{
+    for (const auto dir : {OrderDirection::BUY, OrderDirection::SELL}) {
+        const taosim::event::CancellationEvent ev{
+            taosim::event::Cancellation(23996, 11_dec), 1388271000000, 296_dec, dir};
+        taosim::serialization::HumanReadableStream stream;
+        msgpack::pack(stream, ev);
+        const auto handle = msgpack::unpack(stream.data(), stream.size());
+        const auto fields = handle.get().as<std::map<std::string, msgpack::object>>();
+        ASSERT_TRUE(fields.contains("s")) << "a published cancel carries its side";
+        EXPECT_EQ(fields.at("s").as<uint32_t>(), std::to_underlying(dir));
+        EXPECT_EQ(fields.at("y").as<std::string>(), "c");
+    }
+}
+
+// A PUBLISHED CANCEL CARRIES THE LEVERAGE OF THE ORDER IT CANCELS. The book rests a leveraged order at
+// volume x (1 + leverage), so a replay that removes only the cancelled base volume leaves volume x leverage
+// on the level. An order placed in one update and cancelled in a later one gives the consumer nothing to
+// look the leverage up from: book 21 on capture_20261007T1509 kept 11.2163 (= 992.5902 x 0.0113) at 298.40
+// after order 23637 was cancelled. Published under "l" as the order event publishes it.
+TEST(CancellationEvent, PublishesTheLeverageOfTheOrderItCancels)
+{
+    const taosim::event::CancellationEvent lev{
+        taosim::event::Cancellation(23637, taosim::util::double2decimal(992.5902)), 1871914122244,
+        taosim::util::double2decimal(298.4), OrderDirection::BUY, taosim::util::double2decimal(0.0113)};
+    taosim::serialization::HumanReadableStream stream;
+    msgpack::pack(stream, lev);
+    const auto handle = msgpack::unpack(stream.data(), stream.size());
+    const auto fields = handle.get().as<std::map<std::string, msgpack::object>>();
+    ASSERT_TRUE(fields.contains("l")) << "a published cancel carries its order's leverage";
+    EXPECT_NEAR(fields.at("l").as<double>(), 0.0113, 1e-6);  // double2decimal truncates its input
+    EXPECT_EQ(fields.at("s").as<uint32_t>(), std::to_underlying(OrderDirection::BUY));
+
+    const taosim::event::CancellationEvent plain{
+        taosim::event::Cancellation(23996, 11_dec), 1388271000000, 296_dec, OrderDirection::SELL};
+    taosim::serialization::HumanReadableStream s2;
+    msgpack::pack(s2, plain);
+    const auto h2 = msgpack::unpack(s2.data(), s2.size());
+    const auto f2 = h2.get().as<std::map<std::string, msgpack::object>>();
+    ASSERT_TRUE(f2.contains("l"));
+    EXPECT_EQ(f2.at("l").as<double>(), 0.0) << "an unleveraged cancel publishes 0, as an order event does";
+}

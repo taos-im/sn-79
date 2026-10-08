@@ -186,6 +186,8 @@ The next section displays configuration parameters for the fees applied in the s
 
 #### Fee Parameters
 
+- **Class** - The asset class the fee policy applies to; each class carries its own, and the row follows the asset-class selector.
+
 - **Policy** - Fee structure model being applied (e.g., DIS - Dynamic Incentive Structure).
 
 - **Target MTR** - Target maker-to-taker ratio, the desired proportion of maker trades to taker trades executed by miner agents.
@@ -328,7 +330,7 @@ The Agents table above carries the de-beta columns that decide pay: Scored Books
 
 - **De-beta Score (all miners)** - Per-miner de-beta score over time.
 
-- **Asset classes: making weight, makers and making credit (0.6.3)** - Per asset class: its effective making weight, the number of makers with credit, and the making credit it carries (right axis).  A single-market simulation shows one class.
+- **Asset classes: making weight, makers and making credit** - Per asset class: its effective making weight, the number of makers with credit, and the making credit it carries (right axis).  A single-market simulation shows one class.
 
 ### Incentives Plot
 
@@ -569,15 +571,15 @@ Realized PnL of the agent over the Kappa3 window (the last 3 simulated hours by 
 
 The de-beta decomposition of the agent's score, in seven panels.
 
-- **De-beta score and its two legs** - The score in bold, with the two ranked legs it is built from: `w_make x rank+(making) + (1 - w_make) x rank+(skill)`.  The legs recombine exactly to the score.
+- **De-beta score and its two legs** - The score in bold, with the two ranked legs it is built from: `w_make x rank+(making) + (1 - w_make) x rank+(skill)`.  The legs recombine exactly to the score.  Dashed: the agent's making and skill ranks within each asset class, from the class run the pools are built from; they follow the asset-class selector.
 
-- **Eligibility and factors: presence, coverage, counterparty, tether** - Whether the agent is scorable and present this cycle, its presence share over the query window, the skill coverage factor, the counterparty factor and, from 0.6.3, the tether factor with the background market's share of its fill volume beside it.  All are bounded 0 to 1; 1.0 is no discount.
+- **Eligibility and factors: presence, coverage, counterparty, tether** - Whether the agent is scorable and present this cycle, its presence share over the query window, the skill coverage factor, the counterparty factor and, from 0.6.3, the tether factor with the background market's share of its fill volume beside it.  All are bounded 0 to 1; 1.0 is no discount.  Dashed: the counterparty, tether and coverage factors and the background share within each asset class; they follow the asset-class selector.
 
-- **Making credit: paid, realized and captured** - The making credit the agent is paid on, after the counterparty factor and the tether, in bold; beside it the credit on each basis, captured (the spread at the moment of the fill) and realized (the spread its fills still hold 20 simulation seconds later).  From 0.6.3 the paid credit is the captured credit scaled by the ratio of the two, held between 0 and 1.
+- **Making credit: paid, realized and captured** - The making credit the agent is paid on, after the counterparty factor and the tether, in bold; beside it the credit on each basis, captured (the spread at the moment of the fill) and realized (the spread its fills still hold 20 simulation seconds later).  From 0.6.3 the paid credit is the captured credit scaled by the ratio of the two, held between 0 and 1.  Dashed: the making credit within each asset class, as the class pool reads it; it follows the asset-class selector.
 
 - **Skill: kappa, net alpha and notional** - The agent's floored kappa, the consistency of its alpha across qualifying books; its net alpha, which the skill half pays in proportion to; and the traded notional behind those books, which the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads.
 
-- **Books filled vs books scored** - Books the agent filled in, which the coverage rule reads, against books whose alpha cleared the hurdle, which the skill bar counts.  Breadth and size per book are different things: an agent can fill many books and have few qualify.
+- **Books filled vs books scored** - Books the agent filled in, which the coverage rule reads, against books whose alpha cleared the hurdle, which the skill bar counts.  Breadth and size per book are different things: an agent can fill many books and have few qualify.  Dashed: books filled, books scored and notional within each asset class, and each class's skill bar in red from the class summaries; they follow the asset-class selector.
 
 - **Pool pay: making share and ladder input** - The agent's share of the making half on the left; on the right the score entering the Pareto ladder, which pays the skill half only in a cycle where no miner qualifies for it.
 

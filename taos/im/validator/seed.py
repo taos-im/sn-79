@@ -9,16 +9,27 @@ import argparse
 import signal
 import traceback
 import time
-import bittensor as bt
-
-
-from taos.im.utils.streams import *
 
 _current_log_dir = None
 # mtime of the handoff file when we last read it. The signal is an OPTIMISATION, not the contract:
 # see check_log_dir_change.
 _log_dir_mtime = None
 _log_dir_changed = False
+
+
+def _flag_sigusr1(signum, frame):
+    global _log_dir_changed
+    _log_dir_changed = True
+
+
+# Installed before the slow imports below: the validator signals about two seconds after spawning this
+# process, and SIGUSR1's default disposition kills it (exit -10, 7 October 2026).
+signal.signal(signal.SIGUSR1, _flag_sigusr1)
+
+import bittensor as bt
+
+
+from taos.im.utils.streams import *
 
 
 def _ensure_log_dir(path: str) -> None:

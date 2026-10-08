@@ -43,6 +43,7 @@ add_executable(taosim-tests
     ProcessLogLocationTests.cpp
     MultiAssetSeedTests.cpp
     LifecycleNoticeTests.cpp
+    ValidatorQueuePairingTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the
 # target always configures.

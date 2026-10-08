@@ -255,7 +255,7 @@ class L2Snapshot(BaseModel):
         )
         return (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
 
-    def compare(self, target: 'L2Snapshot', config: MarketSimulationConfig) -> tuple[bool, list[str], dict[str, dict[float, float]]]:
+    def compare(self, target: 'L2Snapshot', config: MarketSimulationConfig, depth: int | None = None) -> tuple[bool, list[str], dict[str, dict[float, float]]]:
         """
         Compare this snapshot to a target snapshot, and return a list of discrepancies as well as a dictionary mapping price level to the volume determined to already exist at that level
         prior to the original snapshot being constructed.  This is necessary as some new price levels may enter the top levels due to cancellations and trades.
@@ -272,42 +272,40 @@ class L2Snapshot(BaseModel):
         """
         discrepancies = []
         existing_volumes = {'bid': {}, 'ask': {}}
+        # The rebuild rounds every level to the book's volume decimals; the published level keeps the engine's full
+        # precision. A level matches within half a volume increment, and a level within that of zero is absent.
+        tolerance = 0.5 * 10 ** (-config.volumeDecimals)
+        decimals = config.volumeDecimals
 
-        # Compare bids
-        for price, bid in self.bids.items():
-            if price in target.bids:
-                if bid.quantity != target.bids[price].quantity:
-                    discrepancies.append(f"BID : RECON {bid.quantity}@{price} vs. TARGET {target.bids[price].quantity}@{price}")
-                if bid.quantity < target.bids[price].quantity:
-                    existing_volumes['bid'][price] = round(target.bids[price].quantity - bid.quantity, config.volumeDecimals)
-            else:
-                discrepancies.append(f"BID : RECON {bid.quantity}@{price} vs. TARGET 0.0@{price}")
-                if bid.quantity < 0:
-                    existing_volumes['bid'][price] = round(-bid.quantity, config.volumeDecimals)
+        def compare_side(label, mine, theirs, existing):
+            # The publisher prints a fixed number of levels per side. When its side is full, a reconstructed level
+            # beyond its worst printed level was never published and is no disagreement; when the side is short of
+            # the depth every level is printed and a deeper reconstructed level is real.
+            boundary = None
+            if depth is not None and len(theirs) >= depth and theirs:
+                boundary = min(theirs) if label == "BID" else max(theirs)
+            for price, level in mine.items():
+                if boundary is not None and price not in theirs and (
+                        (label == "BID" and price < boundary) or (label == "ASK" and price > boundary)):
+                    continue
+                if price in theirs:
+                    other = theirs[price].quantity
+                    if abs(level.quantity - other) > tolerance:
+                        discrepancies.append(f"{label} : RECON {level.quantity}@{price} vs. TARGET {other}@{price}")
+                    if level.quantity < other - tolerance:
+                        existing[price] = round(other - level.quantity, decimals)
+                else:
+                    if abs(level.quantity) > tolerance:
+                        discrepancies.append(f"{label} : RECON {level.quantity}@{price} vs. TARGET 0.0@{price}")
+                    if level.quantity < -tolerance:
+                        existing[price] = round(-level.quantity, decimals)
+            for price, level in theirs.items():
+                if price not in mine and abs(level.quantity) > tolerance:
+                    discrepancies.append(f"{label} : RECON 0.0@{price} vs. TARGET {level.quantity}@{price}")
+                    existing[price] = level.quantity
 
-        # Add missing bids from target
-        for price, bid in target.bids.items():
-            if price not in self.bids:
-                discrepancies.append(f"BID : RECON 0.0@{price} vs. TARGET {bid.quantity}@{price}")
-                existing_volumes['bid'][price] = bid.quantity
-
-        # Compare asks
-        for price, ask in self.asks.items():
-            if price in target.asks:
-                if ask.quantity != target.asks[price].quantity:
-                    discrepancies.append(f"ASK : RECON {ask.quantity}@{price} vs. TARGET {target.asks[price].quantity}@{price}")
-                if ask.quantity < target.asks[price].quantity:
-                    existing_volumes['ask'][price] = round(target.asks[price].quantity - ask.quantity, config.volumeDecimals)
-            else:
-                discrepancies.append(f"ASK : RECON {ask.quantity}@{price} vs. TARGET 0.0@{price}")
-                if ask.quantity < 0:
-                    existing_volumes['ask'][price] = round(-ask.quantity, config.volumeDecimals)
-
-        # Add missing asks from target
-        for price, ask in target.asks.items():
-            if price not in self.asks:
-                discrepancies.append(f"ASK : RECON 0.0@{price} vs. TARGET {ask.quantity}@{price}")
-                existing_volumes['ask'][price] = ask.quantity
+        compare_side("BID", self.bids, target.bids, existing_volumes['bid'])
+        compare_side("ASK", self.asks, target.asks, existing_volumes['ask'])
 
         return len(discrepancies) == 0, discrepancies, existing_volumes
 
@@ -1200,7 +1198,7 @@ class Book(BaseModel):
 
         # Compare the last snapshot in history with the target snapshot to check for discrepancies
         pre_matched, pre_discrepancies, pre_existing_volumes = (
-            list(history.values())[-1].compare(target_snapshot, config)
+            list(history.values())[-1].compare(target_snapshot, config, depth=depth)
         )
 
         # Build a new history object from the provided snapshots and trades
@@ -1216,7 +1214,7 @@ class Book(BaseModel):
 
         # After reconciliation, compare again to detect any remaining mismatches
         matched, discrepancies, existing_volumes = (
-            list(history_obj.snapshots.values())[-1].compare(target_snapshot, config)
+            list(history_obj.snapshots.values())[-1].compare(target_snapshot, config, depth=depth)
         )
 
         # Insert the target snapshot into the history
@@ -1254,23 +1252,29 @@ class Book(BaseModel):
 
         # Generate target snapshot for comparison
         target_snapshot = self.snapshot(snapshot.timestamp + config.publish_interval)
+        leverage_by_id: dict[int, float] = {}
         # Apply events in chronological order
         for event in sorted(self.events, key=lambda x: x.timestamp):
             match event:
                 case o if isinstance(event, Order):
-                    # Place new order
+                    # Place new order. The engine rests a leveraged order at quantity x (1 + leverage) and removes the
+                    # same on its cancellation, so the leverage is kept by order id for the cancellation that follows.
+                    lev = float(getattr(o, 'leverage', 0.0) or 0.0)
+                    if lev > 0.0:
+                        leverage_by_id[o.id] = lev
+                    rested = o.quantity * (1.0 + lev)
                     if o.side == OrderDirection.BUY:
                         if o.price not in snapshot.bids:
                             snapshot.bids[o.price] = LevelInfo(price=o.price, quantity=0.0, orders=None)
                         snapshot.bids[o.price].q = round(
-                            snapshot.bids[o.price].q + o.quantity,
+                            snapshot.bids[o.price].q + rested,
                             config.volumeDecimals
                         )
                     else:
                         if o.price not in snapshot.asks:
                             snapshot.asks[o.price] = LevelInfo(price=o.price, quantity=0.0, orders=None)
                         snapshot.asks[o.price].q = round(
-                            snapshot.asks[o.price].q + o.quantity,
+                            snapshot.asks[o.price].q + rested,
                             config.volumeDecimals
                         )
 
@@ -1295,11 +1299,21 @@ class Book(BaseModel):
                                 del snapshot.bids[t.price]
 
                 case c if isinstance(event, Cancellation):
-                    # Cancel existing order
-                    if c.price >= snapshot.best_ask():
+                    # Cancel existing order: on the side the event names when it carries one, else the guess
+                    # from the best ask (an engine that publishes no side behaves as before)
+                    side = getattr(c, 's', None)
+                    if side is not None:
+                        on_ask = int(side) == int(OrderDirection.SELL)
+                    else:
+                        on_ask = bool(snapshot.asks) and c.price >= snapshot.best_ask()
+                    # the leverage the cancellation itself carries, else the one seen on the order's placement in
+                    # this update, else none (the placement usually sits in an earlier update)
+                    c_lev = getattr(c, 'l', None)
+                    removed = c.quantity * (1.0 + (float(c_lev) if c_lev is not None else leverage_by_id.get(c.orderId, 0.0)))
+                    if on_ask:
                         if c.price in snapshot.asks:
                             snapshot.asks[c.price].q = round(
-                                snapshot.asks[c.price].q - c.quantity,
+                                snapshot.asks[c.price].q - removed,
                                 config.volumeDecimals
                             )
                             if snapshot.asks[c.price].quantity == 0.0:
@@ -1307,7 +1321,7 @@ class Book(BaseModel):
                     else:
                         if c.price in snapshot.bids:
                             snapshot.bids[c.price].q = round(
-                                snapshot.bids[c.price].q - c.quantity,
+                                snapshot.bids[c.price].q - removed,
                                 config.volumeDecimals
                             )
                             if snapshot.bids[c.price].quantity == 0.0:
@@ -1316,12 +1330,12 @@ class Book(BaseModel):
             # Add snapshot to history after each update
             history[event.timestamp] = snapshot.model_copy(deep=True)
         # Compare resulting snapshot to target
-        pre_matched, pre_discrepancies, pre_existing_volumes = snapshot.compare(target_snapshot, config)
+        pre_matched, pre_discrepancies, pre_existing_volumes = snapshot.compare(target_snapshot, config, depth=depth)
         history_obj = L2History(snapshots=history, trades=trades, retention_mins=retention_mins, publish_interval=config.publish_interval)
         # Apply determined existing volumes to attempt to reconcile any discrepancies
         history_obj.reconcile(pre_existing_volumes, config, depth)
         # Check if any remaining discrepancies after reconciliation
-        matched, discrepancies, existing_volumes = list(history_obj.snapshots.values())[-1].compare(target_snapshot, config)
+        matched, discrepancies, existing_volumes = list(history_obj.snapshots.values())[-1].compare(target_snapshot, config, depth=depth)
         # Add the target snapshot to the history
         history_obj.insert(target_snapshot)
 

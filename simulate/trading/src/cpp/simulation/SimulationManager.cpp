@@ -485,8 +485,11 @@ void SimulationManager::publishStateMessagePack()
     retryMessagePack:
 
     const size_t packedSize = stream.size();
-    m_validatorReqMessageQueue->flush();
-    const bool mqSendSuccess = m_validatorReqMessageQueue->send(
+    // Drain both queues before sending: a reply left in the response queue (by a validator
+    // that answered a previous engine, or a late answer to a resent state) would otherwise be
+    // read as the answer to this state, and every later reply would pair one state late.
+    const bool mqSendSuccess = ipc::sendFreshRequest(
+        *m_validatorReqMessageQueue, *m_validatorResMessageQueue,
         std::span<const char>{std::bit_cast<const char*>(&packedSize), sizeof(packedSize)});
     if (!mqSendSuccess) {
         fmt::println("Sending to /{} timed out, flushing and retrying...", s_validatorReqMessageQueueName);
@@ -840,6 +843,9 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
         ipc::PosixMessageQueueDesc{.name = s_validatorReqMessageQueueName.data()});
     mngr->m_validatorResMessageQueue = std::make_unique<ipc::PosixMessageQueue>(
         ipc::PosixMessageQueueDesc{.name = s_validatorResMessageQueueName.data()});
+    // The queues outlive a killed engine: drop any state or reply it left behind.
+    mngr->m_validatorReqMessageQueue->flush();
+    mngr->m_validatorResMessageQueue->flush();
 
     mngr->m_useMessagePack = node.attribute("useMessagePack").as_bool();
 

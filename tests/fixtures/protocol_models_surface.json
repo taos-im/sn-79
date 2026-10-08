@@ -230,6 +230,11 @@
     "annotation": "<class 'int'>",
     "required": true
    },
+   "l": {
+    "alias": "leverage",
+    "annotation": "float | None",
+    "required": false
+   },
    "p": {
     "alias": "price",
     "annotation": "float | None",
@@ -239,6 +244,11 @@
     "alias": "quantity",
     "annotation": "float | None",
     "required": true
+   },
+   "s": {
+    "alias": "side",
+    "annotation": "int | None",
+    "required": false
    },
    "t": {
     "alias": "timestamp",

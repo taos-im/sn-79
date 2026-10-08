@@ -165,7 +165,11 @@ echo "Updating Validator"
 git pull
 git submodule sync
 git submodule update --init
-pip install -e .
+# THE LOCKFILE ON EVERY START, not only at install. A host that already had an older package kept it as
+# long as it satisfied the unpinned requirement; 0.6.3 testnet validators then served HTTP 500 on every
+# metrics family with a prometheus_client older than the pin.
+_CONSTRAINTS=""; [ -f constraints.txt ] && _CONSTRAINTS="-c constraints.txt"
+pip install -e . $_CONSTRAINTS
 
 # Strip orphaned packages bittensor ≥8 doesn't need.
 pip uninstall substrate-interface scalecodec py-scale-codec cyscale -y 2>/dev/null || true

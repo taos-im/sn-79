@@ -114,6 +114,16 @@ bool PosixMessageQueue::remove(std::string_view name)
 
 //-------------------------------------------------------------------------
 
+bool sendFreshRequest(
+    PosixMessageQueue& req, PosixMessageQueue& res, std::span<const char> msg) noexcept
+{
+    req.flush();
+    res.flush();
+    return req.send(msg);
+}
+
+//-------------------------------------------------------------------------
+
 }  // namespace taosim::ipc
 
 //-------------------------------------------------------------------------

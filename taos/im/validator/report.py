@@ -94,6 +94,22 @@ class ReportingService:
     fundamental_price: float
     shared_state_reporting: bool
 
+    def _response_for(self, data: dict) -> dict:
+        """What the main process gets back for one publish: the step, and the two pieces of state the service owns
+        between cycles. A publish that deferred (the simulation id not yet known on a cold run) returned before it
+        copied the request's state onto the service, so the loop read attributes that were never set and failed every
+        cycle until the id appeared (localnet deploy, 7 October 2026). The request's own values answer in that case,
+        so the main process gets back exactly what it sent."""
+        return {
+            'step': data.get('step'),
+            'initial_balances_published': getattr(self, 'initial_balances_published', None)
+            if getattr(self, 'initial_balances_published', None) is not None
+            else dict(data.get('initial_balances_published') or {}),
+            'miner_stats': getattr(self, 'miner_stats', None)
+            if getattr(self, 'miner_stats', None) is not None
+            else dict(data.get('miner_stats') or {}),
+        }
+
     def __init__(self, config):
         """
         Initialise the reporting service, setting up IPC channels and Prometheus metrics.
@@ -323,6 +339,11 @@ class ReportingService:
         self.prometheus_class_gauges = _SnapshotCollector('class_gauges', 'Gauge summaries per asset class.',
                                                            ['wallet', 'netuid', 'sim_id', 'asset_class', 'class_gauge_name'])
         self.registry_simulation.register(self.prometheus_class_gauges)
+        # the per-class per-uid de-beta detail the class pools are built from (0.6.3), so an agent's making, ranks,
+        # factors and books can be read per asset class on the dashboards
+        self.prometheus_agent_class_gauges = _SnapshotCollector('agent_class_gauges', 'Per-miner de-beta detail per asset class.',
+                                                                 ['wallet', 'netuid', 'sim_id', 'asset_class', 'agent_id', 'agent_class_gauge_name'])
+        self.registry_simulation.register(self.prometheus_agent_class_gauges)
         self.prometheus_validator_gauges = Gauge('validator_gauges', 'Gauge summaries for validator-related metrics.', ['wallet', 'netuid', 'sim_id', 'validator_gauge_name'], registry=self.registry_validator)
         self.prometheus_miner_gauges = _SnapshotCollector('miner_gauges', 'Gauge summaries for miner-related metrics.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'miner_gauge_name'])
         self.registry_miner.register(self.prometheus_miner_gauges)
@@ -454,6 +475,7 @@ class ReportingService:
         snapshots = {
             agent_collector: {},
             self.prometheus_class_gauges: {},
+            self.prometheus_agent_class_gauges: {},
             self.prometheus_trades: {},
             self.prometheus_miner_trades: {},
             self.prometheus_books: {},
@@ -529,12 +551,8 @@ class ReportingService:
                     bt.logging.info(f"Read reporting data ({time.time()-read_start:.4f}s, deserialize={deserialize_time:.4f}s)")
 
                     await self.publish_metrics(data)
-                    
-                    result = {
-                        'step': data.get('step'),
-                        'initial_balances_published': self.initial_balances_published,
-                        'miner_stats': self.miner_stats
-                    }
+
+                    result = self._response_for(data)
                     write_start = time.time()
                     
                     serialize_start = time.time()
@@ -685,6 +703,8 @@ class ReportingService:
             setattr(self, key, data[key])
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
+        self.debeta_class_details = {int(c): {int(u): dict(d) for u, d in (v or {}).items()}
+                                     for c, v in (data.get('debeta_class_details') or {}).items()}
         self.scoring_shadow_health = data.get('scoring_shadow')
         self.history_clock = data.get('history_clock')
 
@@ -887,9 +907,82 @@ def simulation_config_rows(simulation):
         dump = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
         row = {'books': (f"{books[0]}-{books[-1]}" if books else ""), 'n_books': str(len(books))}
         row |= {f"simulation_{k}": str(v) for k, v in dump.items() if k not in ('logDir', 'fee_policy')}
+        # the class's own fee policy, in the labels the Fee Policy table reads (simulation_fee_policy_*), so the
+        # table shows one row per class like the Simulation Config table
+        fee = getattr(cfg, 'fee_policy', None)
+        if hasattr(fee, 'to_prom_info'):
+            row |= fee.to_prom_info()
         row['_book_ids'] = books
         rows[str(getattr(cls, 'name', 'market'))] = row
     return rows
+
+
+def class_names(simulation) -> dict:
+    """``{class index: class name}`` in the configuration's order, the names book_asset_class and
+    simulation_config_info carry; empty when the configuration names no class."""
+    try:
+        return {i: str(getattr(cls, 'name', i)) for i, cls in enumerate(simulation.asset_classes() or [])}
+    except Exception:
+        return {}
+
+
+# per-class per-uid detail key -> agent_class_gauge_name (the miner gauge's name without its debeta_ prefix)
+CLASS_DETAIL_GAUGES = (
+    ('making_raw', 'making'), ('making_rank', 'making_rank'), ('skill_raw', 'skill'), ('skill_rank', 'skill_rank'),
+    ('p11_factor', 'p11_factor'), ('making_s3_factor', 's3_factor'), ('bg_share', 'bg_share'),
+    ('skill_coverage_factor', 'coverage_factor'), ('skill_net_alpha', 'net_alpha'), ('skill_books', 'skill_books'),
+    ('coverage_books', 'coverage_books'), ('present', 'present'), ('notional', 'notional'),
+)
+
+
+def publish_class_gauges(self, updates, wallet_addr, netuid, simid):
+    """class_gauges, one series per class and summary field, labelled by the class's name."""
+    names = class_names(getattr(self, 'simulation', None))
+    for _cls, _summary in (getattr(self, 'debeta_class_summary', None) or {}).items():
+        label = names.get(int(_cls), str(_cls)) if str(_cls).lstrip('-').isdigit() else str(_cls)
+        for _name, _value in _summary.items():
+            updates.append((self.prometheus_class_gauges, float(_value), wallet_addr, netuid, simid, label, _name))
+
+
+def publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid):
+    """agent_class_gauges: the per-class per-uid de-beta detail the class pools were built from (making, ranks,
+    factors, books, notional, presence within the class), labelled by the class's name. A None is absent."""
+    names = class_names(getattr(self, 'simulation', None))
+    coll = getattr(self, 'prometheus_agent_class_gauges', None)
+    if coll is None:
+        return
+    for _cls, _by_uid in (getattr(self, 'debeta_class_details', None) or {}).items():
+        label = names.get(int(_cls), str(_cls)) if str(_cls).lstrip('-').isdigit() else str(_cls)
+        for _uid, _dd in (_by_uid or {}).items():
+            for _key, _gauge in CLASS_DETAIL_GAUGES:
+                _v = _dd.get(_key)
+                if _v is None:
+                    continue
+                updates.append((coll, float(_v), wallet_addr, netuid, simid, label, int(_uid), _gauge))
+
+
+def neuron_info_labels(self) -> dict:
+    """The labels of the neuron_info series: the validator's identity, every scoring dial it runs
+    (config_scoring_*) and the fee policy (simulation_fee_policy_*), which the dashboards' Scoring Config and
+    Fee Policy tables read. The market parameters are NOT here: since 0.6.3 simulation_config_info publishes them
+    per asset class, and carrying a copy of all of them put this series at 150 labels, which the metrics store
+    behind the dashboards refused on 6 October 2026 (VictoriaMetrics ignores a series over its per-series label
+    cap); the two tables went dark while the 100-label per-class series was ingested. Held under 100 by
+    tests/test_the_neuron_info_series_stays_under_the_store_label_cap.py."""
+    hotkey = self.wallet.hotkey.ss58_address
+    labels = {
+        'uid': str(self.metagraph.hotkeys.index(hotkey)) if hotkey in self.metagraph.hotkeys else -1,
+        'network': self.config.subtensor.network,
+        'coldkey': str(self.wallet.coldkeypub.ss58_address),
+        'coldkey_name': self.config.wallet.name,
+        'hotkey': str(hotkey),
+        'name': self.config.wallet.hotkey,
+    }
+    labels |= {f"config_scoring_{name}": str(value) for name, value in self.validator_config['scoring'].items()}
+    fee_policy = getattr(self.simulation, 'fee_policy', None)
+    if fee_policy:
+        labels |= fee_policy.to_prom_info()
+    return labels
 
 
 def publish_simulation_config_info(self):
@@ -927,6 +1020,8 @@ def publish_validator_gauges(self: ReportingService):
     bt.logging.debug("Publishing validator metrics...")
     start = time.time()
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="uid").set( self.uid )
+    # instructions the engine could not encode for the simulator and dropped from a step's message (see SimulationEngine.respond)
+    self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="response_pack_drops").set( float(getattr(getattr(self, 'engine', None), 'response_pack_drops', 0) or 0) )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="stake").set( self.metagraph.stake[self.uid] )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="validator_trust").set( self.metagraph.validator_trust[self.uid] )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="dividends").set( self.metagraph.dividends[self.uid] )
@@ -1098,20 +1193,7 @@ def publish_info(self: ReportingService) -> None:
     Returns:
         None
     """
-    prometheus_info = {
-        'uid': str(self.metagraph.hotkeys.index( self.wallet.hotkey.ss58_address )) if self.wallet.hotkey.ss58_address in self.metagraph.hotkeys else -1,
-        'network': self.config.subtensor.network,
-        'coldkey': str(self.wallet.coldkeypub.ss58_address),
-        'coldkey_name': self.config.wallet.name,
-        'hotkey': str(self.wallet.hotkey.ss58_address),
-        'name': self.config.wallet.hotkey
-    } | {
-        f"config_scoring_{name}": str(value)
-        for name, value in self.validator_config['scoring'].items()
-    } | {
-         f"simulation_{name}" : str(value) for name, value in self.simulation.model_dump().items() if name != 'logDir' and name != 'fee_policy'
-    } | (self.simulation.fee_policy.to_prom_info() if getattr(self.simulation, 'fee_policy', None) else {})
-    self.prometheus_info.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id ).info (prometheus_info)
+    self.prometheus_info.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id ).info (neuron_info_labels(self))
     publish_simulation_config_info(self)
     publish_validator_gauges(self)
     publish_gentrx_gauges(self)
@@ -1539,6 +1621,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             'making_share': kappa_values.get('making_share') if kappa_values else None,
             'ladder_input': kappa_values.get('ladder_input') if kappa_values else None,
                 'making_rank': kappa_values.get('making_rank') if kappa_values else None,
+                # both making bases and which one pays (0.6.3): reward.py stores them on uid_kappa with the
+                # legs above, and the gauge loop and the miners table read them by these keys
+                'making_realized': kappa_values.get('making_realized') if kappa_values else None,
+                'making_captured': kappa_values.get('making_captured') if kappa_values else None,
+                'making_basis': kappa_values.get('making_basis') if kappa_values else None,
                 'skill_raw': kappa_values.get('skill_raw') if kappa_values else None,
                 'skill_rank': kappa_values.get('skill_rank') if kappa_values else None,
                 'p11_factor': kappa_values.get('p11_factor') if kappa_values else None,
@@ -1623,9 +1710,8 @@ async def report(self: ReportingService) -> None:
             simid,
             "step_rate"
         ))
-        for _cls, _summary in (getattr(self, 'debeta_class_summary', None) or {}).items():
-            for _name, _value in _summary.items():
-                updates.append((self.prometheus_class_gauges, float(_value), wallet_addr, netuid, simid, str(_cls), _name))
+        publish_class_gauges(self, updates, wallet_addr, netuid, simid)
+        publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid)
         bt.logging.debug(f"Simulation metrics collected ({time.time()-start:.4f}s).")
 
         has_new_trades = False

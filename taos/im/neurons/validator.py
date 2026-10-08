@@ -2166,6 +2166,7 @@ if __name__ != "__mp_main__":
                 'book_count': book_count,
                 'activity_factors': self.activity_factors,
                 'debeta_class_summary': getattr(self, '_debeta_class_summary', None) or {},
+                'debeta_class_details': getattr(self, '_debeta_class_details', None) or {},
                 'pnl_factors': self.pnl_factors,
                 'kappa_values': self.kappa_values,
                 'unnormalized_scores': self.unnormalized_scores,
@@ -2839,6 +2840,10 @@ if __name__ != "__mp_main__":
                                 "is_partial":       False,
                                 "timestamp":        state.timestamp,
                                 "xo":               _xo,
+                                # the engine's charge, so the service keeps it instead of scheduling a fee
+                                # the trade would have cost; a stated zero stays zero
+                                "taker_fee":        _ev.get("Tf"),
+                                "maker_fee":        _ev.get("Mf"),
                             })
                     elif _ev_type in ("ERDPOL", "ERDPOM"):
                         _agent_uid = _ev.get("a") if _ev.get("a") is not None else _ev.get("agentId")
@@ -3691,6 +3696,9 @@ if __name__ != "__mp_main__":
                     try:
                         raw_message, normalized_state, receive_start = await self.engine.receive()
                         if normalized_state is not None:
+                            if isinstance(raw_message, (bytes, bytearray)):
+                                # opt-in record of the stream for the scoring acceptance's replay harness (STATE_CAPTURE_DIR)
+                                capture_state(raw_message, normalized_state.timestamp)
                             if self._scoring_shadow is not None and isinstance(raw_message, (bytes, bytearray)):
                                 self._scoring_shadow.tee(raw_message, normalized_state.timestamp)
                                 if self._scoring_proc_cutover and \
@@ -3897,6 +3905,7 @@ if __name__ != "__mp_main__":
             cleanup(self)
 
     from taos.im.validator.trade import match_trade_fifo, update_trade_volumes
+    from taos.im.validator.state_capture import capture_state
     from taos.im.validator.cleanup import (
         cleanup_ipc, cleanup_executors, cleanup_event_loop, cleanup
     )

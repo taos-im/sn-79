@@ -22,12 +22,15 @@
 #include <taosim/simulation/multiasset/MultiAssetError.hpp>
 #include <taosim/simulation/multiasset/serialization/MultiAssetValidatorRequest.hpp>
 #include <taosim/simulation/util.hpp>
+#include <taosim/util/SLTPDebug.hpp>
 #include <taosim/xml/helpers.hpp>
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <date/date.h>
 #include <date/tz.h>
+#include <chrono>
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <msgpack.hpp>
@@ -94,6 +97,15 @@ std::vector<pugi::xml_document> loadBackgroundDocs(const std::vector<BackgroundD
             throw MultiAssetError{fmt::format(
                 "background '{}' is not a <Simulation> config: {}", label, bg.path.string())};
         }
+        // A BACKGROUND'S RUN-LEVEL SETTINGS DO NOT APPLY, and used to vanish without a word: these are
+        // read from a single-market root, never from a background under the wrapper.
+        const auto root = doc.child("Simulation");
+        for (const auto* attr : {"traceTime", "measureStepWallClockTime", "sltpDebug", "bookStateEndpoint"}) {
+            if (root.attribute(attr)) {
+                fmt::println(" - background '{}' sets {}, which a multi-asset run reads from the wrapper only",
+                    label, attr);
+            }
+        }
         return doc;
     };
 
@@ -134,10 +146,38 @@ struct Impl
 // the realizations' canonical bases let decanonize() recover (realization, book) even
 // though realizations hold different numbers of books.
 
+// THE PER-STEP WALL-CLOCK BREAKDOWN, in SimulationManager's PROCESSED format and meaning: STATE packs the
+// request, PARSE waits for the validator and unpacks its answer, PROC dispatches it. Printed on every way
+// out of publishState, with a phase the step never reached counted as nothing.
+struct StepWallClock
+{
+    using clock = std::chrono::high_resolution_clock;
+    bool on{};
+    Timestamp stepNs{}, nowNs{};
+    clock::time_point t0{clock::now()}, tState{}, tParse{};
+
+    ~StepWallClock()
+    {
+        if (!on) return;
+        using namespace std::chrono;
+        const auto t1 = clock::now();
+        if (tState == clock::time_point{}) tState = t1;
+        if (tParse == clock::time_point{}) tParse = t1;
+        fmt::println(
+            "PROCESSED {:%T} - {:%T} ({:.4f}s | PARSE {:.4f}s | PROC {:.4f}s | STATE {:.4f}s)",
+            duration_cast<seconds>(duration<Timestamp, std::nano>{nowNs - stepNs}),
+            duration_cast<seconds>(duration<Timestamp, std::nano>{nowNs}),
+            duration<double>(t1 - t0).count(), duration<double>(tParse - tState).count(),
+            duration<double>(t1 - tParse).count(), duration<double>(tState - t0).count());
+    }
+};
+
 void publishState(Impl& impl)
 {
     const auto& sims = impl.simulations;
     const auto now = sims.front()->currentTimestamp();
+    StepWallClock wall{.on = impl.config.measureStepWallClockTime,
+                       .stepNs = sims.front()->time().step, .nowNs = sims.front()->time().current};
 
     taosim::serialization::HumanReadableStream stream{1uz << 27};
     msgpack::pack(stream, serialization::MultiAssetValidatorRequest{
@@ -151,11 +191,14 @@ void publishState(Impl& impl)
     shmReq.truncate(stream.size());
     bipc::mapped_region reqRegion{shmReq, bipc::read_write};
     std::memcpy(reqRegion.get_address(), stream.data(), stream.size());
+    wall.tState = StepWallClock::clock::now();
 
     retry:
     const size_t packedSize = stream.size();
-    impl.validatorReqQueue->flush();
-    if (!impl.validatorReqQueue->send(
+    // Drain both queues before sending: a reply left in the response queue (by a validator
+    // that answered a previous engine, or a late answer to a resent state) would otherwise be
+    // read as the answer to this state, and every later reply would pair one state late.
+    if (!ipc::sendFreshRequest(*impl.validatorReqQueue, *impl.validatorResQueue,
             std::span<const char>{std::bit_cast<const char*>(&packedSize), sizeof(packedSize)})) {
         fmt::println("Sending to /{} timed out, retrying...",
             SimulationManager::s_validatorReqMessageQueueName);
@@ -181,6 +224,7 @@ void publishState(Impl& impl)
         return;
     }
     const msgpack::object obj = oh.get();
+    wall.tParse = StepWallClock::clock::now();
 
     // Source/target names are taken from the leading realization; the proxy and
     // exchange are named identically across realizations, so the routed realization
@@ -369,6 +413,8 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
 
     impl.config = MultiAssetConfig::fromXML(root, configPath.parent_path());
     impl.config.sourcePath = configPath;
+    // SimulationManager sets this from its own root, a path a multi-asset run never takes.
+    ::taosim::util::SLTPDebugger::enabled = impl.config.sltpDebug;
 
     // Each run gets its own directory under baseDir (baseDir/<id>), like the single-config
     // scheme: <id> is the wrapper's 'id' attribute or a generated timestamp (stamped back
@@ -489,6 +535,9 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
         impl.validatorResQueue = std::make_unique<ipc::PosixMessageQueue>(
             ipc::PosixMessageQueueDesc{
                 .name = SimulationManager::s_validatorResMessageQueueName.data()});
+        // The queues outlive a killed engine: drop any state or reply it left behind.
+        impl.validatorReqQueue->flush();
+        impl.validatorResQueue->flush();
     }
 
     // Checkpointing: a dedicated write pool (the run pool is parked on the barrier while a
@@ -671,6 +720,12 @@ void MultiAssetSimulationOrchestrator::run()
             // The L3 record IS what publishing consumes, so that is cleared after.
             for (const auto& sim : sims) {
                 sim->clearFilledOrders();
+            }
+            if (impl.config.traceTime) {
+                const auto total = sims.front()->time().current;
+                const auto secs = total / 1'000'000'000;
+                fmt::println("TIME : {:02d}:{:02d}:{:02d}.{:09d}",
+                    secs / 3600, (secs / 60) % 60, secs % 60, total % 1'000'000'000);
             }
             if (publish
                 && impl.simulations.front()->currentTimestamp() >= impl.config.gracePeriod) {

@@ -140,3 +140,28 @@ TEST(LifecycleNotice, WrapperNetworkAttributesAreReadFromTheRoot)
     EXPECT_EQ(cfg.netInfo.readTimeout, 7);
     EXPECT_EQ(cfg.netInfo.connectTimeout, 3) << "an attribute left out keeps its default";
 }
+
+// THE SL/TP TRACER IS A WRAPPER SETTING. SimulationManager reads `sltpDebug` from its own root, but
+// a multi-asset run never builds through that path, so the attribute was dead under the wrapper and
+// in every background file that set it: the 7 October acceptance run could not show the trigger
+// table its SL/TP check needed. The wrapper root carries it now, like the other wrapper settings.
+TEST(LifecycleNotice, WrapperReadsTheSltpTracerFlag)
+{
+    EXPECT_TRUE(wrapperConfig("sltpDebug=\"1\"").sltpDebug);
+    EXPECT_FALSE(wrapperConfig("").sltpDebug) << "off unless the wrapper asks for it";
+}
+
+// THE STEP DIAGNOSTICS ARE WRAPPER SETTINGS TOO. traceTime prints the sim clock each step and
+// measureStepWallClockTime the PROCESSED wall-clock breakdown; SimulationManager reads both from its root,
+// a multi-asset run never builds through it, and the background files that set them were ignored, so a
+// 0.6.3 validator's engine log carried neither line.
+TEST(LifecycleNotice, WrapperReadsTheStepDiagnostics)
+{
+    const auto on = wrapperConfig("traceTime=\"1\" measureStepWallClockTime=\"1\"");
+    EXPECT_TRUE(on.traceTime);
+    EXPECT_TRUE(on.measureStepWallClockTime);
+    const auto off = wrapperConfig("");
+    EXPECT_FALSE(off.traceTime);
+    EXPECT_FALSE(off.measureStepWallClockTime);
+}
+

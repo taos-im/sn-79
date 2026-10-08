@@ -57,6 +57,9 @@ struct MultiAssetConfig
     uint64_t ckptNumLastFilesToKeep{};        // retain only the most recent N checkpoint dirs
     bool ckptMeasureWallClockTime{};          // log per-save wall-clock time
     uint32_t ckptNumWorkers{1};               // dedicated pool size for parallel block writes
+    bool sltpDebug{};                         // the SL/TP tracer; a background's own flag is ignored
+    bool traceTime{};                         // print the sim clock (TIME) each global step
+    bool measureStepWallClockTime{};          // print the per-step PROCESSED wall-clock breakdown
     // Where EVENT_SIMULATION_START/END go: HTTP to host:port + generalMsgEndpoint, as
     // SimulationManager sends them. Empty host or port => offline, nothing is sent.
     net::NetworkingInfo netInfo;

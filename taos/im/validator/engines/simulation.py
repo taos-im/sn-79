@@ -509,10 +509,30 @@ class SimulationEngine(MarketEngine):
         """
         try:
             self.validator.last_response = response
-            packed = msgpack.packb(response, use_bin_type=True)
+            try:
+                packed = msgpack.packb(response, use_bin_type=True)
+            except (OverflowError, ValueError, TypeError) as exc:
+                packed = self._pack_dropping_unencodable(response, exc)
             self._send_bytes(packed)
         except Exception as exc:
             logger.error(f"SimulationEngine.respond error: {exc}")
+
+    def _pack_dropping_unencodable(self, response: dict, exc: Exception) -> bytes:
+        """The step's message with only the instructions the wire can encode: one instruction that cannot be
+        encoded must not cost every other miner its step. The agents whose instructions were dropped are named
+        and counted (response_pack_drops), so a repeat offender is visible."""
+        kept, dropped = [], []
+        for item in response.get("responses", []):
+            try:
+                msgpack.packb(item, use_bin_type=True)
+                kept.append(item)
+            except (OverflowError, ValueError, TypeError):
+                dropped.append(item.get("agentId") if isinstance(item, dict) else None)
+        self.response_pack_drops = getattr(self, "response_pack_drops", 0) + len(dropped)
+        logger.error(
+            f"SimulationEngine.respond: dropped {len(dropped)} instruction(s) the wire cannot encode from agent(s) "
+            f"{sorted({str(a) for a in dropped})} ({type(exc).__name__}: {exc}); {len(kept)} sent")
+        return msgpack.packb({**response, "responses": kept}, use_bin_type=True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # on_start()

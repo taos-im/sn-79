@@ -44,6 +44,7 @@ MultiAssetConfig MultiAssetConfig::fromXML(
         return bgs;
     }();
 
+
     return MultiAssetConfig{
         .backgrounds = std::move(backgrounds),
         .requestedWorkers = node.attribute("threads").as_uint(0),
@@ -73,6 +74,9 @@ MultiAssetConfig MultiAssetConfig::fromXML(
         .ckptNumLastFilesToKeep = node.attribute("ckptNumLastFilesToKeep").as_ullong(0),
         .ckptMeasureWallClockTime = node.attribute("ckptMeasureWallClockTime").as_bool(),
         .ckptNumWorkers = node.attribute("ckptNumWorkers").as_uint(1),
+        .sltpDebug = node.attribute("sltpDebug").as_bool(),
+        .traceTime = node.attribute("traceTime").as_bool(),
+        .measureStepWallClockTime = node.attribute("measureStepWallClockTime").as_bool(),
         // The validator's address for the lifecycle notices, read from the wrapper root
         // with SimulationManager's attribute names and defaults (SimulationManager.cpp
         // fromConfig); a background's own host/port is ignored, as documented.

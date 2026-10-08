@@ -225,7 +225,7 @@
    "orderId": 1,
    "quantity": 1.5
   },
-  "json": "{\"y\":\"c\",\"i\":1,\"t\":null,\"p\":null,\"q\":1.5}"
+  "json": "{\"y\":\"c\",\"i\":1,\"t\":null,\"p\":null,\"q\":1.5,\"s\":null,\"l\":null}"
  },
  "ExchangeConfig": {
   "how": "validate",

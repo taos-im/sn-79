@@ -128,3 +128,19 @@ def test_the_bulk_families_of_the_reporter_are_all_snapshot_backed():
                    'agent_gauges', 'trades', 'miner_trades', 'books'):
         assert f"_SnapshotCollector('{family}'" in src, f"{family} is still an eager Gauge"
     assert "self.exposition.publish(" in inspect.getsource(report.report)
+
+
+def test_the_renderer_needs_no_escaping_api_from_the_client(monkeypatch):
+    """The 6 October testnet deploy served HTTP 500 on every metrics family: the renderer reached for
+    prometheus_client's metric-name escaping API (escape_metric_name, UNDERSCORES, added in 0.22), which the
+    host's older package did not have, and nothing pinned the version the launcher installs. The renderer
+    carries its own escaping, so the same bytes come out whatever the installed client offers."""
+    import prometheus_client.openmetrics.exposition as om
+    regs, _, _ = _registries()
+    expected = b''.join(generate_latest(regs[n]) for n in ORDER)   # the client's own render, taken while it still works
+    for name in ("UNDERSCORES", "ALLOWUTF8", "escape_metric_name", "escape_label_name", "_escape"):
+        if hasattr(om, name):
+            monkeypatch.delattr(om, name)
+    snap = ex.CycleSnapshot(regs, ORDER, step=1, sim_timestamp=5, sim_id='s')
+    body, ranges = snap.render()
+    assert body[len(snap.comment().encode()):] == expected

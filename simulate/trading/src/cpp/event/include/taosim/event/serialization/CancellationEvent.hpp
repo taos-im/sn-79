@@ -54,7 +54,7 @@ struct pack<taosim::event::CancellationEvent>
         msgpack::packer<Stream>& o, const taosim::event::CancellationEvent& v) const
     {
         if constexpr (std::same_as<Stream, taosim::serialization::HumanReadableStream>) {
-            o.pack_map(5);
+            o.pack_map(7);
     
             o.pack("y");
             o.pack("c");
@@ -70,6 +70,10 @@ struct pack<taosim::event::CancellationEvent>
 
             o.pack("q");
             o.pack(v.cancellation.volume);
+            o.pack("s");
+            o.pack(std::to_underlying(v.direction));
+            o.pack("l");
+            o.pack(v.leverage);
         }
         else if constexpr (std::same_as<Stream, taosim::serialization::BinaryStream>) {
             o.pack_map(4);

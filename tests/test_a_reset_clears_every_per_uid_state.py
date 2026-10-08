@@ -66,6 +66,7 @@ EXEMPT = {
     "debeta_floor": "per-round output", "debeta_w_make": "per-round output", "debeta_absent": "per-round, from presence",
     "_debeta_class_shares": "per-round output (the class-mixed pool shares, rebuilt from the accumulators)",
     "_debeta_class_summary": "per-round output (the per-class summary the report publishes)",
+    "_debeta_class_details": "per-round output (the per-class per-uid detail the report publishes as agent_class_gauges)",
     "_debeta_class_map_cache": "layout cache (book to asset class), keyed by the simulation object, not by uid",
     "debeta_presence_shares": "per-round, from presence", "_trading_score_ema_ts": "a timestamp",
     # keyed by book or by trade id, not by uid

@@ -65,6 +65,14 @@ private:
 
 //-------------------------------------------------------------------------
 
+// Sends a request on a request/response queue pair after draining both, so a frame left in
+// either queue (by a killed engine, or by a validator that answered one) can never pair with
+// this request. Call it only before a send, never between a send and its receive.
+bool sendFreshRequest(
+    PosixMessageQueue& req, PosixMessageQueue& res, std::span<const char> msg) noexcept;
+
+//-------------------------------------------------------------------------
+
 }  // namespace taosim::ipc
 
 //-------------------------------------------------------------------------

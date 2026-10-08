@@ -17,7 +17,9 @@ MVTRX_METRICS_SNAPSHOT=0 restores the per-scrape live render. MVTRX_METRICS_MAIN
 without the two bulk registries (agent, trades), which keep their own endpoints; the default, all, keeps
 /metrics complete so a scraper that has not been told about the endpoints sees no gap.
 """
+import functools
 import os
+import re
 import threading
 import time
 
@@ -29,20 +31,61 @@ SNAPSHOT_ENABLED = os.environ.get("MVTRX_METRICS_SNAPSHOT", "1").strip().lower()
 MAIN_MODE = os.environ.get("MVTRX_METRICS_MAIN", "all").strip().lower() or "all"
 
 
+# Name and value escaping as the text exposition writes them: a legacy-valid name goes through unchanged, any other
+# rune becomes an underscore, and a label value escapes backslash, newline and double quote. Written here rather
+# than taken from prometheus_client.openmetrics.exposition, whose escaping functions exist only from 0.22: a host
+# with an older package served HTTP 500 on every metrics family (testnet, 6 October 2026).
+#
+# Speed matters here as much as correctness: a cycle renders a few hundred megabytes, tens of millions of label
+# escapes, in a thread that shares the interpreter with the validator. A per-character check cost four times the
+# client's regex and stalled the testnet validator's metrics server within minutes of its deploy (6 October 2026).
+# Names come from a small fixed set and label values repeat heavily (uids, book ids, wallets), so both are cached;
+# the regex check runs once per distinct name, and a value without a special character is returned as it is.
+_LEGACY_METRIC_NAME = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*$')
+_LEGACY_LABEL_NAME = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+
+def _legacy_rune(ch, i, colon):
+    return ('a' <= ch <= 'z') or ('A' <= ch <= 'Z') or ch == '_' or (colon and ch == ':') or ('0' <= ch <= '9' and i > 0)
+
+
+def _escape_name(name, colon):
+    return ''.join(ch if _legacy_rune(ch, i, colon) else '_' for i, ch in enumerate(name))
+
+
+@functools.lru_cache(maxsize=None)
+def _escape_metric_name(name):
+    return name if _LEGACY_METRIC_NAME.match(name) else _escape_name(name, colon=True)
+
+
+@functools.lru_cache(maxsize=None)
+def _escape_label_name(name):
+    return name if _LEGACY_LABEL_NAME.match(name) else _escape_name(name, colon=False)
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _escape_label_value_str(value):
+    if '\\' in value or '\n' in value or '"' in value:
+        return value.replace('\\', r'\\').replace('\n', r'\n').replace('"', r'\"')
+    return value
+
+
+def _escape_label_value(value):
+    return _escape_label_value_str(value if isinstance(value, str) else str(value))
+
+
 def _sample_line(name, labels, value):
     """One sample line, as generate_latest writes it (legacy names, UTF-8 label values)."""
-    om = _pe.openmetrics
     if labels:
         labelstr = '{' + ','.join(
-            '{}="{}"'.format(om.escape_label_name(k, om.UNDERSCORES), om._escape(v, om.ALLOWUTF8, False))
+            '{}="{}"'.format(_escape_label_name(k), _escape_label_value(v))
             for k, v in sorted(labels.items())) + '}'
     else:
         labelstr = ''
-    return f'{om.escape_metric_name(name, om.UNDERSCORES)}{labelstr} {_pe.floatToGoString(value)}\n'
+    return f'{_escape_metric_name(name)}{labelstr} {_pe.floatToGoString(value)}\n'
 
 
 def _header(name, mtype, documentation):
-    om = _pe.openmetrics
     mname = name
     if mtype == 'counter':
         mname = name + '_total'
@@ -56,8 +99,8 @@ def _header(name, mtype, documentation):
     elif mtype == 'unknown':
         mtype = 'untyped'
     doc = documentation.replace('\\', r'\\').replace('\n', r'\n')
-    return (f'# HELP {om.escape_metric_name(mname, om.UNDERSCORES)} {doc}\n'
-            f'# TYPE {om.escape_metric_name(mname, om.UNDERSCORES)} {mtype}\n')
+    return (f'# HELP {_escape_metric_name(mname)} {doc}\n'
+            f'# TYPE {_escape_metric_name(mname)} {mtype}\n')
 
 
 def render_metric(metric, out):

@@ -217,18 +217,55 @@ def _mark_weight(t):
 
 
 def _weighted_mark(prices, weights):
-    """Size-weighted average over the background-sided prints of a window; the plain average when none is."""
+    """Size-weighted average over the background-sided prints of a window; None when the window holds none.
+
+    There is no plain-average fallback: a window filled with prints arranged between miners would otherwise set
+    the mark a third uid's fill is graded against (reported 7 October 2026: 31 dust prints straddling one fill's
+    horizon took its uid's quality from 0 to 1), and 0.26% of real windows reach an empty window with no attack."""
     tw = sum(weights)
     if tw > 0:
         return sum(p * w for p, w in zip(prices, weights)) / tw
-    return sum(prices) / len(prices)
+    return None
 
 
-def centered_mark(prices, weights, W):
-    """The realized basis's mark at each print: _weighted_mark over the same symmetric window centered_mid uses."""
+MARK_REACH_WINDOWS = 4  # how far, in multiples of W, a mark reaches outward for a background-sided print
+
+
+def _mark_near(prices, weights, i, W, reach):
+    """The mark at print i: the weighted mark of the centered window, widened outward (doubling) to the nearest
+    background-sided prints up to `reach` prints each side; None when none is in reach."""
     n = len(prices)
-    return [_weighted_mark(prices[max(0, i - W):min(n, i + W + 1)], weights[max(0, i - W):min(n, i + W + 1)])
-            for i in range(n)]
+    h = W
+    while True:
+        lo, hi = max(0, i - h), min(n, i + h + 1)
+        m = _weighted_mark(prices[lo:hi], weights[lo:hi])
+        if m is not None or h >= reach or (lo == 0 and hi == n):
+            return m
+        h = min(reach, h * 2)
+
+
+def centered_mark(prices, weights, W, reach=None):
+    """The realized basis's mark at each print: the weighted mark over the symmetric window centered_mid uses,
+    reaching outward to the nearest background-sided prints when that window holds none; None where none is in
+    reach (MARK_REACH_WINDOWS x W prints each side by default)."""
+    n = len(prices)
+    r = int(reach) if reach is not None else MARK_REACH_WINDOWS * W
+    return [_mark_near(prices, weights, i, W, r) for i in range(n)]
+
+
+def _capped_mark(t, mark, cap_mid):
+    """The mark that books the maker's realized spread on this fill clamped to plus or minus its captured spread, so
+    one fill moves a uid's markout quality by at most its own weight (the quality sums over fills before the ratio,
+    and one pumped fill lifted it from 0 to 1 on the 7 October test tape). A fill with no mark in reach books nothing:
+    its mark is its own price."""
+    p, q = float(t["p"]), float(t["q"])
+    if mark is None or q <= 0.0:
+        return p
+    cap = abs((float(cap_mid) - p) * q)
+    realized_buy = (float(mark) - p) * q
+    if abs(realized_buy) <= cap:
+        return float(mark)
+    return p + (cap if realized_buy > 0 else -cap) / q
 
 
 def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts, maker_only=False):
@@ -258,6 +295,19 @@ def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist
 
 CAPTURE_FLUSH_NS = 60_000_000_000  # force-finalize a pending fill after 60 sim-s without W forward prints
 REALIZED_HORIZON_NS_DEFAULT = 20_000_000_000  # realized spread: a fill is marked against the mid this far after it (sim time)
+
+
+def _print_time(t, ts):
+    """A print's own simulation time: the wire event's `t`, an offline record's `ts`, else the batch stamp. The
+    horizon is measured on this clock; `ts` as passed by the caller is the SAMPLED timestamp that keys the windowed
+    histories, and on it every print of a sampling bucket reads alike, so a fill could only mature at the next bucket
+    (found on the 0.6.3 testnet, 6 October 2026)."""
+    v = t.get("t")
+    if v is None:
+        v = t.get("ts")
+    if v is None:
+        return int(ts) if ts is not None else -1
+    return int(v)
 
 
 def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
@@ -323,10 +373,13 @@ def _finalize_realized_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell
             break
         if j is None:
             j = n - 1
-        lo = max(0, j - W) - base
-        hi = min(n, j + W + 1) - base
         wts = st.get("wts") or [0.0] * len(prices)
-        _attribute_capture(buy_sums, sell_sums, book_id, t, _weighted_mark(prices[lo:hi], wts[lo:hi]),
+        mark = _mark_near(prices, wts, j - base, W, MARK_REACH_WINDOWS * W)
+        # the fill's own centered window, the captured basis's mid, bounds how much realized spread it can book
+        fi = max(0, idx - base)
+        cap_lo, cap_hi = max(0, fi - W), min(len(prices), fi + W + 1)
+        cap_mid = sum(prices[cap_lo:cap_hi]) / max(1, cap_hi - cap_lo)
+        _attribute_capture(buy_sums, sell_sums, book_id, t, _capped_mark(t, mark, cap_mid),
                            buy_hist, sell_hist, ts, maker_only=True)
         rpend.pop(0)
 
@@ -335,7 +388,7 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
                             buy_hist=None, sell_hist=None, ts=None,
                             mid_state=None, flush_ns=CAPTURE_FLUSH_NS,
                             real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
-                            horizon_ns=None):
+                            horizon_ns=None, now_ns=None):
     """Accumulate per-uid two-sided spread capture for ONE book's ordered trade batch into
     buy_sums / sell_sums ({uid: {book: cap}}), in place. Each `trade` is dict-like with keys
     p (price), q (quantity), s (side), Ma (maker uid), Ta (taker uid). side==0 => taker buys /
@@ -373,14 +426,14 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
                 continue
             _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts)
         if real_buy_sums is not None:
-            times = [int(t.get("ts")) if t.get("ts") is not None else int(ts or 0) for t in trades]
+            times = [_print_time(t, ts if ts is not None else 0) for t in trades]
             marks = centered_mark(prices, [_mark_weight(t) for t in trades], W)
             for i, t in enumerate(trades):
                 if t.get("Ma", -1) == t.get("Ta", -1):
                     continue
                 k = min(len(times) - 1, bisect.bisect_left(times, times[i] + _h))
-                _attribute_capture(real_buy_sums, real_sell_sums, book_id, t, marks[k], real_buy_hist, real_sell_hist, ts,
-                                   maker_only=True)
+                _attribute_capture(real_buy_sums, real_sell_sums, book_id, t, _capped_mark(t, marks[k], mids[i]),
+                                   real_buy_hist, real_sell_hist, ts, maker_only=True)
         return
     st = mid_state.setdefault(book_id, {"prices": [], "pend": [], "base": 0, "n": 0})
     st.setdefault("rpend", [])
@@ -392,20 +445,24 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
     if len(wts) < len(st["prices"]):
         # carried from before the weighted mark: those prints count as unweighted until they leave the window
         wts[:0] = [0.0] * (len(st["prices"]) - len(wts))
+    # two clocks: `ts` (sampled) keys the windowed histories; the prints' own times and `now` (the update's time)
+    # measure the horizon and the flush grace, so a fill matures when the market has moved on, not when a bucket ends
+    _now = int(now_ns) if now_ns is not None else ts
     for t in trades:
         st["prices"].append(float(t["p"]))
-        times.append(int(ts) if ts is not None else -1)
+        pt = _print_time(t, ts)
+        times.append(pt)
         wts.append(_mark_weight(t))
         if t.get("Ma", -1) != t.get("Ta", -1):
-            st["pend"].append((st["n"], ts, t))
+            st["pend"].append((st["n"], pt, t))
             # only fills with a miner on either side can earn or pay realized spread; background-on-background
             # prints shape the mid but never wait on the queue (it would otherwise hold the horizon's prints twice)
             if real_buy_sums is not None and ((t.get("Ma") or -1) >= 0 or (t.get("Ta") or -1) >= 0):
-                st["rpend"].append((st["n"], ts, t))
+                st["rpend"].append((st["n"], pt, t))
         st["n"] += 1
-    _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, ts, flush_ns)
+    _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, _now, flush_ns)
     if real_buy_sums is not None:
-        _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts, ts, _h, flush_ns)
+        _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts, _now, _h, flush_ns)
         _trim_window(st, W)
 
 
@@ -413,19 +470,21 @@ def flush_capture_state(mid_state, buy_sums, sell_sums, W, *,
                         buy_hist=None, sell_hist=None, ts=None,
                         flush_ns=CAPTURE_FLUSH_NS, force=False,
                         real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
-                        horizon_ns=None):
+                        horizon_ns=None, now_ns=None):
     """Finalize stale pending fills on EVERY book (books with no new trades never reach
     accumulate_book_capture, so the live loop calls this each cycle; force=True drains everything,
     for offline end-of-run and the sim-boundary re-base). With the realized arguments, the realized
-    queue is drained on the same terms (stale after horizon + flush_ns, or forced)."""
+    queue is drained on the same terms (stale after horizon + flush_ns of the update's own clock `now_ns`, or
+    forced); `ts` keys the histories."""
     _h = int(horizon_ns) if horizon_ns else REALIZED_HORIZON_NS_DEFAULT
+    _now = int(now_ns) if now_ns is not None else ts
     for book_id, st in mid_state.items():
         _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
-                        ts, flush_ns, force=force)
+                        _now, flush_ns, force=force)
         if real_buy_sums is not None and st.get("rpend"):
             st.setdefault("times", [])
             _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts,
-                                     ts, _h, flush_ns, force=force)
+                                     _now, _h, flush_ns, force=force)
             _trim_window(st, W)
 
 
