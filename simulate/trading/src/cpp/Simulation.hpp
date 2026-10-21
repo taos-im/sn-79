@@ -175,6 +175,10 @@ public:
     }
     
     virtual const fs::path& logDir() const noexcept override { return m_logDir; }
+    // The run's root, where the validator writes the seed files: a multi-asset realization logs into its
+    // own directory below it. A single-config run's root is its log directory.
+    [[nodiscard]] const fs::path& runDir() const noexcept { return m_runDir.empty() ? m_logDir : m_runDir; }
+    void setRunDir(fs::path dir) { m_runDir = std::move(dir); }
     virtual void receiveMessage(Message::Ptr msg) override;
     virtual void configure(const pugi::xml_node& node) override;
 
@@ -251,6 +255,7 @@ private:
     bool m_debug = false;
     bool m_error = false;
     fs::path m_logDir;
+    fs::path m_runDir;
     taosim::simulation::SimulationConfig m_config2;
     uint32_t m_blockIdx{};
     uint32_t m_blockDim{};

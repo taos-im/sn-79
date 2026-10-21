@@ -60,6 +60,8 @@ struct MultiAssetConfig
     bool sltpDebug{};                         // the SL/TP tracer; a background's own flag is ignored
     bool traceTime{};                         // print the sim clock (TIME) each global step
     bool measureStepWallClockTime{};          // print the per-step PROCESSED wall-clock breakdown
+    bool stopOnRealizationFailure{true};      // a failed realization stops the run at the next barrier;
+                                              // "0" lets the others go on without it
     // Where EVENT_SIMULATION_START/END go: HTTP to host:port + generalMsgEndpoint, as
     // SimulationManager sends them. Empty host or port => offline, nothing is sent.
     net::NetworkingInfo netInfo;

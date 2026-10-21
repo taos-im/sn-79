@@ -102,10 +102,10 @@ def test_empty_map_at_full_replacement_scores_zero_without_resurrecting_kappa(mo
         assert (vd['kappa_values'].get(uid) or {}).get('skipped') is True
 
 
-def test_default_weight_is_zero_legacy_scores_with_decomposition():
-    """No weight configured = the old 'disabled' emissions, but the decomposition still publishes:
-    there is no boolean any more; weight 0.0 is the rehearsal rung (legacy emissions, decomposition published)."""
-    vd = _validator_data(debeta_scores={1: 0.9, 2: 0.9})
+def test_weight_zero_scores_legacy_with_decomposition():
+    """Weight 0.0 is the rehearsal rung: legacy emissions, and the decomposition still publishes (there is no
+    boolean any more). A config without the weight reads the parser's default, the shipped full replacement."""
+    vd = _validator_data(debeta_scores={1: 0.9, 2: 0.9}, weight=0.0)
     trading, _ = reward.score_uids(vd)
     for uid in (1, 2):
         assert trading[uid] != pytest.approx(0.9)

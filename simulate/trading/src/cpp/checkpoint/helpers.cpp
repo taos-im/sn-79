@@ -10,6 +10,7 @@
 #include <range/v3/view/transform.hpp>
 
 #include <taosim/checkpoint/CheckpointError.hpp>
+#include <taosim/checkpoint/CheckpointFormat.hpp>
 #include <taosim/checkpoint/CheckpointManager.hpp>
 #include <taosim/checkpoint/serialization/accounting/AccountRegistry.hpp>
 #include <taosim/checkpoint/serialization/agent/ALGOTraderAgent.hpp>
@@ -735,6 +736,7 @@ LoadedCheckpoint loadCheckpointObjects(const fs::path& ckptDir)
         .common = readObject(
             ckptDir / fmt::format("common{}", CheckpointManager::s_fileExtension))
     };
+    requireReadableFormat(loaded.common.get());
 
     static const std::regex blockCkptPattern{
         fmt::format("^\\d+\\{}$", CheckpointManager::s_fileExtension)};

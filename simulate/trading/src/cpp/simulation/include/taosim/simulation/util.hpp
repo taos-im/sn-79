@@ -7,8 +7,12 @@
 #include <taosim/message/Message.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <vector>
+
+class Simulation;
 
 //-------------------------------------------------------------------------
 
@@ -30,8 +34,9 @@ struct DecanonizeResult
 };
 
 // Uniform blocks of `blockDim` books, the single-config manager's layout: block
-// blockIdx owns canonical ids [blockIdx * blockDim, (blockIdx + 1) * blockDim).
-DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim);
+// blockIdx owns canonical ids [blockIdx * blockDim, (blockIdx + 1) * blockDim), and an id
+// past the last of `blockCount` blocks belongs to none.
+DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim, uint32_t blockCount);
 
 // Realizations of uneven size numbered consecutively, the multi-asset layout:
 // realization i owns canonical ids [bases[i], bases[i] + counts[i]), `bases` ascending
@@ -47,6 +52,11 @@ std::optional<RealizationRoute> routeCanonicalBookId(
 
 DecanonizeResult decanonize(
     Message::Ptr msg, std::span<const uint32_t> bases, std::span<const uint32_t> counts);
+
+// Queues a validator response on the block that owns the book it names, or on every block when it names
+// no book. One naming a book no block owns is dropped with one line.
+void queueValidatorResponse(
+    Message::Ptr response, const std::vector<std::unique_ptr<Simulation>>& blocks, uint32_t blockDim);
 
 }  // namespace taosim::simulation
 

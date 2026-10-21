@@ -388,13 +388,16 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                     // agent and the end event reaches only the lifecycle HTTP, so an agent cannot be
                     // told a simulation started or ended by the route every other event takes.
                     //
-                    // Let exactly the two payload types the fan-out handles
-                    // through -- not everything, because packNotice throws on a payload that is
-                    // neither a response nor one of these two.
-                    const bool lifecycle =
-                        std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                        || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
-                    if (!lifecycle) return false;
+                    // Let exactly the two lifecycle notices the fan-out handles through
+                    // (isLifecycleNotice, by type and payload together) -- not everything, because
+                    // packNotice reads any other notice as an agent's response. Anything else that is
+                    // not a response is dropped, and said so.
+                    if (!taosim::simulation::serialization::isLifecycleNotice(msg)) {
+                        fmt::println(
+                            "PUBLISH : DROPPED A NOTICE OF TYPE '{:.64}' : its payload is not an agent's response",
+                            msg->type);
+                        return false;
+                    }
                     // ONE PER PUBLISH, NOT ONE PER REALIZATION. Every block's proxy queues its own
                     // copy of a global event, so a multi-book wrapper would hand each agent one
                     // identical start and end notice per realization. The agent dispatch calls
@@ -438,10 +441,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
         // final update's notice list. Ordinary notices are unaffected -- their occurrence and arrival
         // are the same timestamp -- so this only moves the two lifecycle events to where they belong.
         auto effectiveTimestamp = [](const Message::Ptr& msg) {
-            const bool lifecycle =
-                std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
-            return lifecycle ? msg->arrival : msg->occurrence;
+            return taosim::simulation::serialization::isLifecycleNotice(msg) ? msg->arrival : msg->occurrence;
         };
         ranges::sort(
             collectiveRemoteResponses,
@@ -457,8 +457,7 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
         const auto remoteResponsesPerAgent = [&] {
             std::map<AgentId, std::vector<NoticeWithOffset>> res;
             for (const auto& notice : collectiveRemoteResponses) {
-                if (std::dynamic_pointer_cast<StartSimulationPayload>(notice.msg->payload) != nullptr
-                    || std::dynamic_pointer_cast<EmptyPayload>(notice.msg->payload) != nullptr) {
+                if (taosim::simulation::serialization::isLifecycleNotice(notice.msg)) {
                     for (auto agentId : views::keys(representativeSimulation->exchange()->accounts())) {
                         if (agentId < 0) continue;
                         res[agentId].push_back(notice);

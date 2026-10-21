@@ -138,7 +138,7 @@ The gradient server can run on the same host as the validator (loopback, no API 
 <div style="page-break-after: always;"></div>
 
 ## Requirements <span id="requirements"><span>
-Requirements are subject to change as the subnet matures and evolves; this section describes the recommended resources to be available for the initial simulation conditions.  We currently run 128 orderbooks in a simulation, in eight markets of sixteen books, each market with its own population of background agents (the 0.6.3 default layout gives them two asset classes; mainnet runs the first class on all 128 until the second arrives at a run boundary), while the aim in the near- to mid-term is to reach 1,000+ simulated orderbooks in order to achieve a meaningful level of statistical significance in the evaluation of results.
+Requirements are subject to change as the subnet matures and evolves; this section describes the recommended resources to be available for the initial simulation conditions.  We currently run 128 orderbooks in a simulation, in eight markets of sixteen books, each market with its own population of background agents (the 0.6.5 default layout, which mainnet runs, gives them three asset classes: four markets of `simulation_0` on books 0 to 63, two of `simulation_1` on books 64 to 95 and two of `simulation_2` on books 96 to 127), while the aim in the near- to mid-term is to reach 1,000+ simulated orderbooks in order to achieve a meaningful level of statistical significance in the evaluation of results.
 
 ### Validator <span id="requirements-validator"><span>
 Validators need to host the C++ simulator as well as the Python validator.  In the early days of the subnet, the number of orderbooks simulated as well as the count and type of background agents will be reduced so as to limit the requirements before the subnet matures and sufficient emissions are gained to justify the expense of hosting more powerful machinery.  Basic requirements:
@@ -164,7 +164,7 @@ In order to separate the basic network logic from the actual trading logic and a
 
 Only some basic agents are immediately included as examples, designed to illustrate the fundamentals of reading the state updates and creating instructions.  We expect miners to develop their own custom logic in order to compete in the subnet, but plan to release additional examples, tools and templates to facilitate implementation of certain common classes of trading strategies.  An overview of the information needed to begin developing strategies is provided [here](agents/README.md).  It is also possible to test agents offline against the background model on your local machine by following [these instructions](agents/proxy/README.md).
 
-Agents serve both the simulation and the exchange from one class. Subclass `FinanceAgent` (or `GenTRXAgent`) and implement `respond(state)`; it is called in both modes, and you can override `respond_exchange` only if you want the exchange to behave differently. If you already run an agent, read [`agents/MIGRATION_0.6.3.md`](agents/MIGRATION_0.6.3.md): on the two-class layout books 96 to 127 have their own price level and minimum order, so read grids and minimums per book. [`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md) covers the exchange interface added in 0.6.0.
+Agents serve both the simulation and the exchange from one class. Subclass `FinanceAgent` (or `GenTRXAgent`) and implement `respond(state)`; it is called in both modes, and you can override `respond_exchange` only if you want the exchange to behave differently. If you already run an agent, read [`agents/MIGRATION_0.6.3.md`](agents/MIGRATION_0.6.3.md): on the 0.6.5 three-class layout each class has its own price level and minimum order, and `simulation_2` (books 96 to 127) its own finer price grid, so read the class, grids and minimums per book rather than from fixed book ranges. [`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md) covers the exchange interface added in 0.6.0.
 
 Miners participating in GenTRX distributed training define their agent by subclassing `GenTRXAgent`, which adds data collection, gradient compression, and S3 upload alongside the standard trading loop.  Example GenTRX-capable agents (`HybridTrainingAgent`, `RandomMakerAgent`, `RandomTakerAgent`) are included in the `agents` directory as starting points.  A guide to overriding the training hooks (`collect_row`, `select_training_files`, `train`) is provided in [`doc/gentrx/integration.md`](doc/gentrx/integration.md).
 
@@ -189,7 +189,7 @@ details announced before it does.
 
 **The exchange interface needs no change to a simulation agent.** Nothing in it requires a change to an agent
 that trades the simulation, and no exchange payload can reach a mainnet miner. See
-[`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md); for the 0.6.3 simulation changes see
+[`agents/MIGRATION_0.6.0.md`](agents/MIGRATION_0.6.0.md); for the multi-class simulation layout (0.6.3, 0.6.5) see
 [`agents/MIGRATION_0.6.3.md`](agents/MIGRATION_0.6.3.md).
 
 **What differs from the simulation.** The interface is shared, but the venue is real, and three differences
@@ -211,7 +211,7 @@ aliases of `BASE`/`QUOTE`).
 |---|---|
 | Writing an exchange agent | [agents/README.md](agents/README.md), section "Exchange venue behaviours that catch people out" |
 | Migrating an existing agent | [agents/MIGRATION_0.6.0.md](agents/MIGRATION_0.6.0.md) |
-| Agents on the two-class layout (0.6.3) | [agents/MIGRATION_0.6.3.md](agents/MIGRATION_0.6.3.md) |
+| Agents on the multi-class layout (0.6.3, 0.6.5) | [agents/MIGRATION_0.6.3.md](agents/MIGRATION_0.6.3.md) |
 | Full agent guide | [agents/README.md](agents/README.md) |
 | Exchange UI | [mvtrx.ai](https://mvtrx.ai) |
 | Market data and terminal | [mvtrx.fi](https://mvtrx.fi) |

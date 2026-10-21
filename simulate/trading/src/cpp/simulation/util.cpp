@@ -4,9 +4,12 @@
  */
 #include <taosim/simulation/util.hpp>
 
+#include "Simulation.hpp"
 #include <taosim/message/ExchangeAgentMessagePayloads.hpp>
 #include <taosim/message/MessagePayload.hpp>
 #include <taosim/message/MultiBookMessagePayloads.hpp>
+
+#include <fmt/core.h>
 
 //-------------------------------------------------------------------------
 
@@ -165,19 +168,23 @@ std::optional<BookId> rewriteBookId(
 
 //-------------------------------------------------------------------------
 
-DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim)
+DecanonizeResult decanonize(Message::Ptr msg, uint32_t blockDim, uint32_t blockCount)
 {
     const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
 
     if (payload == nullptr) return {.msg = msg, .blockIdx = {}};
 
-    const auto bookIdCanon = rewriteBookId(payload, [=](BookId& bookId) -> BookId {
+    std::optional<uint32_t> block;
+    const auto bookIdCanon = rewriteBookId(payload, [&](BookId& bookId) -> BookId {
+        if (bookId / blockDim >= blockCount) return bookId;
+        block = bookId / blockDim;
         return std::exchange(bookId, bookId % blockDim);
     });
 
     return {
         .msg = msg,
-        .blockIdx = bookIdCanon.transform([&](BookId bookId) { return bookId / blockDim; })
+        .blockIdx = block,
+        .unrouted = bookIdCanon.has_value() && !block.has_value()
     };
 }
 
@@ -219,6 +226,26 @@ DecanonizeResult decanonize(
         .blockIdx = realization,
         .unrouted = bookIdCanon.has_value() && !realization.has_value()
     };
+}
+
+//-------------------------------------------------------------------------
+
+void queueValidatorResponse(
+    Message::Ptr response, const std::vector<std::unique_ptr<Simulation>>& blocks, uint32_t blockDim)
+{
+    const auto [msg, blockIdx, unrouted] =
+        decanonize(std::move(response), blockDim, static_cast<uint32_t>(blocks.size()));
+    if (unrouted) {
+        fmt::println("Dropping a validator instruction that names a book no block owns");
+        return;
+    }
+    if (!blockIdx) {
+        for (const auto& block : blocks) {
+            block->queueMessage(msg);
+        }
+        return;
+    }
+    blocks.at(*blockIdx)->queueMessage(msg);
 }
 
 //-------------------------------------------------------------------------

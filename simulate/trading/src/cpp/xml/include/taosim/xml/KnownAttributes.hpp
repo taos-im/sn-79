@@ -29,7 +29,7 @@
 namespace taosim::xml
 {
 
-inline constexpr std::array<std::string_view, 211> kKnownAttributes{{
+inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
     "GBM_X0",
     "GBM_mu",
     "GBM_seed",
@@ -170,6 +170,7 @@ inline constexpr std::array<std::string_view, 211> kKnownAttributes{{
     "scale",
     "scaleR",
     "seed",
+    "seedFile",
     "seedInterval",
     "sensitivityCoef",
     "shape",

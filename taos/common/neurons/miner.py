@@ -40,6 +40,9 @@ from taos.common.agents import SimulationAgent
 from taos.common.protocol import SimulationStateUpdate, EventNotification
 
 
+AXON_KEEP_ALIVE_S = 120
+
+
 class BaseMinerNeuron(BaseNeuron):
     """
     Base class for simulation subnet miners.    
@@ -96,6 +99,9 @@ class BaseMinerNeuron(BaseNeuron):
 
         # The axon handles request processing, allowing validators to send this miner requests.
         self.axon = bt.Axon(wallet=self.wallet, config=self.config, ip=self.config.axon.ip, port=self.config.axon.port, external_ip=self.config.axon.external_ip, external_port=self.config.axon.external_port)
+        # Rounds are about 5.2 s apart and uvicorn closes an idle connection after 5 s, so every round paid a new
+        # handshake; a longer keep-alive lets a validator that reuses its session keep the connection.
+        self.axon.fast_config.timeout_keep_alive = AXON_KEEP_ALIVE_S
 
         # Attach determiners which functions are called when servicing a request.
         bt.logging.info("Attaching forward function to miner axon.")

@@ -333,4 +333,5 @@ class Account(BaseModel):
             l={int(k): Loan.from_json(v) for k, v in json.get("l", {}).items()},
             f=Fees.model_construct(**json["f"]) if json.get("f") else None,
             v=json.get("v"),
+            ds=json.get("ds", {}) or {},
         )

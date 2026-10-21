@@ -1,7 +1,9 @@
 <!--
-  simulation_0 plus simulation_1 in the 96+32 shape: six realizations of simulation_0 (ids 0-95) and two of
-  simulation_1 (ids 96-127), sixteen books each, 128 books in all. Both quote on the same 2/4 grid.
-  The default layout of run_validator.sh; another layout is chosen with -g <name>.
+  THE PUBLISHED DEFAULT LAYOUT, three classes from 0.6.5: four realizations of simulation_0 (books 0-63), two of
+  simulation_1 (64-95) and two of simulation_2 (96-127), sixteen books each, 128 in all; the layout run_validator.sh
+  runs by default. simulation_2.xml is the third class, its own market
+  parameters over simulation_1.xml's step, blocks, checkpoints and logging, on a finer price grid, so it comes last.
+  Book ids run consecutively across the realizations and the coarsest grid comes first, as every layout must.
 -->
 <MultiAssetSimulation
     traceTime="1"
@@ -20,7 +22,8 @@
     ckptNumWorkers="4"
     ckptMeasureWallClockTime="1">
 
-    <Background name="simulation_0" path="simulation_0.xml" instanceCount="6"/>
+    <Background name="simulation_0" path="simulation_0.xml" instanceCount="4"/>
     <Background name="simulation_1" path="simulation_1.xml" instanceCount="2"/>
+    <Background name="simulation_2" path="simulation_2.xml" instanceCount="2"/>
 
 </MultiAssetSimulation>

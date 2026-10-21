@@ -23,7 +23,7 @@ def _dials_the_scorer_reads():
     """Names read off the de-beta config object in reward.py, taken from the source so the test
     tracks the code rather than a list someone remembers to update."""
     src = open("taos/im/validator/reward.py", encoding="utf-8").read()
-    names = set(re.findall(r"getattr\(dcfg,\s*'([a-z0-9_]+)'", src))
+    names = set(re.findall(r"(?:getattr|debeta_dial)\(dcfg,\s*'([a-z0-9_]+)'", src))
     # `dcfg` names two objects in that file; 'debeta' is read off the scoring config to reach the de-beta
     # namespace itself, so it is not a duck field.
     return names - {"debeta"}

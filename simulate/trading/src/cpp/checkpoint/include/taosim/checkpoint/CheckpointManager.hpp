@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string_view>
 
@@ -55,9 +56,15 @@ public:
     // re-minted. That is what makes `taosim -c latest` usable across a deliberate restart.
     void saveCheckpointOnShutdown();
 
+    // Exempts the newest checkpoint in the store from cleanup for good, across restarts, and returns
+    // it; nothing when the store holds none. It stays where it is and keeps its write time, so it is
+    // not taken for the newest checkpoint later on.
+    std::optional<std::filesystem::path> keepLatest();
+
     static constexpr std::string_view s_storeDirName{"ckpt"};
     static constexpr std::string_view s_dirExtension{".ckptd"};
     static constexpr std::string_view s_fileExtension{".ckpt"};
+    static constexpr std::string_view s_keepMarkerName{"keep"};
     static inline const std::regex s_relevantLogFilePattern{R"(((L[23]|fees).*\.log)|(.*\.csv))"};
 
 private:

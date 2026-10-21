@@ -127,11 +127,14 @@ def test_reward_passes_the_dial_and_the_child_config_carries_it():
     reward_src = (DEV / "taos/im/validator/reward.py").read_text()
     shadow_src = (DEV / "taos/im/validator/scoring_shadow.py").read_text()
     config_src = (DEV / "taos/im/config/__init__.py").read_text()
-    assert "making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0)" in reward_src
-    assert "making_floor_scale=_num(getattr(_d, 'making_floor_scale', None), 0.0, float)" in shadow_src, (
+    assert "making_floor_scale=float(debeta_dial(dcfg, 'making_floor_scale'))" in reward_src
+    from types import SimpleNamespace
+    from taos.im.validator.scoring_shadow import _debeta_duck
+    assert _debeta_duck(SimpleNamespace(making_floor_scale=0.25)).making_floor_scale == 0.25, (
         "the CUTOVER child scores from the config duck: a dial missing there is silently off in the "
         "authoritative scorer, and its default must match the config's"
     )
+    assert _debeta_duck(SimpleNamespace()).making_floor_scale == 0.0 and shadow_src
     assert '"--scoring.debeta.making_floor_scale"' in config_src
 
 

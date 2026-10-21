@@ -47,7 +47,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-_MVTRX_DATA_SERVICE_URL = os.environ.get("MVTRX_DATA_SERVICE_URL", "")
+# Set by --data-service-url only: a proxy started for a test inherits whatever environment its shell carries.
+_DATA_SERVICE_URL = ""
 
 
 def _ipc_name(base: str) -> str:
@@ -55,13 +56,15 @@ def _ipc_name(base: str) -> str:
     (lets several sim+proxy pairs coexist on one machine)."""
     return f"/{base}{os.environ.get('TAOSIM_IPC_SUFFIX', '')}"
 
-async def _push_proxy_state_to_mvtrx(state, block: int) -> None:
+async def _push_proxy_state(state, block: int) -> None:
     """Delegate to the optional data-service push module when present."""
+    if not _DATA_SERVICE_URL:
+        return
     try:
         from agents.proxy.mvtrx_push import push_proxy_state as _push
     except ImportError:
         return
-    await _push(state, block, _MVTRX_DATA_SERVICE_URL)
+    await _push(state, block, _DATA_SERVICE_URL)
 
 # GenTRX integration — StatePackager + assignment fetch via GenTRXService
 try:
@@ -264,7 +267,7 @@ class Proxy(Validator):
         agent_responses = set_delays(self, synapse_responses)
         simulator_response = SimulatorResponseBatch(agent_responses).serialize()
         block_time_ns = getattr(getattr(self, 'simulation', None), 'block_time_ns', 12_000_000_000) or 12_000_000_000
-        asyncio.create_task(_push_proxy_state_to_mvtrx(state, state.timestamp // block_time_ns))
+        asyncio.create_task(_push_proxy_state(state, state.timestamp // block_time_ns))
         bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
         return simulator_response
 
@@ -380,15 +383,20 @@ class Proxy(Validator):
                 self.onStart(message['timestamp'], FinanceEventNotification.from_json(message).event)
 
 #--------------------------------------------------------------------------
-if __name__ == "__main__":
+def _parse_args(argv=None):
+    global _DATA_SERVICE_URL
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default="config.json")
     parser.add_argument('--data-service-url', type=str, default=None,
-                        help="Base URL of the MVTRX Data Service for ingest push.")
-    args = parser.parse_args()
-
+                        help="Base URL of a data service to post each state's fills to. No post without it.")
+    args = parser.parse_args(argv)
     if args.data_service_url is not None:
-        _MVTRX_DATA_SERVICE_URL = args.data_service_url
+        _DATA_SERVICE_URL = args.data_service_url
+    return args
+
+
+if __name__ == "__main__":
+    args = _parse_args()
 
     config = json.load(open(args.config))
     app = FastAPI()

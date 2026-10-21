@@ -260,6 +260,32 @@ TEST_F(DistributedResetTest, ResetOfAllRemoteAgentsSparesEveryUnwrappedMessage)
 
 //-------------------------------------------------------------------------
 
+TEST_F(DistributedResetTest, ResetKeepsTheOrderOfMessagesDueAtTheSameTime)
+{
+    configureSimulation();
+    static constexpr Timestamp kDue{5};
+    const auto queueLabelled = [&](std::string label) {
+        simulation->queueMessage(Message::create(
+            Timestamp{}, kDue, kHeartbeatAgentName, kHeartbeatAgentName, std::move(label),
+            MessagePayload::create<EmptyPayload>()));
+    };
+    for (const auto* label : {"1st", "2nd", "3rd", "4th", "5th"}) queueLabelled(label);
+
+    exchange->receiveMessage(makeResetMessage({AgentId{0}}));
+    queueLabelled("6th");
+
+    std::vector<std::string> deliveryOrder;
+    auto& queue = simulation->messageQueue();
+    while (!queue.empty()) {
+        if (queue.top()->arrival == kDue) deliveryOrder.push_back(queue.top()->type);
+        queue.pop();
+    }
+    EXPECT_THAT(deliveryOrder, testing::ElementsAre("1st", "2nd", "3rd", "4th", "5th", "6th"))
+        << "a message queued after the reset overtook ones queued before it";
+}
+
+//-------------------------------------------------------------------------
+
 TEST_F(DistributedResetTest, BackgroundHeartbeatAgentKeepsActingAcrossLowIdReset)
 {
     // Registration happens inside configure (name routing + account), so the agent

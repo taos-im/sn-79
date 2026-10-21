@@ -88,8 +88,8 @@ def test_the_fee_policy_is_published_per_class_on_the_config_row():
 
 
 def test_the_per_class_series_stays_under_the_store_label_cap_with_the_fee_fields():
-    """The store behind the dashboards took the per-class series at 100 labels and refused neuron_info at 150 (6 October
-    2026); the real class configuration with its fee policy must stay well inside that."""
+    """The store behind the dashboards took the per-class series at 100 labels and refused neuron_info at 150; the real
+    class configuration with its fee policy must stay well inside that."""
     from pathlib import Path
     from xml.etree import ElementTree as ET
 

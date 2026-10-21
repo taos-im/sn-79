@@ -66,7 +66,7 @@ struct convert<taosim::process::FundamentalPrice>
             }
             else if (key == "lastSeed") {
                 val.convert(s.lastSeed);
-                v.rng()->seed(s.lastSeed);
+                v.reseed(s.lastSeed);
             }
             else if (key == "lastSeedTime") {
                 val.convert(s.lastSeedTime);

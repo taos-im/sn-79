@@ -159,8 +159,9 @@ def test_debeta_scores_p11_demotes_feeder_maker():
 def _fake_validator(enabled, w_make=0.30, min_books=4):
     from types import SimpleNamespace
 
+    from debeta_isolated import isolated
     debeta_cfg = SimpleNamespace(
-        enabled=enabled, w_make=w_make, centered_window=15, floor_scale=0.5, min_books=min_books
+        **isolated(enabled=enabled, w_make=w_make, centered_window=15, floor_scale=0.5, min_books=min_books)
     )
     self = SimpleNamespace(config=SimpleNamespace(scoring=SimpleNamespace(debeta=debeta_cfg)))
     # Warm accumulators: 6 books, a clean two-sided maker (uid 1) + a one-sided rider (uid 2).

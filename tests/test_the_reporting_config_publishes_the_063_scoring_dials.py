@@ -55,6 +55,12 @@ def _shipped_config():
     return root
 
 
+def _scope(self):
+    """What the payload's expressions see: the validator, its de-beta block read once and the dial reader."""
+    from taos.im.config import debeta_dial
+    return {"self": self, "_dcfg": getattr(self.config.scoring, "debeta", None), "debeta_dial": debeta_dial}
+
+
 def test_the_063_scoring_dials_are_in_the_reporting_config():
     missing = set(EXPECTED) - set(_reporting_scoring_dict())
     assert not missing, f"not published to neuron_info: {sorted(missing)}"
@@ -64,7 +70,7 @@ def test_each_published_value_is_the_shipped_default_and_a_label_can_carry_it():
     entries = _reporting_scoring_dict()
     self = SimpleNamespace(config=_shipped_config())
     for key, want in EXPECTED.items():
-        value = eval(compile(ast.Expression(entries[key]), str(SRC), "eval"), {}, {"self": self})
+        value = eval(compile(ast.Expression(entries[key]), str(SRC), "eval"), {}, _scope(self))
         assert isinstance(value, (str, int, float)), (key, type(value))
         assert value == want, (key, value, want)
 
@@ -73,7 +79,8 @@ def test_an_older_config_without_the_dials_still_publishes():
     entries = _reporting_scoring_dict()
     self = SimpleNamespace(config=SimpleNamespace(scoring=SimpleNamespace(debeta=SimpleNamespace())))
     for key in EXPECTED:
-        value = eval(compile(ast.Expression(entries[key]), str(SRC), "eval"), {}, {"self": self})
+        value = eval(compile(ast.Expression(entries[key]), str(SRC), "eval"), {}, _scope(self))
+        assert value == EXPECTED[key], (key, value, "a dial the config lacks publishes the parser default")
         assert isinstance(value, (str, int, float)), (key, value)
 
 

@@ -114,7 +114,8 @@ MessagePayload::Ptr PayloadFactory::createFromJsonMessage(const rapidjson::Value
 
 //-------------------------------------------------------------------------
 
-MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object& o, std::string_view type)
+MessagePayload::Ptr PayloadFactory::createFromMessagePack(
+    const msgpack::object& o, std::string_view type, UnknownType unknownType)
 {
     using namespace std::literals::string_view_literals;
 
@@ -126,7 +127,8 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
                 *taosim::serialization::msgpackFindMap<AgentId>(o, "agentId"),
                 createFromMessagePack(
                     *taosim::serialization::msgpackFindMapObj(o, "payload"),
-                    type.substr(prefix.size())
+                    type.substr(prefix.size()),
+                    unknownType
                 )
             );
         }
@@ -149,7 +151,8 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
         }
     };
 
-    if (type == "PLACE_ORDER_MARKET") {
+    // A margin call is the market order that closes the called loan.
+    if (type == "PLACE_ORDER_MARKET" || type == "PLACE_ORDER_MARKET_MC") {
         return makePayload.operator()<PlaceOrderMarketPayload>();
     }
     else if (type == "RESPONSE_PLACE_ORDER_MARKET") {
@@ -256,7 +259,7 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(const msgpack::object&
     else if (type == "EVENT_SIMULATION_START" || type == "EVENT_SIMULATION_END") {
         return MessagePayload::create<EmptyPayload>();
     }
-    else {
+    else if (unknownType == UnknownType::EMPTY_PAYLOAD) {
         return MessagePayload::create<EmptyPayload>();
     }
 

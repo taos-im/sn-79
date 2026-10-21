@@ -6,6 +6,7 @@
 
 #include <MultiBookExchangeAgent.hpp>
 #include <Simulation.hpp>
+#include <taosim/checkpoint/CheckpointFormat.hpp>
 #include <taosim/checkpoint/CheckpointManager.hpp>
 #include <taosim/checkpoint/helpers.hpp>
 #include <taosim/filesystem/utils.hpp>
@@ -127,6 +128,7 @@ struct Impl
     std::vector<std::unique_ptr<Simulation>> simulations;      // the N realizations, flat-indexed
     std::vector<uint32_t> bookIdBases;                         // per realization: its first canonical book id
     std::vector<uint32_t> bookCounts;                          // per realization: its book count
+    std::vector<std::string> backgroundNames;                  // per realization: its background's name
     // Validator IPC, populated only when useMessagePack: the request/response message
     // queues that pair with the state/responses shared-memory segments. Channel names
     // are shared with SimulationManager, so one validator serves either run mode.
@@ -136,7 +138,53 @@ struct Impl
     // (not the run pool, which is parked on the per-step barrier when a save is taken).
     std::unique_ptr<boost::asio::thread_pool> ckptPool;
     std::unique_ptr<checkpoint::CheckpointManager> checkpointManager;
+    // Per realization, set when it throws: it is stepped no more and the run goes on without it. A
+    // worker writes only its own cohort's entries; the others are read once every worker has met at
+    // the barrier.
+    std::vector<uint8_t> failed;
+    // Whether the last checkpoint before the run's first failure has been kept (or the failures came
+    // with the checkpoint this run resumed).
+    bool failureHandled{};
 };
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+constexpr std::string_view kFailedRealizationsKey{"failedRealizations"};
+
+// THE RUN'S CLOCK IS THE FIRST REALIZATION STILL STEPPING. All realizations share one grid, so while any
+// is healthy this is the grid time; a failed realization's own clock stops where it failed.
+const Simulation& clockOf(const Impl& impl)
+{
+    for (size_t idx = 0; idx < impl.simulations.size(); ++idx) {
+        if (!impl.failed[idx]) return *impl.simulations[idx];
+    }
+    return *impl.simulations.front();
+}
+
+std::vector<uint32_t> failedRealizations(const Impl& impl)
+{
+    std::vector<uint32_t> out;
+    for (uint32_t idx = 0; idx < impl.failed.size(); ++idx) {
+        if (impl.failed[idx]) out.push_back(idx);
+    }
+    return out;
+}
+
+std::string describe(const std::exception_ptr& error)
+{
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "an exception that is not a std::exception";
+    }
+}
+
+}  // namespace
 
 //-------------------------------------------------------------------------
 // Single-threaded validator round-trip, driven from the per-step barrier completion
@@ -175,9 +223,10 @@ struct StepWallClock
 void publishState(Impl& impl)
 {
     const auto& sims = impl.simulations;
-    const auto now = sims.front()->currentTimestamp();
+    const auto& clock = clockOf(impl);
+    const auto now = clock.currentTimestamp();
     StepWallClock wall{.on = impl.config.measureStepWallClockTime,
-                       .stepNs = sims.front()->time().step, .nowNs = sims.front()->time().current};
+                       .stepNs = clock.time().step, .nowNs = clock.time().current};
 
     taosim::serialization::HumanReadableStream stream{1uz << 27};
     msgpack::pack(stream, serialization::MultiAssetValidatorRequest{
@@ -328,12 +377,19 @@ const ResourceAllocation& MultiAssetSimulationOrchestrator::allocation() const n
 }
 
 //-------------------------------------------------------------------------
-// CheckpointSource. All realizations share one (wrapper-stamped) grid, so the first
+// CheckpointSource. All realizations share one (wrapper-stamped) grid, so the run's clock
 // dates a checkpoint and gates warmup.
 
 bool MultiAssetSimulationOrchestrator::warmingUp() const
 {
-    return m_impl->simulations.front()->currentTimestamp() < m_impl->config.gracePeriod;
+    return clockOf(*m_impl).currentTimestamp() < m_impl->config.gracePeriod;
+}
+
+//-------------------------------------------------------------------------
+
+uint64_t MultiAssetSimulationOrchestrator::checkpointTimestamp() const
+{
+    return clockOf(*m_impl).currentTimestamp();
 }
 
 //-------------------------------------------------------------------------
@@ -353,21 +409,23 @@ boost::asio::thread_pool& MultiAssetSimulationOrchestrator::checkpointExecutor()
 
 //-------------------------------------------------------------------------
 // The "common" state: the shared grid timestamp plus, per realization, the sizes of
-// its log files (each realization keeps its own subdirectory of the run root). The
-// per-book block state is written generically by the CheckpointManager.
+// its log files (each realization keeps its own subdirectory of the run root), and the
+// realizations that have failed, when any has. The per-book block state is written
+// generically by the CheckpointManager.
 
 void MultiAssetSimulationOrchestrator::writeCommonCheckpoint(
     const std::filesystem::path& commonFile) const
 {
     const auto& sims = m_impl->simulations;
+    const auto failed = failedRealizations(*m_impl);
 
     taosim::serialization::BinaryStream stream;
     msgpack::packer packer{stream};
 
-    packer.pack_map(2);
+    packer.pack_map(2 + checkpoint::kFormatKeyCount + (failed.empty() ? 0 : 1));
 
     packer.pack(std::string{"timestamp"});
-    packer.pack(sims.front()->currentTimestamp());
+    packer.pack(clockOf(*m_impl).currentTimestamp());
 
     packer.pack(std::string{"logFileSizes"});
     packer.pack_array(static_cast<uint32_t>(sims.size()));
@@ -386,6 +444,14 @@ void MultiAssetSimulationOrchestrator::writeCommonCheckpoint(
             packer.pack(std::filesystem::file_size(file));
         }
     }
+
+    static constexpr std::array<std::string_view, 1> markedFailures{checkpoint::kFailedRealizationsCapability};
+    if (!failed.empty()) {
+        packer.pack(kFailedRealizationsKey);
+        packer.pack(failed);
+    }
+    checkpoint::packFormat(
+        packer, failed.empty() ? std::span<const std::string_view>{} : std::span{markedFailures});
 
     checkpoint::atomicWrite(commonFile, {stream.data(), stream.size()});
 }
@@ -519,14 +585,17 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
                 ? 0u : impl.bookIdBases.back() + impl.bookCounts.back();
             impl.bookIdBases.push_back(base);
             impl.bookCounts.push_back(bookCount);
+            impl.backgroundNames.push_back(bg.name.empty() ? fmt::format("bg{}", bgIdx) : bg.name);
             auto sim = std::make_unique<Simulation>(
                 flatIdx, bookCount, logDir, &impl.sharedResources[bgIdx]);
             sim->setBookIdBase(base);
+            sim->setRunDir(runRoot);
             sim->configure(adjusted.child("Simulation"));
             impl.simulations.push_back(std::move(sim));
             ++flatIdx;
         }
     }
+    impl.failed.assign(impl.simulations.size(), 0);
 
     // Validator IPC: only when publishing is requested. Channel names are shared with
     // SimulationManager so one validator process serves either run mode (one at a time).
@@ -598,6 +667,21 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
     checkpoint::setupUsingCkptDataMultiAsset(
         impl.simulations, impl.checkpointManager.get(), commonObj, loaded.blocks);
 
+    // A realization that failed before the checkpoint stays stopped: its state is what it held when it
+    // threw, published as it was, never stepped again.
+    if (const auto failedObj = taosim::serialization::msgpackFindMapObj(commonObj, kFailedRealizationsKey)) {
+        for (const auto idx : failedObj->get().as<std::vector<uint32_t>>()) {
+            if (idx >= impl.simulations.size()) {
+                throw MultiAssetError{fmt::format(
+                    "the checkpoint marks realization {} failed, but the run has {}", idx, impl.simulations.size())};
+            }
+            impl.failed[idx] = 1;
+            fmt::println("Realization {} ({}) failed before this checkpoint and stays stopped",
+                idx, impl.simulations[idx]->logDir().filename().c_str());
+        }
+        impl.failureHandled = true;
+    }
+
     fmt::println("Load from checkpoint successful.");
 
     return orchestrator;
@@ -618,8 +702,8 @@ namespace
 // orchestrator has no JSON state path, so a START without ticks would leave the
 // validator waiting for an episode that never arrives. Offline runs send nothing.
 // START is suppressed on a resumed run (state != INACTIVE), as in the single-config
-// path; END is sent only after a clean run, so a failed one never announces itself
-// as finished (the single-config manager sends it unconditionally).
+// path; END is sent only by a run that ran its grid to the end without a stop, so
+// neither a failed run nor a stopped one announces itself as finished.
 
 [[nodiscard]] bool publishesLifecycle(const Impl& impl) noexcept
 {
@@ -641,6 +725,44 @@ void publishStartInfo(const Impl& impl)
     postGeneralMessage(
         *sims.front(), impl.config.netInfo, impl.config.generalMsgEndpoint,
         makeNoticeBatch(notices));
+}
+
+// Kept once, at the first failure: the newest checkpoint then is the last that holds every
+// realization healthy, so a resume from it brings the failed one back.
+void keepTheLastCheckpointBeforeTheFailure(Impl& impl) noexcept
+{
+    if (!impl.checkpointManager) return;
+    try {
+        if (const auto kept = impl.checkpointManager->keepLatest()) {
+            fmt::println("Keeping checkpoint {}, the last before the failure, past the retention bound",
+                kept->c_str());
+        }
+    } catch (const std::exception& e) {
+        fmt::println("Could not keep the last checkpoint before the failure: {}", e.what());
+    }
+}
+
+// The one notice a run stopped by a failed realization sends, before it exits. Sent once and not
+// retried: an engine waiting on a validator that has gone would never exit.
+struct RealizationFailure
+{
+    uint32_t realization{};
+    uint64_t time{};
+    std::string error;
+};
+
+void publishFailureInfo(const Impl& impl, const RealizationFailure& failure) noexcept
+{
+    if (!publishesLifecycle(impl)) return;
+    try {
+        const std::vector notices{makeFailureNotice(
+            failure.realization, impl.backgroundNames.at(failure.realization), failure.time, failure.error)};
+        postGeneralMessage(
+            *impl.simulations.front(), impl.config.netInfo, impl.config.generalMsgEndpoint,
+            makeNoticeBatch(notices), true);
+    } catch (const std::exception& e) {
+        fmt::println("Could not send the failure notice: {}", e.what());
+    }
 }
 
 void publishEndInfo(const Impl& impl)
@@ -713,10 +835,26 @@ void MultiAssetSimulationOrchestrator::run()
     std::signal(SIGINT, onMultiAssetStopSignal);
     std::signal(SIGTERM, onMultiAssetStopSignal);
     std::atomic_bool leaving{false};
+    bool stoppedOnFailure{false};
     boost::asio::thread_pool pool{alloc.workerCount};
     std::barrier barrier{
         static_cast<std::ptrdiff_t>(alloc.workerCount),
-        [&sims, &impl, &leaving, publish]() noexcept {
+        [&sims, &impl, &leaving, &stoppedOnFailure, publish]() noexcept {
+            // A failed realization stops the run here, with nothing published or checkpointed for this
+            // step, unless the run asked to go on without it and some realization is still stepping.
+            if (const auto failures = static_cast<size_t>(std::ranges::count(impl.failed, uint8_t{1}))) {
+                if (!impl.failureHandled) {
+                    impl.failureHandled = true;
+                    keepTheLastCheckpointBeforeTheFailure(impl);
+                }
+                if (impl.config.stopOnRealizationFailure || failures == sims.size()) {
+                    fmt::println("Stopping the run at this step: {} of {} realization(s) failed",
+                        failures, sims.size());
+                    stoppedOnFailure = true;
+                    leaving.store(true, std::memory_order_release);
+                    return;
+                }
+            }
             // Ghosts BEFORE publishing. Filled orders stay in the book as zero-volume
             // ghosts for the exchange service's on-chain reconciliation; nothing in a
             // simulation run reads them, and publishing them left a consumed best level
@@ -727,13 +865,12 @@ void MultiAssetSimulationOrchestrator::run()
                 sim->clearFilledOrders();
             }
             if (impl.config.traceTime) {
-                const auto total = sims.front()->time().current;
+                const auto total = clockOf(impl).time().current;
                 const auto secs = total / 1'000'000'000;
                 fmt::println("TIME : {:02d}:{:02d}:{:02d}.{:09d}",
                     secs / 3600, (secs / 60) % 60, secs % 60, total % 1'000'000'000);
             }
-            if (publish
-                && impl.simulations.front()->currentTimestamp() >= impl.config.gracePeriod) {
+            if (publish && clockOf(impl).currentTimestamp() >= impl.config.gracePeriod) {
                 try {
                     publishState(impl);
                 } catch (const std::exception& e) {
@@ -758,10 +895,37 @@ void MultiAssetSimulationOrchestrator::run()
             }
         }};
 
-    // First worker exception wins; the failing worker drops out of the barrier so
-    // the survivors aren't stranded, and it's rethrown after a clean join.
+    // A REALIZATION THAT THROWS IS STOPPED ON ITS OWN, logged here, once, with its index. Its worker
+    // finishes the step for the rest of its cohort and the barrier completion decides whether the run
+    // goes on. The first such failure is the one a stopped run reports and rethrows after the join.
     std::mutex errorMutex;
     std::exception_ptr firstError;
+    std::optional<RealizationFailure> firstFailure;
+    auto isolate = [&](uint32_t idx, auto&& action) {
+        if (impl.failed[idx]) return;
+        try {
+            action(*sims[idx]);
+        } catch (...) {
+            impl.failed[idx] = 1;
+            const auto error = std::current_exception();
+            const auto what = describe(error);
+            const std::scoped_lock lock{errorMutex};
+            if (!firstError) {
+                firstError = error;
+                firstFailure = RealizationFailure{
+                    .realization = idx, .time = sims[idx]->currentTimestamp(), .error = what};
+            }
+            fmt::println(
+                "REALIZATION FAILED: realization {} ({}) threw at {}: {}; {}",
+                idx, sims[idx]->logDir().filename().c_str(), sims[idx]->currentTimestamp(), what,
+                cfg.stopOnRealizationFailure ? "the run stops at the end of this step"
+                                             : "it stops here and the other realizations keep stepping");
+        }
+    };
+
+    // An exception outside any realization's step still drops its worker out of the barrier, so the
+    // survivors are not stranded, and is rethrown after a clean join.
+    std::exception_ptr workerError;
 
     uint32_t cohortBegin = 0;
     for (uint32_t w = 0; w < alloc.workerCount; ++w) {
@@ -774,26 +938,28 @@ void MultiAssetSimulationOrchestrator::run()
             pool,
             [&, begin, size, stepCount] {
                 try {
-                    const auto cohort = std::span{sims}.subspan(begin, size);
-                    for (const auto& sim : cohort) {
-                        if (sim->state() == taosim::simulation::SimulationState::INACTIVE) {
-                            sim->start();
-                        }
+                    const auto end = begin + size;
+                    for (uint32_t idx = begin; idx < end; ++idx) {
+                        isolate(idx, [](Simulation& sim) {
+                            if (sim.state() == taosim::simulation::SimulationState::INACTIVE) {
+                                sim.start();
+                            }
+                        });
                     }
                     for (uint64_t s = 0; s < stepCount; ++s) {
-                        for (const auto& sim : cohort) {
-                            sim->step();
+                        for (uint32_t idx = begin; idx < end; ++idx) {
+                            isolate(idx, [](Simulation& sim) { sim.step(); });
                         }
                         barrier.arrive_and_wait();
                         if (leaving.load(std::memory_order_acquire)) break;
                     }
-                    for (const auto& sim : cohort) {
-                        sim->stop();
+                    for (uint32_t idx = begin; idx < end; ++idx) {
+                        isolate(idx, [](Simulation& sim) { sim.stop(); });
                     }
                 } catch (...) {
                     {
                         const std::scoped_lock lock{errorMutex};
-                        if (!firstError) firstError = std::current_exception();
+                        if (!workerError) workerError = std::current_exception();
                     }
                     barrier.arrive_and_drop();
                 }
@@ -801,8 +967,21 @@ void MultiAssetSimulationOrchestrator::run()
     }
     pool.join();
 
-    if (firstError) std::rethrow_exception(firstError);
+    if (workerError) std::rethrow_exception(workerError);
 
+    if (stoppedOnFailure) {
+        if (firstFailure) publishFailureInfo(impl, *firstFailure);
+        fmt::println("Stopped after a realization failed; no end notice published");
+        if (firstError) std::rethrow_exception(firstError);
+        throw MultiAssetError{"no realization is left stepping"};
+    }
+    if (leaving.load(std::memory_order_acquire)) {
+        fmt::println("Stopped on request; no end notice published");
+        return;
+    }
+    if (const auto failed = failedRealizations(impl); !failed.empty()) {
+        fmt::println("The run reached its end with {} failed realization(s): {}", failed.size(), fmt::join(failed, ", "));
+    }
     publishEndInfo(impl);
     fmt::println("Multi-asset run complete.");
 }

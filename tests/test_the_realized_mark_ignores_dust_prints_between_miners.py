@@ -1,7 +1,7 @@
 """The realized making basis marks each fill against the centered window around the print 60 simulation seconds
 later. That window is weighted by print size and built from prints with the background market on at least one
-side, so two cooperating miners cannot move the mark with dust prints to each other at the horizon. Since 7 October
-2026 a window with no background print reaches outward to the nearest background-sided prints and a fill with none
+side, so two cooperating miners cannot move the mark with dust prints to each other at the horizon. A window with
+no background print reaches outward to the nearest background-sided prints and a fill with none
 in reach books nothing (there is no plain-average fallback for a burst to fill), and a fill's realized spread is
 clamped to its captured spread, so an honest fill in a flat market books its captured spread and no more."""
 import collections

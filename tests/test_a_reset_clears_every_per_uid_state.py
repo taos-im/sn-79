@@ -37,9 +37,14 @@ CLEARED = {
     # scorer inputs (the scoring child's replicated state)
     "trade_volumes", "volume_sums", "maker_volume_sums", "taker_volume_sums", "self_volume_sums",
     "roundtrip_volumes", "roundtrip_volume_sums", "realized_pnl_history", "agent_pnl_by_book", "agent_pnl_total",
-    "open_positions", "inventory_history", "initial_balances", "recent_miner_trades",
+    "open_positions", "inventory_history", "inventory_quote", "initial_balances", "recent_miner_trades",
     "kappa_values", "kappa_cache", "activity_factors", "pnl_factors",
     "capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_heldn", "debeta_heldinv",
+    # the alternative mark's per-uid leg (0.6.5)
+    "debeta_mtm_alt", "debeta_invsum_alt", "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
+    # the liquidity a maker provides (0.6.5)
+    "debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size",
+    "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
     "debeta_helddrift", "debeta_notional", "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist",
     "debeta_invsum_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
     "debeta_notional_hist", "debeta_cp", "debeta_cp_hist",
@@ -48,13 +53,16 @@ CLEARED = {
     "miner_presence", "_trading_score_ema_pre",
 }
 # book-first per-uid state ({book: {uid: ...}})
-CLEARED_BOOK_FIRST = {"debeta_inv"}
+CLEARED_BOOK_FIRST = {"debeta_inv", "debeta_inv_alt"}
 # class-first per-uid state ({asset class: {maker uid: {taker uid: ...}}}): the counterparty rows kept per class
 CLEARED_CLASS_FIRST = {"debeta_cpc", "debeta_cpc_hist"}
 EXEMPT = {
     # configuration, handles and scalars
     "config": "configuration", "engine": "engine handle", "device": "torch device", "simulation": "config",
     "simulation_config": "the scoring child's copy of the simulation config (skill_bar reads its book count)",
+    # round timing the report publishes: the validator's own clocks, not per-uid state
+    "round_gaps": "wall seconds between states, validator-wide", "query_waits": "the query service's wait per round",
+    "reward_gate_waits": "waits for the reward lock, validator-wide", "_round_clock": "the last state's wall time",
     "simulation_timestamp": "clock", "effective_max_uids": "scalar", "reward_cores": "worker count",
     "subtensor": "chain handle", "metagraph": "chain view", "wallet": "wallet", "uid": "own uid",
     "deregistered_uids": "the reset queue itself",
@@ -73,6 +81,9 @@ EXEMPT = {
     "debeta_invn": "book-keyed", "debeta_invn_hist": "book-keyed", "debeta_drift": "book-keyed",
     "debeta_drift_hist": "book-keyed", "debeta_pfirst": "book-keyed", "debeta_plast": "book-keyed",
     "debeta_mark_state": "book-keyed", "debeta_capture_mid": "book-keyed",
+    "debeta_invn_alt": "book-keyed", "debeta_invn_alt_hist": "book-keyed", "debeta_drift_alt": "book-keyed",
+    "debeta_drift_alt_hist": "book-keyed", "debeta_pfirst_alt": "book-keyed", "debeta_plast_alt": "book-keyed",
+    "debeta_mark_state_alt": "book-keyed",
     "_debeta_seen_tids": "trade-id ledger", "_volume_seen_tids": "trade-id ledger",
     "fee_sums": "not read by the pay path's scoring", "recent_trades": "book-keyed trade tape",
     "_gentrx": "object; its _scores are cleared by handle_deregistration",

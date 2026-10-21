@@ -45,8 +45,8 @@ class FinanceSimulationAIAgent(GenTRXAgent):
         # itself. FinanceAgent.handle is where exchange-mode detection, the
         # respond_simulation/respond_exchange dispatch and UnifiedAgentResponse.finalize() live, so
         # bypassing it makes an AI agent SIMULATION-ONLY by construction, unable to answer an exchange
-        # update at all. It also skipped the SIMULATION/EXCHANGE INSTRUCTIONS logging the acceptance
-        # suite reads, so an AI agent looked silent even when it worked.
+        # update at all. It also skipped the SIMULATION/EXCHANGE INSTRUCTIONS logging that shows what an
+        # agent sent, so an AI agent looked silent even when it worked.
         #
         # The training trigger is the only thing this class genuinely adds, so run it and hand off.
         # super().handle() performs update() itself; doing it here as well would double-update.

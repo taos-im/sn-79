@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include <taosim/checkpoint/CheckpointError.hpp>
+#include <taosim/checkpoint/CheckpointFormat.hpp>
 #include <taosim/checkpoint/helpers.hpp>
 #include <taosim/checkpoint/serialization/helpers.hpp>
 #include <taosim/filesystem/TempPath.hpp>
@@ -127,6 +128,12 @@ void SimulationManager::runSimulations()
     }
     latch.wait();
 
+    // The validator takes the end notice as the end of the run and opens the next one. A stopped run
+    // resumes from its shutdown checkpoint, so it sends none.
+    if (m_leaving) {
+        fmt::println("Stopped on request; no end notice published");
+        return;
+    }
     publishEndInfo();
 }
 
@@ -410,16 +417,10 @@ void SimulationManager::publishStateJson()
     const Timestamp now = reprSimu->currentTimestamp();
 
     for (const auto& response : resJson["responses"].GetArray()) {
-        const auto [msg, blockIdx, unrouted] = decanonize(
+        queueValidatorResponse(
             Message::fromJsonResponse(response, now, reprSimu->proxy()->name()),
+            m_simulations,
             m_blockInfo.dimension);
-        if (!blockIdx) {
-            for (const auto& simulation : m_simulations) {
-                simulation->queueMessage(msg);
-            }
-            continue;
-        }
-        m_simulations.at(*blockIdx)->queueMessage(msg);
     }
 }
 
@@ -683,14 +684,7 @@ void SimulationManager::publishStateMessagePack()
     }
 
     for (const auto& response : unpackedResponses) {
-        const auto [msg, blockIdx, unrouted] = decanonize(response, m_blockInfo.dimension);
-        if (!blockIdx) {
-            for (const auto& simulation : m_simulations) {
-                simulation->queueMessage(msg);
-            }
-            continue;
-        }
-        m_simulations.at(*blockIdx)->queueMessage(msg);
+        queueValidatorResponse(response, m_simulations, m_blockInfo.dimension);
     }
 }
 
@@ -892,6 +886,7 @@ std::unique_ptr<SimulationManager> SimulationManager::fromCheckpoint(
     msgpack::object_handle commonOh =
         msgpack::unpack(commonCkptByteBuffer.data(), commonCkptByteSize);
     msgpack::object commonObj = commonOh.get();
+    checkpoint::requireReadableFormat(commonObj);
 
     // Blocks.
     std::vector<msgpack::object_handle> blockObjHandles;
@@ -1122,13 +1117,14 @@ rapidjson::Document SimulationManager::makeStateJson() const
                     // agent and the end event reaches only the lifecycle HTTP, so an agent cannot be
                     // told a simulation started or ended by the route every other event takes.
                     //
-                    // Let exactly the two payload types the fan-out handles
-                    // through -- not everything, because packNotice throws on a payload that is
-                    // neither a response nor one of these two.
-                    const bool lifecycle =
-                        std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                        || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
-                    if (!lifecycle) return false;
+                    // Let exactly the two lifecycle notices through (isLifecycleNotice, by type and
+                    // payload together); anything else that is not a response is dropped, and said so.
+                    if (!taosim::simulation::serialization::isLifecycleNotice(msg)) {
+                        fmt::println(
+                            "PUBLISH : DROPPED A NOTICE OF TYPE '{:.64}' : its payload is not an agent's response",
+                            msg->type);
+                        return false;
+                    }
                     // ONE PER PUBLISH, NOT ONE PER REALIZATION. Every block's proxy queues its own
                     // copy of a global event, so a multi-book wrapper would hand each agent one
                     // identical start and end notice per realization. The agent dispatch calls

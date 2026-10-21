@@ -667,8 +667,12 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "self_volume_sums", "roundtrip_volume_sums",
         "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
         "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
+        # the alternative mark's leg and the liquidity a maker provides (0.6.5)
+        "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
+        "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
         "debeta_cpc_hist",  # the per-asset-class counterparty rows (0.6.3), after the pooled histories
-        "debeta_invn_hist", "debeta_drift_hist", "debeta_inv", "debeta_plast",
+        "debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_inv", "debeta_plast",
+        "debeta_inv_alt", "debeta_plast_alt",
         "miner_stats",
         "miner_presence",
     ]

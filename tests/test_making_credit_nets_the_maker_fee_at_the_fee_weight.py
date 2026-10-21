@@ -84,6 +84,8 @@ def test_the_dial_ships_at_the_first_step():
 def test_main_and_the_scoring_child_read_the_same_weight_at_every_capture_call():
     trade = (DEV / "taos/im/validator/trade.py").read_text()
     assert trade.count("fee_weight=") >= 3, "the live accumulator, the per-update flush and the boundary flush"
-    shadow = (DEV / "taos/im/validator/scoring_shadow.py").read_text()
-    assert "making_fee_weight=" in shadow, "the child's config carries the dial, or it nets nothing while main does"
+    from types import SimpleNamespace
+    from taos.im.validator.scoring_shadow import _debeta_duck
+    assert _debeta_duck(SimpleNamespace(making_fee_weight=0.01)).making_fee_weight == 0.01, (
+        "the child's config carries the dial, or it nets nothing while main does")
     assert "fee_weight" in inspect.signature(debeta.flush_capture_state).parameters

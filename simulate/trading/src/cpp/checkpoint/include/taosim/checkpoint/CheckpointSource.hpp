@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -31,11 +32,13 @@ struct CheckpointSource
     // Skip checkpointing while the run is still warming up.
     [[nodiscard]] virtual bool warmingUp() const = 0;
 
-    // The per-block simulations to persist (one checkpoint file each); the first also
-    // dates the checkpoint. A "block" is a single-config block or a multi-asset
-    // realization — both are just Simulations.
+    // The per-block simulations to persist (one checkpoint file each). A "block" is a
+    // single-config block or a multi-asset realization; both are just Simulations.
     [[nodiscard]] virtual std::span<const std::unique_ptr<Simulation>>
         checkpointBlocks() const = 0;
+
+    // The grid time a checkpoint is named and dated by; the first block's unless overridden.
+    [[nodiscard]] virtual uint64_t checkpointTimestamp() const;
 
     // Execution context for the parallel per-block writes. Implementations must size it
     // with spare capacity beyond their stepping threads: the writes are posted while the

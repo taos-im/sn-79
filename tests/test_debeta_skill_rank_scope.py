@@ -102,10 +102,13 @@ def test_debeta_scores_whole_reproduces_the_clamp_rule():
 def test_the_dial_reaches_the_scorer_and_the_child_and_defaults_to_positives():
     reward_src = (DEV / "taos/im/validator/reward.py").read_text()
     shadow_src = (DEV / "taos/im/validator/scoring_shadow.py").read_text()
-    assert "skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives')" in reward_src
-    assert "skill_rank_scope=str(_d_scope if (_d_scope := getattr(_d, 'skill_rank_scope', None)) is not None" in shadow_src, (
+    assert "skill_rank_scope=str(debeta_dial(dcfg, 'skill_rank_scope'))" in reward_src
+    from types import SimpleNamespace
+    from taos.im.validator.scoring_shadow import _debeta_duck
+    assert _debeta_duck(SimpleNamespace(skill_rank_scope="all")).skill_rank_scope == "all", (
         "the CUTOVER child scores from the config duck: a dial missing there silently reverts the child"
     )
+    assert shadow_src
     from taos.im.config import add_im_validator_args
     parser = argparse.ArgumentParser()
     add_im_validator_args(object, parser)

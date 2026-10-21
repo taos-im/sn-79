@@ -143,7 +143,10 @@ void SLTPContainer::onOrderTrade(const OnOrderTradeContext& ctx)
     // 2-unit slot on the opposite side; with no prior position the full
     // fill survives and a slot for the whole filled volume is opened.
     auto infoIt = perBook.orderInfo.find(ctx.originatingOrderId);
-    if (infoIt == perBook.orderInfo.end()) return;
+    if (infoIt == perBook.orderInfo.end()) {
+        pruneAgentIfEmpty(perBook, ctx.agentId);
+        return;
+    }
     auto& info = infoIt->second;
 
     if (remaining > 0_dec && (info.stopLoss || info.takeProfit)) {

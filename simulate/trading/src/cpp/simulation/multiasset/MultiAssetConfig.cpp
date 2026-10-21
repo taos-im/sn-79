@@ -77,6 +77,7 @@ MultiAssetConfig MultiAssetConfig::fromXML(
         .sltpDebug = node.attribute("sltpDebug").as_bool(),
         .traceTime = node.attribute("traceTime").as_bool(),
         .measureStepWallClockTime = node.attribute("measureStepWallClockTime").as_bool(),
+        .stopOnRealizationFailure = node.attribute("stopOnRealizationFailure").as_bool(true),
         // The validator's address for the lifecycle notices, read from the wrapper root
         // with SimulationManager's attribute names and defaults (SimulationManager.cpp
         // fromConfig); a background's own host/port is ignored, as documented.

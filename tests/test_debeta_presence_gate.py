@@ -58,9 +58,10 @@ def test_update_stats_records_presence_outcomes():
 def _fake_validator(presence=None, gate=1, window=50, absent=None):
     from taos.im.validator.debeta import accumulate_book_mtm
 
-    cfg = SimpleNamespace(enabled=True, w_make=0.30, centered_window=15, floor_scale=0.0, min_books=1, p11_strength=0.0,
-                          making_floor_scale=0.0, skill_rank_scope="positives", making_rank_scope="positives",
-                          presence_gate=gate, presence_window=window)
+    from debeta_isolated import isolated
+    cfg = SimpleNamespace(**isolated(enabled=True, w_make=0.30, centered_window=15, floor_scale=0.0, min_books=1,
+                                     making_floor_scale=0.0, skill_rank_scope="positives",
+                                     making_rank_scope="positives", presence_gate=gate, presence_window=window))
     v = SimpleNamespace(config=SimpleNamespace(scoring=SimpleNamespace(debeta=cfg)))
     mtm, invsum, invn, inv = defaultdict(dict), defaultdict(dict), {}, defaultdict(dict)
     pf, pl, drift = {}, {}, {}
@@ -135,9 +136,11 @@ def test_the_dials_exist_and_default_on():
 
 
 def test_the_child_config_duck_and_the_frames_carry_the_gate():
+    from taos.im.validator.scoring_shadow import _debeta_duck
+    assert (_debeta_duck(SimpleNamespace()).presence_gate, _debeta_duck(SimpleNamespace()).presence_window) == (1, 50)
+    carried = _debeta_duck(SimpleNamespace(presence_gate=0, presence_window=20))
+    assert (carried.presence_gate, carried.presence_window) == (0, 20)
     shadow_src = (DEV / "taos/im/validator/scoring_shadow.py").read_text()
-    assert "presence_gate=_num(getattr(_d, 'presence_gate', None), 1, int)" in shadow_src
-    assert "presence_window=_num(getattr(_d, 'presence_window', None), 50, int)" in shadow_src
     assert "absent" in shadow_src and "debeta_absent" in shadow_src, "the child scores on the absent set main ships"
     validator_src = (DEV / "taos/im/neurons/validator.py").read_text()
     assert validator_src.count("absent_now(self)") == 2, "main computes the absent set for both the eager and the pull path"

@@ -77,6 +77,11 @@ _DEFERRED_RESTART_CEILING_S = 3600.0
 _END_SAVE_TIMEOUT_S = 30.0
 
 
+def _ipc_name(base: str) -> str:
+    """Name of an engine IPC object, with TAOSIM_IPC_SUFFIX appended as the engine and the proxy do."""
+    return f"/{base}{os.environ.get('TAOSIM_IPC_SUFFIX', '')}"
+
+
 def _network_label(network: str) -> str:
     """Map subtensor network name to a filesystem-safe label."""
     _map = {'local': 'localnet', 'test': 'testnet', 'finney': 'mainnet', 'mainnet': 'mainnet'}
@@ -203,7 +208,7 @@ class SimulationEngine(MarketEngine):
         # ── 4. Open IPC request socket ─────────────────────────────────────────
         import posix_ipc as _posix_ipc
         self._req_socket = _posix_ipc.MessageQueue(
-            "/taosim-req",
+            _ipc_name("taosim-req"),
             flags=_posix_ipc.O_CREAT,
             max_messages=1,
             max_message_size=8,
@@ -1688,7 +1693,7 @@ class SimulationEngine(MarketEngine):
                         pass
                     try:
                         self._req_socket = _pi.MessageQueue(
-                            "/taosim-req",
+                            _ipc_name("taosim-req"),
                             flags=_pi.O_CREAT,
                             max_messages=1,
                             max_message_size=8,
@@ -1705,7 +1710,7 @@ class SimulationEngine(MarketEngine):
         msg, _ = await loop.run_in_executor(None, _mq_recv)
         _t_resume = time.time()
         byte_size = int.from_bytes(msg, byteorder="little")
-        shm_req = _posix_ipc.SharedMemory("/state")
+        shm_req = _posix_ipc.SharedMemory(_ipc_name("state"))
         packed_data = None
         try:
             # Wait for the SHM /state write to be ready, then read it. The
@@ -1780,7 +1785,7 @@ class SimulationEngine(MarketEngine):
         byte_size = len(prev_bytes)
         loop = asyncio.get_event_loop()
         def _read():
-            shm = _posix_ipc.SharedMemory("/state")
+            shm = _posix_ipc.SharedMemory(_ipc_name("state"))
             try:
                 # Flat cap: the old byte_size/100_000 was ~80s for an 8 MB
                 # payload. The loop breaks immediately when the SHM already holds
@@ -1815,9 +1820,9 @@ class SimulationEngine(MarketEngine):
 
         byte_size = len(data)
         mq_res = _posix_ipc.MessageQueue(
-            "/taosim-res", flags=_posix_ipc.O_CREAT, max_messages=1, max_message_size=8
+            _ipc_name("taosim-res"), flags=_posix_ipc.O_CREAT, max_messages=1, max_message_size=8
         )
-        shm_res = _posix_ipc.SharedMemory("/responses", flags=_posix_ipc.O_CREAT, size=byte_size)
+        shm_res = _posix_ipc.SharedMemory(_ipc_name("responses"), flags=_posix_ipc.O_CREAT, size=byte_size)
         with _mmap.mmap(shm_res.fd, byte_size, _mmap.MAP_SHARED, _mmap.PROT_WRITE | _mmap.PROT_READ) as mm:
             shm_res.close_fd()
             mm.write(data)

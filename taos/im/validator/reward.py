@@ -37,6 +37,7 @@ from taos.im.validator.debeta import (markout_quality, absent_uids, book_alphas_
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.protocol.instructions import MAX_INSTRUCTION_DELAY
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
+from taos.im.config import debeta_dial
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -123,7 +124,7 @@ def _outlier_penalty(data):
 def _compute_pnl_factors(uid, pnl_factors, normalized_kappas, config, lookback, simulation_config, realized_pnl_history, lookback_threshold):
     """STEP 5 helper: per-book P&L multipliers. Pure extraction; logic unchanged."""
     pnl_factors_uid = pnl_factors.get(uid, {b: 1.0 for b in normalized_kappas})
-    pnl_impact = config.get('kappa', {}).get('pnl', {}).get('impact', 0.0)
+    pnl_impact = float(config.get('kappa', {}).get('pnl_impact', 0.0) or 0.0)
 
     if pnl_impact > 0:
         # Normalization: 100% DAILY return is the baseline for max boost
@@ -797,7 +798,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
     # nonzero; de-beta is always computed (cheap, and the decomposition must stay visible).
     # An empty de-beta map (warming/exception) renormalizes onto the legacy components.
     _debeta_replace = bool(debeta_map)
-    _debeta_weight = max(0.0, min(1.0, float(debeta_cfg.get('weight', 0.0))))
+    _debeta_weight = max(0.0, min(1.0, float(debeta_dial(debeta_cfg, 'weight'))))
     _kappa_dead = float(config['kappa'].get('weight', 0.0)) <= 0.0
 
     # ===== STEP 1: CALCULATE KAPPA SCORE COMPONENT =====
@@ -940,7 +941,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['making_basis'] = _d.get('making_basis') if _d else None
         uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
         # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
-        for _k in ('skill_other', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
+        for _k in ('skill_other', 'skill_mark_alt', 'skill_net_alpha_mark_alt', 'maker_notional_two_sided', 'at_best_seconds', 'best_size', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
                    'presence_share', 'skill_coverage_factor', 'coverage_books',
                    'skill_p11_factor', 'skill_net_alpha'):
             uid_kappa[_k] = _d.get(_k) if _d else None
@@ -1473,12 +1474,11 @@ def skill_bar(self) -> int:
             n = len(sc.get('book_ids') or []) or int(sc.get('book_count') or 0)
     if not n:
         n = int(getattr(getattr(self, 'simulation', None), 'book_count', 0) or 0)
-    return resolve_skill_min_books(getattr(dcfg, 'skill_min_books', 0),
-                                   getattr(dcfg, 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE), n)
+    return resolve_skill_min_books(debeta_dial(dcfg, 'skill_min_books'), debeta_dial(dcfg, 'skill_min_books_share'), n)
 
 
 def smoothed_skill_share(dcfg, detail, all_uids, class_shares, pool_ema, deregs, ts, halflife, n_snap, last_snap,
-                         scorable):
+                         scorable, skill_min_books=SKILL_MIN_BOOKS_FLOOR):
     """The skill half's share after the track-record EMA, under scoring.debeta.skill_share_ema; None when the dial
     is off or there is no EMA, which leaves pool_pay_vector computing the round's share as before.
 
@@ -1486,12 +1486,12 @@ def smoothed_skill_share(dcfg, detail, all_uids, class_shares, pool_ema, deregs,
     standing gradually rather than all at once; this gives the skill half the same schedule (a copy of the
     pre-round count map and timestamp, as the making vectors use), carried under pool_ema["skill"]. ONE
     implementation for main (get_rewards) and the scoring child (shadow_score)."""
-    if not int((dcfg or {}).get('skill_share_ema', 0) or 0) or not halflife or halflife <= 0:
+    if not int(debeta_dial(dcfg or {}, 'skill_share_ema')) or not halflife or halflife <= 0:
         return None
     if class_shares:
         share = {uid: float(class_shares[1].get(uid, 0.0)) for uid in all_uids}
     else:
-        share = skill_pool_share(detail or {}, all_uids, int((dcfg or {}).get('skill_min_books', 4) or 4))
+        share = skill_pool_share(detail or {}, all_uids, int(skill_min_books))
     st = dict(pool_ema.get("skill") or {})
     smoothed, _ = apply_track_record_ema(dict(share), all_uids, deregs, ts, halflife, st, dict(n_snap), last_snap,
                                          scorable)
@@ -1541,7 +1541,7 @@ def making_basis_sums(self):
     captured, so a misspelt value cannot select a third behaviour. Both pairs are accumulated and published
     whatever the dial says."""
     dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
-    basis = str(getattr(dcfg, 'making_basis', None) or 'captured')
+    basis = str(debeta_dial(dcfg, 'making_basis'))
     cb = getattr(self, 'capture_buy_sums', {}) or {}
     cs = getattr(self, 'capture_sell_sums', {}) or {}
     if basis == 'realized':
@@ -1598,16 +1598,25 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             book_alphas_held_by_book(getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_heldinv', {}),
                                      getattr(self, 'debeta_heldn', {}), getattr(self, 'debeta_helddrift', {})),
             _caps_b, _caps_s)
-        _variant = str(getattr(dcfg, 'skill_variant', None) or 'drift')
+        _variant = str(debeta_dial(dcfg, 'skill_variant'))
         pool_by_book = held_by_book if _variant == 'held' else self.debeta_alphas_by_book
         other_by_book = self.debeta_alphas_by_book if _variant == 'held' else held_by_book
         alphas = {uid: list(by_book.values()) for uid, by_book in pool_by_book.items()}
         floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
         other_floor = median_abs_floor({u: list(b.values()) for u, b in other_by_book.items()}, scale=float(dcfg.floor_scale))
         other_skill = {u: kappa_floored(list(b.values()), other_floor) for u, b in other_by_book.items()}
+        # the alternative mark's skill (scoring.debeta.mark_mode_alt): the paid leg's floor rule and bar on its own
+        # accumulators, published per uid so a change of mark is judged on live data; never paid
+        _alt_mtm = getattr(self, 'debeta_mtm_alt', None) or {}
+        _alt_by_book = (book_alphas_by_book(_alt_mtm, getattr(self, 'debeta_invsum_alt', {}) or {},
+                                            getattr(self, 'debeta_invn_alt', {}) or {}, getattr(self, 'debeta_drift_alt', {}) or {})
+                        if _alt_mtm else {})
+        _alt_floor = median_abs_floor({u: list(b.values()) for u, b in _alt_by_book.items()}, scale=float(dcfg.floor_scale))
+        alt_skill = {u: kappa_floored(list(b.values()), _alt_floor, _bar) for u, b in _alt_by_book.items()}
+        alt_net = {u: sum(float(a) for a in b.values()) for u, b in _alt_by_book.items()}
         # Absolute hurdle on filled notional, and the pool it leaves.
-        _hurdle_bps = float(getattr(dcfg, 'skill_hurdle_bps', 0.0) or 0.0)
-        _hurdle_books = int(getattr(dcfg, 'skill_hurdle_books', 4) or 4)
+        _hurdle_bps = float(debeta_dial(dcfg, 'skill_hurdle_bps'))
+        _hurdle_books = int(debeta_dial(dcfg, 'skill_hurdle_books'))
         kept_by_book = hurdle_filter(pool_by_book, getattr(self, 'debeta_notional', {}) or {}, _hurdle_bps)
         pool_factor = skill_pool_factor(kept_by_book, pool_by_book, _hurdle_books)
         skill_pool = kept_by_book if _hurdle_bps > 0 else pool_by_book
@@ -1620,22 +1629,21 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         _t_start = (_t_end - _lookback) if _t_end is not None else None
         sub3 = book_alphas_by_subwindow(*_hists, _t_start, _t_end, 3) if _t_end is not None and _lookback > 0 else None
         weakest3, _ = subwindow_skill(skill_pool, sub3, 'weakest', 2, floor) if sub3 else ({}, {})
-        _k = int(getattr(dcfg, 'skill_subwindows', 1) or 1)
-        _form = str(getattr(dcfg, 'skill_subwindow_form', None) or 'sign_gated')
-        _agree = int(getattr(dcfg, 'skill_subwindow_min_agree', 2) or 2)
+        _k = int(debeta_dial(dcfg, 'skill_subwindows'))
+        _form = str(debeta_dial(dcfg, 'skill_subwindow_form'))
+        _agree = int(debeta_dial(dcfg, 'skill_subwindow_min_agree'))
         skill_values, sub_info = None, {}
         _hurdle_books_by_uid = None
         if _k > 1 and _t_end is not None and _lookback > 0:
             sub_k = sub3 if _k == 3 else book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k)
-            skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor)
+            skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor, min_books=_bar)
         elif _hurdle_bps > 0:
             skill_values, _hurdle_books_by_uid = hurdle_skill(skill_pool, floor, _bar)
-        _pool_scaling = int(getattr(dcfg, 'skill_pool_scaling', 0) or 0)
-        p11_strength = float(getattr(dcfg, 'p11_strength', 0.0) or 0.0)
-        skill_p11_strength = float(getattr(dcfg, 'skill_p11_strength', 0.0) or 0.0)
-        # getattr default 2: the shipped scope, so an older config duck reproduces 0.6.1 exactly.
-        p11_topk = int(getattr(dcfg, 'p11_topk', 2) or 2)
-        s3_k = float(getattr(dcfg, 's3_k', 0.0) or 0.0)
+        _pool_scaling = int(debeta_dial(dcfg, 'skill_pool_scaling'))
+        p11_strength = float(debeta_dial(dcfg, 'p11_strength'))
+        skill_p11_strength = float(debeta_dial(dcfg, 'skill_p11_strength'))
+        p11_topk = int(debeta_dial(dcfg, 'p11_topk'))
+        s3_k = float(debeta_dial(dcfg, 's3_k'))
         # The counterparty map feeds BOTH discounts. Building it only for the making one meant that
         # with p11_strength 0 the skill-leg factor could never receive a map and silently stayed at
         # 1.0, contradicting the dial's own help text (found by the deployment-conditions suite,
@@ -1657,16 +1665,12 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             cp=cp,
             p11_strength=p11_strength,
             detail=_detail,
-            # getattr with a default: the scoring child's config duck must carry this too (it does),
-            # but an older duck must degrade to no floor, not to an exception fallback.
-            making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
-            skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
-            making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
+            making_floor_scale=float(debeta_dial(dcfg, 'making_floor_scale')),
+            skill_rank_scope=str(debeta_dial(dcfg, 'skill_rank_scope')),
+            making_rank_scope=str(debeta_dial(dcfg, 'making_rank_scope')),
             skill_values=skill_values,
             skill_rank_scale=(pool_factor if _pool_scaling else 1.0),
-            # getattr default 0.0: off reproduces the 0.6.1 leg exactly, and an older config duck
-            # (the scoring child, a test) degrades to off rather than to an exception fallback.
-            skill_max_inactive_books=float(getattr(dcfg, 'skill_max_inactive_books', 0.0) or 0.0),
+            skill_max_inactive_books=float(debeta_dial(dcfg, 'skill_max_inactive_books')),
             skill_min_books=_bar,
             skill_p11_strength=skill_p11_strength,
             p11_topk=p11_topk,
@@ -1679,7 +1683,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         _cap_credit = balanced_reward_per_book(_cb, _cs, sorted(set(_cb) | set(_cs)))
         _q = markout_quality(_cb, _cs, _rb, _rs, sorted(set(_cb) | set(_cs)))
         _real_credit = {u: v * _q.get(u, 0.0) for u, v in _cap_credit.items()}
-        _basis_flag = 1.0 if str(getattr(dcfg, 'making_basis', None) or 'captured') == 'realized' else 0.0
+        _basis_flag = 1.0 if str(debeta_dial(dcfg, 'making_basis')) == 'realized' else 0.0
         for _u in set(_detail) | set(_real_credit) | set(_cap_credit):
             _dd = _detail.setdefault(_u, {})
             _dd['making_realized'] = float(_real_credit.get(_u, 0.0))
@@ -1691,6 +1695,15 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             if _hurdle_books_by_uid is not None:
                 _dd['skill_books'] = int(_hurdle_books_by_uid.get(_u, 0))
             _dd['skill_other'] = float(other_skill.get(_u, 0.0))
+            _dd['skill_mark_alt'] = float(alt_skill.get(_u, 0.0))
+            _dd['skill_net_alpha_mark_alt'] = float(alt_net.get(_u, 0.0))
+            # the liquidity the uid provides (0.6.5): two-sided maker notional, states at the best, size at the best
+            _mbn = (getattr(self, 'debeta_maker_buy_notional', None) or {}).get(_u) or {}
+            _msn = (getattr(self, 'debeta_maker_sell_notional', None) or {}).get(_u) or {}
+            _dd['maker_notional_two_sided'] = float(sum(2.0 * min(float(_mbn.get(b, 0.0)), float(_msn.get(b, 0.0)))
+                                                        for b in set(_mbn) | set(_msn)))
+            _dd['at_best_seconds'] = int(sum(((getattr(self, 'debeta_at_best', None) or {}).get(_u) or {}).values()))
+            _dd['best_size'] = float(sum(((getattr(self, 'debeta_best_size', None) or {}).get(_u) or {}).values()))
             _dd['skill_weakest3'] = float(weakest3.get(_u, 0.0)) if weakest3 else None
             _dd['skill_books_kept'] = int(sub_info[_u]['books']) if _u in sub_info else len(skill_pool.get(_u, {}))
             _dd['skill_pool_factor'] = float(pool_factor)
@@ -1699,8 +1712,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         # cycle (dropped from the map, so the blend reads 0 and scorable is False); its legs stay in
         # the detail with present=False and its accumulators keep running. The scoring child gets the
         # absent set from main with its score inputs (debeta_absent), so both scorers agree.
-        _gate_dial = getattr(dcfg, 'presence_gate', None)
-        _gate = 1 if _gate_dial is None else int(_gate_dial)
+        _gate = int(debeta_dial(dcfg, 'presence_gate'))
         _absent = set()
         if _gate:
             _shipped = getattr(self, 'debeta_absent', None)
@@ -1708,16 +1720,16 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                 _absent = {int(u) for u in _shipped}
             else:
                 _absent = absent_uids(getattr(self, 'miner_presence', {}) or {},
-                                      int(getattr(dcfg, 'presence_window', None) or 50))
+                                      int(debeta_dial(dcfg, 'presence_window') or 50))
         # Graded presence: the success share over the presence window, shipped from main to the child
         # like the absent set. Weighting and the minimum share are dials that default to off.
         _shares = getattr(self, 'debeta_presence_shares', None)
         if _shares is None and _gate:
             _shares = presence_shares(getattr(self, 'miner_presence', {}) or {},
-                                      int(getattr(dcfg, 'presence_window', None) or 50))
+                                      int(debeta_dial(dcfg, 'presence_window') or 50))
         _shares = {int(u): float(v) for u, v in (_shares or {}).items()}
-        _min_share = float(getattr(dcfg, 'presence_min_share', 0.0) or 0.0)
-        _share_weighting = int(getattr(dcfg, 'presence_share_weighting', 0) or 0)
+        _min_share = float(debeta_dial(dcfg, 'presence_min_share'))
+        _share_weighting = int(debeta_dial(dcfg, 'presence_share_weighting'))
         if _gate and _min_share > 0:
             _absent |= {u for u, sh in _shares.items() if sh < _min_share}
         for _u in list(scores):
@@ -1734,7 +1746,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         # stays what the gauges publish. The counterparty map is per uid, not per book, so the P11
         # factor a class run sees is the uid's whole-field factor.
         _cmap = class_map(self)
-        _cw = class_weights_for_layout(getattr(dcfg, 'class_weights', None), _cmap)
+        _cw = class_weights_for_layout(debeta_dial(dcfg, 'class_weights'), _cmap)
         if len(_cw) >= 2 and _cmap:
             _by_class = split_by_class(
                 {u: dict(b) for u, b in _mk_b.items()},
@@ -1743,8 +1755,8 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             _details, _bars = {}, {}
             for _c, _part in _by_class.items():
                 _bars[_c] = resolve_skill_min_books(
-                    getattr(dcfg, 'skill_min_books', 0),
-                    getattr(dcfg, 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE), _part['n_books'])
+                    debeta_dial(dcfg, 'skill_min_books'), debeta_dial(dcfg, 'skill_min_books_share'),
+                    _part['n_books'])
                 _cvals, _ckept = ((hurdle_skill(_part['pool'], floor, _bars[_c]))
                                   if _hurdle_bps > 0 else (None, None))
                 _cd = {}
@@ -1754,11 +1766,11 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                     floor=floor, w_make=float(dcfg.w_make),
                     cp=((getattr(self, 'debeta_cpc', None) or {}).get(_c) or cp), cp_tether=cp,
                     p11_strength=p11_strength, detail=_cd,
-                    making_floor_scale=float(getattr(dcfg, 'making_floor_scale', 0.0) or 0.0),
-                    skill_rank_scope=str(getattr(dcfg, 'skill_rank_scope', None) or 'positives'),
-                    making_rank_scope=str(getattr(dcfg, 'making_rank_scope', None) or 'positives'),
+                    making_floor_scale=float(debeta_dial(dcfg, 'making_floor_scale')),
+                    skill_rank_scope=str(debeta_dial(dcfg, 'skill_rank_scope')),
+                    making_rank_scope=str(debeta_dial(dcfg, 'making_rank_scope')),
                     skill_values=_cvals, skill_rank_scale=1.0,
-                    skill_max_inactive_books=float(getattr(dcfg, 'skill_max_inactive_books', 0.0) or 0.0),
+                    skill_max_inactive_books=float(debeta_dial(dcfg, 'skill_max_inactive_books')),
                     skill_min_books=_bars[_c], skill_p11_strength=skill_p11_strength, p11_topk=p11_topk,
                     s3_k=s3_k,
                 )
@@ -1809,7 +1821,7 @@ def _debeta_fallback_map(self: 'Validator', dcfg, why: str) -> Dict[int, float]:
     """
     weight = 0.0
     try:
-        weight = float(getattr(dcfg, 'weight', 0.0) or 0.0)
+        weight = float(debeta_dial(dcfg, 'weight'))
     except (TypeError, ValueError):
         pass
     last = getattr(self, '_debeta_last', None) or {}
@@ -1841,6 +1853,7 @@ def build_scoring_config(self: 'Validator') -> Dict:
     (scoring_shadow ships this dict to the child), so the two sides can never
     drift on config shape.
     """
+    _dcfg = getattr(self.config.scoring, 'debeta', None)
     return {
         'scoring': {
             'kappa': {
@@ -1864,25 +1877,21 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 }
             },
             'debeta': {
-                'weight': float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0)),
-                'w_make': float(getattr(getattr(self.config.scoring, 'debeta', None), 'w_make', 0.30)),
-                'centered_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 15)),
-                'floor_scale': float(getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.5)),
-                'min_books': int(getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 4)),
-                'p11_strength': float(getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0)),
-                'p11_topk': int(getattr(getattr(self.config.scoring, 'debeta', None), 'p11_topk', 2) or 2),
-                'mark_mode': str(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_mode', 'last') or 'last'),
-                'mark_window': int(getattr(getattr(self.config.scoring, 'debeta', None), 'mark_window', 200) or 200),
-                'making_pool': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_pool', 'rank') or 'rank'),
+                'weight': float(debeta_dial(_dcfg, 'weight')),
+                'w_make': float(debeta_dial(_dcfg, 'w_make')),
+                'centered_window': int(debeta_dial(_dcfg, 'centered_window')),
+                'floor_scale': float(debeta_dial(_dcfg, 'floor_scale')),
+                'min_books': int(debeta_dial(_dcfg, 'min_books')),
+                'p11_strength': float(debeta_dial(_dcfg, 'p11_strength')),
+                'p11_topk': int(debeta_dial(_dcfg, 'p11_topk')),
+                'mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
+                'mark_window': int(debeta_dial(_dcfg, 'mark_window')),
+                'making_pool': str(debeta_dial(_dcfg, 'making_pool')),
                 # resolved here so the scoring child and the pool read the same count as the legs
                 'skill_min_books': skill_bar(self),
-                'skill_min_books_share': float(
-                    getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books_share', SKILL_MIN_BOOKS_SHARE)
-                    or SKILL_MIN_BOOKS_SHARE),
-                'skill_share_ema': int(
-                    getattr(getattr(self.config.scoring, 'debeta', None), 'skill_share_ema', 0) or 0),
-                'class_weights': class_weights_published(
-                    getattr(getattr(self.config.scoring, 'debeta', None), 'class_weights', None)),
+                'skill_min_books_share': float(debeta_dial(_dcfg, 'skill_min_books_share')),
+                'skill_share_ema': int(debeta_dial(_dcfg, 'skill_share_ema')),
+                'class_weights': class_weights_published(debeta_dial(_dcfg, 'class_weights')),
             },
             'gentrx': {
                 'simulation_share': getattr(getattr(self.config.scoring, 'gentrx', None), 'simulation_share', 0.0) or 0.0,
@@ -2177,9 +2186,9 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     # vectors, so a COPY of the pre-call count map and timestamp advances exactly as the real one
     # did. Only the smoothed values carry between rounds, which keeps one state key on the wire.
     _dcfg = (validator_data['config']['scoring'].get('debeta') or {})
-    _pool_mode = str(_dcfg.get('making_pool', 'rank') or 'rank')
-    _w_deb = float(_dcfg.get('weight', 0.0) or 0.0)
-    _w_mk = float(_dcfg.get('w_make', 0.0) or 0.0)
+    _pool_mode = str(debeta_dial(_dcfg, 'making_pool'))
+    _w_deb = float(debeta_dial(_dcfg, 'weight'))
+    _w_mk = float(debeta_dial(_dcfg, 'w_make'))
     _pool = max(0.0, min(1.0, _w_deb * _w_mk))
     # Computed and published under BOTH settings, and its EMA kept warm under both, so the
     # alternative is visible on the dashboards before the dial turns and switching costs no
@@ -2216,12 +2225,12 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     if _ema_hl and _ema_hl > 0 and _pool > 0.0 and _pool_mode == "proportional_both":
         _skill_sm = smoothed_skill_share(_dcfg, validator_data.get('debeta_detail') or {}, all_uids, _class_shares,
                                          _pool_ema, validator_data['deregistered_uids'], _ts, _ema_hl, _n_snap,
-                                         _last_snap, _scorable)
+                                         _last_snap, _scorable, skill_min_books=skill_bar(self))
         if not (_pin and 'trading_ema' in _pin):
             self._debeta_pool_ema = _pool_ema
     distributed_trading = pool_pay_vector(
         _pool_mode, _pool, validator_data.get('debeta_detail') or {}, all_uids, _ladder_scores,
-        trading_uid_scores, _make_share, validator_data['config'], int(_dcfg.get('skill_min_books', 4) or 4),
+        trading_uid_scores, _make_share, validator_data['config'], skill_bar(self),
         class_shares=_class_shares, skill_share=_skill_sm,
     ).to(self.device)
     _prof_pareto = time.perf_counter()

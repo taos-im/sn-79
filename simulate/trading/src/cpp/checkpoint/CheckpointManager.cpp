@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <latch>
 
 //-------------------------------------------------------------------------
@@ -39,6 +40,13 @@ struct Impl
     ssize_t stepCounter{-1};
     std::filesystem::path latestCkptDir;
 };
+
+//-------------------------------------------------------------------------
+
+uint64_t CheckpointSource::checkpointTimestamp() const
+{
+    return checkpointBlocks().front()->currentTimestamp();
+}
 
 //-------------------------------------------------------------------------
 
@@ -122,7 +130,7 @@ void CheckpointManager::saveCheckpointOnShutdown()
 void CheckpointManager::saveCheckpointImpl()
 {
     const auto blocks = m_impl->source->checkpointBlocks();
-    const auto simuTime = blocks.front()->currentTimestamp();
+    const auto simuTime = m_impl->source->checkpointTimestamp();
 
     m_impl->latestCkptDir = m_impl->dir / fmt::format("{}{}", simuTime, s_dirExtension);
     std::filesystem::create_directories(m_impl->latestCkptDir);
@@ -193,9 +201,29 @@ void CheckpointManager::saveCheckpointMeasured()
 
 //-------------------------------------------------------------------------
 
+std::optional<fs::path> CheckpointManager::keepLatest()
+{
+    // The one this run wrote last when there is one: write times a few milliseconds apart can compare
+    // equal, so the store's order alone cannot tell two quick checkpoints apart.
+    fs::path latest = m_impl->latestCkptDir;
+    if (latest.empty() || !fs::is_directory(latest)) {
+        if (!fs::is_directory(m_impl->dir)) return {};
+        const auto dirs = ckptDirsSortedByWriteTime(m_impl->dir);
+        if (dirs.empty()) return {};
+        latest = dirs.back();
+    }
+    const auto writeTime = fs::last_write_time(latest);
+    std::ofstream{latest / s_keepMarkerName};
+    fs::last_write_time(latest, writeTime);
+    return latest;
+}
+
+//-------------------------------------------------------------------------
+
 void CheckpointManager::cleanup()
 {
-    const auto dirs = ckptDirsSortedByWriteTime(m_impl->dir);
+    auto dirs = ckptDirsSortedByWriteTime(m_impl->dir);
+    std::erase_if(dirs, [](const fs::path& dir) { return fs::exists(dir / s_keepMarkerName); });
 
     auto dirsToRemoveView = dirs
         | ranges::views::filter([&](auto&& f) {

@@ -5,8 +5,11 @@
 #include "taosim/decimal/serialization/decimal.hpp"
 #include "taosim/serialization/msgpack/common.hpp"
 
+#include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <utility>
 
 //-------------------------------------------------------------------------
 
@@ -114,5 +117,44 @@ TEST(DecimalDeserialization, AnUnsupportedTypeStillThrows)
     msgpack::object deserialized = oh.get();
     EXPECT_THROW(deserialized.as<decimal_t>(), taosim::serialization::MsgPackError);
 }
+
+//-------------------------------------------------------------------------
+
+// A FLOAT ON THE WIRE IS READ AS THE DECIMAL IT WAS WRITTEN AS: the shortest decimal that converts back
+// to the same double. The double nearest 29.56 lies just below it (29.559999999999998721...), so reading
+// its exact binary value and truncating it lands a whole unit low. A value with more places than the
+// decode keeps is still truncated, and a value a double holds exactly is unchanged.
+
+struct DecimalFloatDeserializationTest : TestWithParam<std::pair<double, decimal_t>>
+{
+};
+
+TEST_P(DecimalFloatDeserializationTest, AFloatOnTheWireDeserializesToTheDecimalItWasWrittenAs)
+{
+    const auto [sent, expected] = GetParam();
+    serialization::HumanReadableStream stream;
+    msgpack::pack(stream, sent);
+    msgpack::object_handle oh = msgpack::unpack(stream.data(), stream.size());
+    msgpack::object deserialized = oh.get();
+
+    ASSERT_EQ(deserialized.type, msgpack::type::FLOAT64);
+    EXPECT_EQ(deserialized.as<decimal_t>(), expected) << fmt::format("sent {:.17g}", sent);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DecimalSerializationTests,
+    DecimalFloatDeserializationTest,
+    Values(
+        std::pair{29.56, DEC(29.56)},
+        std::pair{0.3, DEC(0.3)},
+        std::pair{29.567, DEC(29.567)},
+        std::pair{0.0068359, DEC(0.0068359)},
+        std::pair{-293.497, DEC(-293.497)},
+        std::pair{1e-05, DEC(0.00001)},
+        std::pair{0.123456789, DEC(0.12345678)},
+        std::pair{2.5, DEC(2.5)},
+        std::pair{0.25, DEC(0.25)},
+        std::pair{300.0, DEC(300.0)}
+    ));
 
 //-------------------------------------------------------------------------

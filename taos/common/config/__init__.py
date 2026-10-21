@@ -187,6 +187,14 @@ def add_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--neuron.reuse_connections",
+        action="store_true",
+        help="Keep one session to the miners across rounds, so their connections stay open, instead of a new one "
+             "every round.",
+        default=False,
+    )
+
+    parser.add_argument(
         "--neuron.global_query_timeout",
         type=float,
         help="The hard wall-clock timeout for the entire dendrite query process to complete.",

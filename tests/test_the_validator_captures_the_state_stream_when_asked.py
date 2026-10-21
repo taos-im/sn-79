@@ -44,8 +44,9 @@ def test_a_failing_write_returns_none_instead_of_raising(tmp_path):
 def test_the_validator_captures_every_received_state_before_anything_else_reads_it():
     src = VALIDATOR.read_text()
     receive = src.index("raw_message, normalized_state, receive_start = await self.engine.receive()")
-    call = re.search(r"capture_state\(raw_message, normalized_state\.timestamp\)", src)
-    assert call, "the listener loop does not call capture_state on the received bytes"
+    call = re.search(r"submit_capture\(raw_message, normalized_state\.timestamp\)", src)
+    assert call, "the listener loop does not hand the received bytes to submit_capture (never the synchronous write)"
+    assert not re.search(r"^\s*capture_state\(raw_message", src, flags=re.M), "the listener loop must not write synchronously"
     tee = src.index("self._scoring_shadow.tee(raw_message, normalized_state.timestamp)")
     assert receive < call.start() < tee, "the capture sits between the receive and the shadow tee, so it sees every update"
-    assert re.search(r"^\s*from taos\.im\.validator\.state_capture import capture_state", src, flags=re.M)
+    assert re.search(r"^\s*from taos\.im\.validator\.state_capture import submit_capture", src, flags=re.M)

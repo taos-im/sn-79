@@ -82,7 +82,7 @@ def test_calculate_kappa_score_full_path_regression():
         "interval": 5_000_000_000,
         "max_inactive_books_ratio": 0.375,
         "kappa": {"normalization_min": -2.5, "normalization_max": 2.5,
-                  "lookback": 10800_000_000_000, "pnl": {"impact": 0.5}},
+                  "lookback": 10800_000_000_000, "pnl_impact": 0.5},
         "activity": {"capital_turnover_cap": 10.0, "trade_volume_sampling_interval": 600_000_000_000,
                      "decay_grace_period": 600_000_000_000, "impact": 0.33, "decay_rate": 1.0},
     }
@@ -204,7 +204,7 @@ def test_calculate_kappa_score_present_uid_with_no_books_is_zero():
             "interval": 5_000_000_000,
             "max_inactive_books_ratio": 0.375,
             "kappa": {"normalization_min": 0.0, "normalization_max": 2.0,
-                      "lookback": 10800_000_000_000, "pnl": {"impact": 0.5}},
+                      "lookback": 10800_000_000_000, "pnl_impact": 0.5},
             "activity": {"capital_turnover_cap": 10.0,
                          "trade_volume_sampling_interval": 600_000_000_000,
                          "decay_grace_period": 600_000_000_000, "impact": 0.33,

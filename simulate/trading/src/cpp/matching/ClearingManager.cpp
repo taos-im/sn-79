@@ -162,29 +162,20 @@ bool ClearingManager::handleClosePosition(const ClosePositionDesc &closeDesc)
     const auto& loan = balances.getLoan(orderId);
 
     if (loan.has_value()){
-        decimal_t loanAmount = loan->get().amount();
-        decimal_t settleAmount = volumeToClose.value_or(loanAmount);
-
-        if (loan->get().direction() == OrderDirection::BUY){
-            const auto bestBid = m_exchange->books()[bookId]->bestBid();
-            // No active bid means no price to size the closing sell; report the failure instead of
-            // dispatching an order for an infinite amount.
-            if (bestBid <= 0_dec) {
-                m_exchange->simulation()->logDebug(
-                    "{} | AGENT #{} BOOK {} : CLOSE POSITION OF ORDER #{} HAS NO BID TO PRICE IT",
-                    m_exchange->simulation()->currentTimestamp(), agentId,
-                    m_exchange->simulation()->bookIdCanon(bookId), orderId);
-                return false;
-            }
-            settleAmount = util::roundUp(
-                bestBid * util::roundUp(settleAmount / bestBid, 
-                    m_exchange->config().parameters().baseIncrementDecimals),
-                m_exchange->config().parameters().quoteIncrementDecimals);
+        const auto settleAmount = closeOrderSize(bookId, agentId, loan->get(), volumeToClose);
+        // No active bid means no price to size the closing sell; report the failure instead of
+        // dispatching an order for an infinite amount.
+        if (!settleAmount) {
+            m_exchange->simulation()->logDebug(
+                "{} | AGENT #{} BOOK {} : CLOSE POSITION OF ORDER #{} HAS NO BID TO PRICE IT",
+                m_exchange->simulation()->currentTimestamp(), agentId,
+                m_exchange->simulation()->bookIdCanon(bookId), orderId);
+            return false;
         }
 
         auto orderPayload = MessagePayload::create<PlaceOrderMarketPayload>(
                 loan->get().direction() == OrderDirection::BUY ? OrderDirection::SELL : OrderDirection::BUY,
-                settleAmount,
+                *settleAmount,
                 bookId,
                 loan->get().direction() == OrderDirection::BUY ? Currency::QUOTE : Currency::BASE,
                 std::nullopt,
@@ -219,6 +210,35 @@ bool ClearingManager::handleClosePosition(const ClosePositionDesc &closeDesc)
     }
 
     return true;
+}
+
+//-------------------------------------------------------------------------
+
+std::optional<decimal_t> ClearingManager::closeOrderSize(
+    BookId bookId, AgentId agentId, const accounting::Loan& loan, std::optional<decimal_t> volumeToClose) const
+{
+    const auto& params = m_exchange->config().parameters();
+    const bool closesLong = loan.direction() == OrderDirection::BUY;
+
+    decimal_t size = volumeToClose.value_or(loan.amount());
+    if (size >= loan.amount()) {
+        const auto takerRate = m_feePolicy->getRates(bookId, agentId).taker;
+        size = takerRate > 0_dec
+            ? util::roundUp(
+                loan.amount() / (1_dec - takerRate),
+                closesLong ? params.quoteIncrementDecimals : params.baseIncrementDecimals)
+            : loan.amount();
+    }
+    if (!closesLong) {
+        return size;
+    }
+
+    const auto bestBid = m_exchange->books()[bookId]->bestBid();
+    if (bestBid <= 0_dec) {
+        return std::nullopt;
+    }
+    return util::roundUp(
+        bestBid * util::roundUp(size / bestBid, params.baseIncrementDecimals), params.quoteIncrementDecimals);
 }
 
 //-------------------------------------------------------------------------
@@ -396,6 +416,11 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
             aggressingOrderId)};
     }
     Order::Ptr aggressingOrder = *aggressingOrderIt;
+
+    // A trade by the order that settles a called loan is that call filling.
+    if (const auto settleFlag = aggressingOrder->settleFlag(); std::holds_alternative<OrderID>(settleFlag)) {
+        forgetMarginCallRefusal(aggressingAgentId, bookId, std::get<OrderID>(settleFlag));
+    }
 
     auto fees = m_feePolicy->calculateFees(tradeDesc);
 
@@ -691,12 +716,36 @@ void ClearingManager::removeMarginOrders(
         auto ordersIt = marginOrders.find(amount);
         if (ordersIt == marginOrders.end()) continue;
         auto& orders = ordersIt->second;
-        std::erase_if(
-            orders, [orderId](const auto& order) { return order.orderId == orderId; });
+        std::erase_if(orders, [&](const auto& order) {
+            if (order.orderId != orderId) return false;
+            forgetMarginCallRefusal(order.agentId, bookId, orderId);
+            return true;
+        });
         if (orders.empty()) {
             marginOrders.erase(ordersIt);
         }
     }
+}
+
+//-------------------------------------------------------------------------
+
+bool ClearingManager::firstMarginCallRefusal(AgentId agentId, BookId bookId, OrderID loanId)
+{
+    return m_refusedMarginCalls.emplace(agentId, bookId, loanId).second;
+}
+
+//-------------------------------------------------------------------------
+
+void ClearingManager::forgetMarginCallRefusal(AgentId agentId, BookId bookId, OrderID loanId) noexcept
+{
+    m_refusedMarginCalls.erase({agentId, bookId, loanId});
+}
+
+//-------------------------------------------------------------------------
+
+void ClearingManager::forgetMarginCallRefusals(AgentId agentId) noexcept
+{
+    std::erase_if(m_refusedMarginCalls, [agentId](const auto& key) { return std::get<0>(key) == agentId; });
 }
 
 //-------------------------------------------------------------------------

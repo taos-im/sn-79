@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <taosim/checkpoint/CheckpointFormat.hpp>
 #include <taosim/checkpoint/SimulatorState.hpp>
 #include <taosim/xml/helpers.hpp>
 #include <taosim/checkpoint/serialization/accounting/AccountRegistry.hpp>
@@ -182,13 +183,15 @@ void packLogFileSizes(auto& o, const taosim::simulation::SimulationManager& simu
 
 void packCommon(auto& o, const taosim::simulation::SimulationManager* simuMngr)
 {
-    o.pack_map(2);
+    o.pack_map(2 + kFormatKeyCount);
 
     o.pack("timestamp");
     o.pack(simuMngr->simulations().front()->currentTimestamp());
 
     o.pack("logFileSizes");
     packLogFileSizes(o, *simuMngr);
+
+    packFormat(o, {});
 }
 
 //-------------------------------------------------------------------------

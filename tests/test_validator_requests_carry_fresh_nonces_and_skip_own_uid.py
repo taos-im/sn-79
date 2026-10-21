@@ -228,7 +228,9 @@ def test_query_miners_drops_own_uid_in_both_modes(monkeypatch, engine_mode):
     svc = SimpleNamespace(
         wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address=VALIDATOR_HOTKEY)),
         dendrite=SimpleNamespace(_session=None),
+        config=SimpleNamespace(neuron=SimpleNamespace(reuse_connections=False)),
     )
+    svc._round_dendrite = lambda: QueryService._round_dendrite(svc)
     request = {
         "engine_mode": engine_mode,
         "uid": 0,

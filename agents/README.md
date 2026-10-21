@@ -7,8 +7,10 @@ This document aims to provide some clarification and guidelines to assist miners
 > working in the simulation. See [MIGRATION_0.6.0.md](MIGRATION_0.6.0.md) for why, and for the steps to trade the
 > exchange as well.
 >
-> **On 0.6.3?** The simulation carries two asset classes, and books 96 to 127 have their own price level and
-> minimum order. Read grids and minimums per book; see [MIGRATION_0.6.3.md](MIGRATION_0.6.3.md).
+> **On 0.6.5?** The default layout carries three asset classes: books 0 to 63 are `simulation_0`, books 64 to
+> 95 `simulation_1` and books 96 to 127 `simulation_2`, a higher-priced class on a finer price grid. Each class
+> has its own price level and minimum order. Read the class, grids and minimums per book, not from fixed book
+> ranges; see [MIGRATION_0.6.3.md](MIGRATION_0.6.3.md).
 
 ---
 
@@ -351,9 +353,9 @@ if quantity < min_size:
 ```
 
 `min_order_size` is `0.0` only when a book sets no minimum. Shipped configurations set it per asset
-class, 0.25 on `simulation_0` and 2.5364 on `simulation_1`, so an agent that hardcodes a small fixed
-quantity, or reads the top-level `state.config.min_order_size`, can have every order rejected on one
-class while trading normally on the other. Size against the value for the book in hand.
+class, 0.25 on `simulation_0`, 2.5364 on `simulation_1` and 0.2396 on `simulation_2`, so an agent that
+hardcodes a small fixed quantity, or reads the top-level `state.config.min_order_size`, can have every order
+rejected on one class while trading normally on another. Size against the value for the book in hand.
 
 ---
 
@@ -691,7 +693,7 @@ The trading pool is paid in two equal halves.
 
 **Making** pays for liquidity. Each maker fill earns the spread it captured against the centred mid, and the credit on a book is twice the smaller of its buy and sell sides, so only two-sided making counts. From 0.6.3 that credit is scaled by markout quality, the share of the spread the fills still hold 20 simulation seconds later, so quotes the market runs over earn nothing. Credit concentrated on a few counterparties is discounted, and from 0.6.3 a maker's credit is scaled down when its fills against other miners exceed four times its fills against the background market. The half is paid in proportion to each miner's credit.
 
-**Skill** pays for trading profit the market's drift does not explain. On each book the agent's mark-to-market P&L is reduced by its average inventory times the book's price move; what remains is its alpha, and a book counts once its alpha clears a small hurdle relative to the notional traded there. An agent qualifies when its alpha is consistently positive across books, measured by a downside-adjusted consistency ratio, on at least the required number of books (a share of the books scored: 20 of 128 on a single market; from 0.6.3, 15 of the 96 `simulation_0` books and 5 of the 32 `simulation_1` books). Qualifying agents share the half in proportion to their net alpha, after the same counterparty discount.
+**Skill** pays for trading profit the market's drift does not explain. On each book the agent's mark-to-market P&L is reduced by its average inventory times the book's price move; what remains is its alpha, and a book counts once its alpha clears a small hurdle relative to the notional traded there. An agent qualifies when its alpha is consistently positive across books, measured by a downside-adjusted consistency ratio, on at least the required number of books (a share of the books scored: 20 of 128 on a single market; on the 0.6.5 layout, 10 of the 64 `simulation_0` books and 5 of the 32 books in each of `simulation_1` and `simulation_2`). Qualifying agents share the half in proportion to their net alpha, after the same counterparty discount.
 
 The trading score is smoothed over a track record of about three simulated hours, an agent that stops answering validators is not scored until it answers again, and from 0.6.3 each asset class is paid through its own share. The rules are stated in the dial help of the [validator config](../taos/im/config/__init__.py) and implemented in the [rewarding logic](../taos/im/validator/reward.py) and the [de-beta module](../taos/im/validator/debeta.py).
 

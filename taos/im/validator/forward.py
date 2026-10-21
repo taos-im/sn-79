@@ -24,7 +24,6 @@ Validator forward pass: IPC-based query dispatch and miner notification helpers.
 import os
 import time
 import bittensor as bt
-import uvloop
 import asyncio
 import posix_ipc
 import struct
@@ -39,7 +38,41 @@ from taos.im.protocol.instructions import *
 from taos.im.validator.reward import set_delays
 from taos.im.utils import duration_from_timestamp
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+_PLACEMENT_ANSWERS = frozenset({"RDPOL", "RDPOM", "ERDPOL", "ERDPOM"})
+
+
+def update_placement_stats(self: Validator, notices: dict | None) -> None:
+    """Counts each miner's limit and market placements the engine answered in a state, accepted and refused, into its
+    request stats, so they publish and reset with them per block; a refusal for CONTRACT_VIOLATION (post-only, time
+    in force) is also counted apart."""
+    for uid, uid_notices in (notices or {}).items():
+        st = self.miner_stats.setdefault(uid, {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0,
+                                               'call_time': []})
+        for n in uid_notices or ():
+            y = n.get('y') if isinstance(n, dict) else getattr(n, 'y', None)
+            if y not in _PLACEMENT_ANSWERS:
+                continue
+            if y.startswith('E'):
+                st['refused'] = st.get('refused', 0) + 1
+                m = n.get('m') if isinstance(n, dict) else getattr(n, 'm', '')
+                if 'CONTRACT_VIOLATION' in str(m or ''):
+                    st['refused_contract'] = st.get('refused_contract', 0) + 1
+            else:
+                st['placed'] = st.get('placed', 0) + 1
+
+
+def update_query_wait(self: Validator, result: dict | None) -> None:
+    """Records the query service's wait for the round (dispatch to the last answer, or the global timeout), one of the
+    round timing gauges the report publishes; the list keeps the last thousand rounds."""
+    wait = ((result or {}).get('validation_stats') or {}).get('wait')
+    if wait is None:
+        return
+    waits = getattr(self, 'query_waits', None)
+    if waits is None:
+        waits = self.query_waits = []
+    waits.append(float(wait))
+    del waits[:-1000]
+
 
 def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpdate]) -> None:
     """
@@ -335,6 +368,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         synapse_responses = result['responses']
         
         bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
+        update_query_wait(self, result)
         
         start = time.time()
         update_stats(self, synapse_responses)

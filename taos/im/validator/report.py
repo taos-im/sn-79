@@ -27,6 +27,7 @@ from taos.im.protocol.events import TradeEvent
 
 from taos.common.utils.prometheus import prometheus
 from taos.im.utils import duration_from_timestamp
+from taos.im.config import debeta_dial
 from taos.im.validator.ingest_payload import kappa_maps, debeta_maps, scoring_params
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import GaugeMetricFamily
@@ -334,7 +335,7 @@ class ReportingService:
         # Read ONCE at init, not per book: this is checked inside a 259x128 loop, so a getattr
         # chain through the config there would run ~33k times a cycle for a constant.
         _sc = getattr(getattr(self, 'config', None), 'scoring', None)
-        self._debeta_book_gauges = bool(getattr(getattr(_sc, 'debeta', None), 'publish_book_gauges', False))
+        self._debeta_book_gauges = bool(debeta_dial(getattr(_sc, 'debeta', None), 'publish_book_gauges'))
 
         self.prometheus_counters = Counter('counters', 'Counter summaries for the running validator.', ['wallet', 'netuid', 'sim_id', 'timestamp', 'counter_name'], registry=self.registry_validator)
         # simulation_gauges, miner_gauges and book_gauges are snapshot-backed since 30 September 2026 (carry
@@ -690,6 +691,7 @@ class ReportingService:
         self.fee_sums = deserialize_to_nested_dict(data.get('fee_sums', {}))
         self.roundtrip_volume_sums = deserialize_to_nested_dict(data['roundtrip_volume_sums'])
         self.inventory_history = data['inventory_history']
+        self.inventory_quote = data.get('inventory_quote') or {}
 
         self.total_realized_pnl = {
             int(uid): pnl for uid, pnl in data['total_realized_pnl'].items()
@@ -708,13 +710,19 @@ class ReportingService:
                     'step_rates', 'fundamental_price', 'shared_state_rewarding',
                     'current_block', 'uid', 'metagraph_data', 'validator_config']:
             setattr(self, key, data[key])
+        self.round_gaps = list(data.get('round_gaps') or [])
+        self.query_waits = list(data.get('query_waits') or [])
+        self.reward_gate_waits = list(data.get('reward_gate_waits') or [])
+        self.pending_reward_tasks = int(data.get('pending_reward_tasks') or 0)
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
         self.debeta_class_details = {int(c): {int(u): dict(d) for u, d in (v or {}).items()}
                                      for c, v in (data.get('debeta_class_details') or {}).items()}
         self.capture_floor_stats = {int(b): dict(v) for b, v in (data.get('capture_floor_stats') or {}).items()}
+        self.capture_settle_by_class = {int(c): dict(v) for c, v in (data.get('capture_settle_by_class') or {}).items()}
         self.scoring_shadow_health = data.get('scoring_shadow')
         self.history_clock = data.get('history_clock')
+        self.exchange_settlement = data.get('exchange_settlement')
 
         def _int_keyed_books(d):
             """IPC serialization stringifies keys; the book-gauge block indexes by int uid/book."""
@@ -971,13 +979,25 @@ def publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid):
 
 def publish_capture_floor_gauges(self, updates, wallet_addr, netuid, simid):
     """book_gauges capture_floor and capture_dust_share: the dust floor's level per book and the share of the live
-    capture window's prints it excludes, the quantity the board monitor flags and the acceptance rows assert."""
+    capture window's prints it excludes."""
     coll = getattr(self, 'prometheus_book_gauges', None)
     for _book, _st in (getattr(self, 'capture_floor_stats', None) or {}).items():
         for _key, _gauge in (("floor", "capture_floor"), ("dust_share", "capture_dust_share")):
             _v = (_st or {}).get(_key)
             if _v is not None:
                 updates.append((coll, float(_v), wallet_addr, netuid, simid, int(_book), 0, _gauge))
+
+
+
+def publish_capture_settle_gauges(self, updates, wallet_addr, netuid, simid):
+    """class_gauges capture_full, capture_cut and capture_cut_share: per asset class, the capture fills settled with a
+    complete forward side, those settled cut, and the cut share."""
+    names = class_names(getattr(self, 'simulation', None))
+    for _cls, _row in (getattr(self, 'capture_settle_by_class', None) or {}).items():
+        label = names.get(int(_cls), str(_cls))
+        for _key, _gauge in (("full", "capture_full"), ("cut", "capture_cut"), ("cut_share", "capture_cut_share")):
+            updates.append((self.prometheus_class_gauges, float(_row.get(_key, 0.0)), wallet_addr, netuid, simid,
+                            label, _gauge))
 
 
 def neuron_info_labels(self) -> dict:
@@ -1023,6 +1043,59 @@ def publish_simulation_config_info(self):
                                   sim_id=self.simulation.simulation_id, book_id=str(b), asset_class=name).set(1)
 
 
+def round_quantile(values, q):
+    """The inclusive quantile, as the metrics store's quantile() computes it, so a live read and a baseline drawn from
+    the store agree; None of nothing."""
+    v = sorted(values)
+    if not v:
+        return None
+    if len(v) == 1:
+        return v[0]
+    rank = q * (len(v) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (rank - lo) * (v[hi] - v[lo])
+
+
+def round_block_gauges(ms) -> list:
+    """A uid's published block of rounds as (gauge, value): the counts, the mean response time of the answered rounds
+    and, from 0.6.5, the block's 5th percentile (the uid's floor) and median, which the round lines read."""
+    times = ms.get('call_time') or []
+    return [
+        ("requests", ms['requests']),
+        ("success", ms['requests'] - ms['failures'] - ms['timeouts'] - ms['rejections']),
+        ("failures", ms['failures']),
+        ("timeouts", ms['timeouts']),
+        ("rejections", ms['rejections']),
+        ("call_time", (sum(times) / len(times)) if times else 0),
+        ("call_time_p5", round_quantile(times, 0.05) if times else 0),
+        ("call_time_median", round_quantile(times, 0.5) if times else 0),
+        ("placed", ms.get('placed', 0)),
+        ("refused", ms.get('refused', 0)),
+        ("refused_contract", ms.get('refused_contract', 0)),
+    ]
+
+
+def round_timing_gauges(self) -> list:
+    """The validator's round timing over its last published rounds, as (gauge, value): the round period's 5th
+    percentile, median and 95th percentile (wall seconds between consecutive states), the query wait's median and 95th
+    percentile (dispatch to the last answer or the global timeout), the longest wait for the reward lock and the reward
+    tasks pending. The lists travel in the report payload; an older payload publishes only the pending count."""
+    out = []
+    gaps = list(getattr(self, 'round_gaps', None) or [])
+    if gaps:
+        out += [("round_period_p5", round_quantile(gaps, 0.05)), ("round_period_median", round_quantile(gaps, 0.5)),
+                ("round_period_p95", round_quantile(gaps, 0.95))]
+    waits = list(getattr(self, 'query_waits', None) or [])
+    if waits:
+        out += [("query_wait_median", round_quantile(waits, 0.5)), ("query_wait_p95", round_quantile(waits, 0.95))]
+    gate = list(getattr(self, 'reward_gate_waits', None) or [])
+    if gate:
+        out.append(("reward_gate_wait_max", max(gate)))
+    out.append(("reward_tasks_pending", int(getattr(self, 'pending_reward_tasks', 0) or 0)))
+    return out
+
+
 def publish_validator_gauges(self: ReportingService):
     """
     Publishes validator-specific metrics to Prometheus gauges.
@@ -1047,6 +1120,8 @@ def publish_validator_gauges(self: ReportingService):
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="emission").set( self.metagraph.emission[self.uid] )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="last_update").set( self.current_block - self.metagraph.last_update[self.uid] )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="active").set( self.metagraph.active[self.uid] )
+    for _name, _value in round_timing_gauges(self):
+        self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
     cpu_usage = psutil.cpu_percent()
     memory_info = psutil.virtual_memory()
     memory_usage = memory_info.percent
@@ -1082,6 +1157,14 @@ def publish_validator_gauges(self: ReportingService):
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
                 sim_id=self.simulation.simulation_id, validator_gauge_name=_gauge,
             ).set(float(_clock.get(_gauge, 0) or 0))
+    _settlement = getattr(self, 'exchange_settlement', None)
+    if _settlement:
+        # Exchange settlement counters, one gauge each as settlement_<name>.
+        for _key, _value in _settlement.items():
+            self.prometheus_validator_gauges.labels(
+                wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                sim_id=self.simulation.simulation_id, validator_gauge_name=f"settlement_{_key}",
+            ).set(float(_value or 0))
     bt.logging.debug(f"Validator metrics published ({time.time()-start:.4f}s).")
 
 def publish_gentrx_gauges(self: ReportingService) -> None:
@@ -1414,6 +1497,47 @@ def _set_if_changed_metric(gauge, value, **labels):
     if child._value.get() != value:
         child.set(value)
 
+def exchange_inventory(inv_history: Dict, quote_by_ts: Dict, initial_quote: Dict):
+    """(totals, per_book) of one uid on the exchange, where one quote balance is shared by every book.
+
+    Each book's inventory value is its wealth less its wealth when its account first appeared, and both include the
+    shared quote, so every book carries the quote's whole change since its own first appearance. A book's own change is
+    its inventory value less that quote change; the account's total is the books' own changes plus the quote's change
+    since the first entry, counted once, and `per_book` gives each book an equal share of that quote change so the
+    books sum to the total. `totals` follows the history's order. A timestamp whose quote was not recorded (the first
+    update after a restart) keeps its plain sum.
+    """
+    tss = list(inv_history)
+    totals, per_book = [], {}
+    if not tss:
+        return totals, per_book
+    q_ref = quote_by_ts.get(tss[0])
+    if q_ref is None:
+        q_ref = next((initial_quote[b] for b in inv_history[tss[0]] if initial_quote.get(b) is not None), None)
+    for ts in tss:
+        row, q = inv_history[ts], quote_by_ts.get(ts)
+        if q is None or q_ref is None or not row:
+            totals.append(sum(row.values()))
+            per_book[ts] = dict(row)
+            continue
+        own = {b: v - (q - (initial_quote[b] if initial_quote.get(b) is not None else q)) for b, v in row.items()}
+        share = (q - q_ref) / len(own)
+        per_book[ts] = {b: v + share for b, v in own.items()}
+        totals.append(sum(own.values()) + (q - q_ref))
+    return totals, per_book
+
+
+def account_quote_totals(accounts_data: Dict, books, is_exchange: bool):
+    """(quote balance, quote loan, quote collateral) of one account: summed over books in simulation, where every book
+    has its own quote, and read once on the exchange, where every book shows the one shared balance."""
+    present = [b for b in books if b in accounts_data]
+    if is_exchange:
+        a = accounts_data[present[0]] if present else {"qb": {"t": 0.0}, "ql": 0.0, "qc": 0.0}
+        return a['qb']['t'], a['ql'], a['qc']
+    return (sum(accounts_data[b]['qb']['t'] for b in present), sum(accounts_data[b]['ql'] for b in present),
+            sum(accounts_data[b]['qc'] for b in present))
+
+
 def report_book_ids(validator_data: Dict):
     """The books a report iterates: the run's id set when the caller supplies it, else the dense range.
     A dense range on a sparse layout skips real books and visits phantom ones."""
@@ -1496,10 +1620,15 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             if len(inventory_history[agentId]) < 2:
                 continue
             
-            total_inventory_history[agentId] = [
-                sum(list(inventory_value.values()))
-                for inventory_value in list(inventory_history[agentId].values())
-            ]
+            if validator_data.get('is_exchange'):
+                total_inventory_history[agentId], _ = exchange_inventory(
+                    inventory_history[agentId], (validator_data.get('inventory_quote') or {}).get(agentId) or {},
+                    (validator_data.get('initial_quote') or {}).get(agentId) or {})
+            else:
+                total_inventory_history[agentId] = [
+                    sum(list(inventory_value.values()))
+                    for inventory_value in list(inventory_history[agentId].values())
+                ]
             pnl[agentId] = total_inventory_history[agentId][-1] - total_inventory_history[agentId][0]
 
         scores = torch.FloatTensor(list(validator_data['scores'].values()))
@@ -1530,18 +1659,10 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 sum([accounts_data[bookId]['bc'] for bookId in books]),
                 base_decimals
             )
-            total_quote_balance = round(
-                sum([accounts_data[bookId]['qb']['t'] for bookId in books]),
-                quote_decimals
-            )
-            total_quote_loan = round(
-                sum([accounts_data[bookId]['ql'] for bookId in books]),
-                quote_decimals
-            )
-            total_quote_collateral = round(
-                sum([accounts_data[bookId]['qc'] for bookId in books]),
-                quote_decimals
-            )
+            _qt, _ql, _qc = account_quote_totals(accounts_data, books, bool(validator_data.get('is_exchange')))
+            total_quote_balance = round(_qt, quote_decimals)
+            total_quote_loan = round(_ql, quote_decimals)
+            total_quote_collateral = round(_qc, quote_decimals)
 
             total_daily_volume = {
                 role: round(
@@ -1657,6 +1778,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'skill_other': kappa_values.get('skill_other') if kappa_values else None,
                 'skill_weakest3': kappa_values.get('skill_weakest3') if kappa_values else None,
                 'skill_books_kept': kappa_values.get('skill_books_kept') if kappa_values else None,
+                'skill_mark_alt': kappa_values.get('skill_mark_alt') if kappa_values else None,
+                'skill_net_alpha_mark_alt': kappa_values.get('skill_net_alpha_mark_alt') if kappa_values else None,
+                'maker_notional_two_sided': kappa_values.get('maker_notional_two_sided') if kappa_values else None,
+                'at_best_seconds': kappa_values.get('at_best_seconds') if kappa_values else None,
+                'best_size': kappa_values.get('best_size') if kappa_values else None,
                 'skill_pool_factor': kappa_values.get('skill_pool_factor') if kappa_values else None,
                 'skill_coverage_factor': kappa_values.get('skill_coverage_factor') if kappa_values else None,
                 'coverage_books': kappa_values.get('coverage_books') if kappa_values else None,
@@ -1730,6 +1856,7 @@ async def report(self: ReportingService) -> None:
             "step_rate"
         ))
         publish_class_gauges(self, updates, wallet_addr, netuid, simid)
+        publish_capture_settle_gauges(self, updates, wallet_addr, netuid, simid)
         publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid)
         bt.logging.debug(f"Simulation metrics collected ({time.time()-start:.4f}s).")
 
@@ -1899,6 +2026,10 @@ async def report(self: ReportingService) -> None:
             'self_volume_sums': self_volume_sums_snapshot,
             'roundtrip_volume_sums': {uid: dict(books) for uid, books in self.roundtrip_volume_sums.items()},
             'inventory_history': self.inventory_history,
+            'is_exchange': not hasattr(self.simulation, 'block_count'),
+            'inventory_quote': {uid: dict(v) for uid, v in (getattr(self, 'inventory_quote', None) or {}).items()},
+            'initial_quote': {uid: {b: (d or {}).get('QUOTE') for b, d in books_.items()}
+                              for uid, books_ in (self.initial_balances or {}).items()},
             'total_realized_pnl': self.total_realized_pnl,
             'realized_pnl_by_book': self.realized_pnl_by_book,
             'fee_sums': {uid: dict(books) for uid, books in self.fee_sums.items()},
@@ -1958,7 +2089,13 @@ async def report(self: ReportingService) -> None:
                 continue
             if len(self.inventory_history[agentId]) < 2:
                 continue
-            inv_values = list(self.inventory_history[agentId].values())
+            _hist = self.inventory_history[agentId]
+            if not hasattr(self.simulation, 'block_count'):
+                _, _per_book = exchange_inventory(
+                    _hist, (getattr(self, 'inventory_quote', None) or {}).get(agentId) or {},
+                    {b: (d or {}).get('QUOTE') for b, d in (self.initial_balances.get(agentId) or {}).items()})
+                _hist = {ts: _per_book.get(ts, row) for ts, row in _hist.items()}
+            inv_values = list(_hist.values())
             start_inventories[agentId] = [i for i in inv_values if len(i) > 0][0]
             last_inventories[agentId] = inv_values[-1]
             kappa_data[agentId] = self.kappa_values.get(agentId)
@@ -2222,6 +2359,13 @@ async def report(self: ReportingService) -> None:
                            # weakest sub-window kappa, books left after the hurdle, the pool factor, the
                            # filled notional and the graded presence share
                            ('skill_other', 'debeta_skill_other_variant'),
+                           # the alternative mark's skill (0.6.5): judged on live data before a change of mark pays
+                           ('skill_mark_alt', 'debeta_skill_mark_alt'),
+                           ('skill_net_alpha_mark_alt', 'debeta_skill_net_alpha_mark_alt'),
+                           # the liquidity a maker provides (0.6.5): read before a making rule pays for it
+                           ('maker_notional_two_sided', 'debeta_maker_notional_two_sided'),
+                           ('at_best_seconds', 'debeta_at_best_seconds'),
+                           ('best_size', 'debeta_best_size'),
                            ('skill_weakest3', 'debeta_skill_weakest3'),
                            ('skill_books_kept', 'debeta_skill_books_kept'),
                            ('skill_pool_factor', 'debeta_skill_pool_factor'),
@@ -2253,13 +2397,10 @@ async def report(self: ReportingService) -> None:
 
             _ms = self.miner_stats.get(agentId)
             if _ms and _ms['requests'] >= 100:
-                updates.append((miner_gauges, _ms['requests'], wallet_addr, netuid, simid, agentId, "requests"))
-                updates.append((miner_gauges, _ms['requests'] - _ms['failures'] - _ms['timeouts'] - _ms['rejections'], wallet_addr, netuid, simid, agentId, "success"))
-                updates.append((miner_gauges, _ms['failures'], wallet_addr, netuid, simid, agentId, "failures"))
-                updates.append((miner_gauges, _ms['timeouts'], wallet_addr, netuid, simid, agentId, "timeouts"))
-                updates.append((miner_gauges, _ms['rejections'], wallet_addr, netuid, simid, agentId, "rejections"))
-                updates.append((miner_gauges, (sum(_ms['call_time']) / len(_ms['call_time']) if _ms['call_time'] else 0), wallet_addr, netuid, simid, agentId, "call_time"))
-                self.miner_stats[agentId] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': []}
+                for _name, _value in round_block_gauges(_ms):
+                    updates.append((miner_gauges, _value, wallet_addr, netuid, simid, agentId, _name))
+                self.miner_stats[agentId] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': [],
+                                             'placed': 0, 'refused': 0, 'refused_contract': 0}
 
             _set_if_changed_metric(
                 self.prometheus_miners,

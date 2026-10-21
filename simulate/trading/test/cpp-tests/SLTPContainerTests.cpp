@@ -769,9 +769,10 @@ TEST(SLTPContainerTest, FiringSLEraseTPAndKeepsSlotForCounterTrade)
     EXPECT_EQ(fifo.front().volume, 5_dec);
 
     // The closing market order would now come in as a SELL counter-trade —
-    // simulate it; the slot drains and the FIFO is empty.
+    // simulate it; the slot drains, and the drained agent is pruned, so `fifo`
+    // must not be read past this point.
     trade(setup, /*anyId=*/99, agentId, bookId, OrderDirection::SELL, 90_dec, 5_dec);
-    EXPECT_TRUE(fifo.empty());
+    EXPECT_FALSE(perBook.openSlots.contains(agentId));
 
     // Subsequent price moves fire nothing.
     setup.container.onPriceUpdate(bookId, 120_dec);
@@ -909,6 +910,30 @@ TEST(SLTPContainerTest, RemoveOrderDropsFIFOSlot)
     // [empty, empty] residuals for departed agents.
     EXPECT_FALSE(openSlots.contains(agentId));
     EXPECT_EQ(setup.container.books()[bookId].triggers.size(), 0u);
+}
+
+//-------------------------------------------------------------------------
+// An unflagged trade that drains an agent's last slot prunes the agent too
+//-------------------------------------------------------------------------
+
+TEST(SLTPContainerTest, UnflaggedTradeDrainingTheLastSlotPrunesTheAgent)
+{
+    SLTPSetup setup;
+    setup.setUp();
+    constexpr BookId bookId{};
+    constexpr AgentId agentId{-1};
+
+    createFlaggedOrder(setup, 1, agentId, bookId, OrderDirection::BUY, 5_dec, DEC(-0.05), DEC(0.10));
+    trade(setup, 1, agentId, bookId, OrderDirection::BUY, 100_dec, 5_dec);
+    const auto& perBook = setup.container.books()[bookId];
+    ASSERT_TRUE(perBook.openSlots.contains(agentId));
+
+    // The counter-trade has no SL/TP of its own, so no order info is kept for it.
+    trade(setup, /*unflagged=*/500, agentId, bookId, OrderDirection::SELL, 100_dec, 5_dec);
+
+    EXPECT_EQ(perBook.activeSlotCount, 0u);
+    EXPECT_EQ(perBook.triggers.size(), 0u);
+    EXPECT_FALSE(perBook.openSlots.contains(agentId)) << "the drained agent's empty entry was left behind";
 }
 
 //-------------------------------------------------------------------------

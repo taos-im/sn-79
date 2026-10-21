@@ -8,6 +8,7 @@
 
 #include <boost/asio/io_context.hpp>
 
+#include <algorithm>
 #include <vector>
 
 //-------------------------------------------------------------------------
@@ -47,6 +48,41 @@ Message::Ptr makeEndNotice(uint64_t start)
 
 //-------------------------------------------------------------------------
 
+void SimulationFailedPayload::jsonSerialize(rapidjson::Document& json, const std::string& key) const
+{
+    auto serialize = [this](rapidjson::Document& json) {
+        json.SetObject();
+        auto& allocator = json.GetAllocator();
+        json.AddMember("realization", rapidjson::Value{realization}, allocator);
+        json.AddMember("background", rapidjson::Value{background.c_str(), allocator}, allocator);
+        json.AddMember("time", rapidjson::Value{time}, allocator);
+        json.AddMember("error", rapidjson::Value{error.c_str(), allocator}, allocator);
+    };
+    taosim::json::serializeHelper(json, key, serialize);
+}
+
+//-------------------------------------------------------------------------
+
+Message::Ptr makeFailureNotice(
+    uint32_t realization, std::string_view background, uint64_t time, std::string_view error)
+{
+    // Back off to the start of a UTF-8 sequence, so the clipped text is still valid JSON text.
+    size_t length = std::min(error.size(), kFailureNoticeErrorLength);
+    if (length < error.size()) {
+        while (length > 0 && (static_cast<unsigned char>(error[length]) & 0xC0) == 0x80) --length;
+    }
+    return Message::create(
+        time,
+        time,
+        "SIMULATION",
+        "*",
+        "EVENT_SIMULATION_FAILED",
+        MessagePayload::create<SimulationFailedPayload>(
+            realization, std::string{background}, time, std::string{error.substr(0, length)}));
+}
+
+//-------------------------------------------------------------------------
+
 rapidjson::Document makeNoticeBatch(std::span<const Message::Ptr> messages)
 {
     rapidjson::Document json{rapidjson::kObjectType};
@@ -67,7 +103,8 @@ void postGeneralMessage(
     const Simulation& logger,
     const net::NetworkingInfo& netInfo,
     std::string_view endpoint,
-    const rapidjson::Document& body)
+    const rapidjson::Document& body,
+    bool failFast)
 {
     rapidjson::Document res;
     net::asio::io_context ctx;
@@ -78,7 +115,8 @@ void postGeneralMessage(
             .netInfo = netInfo,
             .reqBody = body,
             .endpoint = endpoint,
-            .resJson = res
+            .resJson = res,
+            .failFast = failFast
         }),
         net::asio::detached);
     ctx.run();

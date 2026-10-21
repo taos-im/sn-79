@@ -10,7 +10,7 @@ excluded from the carve for raising FileNotFoundError on files that do not ship.
 capability therefore had no published test at all.
 
 This one reads the layout that ships, so it fails in a miner's tree if the carve ever stops shipping a
-piece of it, and it states the properties an agent is entitled to rely on: contiguous ids from zero, two
+piece of it, and it states the properties an agent is entitled to rely on: contiguous ids from zero, three
 named classes, and a grid per book rather than one top-level priceDecimals.
 """
 import xml.etree.ElementTree as ET
@@ -40,10 +40,11 @@ def test_every_class_the_default_layout_names_is_present():
     assert not missing, f"the default layout references {missing}, which this tree does not contain"
 
 
-def test_the_default_layout_loads_as_two_named_classes():
+def test_the_default_layout_loads_as_three_named_classes():
     classes = _layout().asset_classes()
-    assert [c.name for c in classes] == ["simulation_0", "simulation_1"], (
+    assert [c.name for c in classes] == ["simulation_0", "simulation_1", "simulation_2"], (
         "the published layout's classes are the names the migration note and the announcement use")
+    assert [len(c.books) for c in classes] == [64, 32, 32]
 
 
 def test_book_ids_run_contiguously_from_zero_across_the_whole_layout():
@@ -56,10 +57,8 @@ def test_book_ids_run_contiguously_from_zero_across_the_whole_layout():
 
 def test_each_book_carries_its_own_grid():
     cfg = _layout()
-    first, second = cfg.asset_classes()
-    for book in (first.books[0], first.books[-1]):
-        assert cfg.config_for_book(book).priceDecimals == first.priceDecimals
-    for book in (second.books[0], second.books[-1]):
-        assert cfg.config_for_book(book).priceDecimals == second.priceDecimals
+    for cls in cfg.asset_classes():
+        for book in (cls.books[0], cls.books[-1]):
+            assert cfg.config_for_book(book).priceDecimals == cls.priceDecimals
     with pytest.raises(KeyError):
         cfg.config_for_book(cfg.book_ids[-1] + 1)

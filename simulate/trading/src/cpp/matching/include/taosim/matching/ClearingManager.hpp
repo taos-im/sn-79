@@ -5,12 +5,15 @@
 #pragma once
 
 #include <taosim/accounting/AccountRegistry.hpp>
+#include <taosim/accounting/Loan.hpp>
 #include <taosim/matching/FeePolicyWrapper.hpp>
 #include <taosim/matching/OrderPlacementValidator.hpp>
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <tuple>
 #include <variant>
 
 //-------------------------------------------------------------------------
@@ -87,7 +90,21 @@ public:
     [[nodiscard]] OrderResult handleOrder(const OrderDesc& orderDesc);
     void handleCancelOrder(const CancelOrderDesc& cancelDesc);
     bool handleClosePosition(const ClosePositionDesc& closeDesc);
+    // The size of the market order that closes `loan`. A partial close sends `volumeToClose`. A full close,
+    // no volume or one that covers the loan, sends the loan grossed up by the agent's taker rate, since the
+    // loan is settled from the order's proceeds net of the taker fee. The sell that closes a long is put on
+    // the base grid at the best bid, so its proceeds there cover the amount; nothing without a bid.
+    [[nodiscard]] std::optional<decimal_t> closeOrderSize(
+        BookId bookId,
+        AgentId agentId,
+        const accounting::Loan& loan,
+        std::optional<decimal_t> volumeToClose = {}) const;
     Fees handleTrade(const TradeDesc& tradeDesc);
+    // A called position's agent is told once that its margin call could not be placed. True for the first
+    // refusal since the position was called, its call last filled or its entry went; false after that.
+    [[nodiscard]] bool firstMarginCallRefusal(AgentId agentId, BookId bookId, OrderID loanId);
+    void forgetMarginCallRefusal(AgentId agentId, BookId bookId, OrderID loanId) noexcept;
+    void forgetMarginCallRefusals(AgentId agentId) noexcept;
     void updateFeeTiers(Timestamp time) noexcept;
 
     [[nodiscard]] auto&& marginBuys(this auto&& self) noexcept { return self.m_marginBuy; }
@@ -99,6 +116,7 @@ private:
     std::unique_ptr<FeePolicyWrapper> m_feePolicy;
     MarginCallContainer m_marginBuy;
     MarginCallContainer m_marginSell;
+    std::set<std::tuple<AgentId, BookId, OrderID>> m_refusedMarginCalls;
     OrderPlacementValidator m_orderPlacementValidator;
 
     void removeMarginOrders(

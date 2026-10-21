@@ -59,6 +59,29 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
 {
     taosim::decimal_t bestAsk{}, bestBid{};
 
+    // A margin call is a forced close, so like an SL/TP close it is not refused for its size.
+    const auto marginCallPayload = [](OrderDirection direction, taosim::decimal_t volume, BookId bookId,
+                                      Currency currency, OrderID loanId) {
+        auto payload = MessagePayload::create<PlaceOrderMarketPayload>(
+            direction, volume, bookId, currency, std::nullopt, STPFlag::CO, loanId);
+        payload->skipMinSizeCheck = true;
+        return payload;
+    };
+
+    // A called position stays called until its loan is settled, so a margin call that found nothing to fill
+    // against is placed again on a later step while the price stays beyond the call. Only the entries whose
+    // loan is gone are dropped.
+    const auto dropSettled = [this](auto& levels, BookId bookId, auto first, auto last) {
+        for (auto level = first; level != last; ) {
+            std::erase_if(level->second, [&](const auto& ctx) {
+                if (accounts()[ctx.agentId][bookId].getLoan(ctx.orderId).has_value()) return false;
+                m_clearingManager->forgetMarginCallRefusal(ctx.agentId, bookId, ctx.orderId);
+                return true;
+            });
+            level = level->second.empty() ? levels.erase(level) : std::next(level);
+        }
+    };
+
     for (const auto book : m_books) {
         const auto bookId = book->id();
 
@@ -79,8 +102,12 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                     for (auto idIt = ids.begin(); idIt != ids.end(); ++idIt) {
 
                         const auto& loan = accounts()[idIt->agentId][bookId].getLoan(idIt->orderId);
-                        if (loan.has_value()){
-                            taosim::decimal_t remainingVolume = loan->get().amount();
+                        // A margin call closes the whole loan, sized as a full close is.
+                        const auto closeSize = loan.has_value()
+                            ? m_clearingManager->closeOrderSize(bookId, idIt->agentId, loan->get())
+                            : std::nullopt;
+                        if (closeSize.has_value()){
+                            taosim::decimal_t remainingVolume = *closeSize;
 
                             simulation()->logDebug("Margin Call for BUY order #{} of agent {} at price {} (marginCall:{}) in Book {} for volume {}x{}",
                                 idIt->orderId,
@@ -105,15 +132,8 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                     accounts().idBimap().right.at(idIt->agentId),
                                     name(),
                                     "PLACE_ORDER_MARKET_MC",
-                                    MessagePayload::create<PlaceOrderMarketPayload>(
-                                        OrderDirection::SELL,
-                                        remainingVolume,
-                                        bookId,
-                                        Currency::QUOTE,
-                                        std::nullopt,
-                                        STPFlag::CO,
-                                        idIt->orderId
-                                    ),
+                                    marginCallPayload(
+                                        OrderDirection::SELL, remainingVolume, bookId, Currency::QUOTE, idIt->orderId),
                                     m_marginCallCounter++
                                 );
 
@@ -127,15 +147,8 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                     "DISTRIBUTED_PLACE_ORDER_MARKET_MC",
                                     MessagePayload::create<DistributedAgentResponsePayload>(
                                         idIt->agentId,
-                                        MessagePayload::create<PlaceOrderMarketPayload>(
-                                            OrderDirection::SELL,
-                                            remainingVolume,
-                                            bookId,
-                                            Currency::QUOTE,
-                                            std::nullopt,
-                                            STPFlag::CO,
-                                            idIt->orderId
-                                        )
+                                        marginCallPayload(
+                                            OrderDirection::SELL, remainingVolume, bookId, Currency::QUOTE, idIt->orderId)
                                     ),
                                     m_marginCallCounter++
                                 );
@@ -148,12 +161,7 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                         }
                     }
                 }
-                ///##/ This is important to check whether the order successfully happens
-                // if it is not then it should be resend
-                // if it succeeds it should remove the id from m_marginBuy
-                // but if we don't remove it here it might happen several times?
-                // this should be checked and the same for m_marginSell ///##/
-                marginBuyOrders.erase(it, marginBuyOrders.end());   
+                dropSettled(marginBuyOrders, bookId, it, marginBuyOrders.end());
             }
         }
 
@@ -175,9 +183,12 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                     for (auto idIt = ids.begin(); idIt != ids.end(); ++idIt) {
 
                         const auto& loan = accounts()[idIt->agentId][bookId].getLoan(idIt->orderId);
-                        if (loan.has_value()){
-                            taosim::decimal_t remainingVolume = loan->get().amount();
-                            
+                        const auto closeSize = loan.has_value()
+                            ? m_clearingManager->closeOrderSize(bookId, idIt->agentId, loan->get())
+                            : std::nullopt;
+                        if (closeSize.has_value()){
+                            taosim::decimal_t remainingVolume = *closeSize;
+
 
                             simulation()->logDebug("Margin Call for SELL order #{} of agent {} at price {} (marginCall:{}) in Book {} for volume {}x{}",
                                 idIt->orderId,
@@ -202,15 +213,8 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                     accounts().idBimap().right.at(idIt->agentId),
                                     name(),
                                     "PLACE_ORDER_MARKET_MC",
-                                    MessagePayload::create<PlaceOrderMarketPayload>(
-                                        OrderDirection::BUY,
-                                        remainingVolume,
-                                        bookId,
-                                        Currency::BASE,
-                                        std::nullopt,
-                                        STPFlag::CO,
-                                        idIt->orderId
-                                    ),
+                                    marginCallPayload(
+                                        OrderDirection::BUY, remainingVolume, bookId, Currency::BASE, idIt->orderId),
                                     m_marginCallCounter++
                                 );
 
@@ -224,15 +228,8 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                                     "DISTRIBUTED_PLACE_ORDER_MARKET_MC",
                                     MessagePayload::create<DistributedAgentResponsePayload>(
                                         idIt->agentId,
-                                        MessagePayload::create<PlaceOrderMarketPayload>(
-                                            OrderDirection::BUY,
-                                            remainingVolume,
-                                            bookId,
-                                            Currency::BASE,
-                                            std::nullopt,
-                                            STPFlag::CO,
-                                            idIt->orderId
-                                        )
+                                        marginCallPayload(
+                                            OrderDirection::BUY, remainingVolume, bookId, Currency::BASE, idIt->orderId)
                                     ),
                                     m_marginCallCounter++
                                 );
@@ -240,7 +237,7 @@ void MultiBookExchangeAgent::checkMarginCall() noexcept
                         }   
                     }   
                 }
-                marginSellOrders.erase(marginSellOrders.begin(), it);
+                dropSettled(marginSellOrders, bookId, marginSellOrders.begin(), it);
             }
         }
     }
@@ -750,28 +747,145 @@ void MultiBookExchangeAgent::handleException()
 
 //-------------------------------------------------------------------------
 
+namespace
+{
+
+enum class DistributedRequest
+{
+    PLACE_ORDER_MARKET,
+    PLACE_ORDER_LIMIT,
+    RETRIEVE_ORDERS,
+    CANCEL_ORDERS,
+    CLOSE_POSITIONS,
+    RESET_AGENT
+};
+
+// Each family is named by exactly one type; the margin call is the exchange's own market order.
+[[nodiscard]] std::optional<DistributedRequest> distributedRequest(std::string_view type) noexcept
+{
+    using enum DistributedRequest;
+    if (type == "DISTRIBUTED_PLACE_ORDER_MARKET" || type == "DISTRIBUTED_PLACE_ORDER_MARKET_MC") {
+        return PLACE_ORDER_MARKET;
+    }
+    if (type == "DISTRIBUTED_PLACE_ORDER_LIMIT") return PLACE_ORDER_LIMIT;
+    if (type == "DISTRIBUTED_RETRIEVE_ORDERS") return RETRIEVE_ORDERS;
+    if (type == "DISTRIBUTED_CANCEL_ORDERS") return CANCEL_ORDERS;
+    if (type == "DISTRIBUTED_CLOSE_POSITIONS") return CLOSE_POSITIONS;
+    if (type == "DISTRIBUTED_RESET_AGENT") return RESET_AGENT;
+    return std::nullopt;
+}
+
+[[nodiscard]] bool carriesItsPayload(DistributedRequest request, const MessagePayload::Ptr& payload)
+{
+    using enum DistributedRequest;
+    switch (request) {
+        case PLACE_ORDER_MARKET: return std::dynamic_pointer_cast<PlaceOrderMarketPayload>(payload) != nullptr;
+        case PLACE_ORDER_LIMIT: return std::dynamic_pointer_cast<PlaceOrderLimitPayload>(payload) != nullptr;
+        case RETRIEVE_ORDERS: return std::dynamic_pointer_cast<RetrieveOrdersPayload>(payload) != nullptr;
+        case CANCEL_ORDERS: return std::dynamic_pointer_cast<CancelOrdersPayload>(payload) != nullptr;
+        case CLOSE_POSITIONS: return std::dynamic_pointer_cast<ClosePositionsPayload>(payload) != nullptr;
+        case RESET_AGENT: return std::dynamic_pointer_cast<ResetAgentsPayload>(payload) != nullptr;
+    }
+    return false;
+}
+
+// The book an order, a retrieve or a close names, read from a payload carriesItsPayload accepted. A cancel
+// answers for a book it does not find itself, and a reset names none.
+[[nodiscard]] std::optional<BookId> bookNamed(DistributedRequest request, const MessagePayload::Ptr& payload)
+{
+    using enum DistributedRequest;
+    switch (request) {
+        case PLACE_ORDER_MARKET: return std::static_pointer_cast<PlaceOrderMarketPayload>(payload)->bookId;
+        case PLACE_ORDER_LIMIT: return std::static_pointer_cast<PlaceOrderLimitPayload>(payload)->bookId;
+        case RETRIEVE_ORDERS: return std::static_pointer_cast<RetrieveOrdersPayload>(payload)->bookId;
+        case CLOSE_POSITIONS: return std::static_pointer_cast<ClosePositionsPayload>(payload)->bookId;
+        case CANCEL_ORDERS:
+        case RESET_AGENT: return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// The line names the message by its type and that type's length, and carries none of its content.
+void dropDistributedMessage(Timestamp now, const Message& msg, std::string_view reason)
+{
+    fmt::println(
+        "{} | EXCHANGE : DROPPED A MESSAGE OF TYPE '{:.64}' ({} CHARS) : {}",
+        now, msg.type, msg.type.size(), reason);
+}
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
+// Every distributed message passes this one check before its handler, and the handlers cast to the
+// payloads it accepted. A message is handled by the family its type names exactly. One that carries no
+// agent payload, or not the payload its type carries, is dropped. An order, a retrieve or a close must
+// name a book the exchange has, and an order or a close must come from an agent whose account holds that
+// book; one that does not is answered with its family's error. None of these ends the step.
 void MultiBookExchangeAgent::handleDistributedMessage(const Message::Ptr& msg)
 {
-    if (msg->type.contains("PLACE_ORDER_MARKET")) {
-        handleDistributedPlaceMarketOrder(msg);
+    using enum DistributedRequest;
+
+    const auto payload = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+    if (payload == nullptr) {
+        return dropDistributedMessage(simulation()->currentTimestamp(), *msg, "no agent payload");
     }
-    else if (msg->type.ends_with("PLACE_ORDER_LIMIT")) {
-        handleDistributedPlaceLimitOrder(msg);
+    const auto request = distributedRequest(msg->type);
+    if (!request) {
+        return handleDistributedUnknownMessage(msg);
     }
-    else if (msg->type.ends_with("RETRIEVE_ORDERS")) {
-        handleDistributedRetrieveOrders(msg);
+    if (!carriesItsPayload(*request, payload->payload)) {
+        return dropDistributedMessage(
+            simulation()->currentTimestamp(), *msg, "not the payload its type carries");
     }
-    else if (msg->type.ends_with("CANCEL_ORDERS")) {
-        handleDistributedCancelOrders(msg);
+
+    const auto refusal = [&] -> std::optional<OrderErrorCode> {
+        const auto bookId = bookNamed(*request, payload->payload);
+        if (!bookId) return std::nullopt;
+        if (*bookId >= m_books.size()) return OrderErrorCode::CONTRACT_VIOLATION;
+        if (*request == RETRIEVE_ORDERS) return std::nullopt;
+        if (!accounts().contains(payload->agentId)) return OrderErrorCode::NONEXISTENT_ACCOUNT;
+        const auto& account = accounts().at(payload->agentId);
+        if (*bookId >= account.holdings().size() || *bookId >= account.activeOrders().size()) {
+            return OrderErrorCode::NONEXISTENT_ACCOUNT;
+        }
+        return std::nullopt;
+    }();
+    if (refusal) {
+        if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
+        const auto error =
+            MessagePayload::create<ErrorResponsePayload>(std::string{OrderErrorCode2StrView(*refusal)});
+        const auto answer = [&] -> MessagePayload::Ptr {
+            if (*request == PLACE_ORDER_MARKET) {
+                return MessagePayload::create<PlaceOrderMarketErrorResponsePayload>(
+                    std::static_pointer_cast<PlaceOrderMarketPayload>(payload->payload), error);
+            }
+            if (*request == PLACE_ORDER_LIMIT) {
+                return MessagePayload::create<PlaceOrderLimitErrorResponsePayload>(
+                    std::static_pointer_cast<PlaceOrderLimitPayload>(payload->payload), error);
+            }
+            if (*request == CLOSE_POSITIONS) {
+                const auto closes = std::static_pointer_cast<ClosePositionsPayload>(payload->payload);
+                return MessagePayload::create<ClosePositionsErrorResponsePayload>(
+                    closes->closePositions
+                        | views::transform([](const ClosePosition& close) { return close.id; })
+                        | ranges::to<std::vector>(),
+                    closes,
+                    error);
+            }
+            return error;
+        }();
+        return fastRespondToMessage(
+            msg, "ERROR", MessagePayload::create<DistributedAgentResponsePayload>(payload->agentId, answer));
     }
-    else if (msg->type.ends_with("CLOSE_POSITIONS")) {
-        handleDistributedClosePositions(msg);
-    }
-    else if (msg->type.ends_with("RESET_AGENT")) {
-        handleDistributedAgentReset(msg);
-    }
-    else {
-        handleDistributedUnknownMessage(msg);
+
+    switch (*request) {
+        case PLACE_ORDER_MARKET: return handleDistributedPlaceMarketOrder(msg);
+        case PLACE_ORDER_LIMIT: return handleDistributedPlaceLimitOrder(msg);
+        case RETRIEVE_ORDERS: return handleDistributedRetrieveOrders(msg);
+        case CANCEL_ORDERS: return handleDistributedCancelOrders(msg);
+        case CLOSE_POSITIONS: return handleDistributedClosePositions(msg);
+        case RESET_AGENT: return handleDistributedAgentReset(msg);
     }
 }
 
@@ -903,6 +1017,7 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr& msg
             cancellations.push_back(std::move(bookCancellations));
         }
         accounts().reset(agentId);
+        m_clearingManager->forgetMarginCallRefusals(agentId);
         simulation()->logDebug("{} | AGENT #{} : RESET-CANCELS DONE", simulation()->currentTimestamp(), agentId);
     }
     simulation()->logDebug("{} | ALL RESET-CANCELS DONE", simulation()->currentTimestamp());
@@ -952,6 +1067,9 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr& msg
             json, ofs, taosim::json::FormatOptions{.indent = taosim::json::IndentOptions{}});
     }
 
+    // The counter carries over, so a message queued from here on still breaks an arrival tie behind the
+    // messages kept.
+    const auto messageIdCounter = simulation()->m_messageQueue.idCounter();
     simulation()->m_messageQueue = taosim::message::MessageQueue{
         simulation()->m_messageQueue.queue().underlying()
             | views::filter([&](const auto& prioMsgWithId) {
@@ -963,6 +1081,7 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr& msg
                 return !(distributedPayload && resetAgentIds.contains(distributedPayload->agentId));
             })
             | ranges::to<std::vector>};
+    simulation()->m_messageQueue.idCounter() = messageIdCounter;
     simulation()->logDebug("{} | MESSAGE QUEUE CLEARED", simulation()->currentTimestamp());
 
     simulation()->fastRespondToMessage(
@@ -1019,6 +1138,12 @@ void MultiBookExchangeAgent::handleDistributedPlaceMarketOrder(const Message::Pt
             orderResult.ec,
             payload);
         if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
+        // A margin call is retried every step while its position stays called; the agent hears of the
+        // refusal once.
+        if (const auto* loanId = std::get_if<OrderID>(&subPayload->settleFlag); isMarginCall && loanId
+            && !m_clearingManager->firstMarginCallRefusal(payload->agentId, subPayload->bookId, *loanId)) {
+            return;
+        }
         return fastRespondToMessage(
             msg,
             "ERROR",
@@ -1453,6 +1578,11 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr& msg
             orderResult.ec,
             payload);
         if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
+        if (const auto* loanId = std::get_if<OrderID>(&payload->settleFlag); isMarginCall && loanId
+            && !m_clearingManager->firstMarginCallRefusal(
+                accounts().lookupLocalAgentId(msg->source), payload->bookId, *loanId)) {
+            return;
+        }
         return fastRespondToMessage(
             msg,
             "ERROR",
@@ -1469,6 +1599,8 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr& msg
         accounts().lookupLocalAgentId(msg->source), payload->clientOrderId, payload->delegate,
         payload->currency);
     sweepCtx.initiatorAgentId = payload->initiatorAgentId;
+    sweepCtx.closeReason = payload->closeReason;
+    sweepCtx.originatingOrderId = payload->originatingOrderId;
     const auto order = m_books[payload->bookId]->placeMarketOrder(
         std::move(sweepCtx),
         msg->arrival,

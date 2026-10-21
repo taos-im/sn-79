@@ -150,8 +150,8 @@ def test_the_update_check_and_the_run_end_pull_follow_the_mode():
 
 
 def test_the_default_mode_is_branch_until_a_signing_key_ships():
-    """0.6.4 ships the signed mode as an opt-in and keeps 0.6.3's branch-tip update as the default (operator, 11
-    October 2026): no signing key exists yet, and with none listed the signed mode would never update a validator."""
+    """0.6.4 ships the signed mode as an opt-in and keeps 0.6.3's branch-tip update as the default: no
+    signing key exists yet, and with none listed the signed mode would never update a validator."""
     import inspect
 
     from taos.im import config as im_config

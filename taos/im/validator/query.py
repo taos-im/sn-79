@@ -4,6 +4,7 @@
 Standalone query service using POSIX IPC for communication.
 """
 
+import random
 import time
 import asyncio
 import concurrent.futures
@@ -94,6 +95,15 @@ def _log_query_profile(tag, offsets, durations):
         f"max={max(durations, default=0.0):.3f}s"
     )
 
+
+
+def round_order(uid_list, rng=None):
+    """The order a round's requests are dispatched in: a fresh permutation of (index, uid) each round, so the
+    time a miner is recorded with does not follow its uid (requests are prepared one after another on one loop,
+    and a request prepared early is recorded while the later ones are still being prepared)."""
+    order = list(enumerate(uid_list))
+    (rng or random).shuffle(order)
+    return order
 
 class DendriteManager:
     """Owns the dendrite pool used to query miners, recycling connections as they age."""
@@ -513,7 +523,7 @@ class QueryService:
 
         query_tasks = [
             asyncio.create_task(query_uid(uid, self.metagraph.axons[index], axon_synapses[uid]))
-            for index, uid in enumerate(uid_list)
+            for index, uid in round_order(uid_list)
             if uid not in deregistered_uids
         ]
 
@@ -529,6 +539,7 @@ class QueryService:
         )
 
         elapsed = time.time() - query_start
+        self._last_wait_s = elapsed
         bt.logging.info(f"Wait completed: {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
 
         if pending:
@@ -598,7 +609,7 @@ class QueryService:
 
         query_tasks = [
             asyncio.create_task(fire_uid(uid, self.metagraph.axons[index], axon_synapses[uid]))
-            for index, uid in enumerate(uid_list)
+            for index, uid in round_order(uid_list)
             if uid not in deregistered_uids
         ]
 
@@ -614,6 +625,7 @@ class QueryService:
         )
 
         elapsed = time.time() - query_start
+        self._last_wait_s = elapsed
         bt.logging.info(f"Wait completed (fanout): {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
 
         if pending:
@@ -673,11 +685,7 @@ class QueryService:
             gc.disable()
             
             old_dendrite = self.dendrite
-            # Close the old session before it goes out of scope; otherwise
-            # bittensor's Dendrite.__del__ tries to close it without an event
-            # loop and emits "coroutine 'ClientSession.close' was never awaited".
-            await DendriteManager.close_session(old_dendrite)
-            self.dendrite = bt.Dendrite(wallet=self.wallet)
+            await self._round_dendrite()
             
             class MinimalMetagraph:
                 def __init__(self, axons, uids):
@@ -873,7 +881,8 @@ class QueryService:
                     "total_instructions": total_instructions,
                     "success": success,
                     "timeouts": timeouts,
-                    "failures": failures
+                    "failures": failures,
+                    "wait": getattr(self, "_last_wait_s", None),
                 }
             }
 
@@ -888,6 +897,20 @@ class QueryService:
             if gc_was_enabled:
                 gc.enable()
 
+    async def _round_dendrite(self):
+        """The dendrite for this round. A new one every round by default, closing the old session first (otherwise
+        bittensor's Dendrite.__del__ closes it without an event loop and warns that ClientSession.close was never
+        awaited). With neuron.reuse_connections, the same one while its session is open, so the connections it keeps
+        alive carry over, with its synapse history cleared so it does not grow with every round."""
+        d = self.dendrite
+        reuse = bool(getattr(self.config.neuron, 'reuse_connections', False))
+        if reuse and d is not None and getattr(d, '_session', None) is not None and not d._session.closed:
+            d.synapse_history.clear()
+            return d
+        await DendriteManager.close_session(d)
+        self.dendrite = bt.Dendrite(wallet=self.wallet)
+        return self.dendrite
+
     async def _post_query_cleanup(self):
         """Deferred query cleanup, run AFTER the response is written and the main
         loop notified: drop the big request-synapse/compressed-book refs and tear
@@ -901,7 +924,7 @@ class QueryService:
             del refs
             if hasattr(self, 'metagraph'):
                 del self.metagraph
-            if getattr(self, 'dendrite', None) is not None:
+            if getattr(self, 'dendrite', None) is not None and not getattr(self.config.neuron, 'reuse_connections', False):
                 await DendriteManager.close_session(self.dendrite)
         except Exception as e:
             bt.logging.warning(f"_post_query_cleanup: {e}")

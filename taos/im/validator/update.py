@@ -667,7 +667,7 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
                 )
         if end or not checkpoint_success:
             fallback_cmd = [
-                "pm2", "start", "--no-autorestart", "--name=simulator",
+                "pm2", "start", "--no-autorestart", "--kill-timeout", "60000", "--name=simulator",
                 f"../build/src/cpp/taosim -f {self.simulator_config_file}"
             ]
             bt.logging.info(f"STARTING NEW SIMULATION: {' '.join(fallback_cmd)}")
@@ -706,6 +706,22 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
             details={"traceback": traceback.format_exc()}
         )
         raise
+
+def _page_silent_engine(self: Validator, name: str, status: str) -> None:
+    """Page for an engine whose process is up but which has sent no state for longer than the check allows.
+
+    The caller's verdict stays healthy, so nothing restarts it: a slow validator leaves the engine waiting in the
+    same silence, and resuming a hung engine replays the hang. Keyed on the last state's time, so every check of
+    one silence updates one incident.
+    """
+    age = time.time() - self.last_state_time
+    self.pagerduty_alert(
+        f"{name} process is {status} but no state has arrived for {age:.0f}s",
+        method="check_simulator",
+        dedup_key=f"{name.lower()}-silent:{int(self.last_state_time)}",
+        details={"last_state_age_s": round(age), "status": status},
+    )
+
 
 def check_exchange(self: Validator) -> bool:
     """
@@ -768,6 +784,7 @@ def check_exchange(self: Validator) -> bool:
             if status != 'online':
                 self.pagerduty_alert(f"Exchange process (PM2) has stopped! Status={status}")
                 return False
+            _page_silent_engine(self, "Exchange", status)
             return True
 
         # Fall back to raw process scan: taosim with -e flag
@@ -775,6 +792,7 @@ def check_exchange(self: Validator) -> bool:
             for proc in psutil.process_iter(['cmdline']):
                 args = proc.info['cmdline'] or []
                 if any('taosim' in a for a in args) and '-e' in args:
+                    _page_silent_engine(self, "Exchange", "running")
                     return True
         except Exception as e:
             bt.logging.error(f"Error checking exchange processes: {e}")
@@ -906,6 +924,7 @@ def check_simulator(self : Validator) -> bool:
                     f"Simulator process (PM2) has stopped! Status={status}"
                 )
                 return False
+            _page_silent_engine(self, "Simulator", status)
             return True
         found = False
         try:
@@ -922,6 +941,7 @@ def check_simulator(self : Validator) -> bool:
             self.pagerduty_alert("Simulator process (No PM2) has stopped!")
             return False
 
+        _page_silent_engine(self, "Simulator", "running")
         return True
     except Exception as ex:
         bt.logging.error(f"Error during simulator health check: {ex}")

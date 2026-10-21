@@ -8,12 +8,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <random>
 #include <source_location>
+#include <stdexcept>
+#include <utility>
 
 //-------------------------------------------------------------------------
 
 namespace taosim::process
 {
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+// One `count,price` row of a seed file, the price in cents.
+std::optional<std::pair<int, int64_t>> parseSeedRow(const std::string& line)
+{
+    const auto fields = taosim::util::split(line, ',');
+    if (fields.size() != 2) return std::nullopt;
+    try {
+        return std::pair{
+            std::stoi(fields[0]), static_cast<int64_t>(std::llround(std::stod(fields[1]) * 100.0))};
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace
 
 //-------------------------------------------------------------------------
 
@@ -62,7 +86,10 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
     // L is stored as float; widen the row to double so the accumulation matches V.
     m_state.X(1) = m_L->row(1).head(2).cast<double>().dot(m_state.V.head(2));
 
-    m_seedfile = (sim->logDir() / "fundamental_seed.csv").generic_string();
+    m_recordedSeeds = !desc.seedFile.empty();
+    m_seedfile = m_recordedSeeds
+        ? desc.seedFile
+        : (sim->runDir() / "fundamental_seed.csv").generic_string();
 }
 
 //-------------------------------------------------------------------------
@@ -71,54 +98,23 @@ void FundamentalPrice::update(Timestamp timestamp)
 {
     if (m_values.empty()) {
         if (timestamp - m_state.lastSeedTime >= m_seedInterval) {
-            int count = m_state.lastCount;
-            uint64_t seed = 0;
-            if ( fs::exists( m_seedfile ) ) {
-                try {
-                    std::vector<std::string> lines = taosim::util::getLastLines(m_seedfile, 2);
-                    if (lines.size() >= 2) {
-                        std::vector<std::string> line = taosim::util::split(lines[lines.size() - 2], ',');
-                        if (line.size()== 2) {
-                            count = std::stoi(line[0]);
-                            seed = static_cast<uint64_t>(round(std::stof(line[1])*100)) + m_bookId*10;
-                        } else {
-                            fmt::println("FundamentalPrice::update : FAILED TO GET SEED FROM LINE - {}", lines[lines.size() - 2]);
-                        }
-                    } else {
-                        fmt::println("FundamentalPrice::update : FAILED TO GET SEED FROM FILE - NO DATA ({} LINES READ)", lines.size());
-                    }
-                } catch (const std::exception& exc) {
-                    fmt::println("FundamentalPrice::update : ERROR GETTING SEED FROM FILE - {}", exc.what());
-                }
-                if (count == m_state.lastCount) {
-                    std::random_device rd;
-                    std::mt19937 gen(rd());
-                    std::uniform_int_distribution<> distr(-50, 50);
-                    seed = m_state.lastSeed + distr(gen);
-                    if (timestamp >= m_gracePeriod) {
-                        fmt::println("WARNING : Fundamental price seed not updated - using random seed.  Last Count {} | Count {} | Last Seed {} | Seed {}", m_state.lastCount, count, seed, m_state.lastSeed);
-                    }
-                }
+            const auto row = m_recordedSeeds ? std::optional{recordedSeed(timestamp)} : liveSeed(timestamp);
+            uint64_t seed{};
+            if (row) {
+                seed = seedFor(row->cents, m_bookId);
+                m_state.lastCount = row->count;
             } else {
-                if (timestamp >= m_gracePeriod) {
-                    fmt::println("FundamentalPrice::update : NO SEED FILE PRESENT AT {}.  Using random seed.", m_seedfile);
-                }
-                std::random_device rd;
-                std::mt19937 gen(rd());
-                std::uniform_int_distribution<> distr(10800000,11200000);
-                seed = distr(gen);
+                seed = std::random_device{}();
             }
-            // D4b: with ownRng the seed steers a PRIVATE stream; the shared agent
-            // RNG is left alone (legacy reseeded it, restarting every agent's
-            // randomness each seedInterval — see the desc field comment).
+            reseed(seed);
             std::mt19937& rng = m_ownRng ? m_processRng : *m_rng;
-            if (m_ownRng) m_processRng.seed(seed); else m_rng->seed(seed);
-            m_state.lastCount = count;
             m_state.lastSeed = seed;
             m_state.lastSeedTime = timestamp;
             m_state.t += m_dt;
-            // Jump part
-            m_state.dJ += m_poisson(rng) * m_jump(rng);
+            // Jump part, its two draws in a fixed order
+            const int jumps = m_poisson(rng);
+            const double jumpSize = m_jump(rng);
+            m_state.dJ += jumps * jumpSize;
             //fBM
             int64_t step = timestamp/m_updatePeriod;
             cholesky_step(step);
@@ -146,6 +142,103 @@ void FundamentalPrice::update(Timestamp timestamp)
     // The signal carries the latent seed value (like loggedValue()); it has no
     // subscribers in-tree, and the reveal is a read-time presentation, not state.
     m_valueSignal(m_state.value);
+}
+
+//-------------------------------------------------------------------------
+
+std::optional<FundamentalPrice::SeedRow> FundamentalPrice::liveSeed(Timestamp timestamp) const
+{
+    const bool warn = timestamp >= m_gracePeriod;
+    if (!fs::exists(m_seedfile)) {
+        if (warn) {
+            fmt::println("FundamentalPrice::update : NO SEED FILE PRESENT AT {}.  Using random seed.", m_seedfile);
+        }
+        return std::nullopt;
+    }
+    std::optional<SeedRow> row;
+    try {
+        const auto lines = taosim::util::getLastLines(m_seedfile, 2);
+        if (lines.size() >= 2) {
+            if (const auto parsed = parseSeedRow(lines[lines.size() - 2])) {
+                row = SeedRow{parsed->first, parsed->second};
+            } else {
+                fmt::println("FundamentalPrice::update : FAILED TO GET SEED FROM LINE - {}", lines[lines.size() - 2]);
+            }
+        } else {
+            fmt::println(
+                "FundamentalPrice::update : FAILED TO GET SEED FROM FILE - NO DATA ({} LINES READ)", lines.size());
+        }
+    } catch (const std::exception& exc) {
+        fmt::println("FundamentalPrice::update : ERROR GETTING SEED FROM FILE - {}", exc.what());
+    }
+    if (!row || row->count == m_state.lastCount) {
+        if (warn) {
+            fmt::println(
+                "WARNING : Fundamental price seed not updated - using random seed.  Last Count {} | Count {}",
+                m_state.lastCount, row ? row->count : m_state.lastCount);
+        }
+        return std::nullopt;
+    }
+    return row;
+}
+
+//-------------------------------------------------------------------------
+
+FundamentalPrice::SeedRow FundamentalPrice::recordedSeed(Timestamp timestamp)
+{
+    if (m_recorded.empty()) {
+        std::ifstream ifs{m_seedfile};
+        if (!ifs) {
+            throw std::runtime_error{fmt::format(
+                "FundamentalPrice: the recorded seed file {} cannot be read", m_seedfile)};
+        }
+        for (std::string line; std::getline(ifs, line);) {
+            if (line.empty()) continue;
+            const auto parsed = parseSeedRow(line);
+            if (!parsed) {
+                throw std::runtime_error{fmt::format(
+                    "FundamentalPrice: row {} of the recorded seed file {} is not count,price: {}",
+                    m_recorded.size() + 1, m_seedfile, line)};
+            }
+            m_recorded.push_back({parsed->first, parsed->second});
+        }
+    }
+    const uint64_t row = m_seedInterval == 0 ? 0 : timestamp / m_seedInterval;
+    if (row == 0 || row > m_recorded.size()) {
+        throw std::runtime_error{fmt::format(
+            "FundamentalPrice: the recorded seed file {} has {} rows, and the seed step at {} needs row {}",
+            m_seedfile, m_recorded.size(), timestamp, row)};
+    }
+    return m_recorded[row - 1];
+}
+
+//-------------------------------------------------------------------------
+
+uint32_t FundamentalPrice::seedFor(int64_t priceCents, uint64_t bookId) noexcept
+{
+    // The price and the book each pass through a full avalanche, so distinct books and distinct prices
+    // seed distinct streams.
+    auto mix = [](uint64_t z) {
+        z += 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    };
+    const uint64_t z = mix(mix(static_cast<uint64_t>(priceCents)) ^ bookId);
+    return static_cast<uint32_t>(z ^ (z >> 32));
+}
+
+//-------------------------------------------------------------------------
+
+void FundamentalPrice::reseed(uint64_t seed)
+{
+    (m_ownRng ? m_processRng : *m_rng).seed(static_cast<std::mt19937::result_type>(seed));
+    // A normal distribution keeps the second value of each pair it generates; started afresh here, every
+    // draw of a seed step comes from that step's seed.
+    m_gaussian.reset();
+    m_fractionalGaussian.reset();
+    m_jump.reset();
+    m_poisson.reset();
 }
 
 //-------------------------------------------------------------------------
@@ -204,7 +297,8 @@ double FundamentalPrice::valueAt(Timestamp now) const
 
 void FundamentalPrice::cholesky_step(int64_t i)
 {
-    m_state.V(i + 1) = m_fractionalGaussian(m_ownRng ? m_processRng : *m_rng);
+    // The step's own innovation is drawn now, under its own seed; X(i) combines it with the earlier ones.
+    m_state.V(i) = m_fractionalGaussian(m_ownRng ? m_processRng : *m_rng);
     m_state.X(i) = m_L->row(i).head(i + 1).cast<double>().dot(m_state.V.head(i + 1));
 }
 
@@ -256,8 +350,16 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
     // 1 = draw this process's randomness from a PRIVATE per-book generator instead of
     // reseeding the SHARED simulation RNG every seedInterval. Legacy (0) reseeded the shared
     // stream ~34,560 times per 12 h run from a ~400k-state pool, which restarted every agent's
-    // randomness and made nominally independent books share draws. 0 = legacy.
-    const int ownRng = node.attribute("ownRng").as_int(0);
+    // randomness and made nominally independent books share draws. 1 is the default; 0 = legacy.
+    // An element without the attribute is named at load, so that no file relies on the default.
+    const pugi::xml_attribute ownRngAttr = node.attribute("ownRng");
+    if (ownRngAttr.empty()) {
+        fmt::println(
+            "FundamentalPrice::fromXML : WARNING : book {} has no ownRng attribute; it draws from its own "
+            "generator (ownRng=1, the default). Set ownRng explicitly.",
+            bookId);
+    }
+    const int ownRng = ownRngAttr.as_int(1);
 
     // XML structure: <MultiBookExchangeAgent gracePeriod=...><Books><Processes><FundamentalPrice/>
     // Walk up 3 levels to find gracePeriod.
@@ -283,7 +385,8 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
         .proc = {
             .updatePeriod = updatePeriod
         },
-        .L = L
+        .L = L,
+        .seedFile = node.attribute("seedFile").as_string("")
     });
 }
 

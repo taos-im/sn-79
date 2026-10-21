@@ -468,3 +468,110 @@ TEST_P(LoanSettlementTest, ClosePosition)
 
 
 //-------------------------------------------------------------------------
+
+// A close repays its loan from the proceeds of the closing order net of the taker fee, so a full close is
+// sized for that fee and leaves no loan behind. A margin call closes the whole loan the same way.
+
+namespace
+{
+
+class FullCloseTest : public testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        nodes = taosim::util::parseSimulationFile(kTestDataPath / "MultiAgentFees.xml");
+        // A single tier, so the rate a close is sized with is the rate its trade pays.
+        auto feePolicy = nodes.exchange.child("FeePolicy");
+        while (feePolicy.remove_child("Tier")) {}
+        auto tier = feePolicy.append_child("Tier");
+        tier.append_attribute("volumeRequired") = "0";
+        tier.append_attribute("makerFee") = "0.0";
+        tier.append_attribute("takerFee") = "0.002";
+
+        simulation = std::make_unique<Simulation>();
+        simulation->setDebug(false);
+        simulation->configure(nodes.simulation);
+        exchange = simulation->exchange();
+        exchange->accounts().registerLocal("agent1");
+        exchange->accounts().registerLocal("agent2");
+        borrower = exchange->accounts().getAgentId(LocalAgentId{"agent1"});
+        counterparty = exchange->accounts().getAgentId(LocalAgentId{"agent2"});
+        ASSERT_GT(exchange->clearingManager().feePolicy()->getRates(bookId, borrower).taker, 0_dec);
+    }
+
+    void limit(AgentId agentId, OrderDirection direction, decimal_t volume, decimal_t price)
+    {
+        const auto [order, ec] = placeLimitOrder(
+            exchange, agentId, bookId, Currency::BASE, SettleType::NONE, direction, volume, price, 0_dec);
+        ASSERT_EQ(ec, OrderErrorCode::VALID);
+    }
+
+    [[nodiscard]] OrderID openPosition(OrderDirection direction, decimal_t volume, decimal_t leverage)
+    {
+        const auto [order, ec] = placeMarketOrder(
+            exchange, borrower, bookId, Currency::BASE, SettleType::NONE, direction, volume, leverage);
+        EXPECT_EQ(ec, OrderErrorCode::VALID);
+        EXPECT_TRUE(loan(order->id()).has_value()) << "the leveraged order opened no loan";
+        return order->id();
+    }
+
+    [[nodiscard]] std::optional<decimal_t> loan(OrderID orderId)
+    {
+        const auto found = exchange->accounts()[borrower][bookId].getLoan(orderId);
+        return found ? std::make_optional(found->get().amount()) : std::nullopt;
+    }
+
+    const BookId bookId{};
+    taosim::util::Nodes nodes;
+    std::unique_ptr<Simulation> simulation;
+    MultiBookExchangeAgent* exchange{};
+    AgentId borrower{}, counterparty{};
+};
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
+TEST_F(FullCloseTest, AFullCloseOfALongLeavesNoLoan)
+{
+    limit(counterparty, OrderDirection::SELL, 10_dec, 300_dec);
+    const auto loanId = openPosition(OrderDirection::BUY, 2_dec, 1_dec);
+    limit(counterparty, OrderDirection::BUY, 20_dec, 290_dec);
+
+    ASSERT_TRUE(closePositionReq(exchange, borrower, bookId, loanId, std::nullopt));
+
+    EXPECT_EQ(loan(loanId), std::nullopt) << "the full close left a loan of " << loan(loanId).value_or(0_dec);
+    EXPECT_EQ(exchange->accounts()[borrower][bookId].m_quoteLoan, 0_dec);
+}
+
+//-------------------------------------------------------------------------
+
+TEST_F(FullCloseTest, AFullCloseOfAShortLeavesNoLoan)
+{
+    limit(counterparty, OrderDirection::BUY, 10_dec, 300_dec);
+    const auto loanId = openPosition(OrderDirection::SELL, 2_dec, 1_dec);
+    limit(counterparty, OrderDirection::SELL, 20_dec, 310_dec);
+
+    ASSERT_TRUE(closePositionReq(exchange, borrower, bookId, loanId, std::nullopt));
+
+    EXPECT_EQ(loan(loanId), std::nullopt) << "the full close left a loan of " << loan(loanId).value_or(0_dec);
+    EXPECT_EQ(exchange->accounts()[borrower][bookId].m_baseLoan, 0_dec);
+}
+
+//-------------------------------------------------------------------------
+
+TEST_F(FullCloseTest, AMarginCallClosesTheWholeLoan)
+{
+    limit(counterparty, OrderDirection::SELL, 10_dec, 300_dec);
+    const auto loanId = openPosition(OrderDirection::BUY, 2_dec, 1_dec);
+    // Below the margin-call price of 300 * 1 / (2 * 0.9).
+    limit(counterparty, OrderDirection::BUY, 20_dec, 160_dec);
+
+    simulation->step();
+
+    EXPECT_EQ(loan(loanId), std::nullopt) << "the margin call left a loan of " << loan(loanId).value_or(0_dec);
+    EXPECT_EQ(exchange->accounts()[borrower][bookId].m_quoteLoan, 0_dec);
+}
+
+//-------------------------------------------------------------------------

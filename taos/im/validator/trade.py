@@ -12,14 +12,149 @@ import bittensor as bt
 from taos.im.protocol.models import TradeInfo
 from taos.im.protocol.events import TradeEvent, trade_event_from_wire
 from taos.im.protocol import MarketSimulationStateUpdate
+from taos.im.config import debeta_dial
 from taos.im.validator.debeta import (
-    accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
+    _hadd2, accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
     flush_capture_state,
     prune_hist_2level, prune_hist_1level, shift_hist_2level, shift_hist_1level,
 )
 
-# De-beta making: half-window (in trades) for the non-lagging centered mid used for spread capture.
+# De-beta making: default half-window (in trades) for the non-lagging centered mid used for
+# spread capture. Live capture reads --scoring.debeta.centered_window; this constant is the
+# default and the fallback for callers without a validator config (tests, offline agents).
 CAPTURE_W = 15
+
+
+def _centered_window(self):
+    """Half-window (in trades) for the non-lagging centered mid used for spread capture.
+
+    Reads --scoring.debeta.centered_window through the one dial reader, so an absent dial takes the parser's
+    default; CAPTURE_W when the value is unreadable. A non-positive value is treated as missing (a zero-width window is not a
+    centered mid).
+    """
+    try:
+        cfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+        w = int(debeta_dial(cfg, 'centered_window') or CAPTURE_W)  # the parser's default when the dial is absent
+    except (TypeError, ValueError, AttributeError):
+        return CAPTURE_W
+    if w <= 0:
+        return CAPTURE_W
+    return w
+
+# The alternative mark's leg (scoring.debeta.mark_mode_alt): a second mark-to-market set beside the paid one, windowed,
+# pruned, shifted, persisted and reset with it; the scorer publishes its skill per uid, pay never reads it.
+ALT_MARK_STATE = ("debeta_mtm_alt", "debeta_invsum_alt", "debeta_inv_alt", "debeta_invn_alt", "debeta_pfirst_alt",
+                  "debeta_plast_alt", "debeta_drift_alt", "debeta_mark_state_alt",
+                  "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist")
+
+
+# The liquidity a maker provides (0.6.5, read before a making rule pays for it): maker-side notional of its fills by
+# side, the states it had an order resting at the best bid or ask, and the size resting there; per uid and book,
+# windowed, pruned, shifted, persisted and reset with the other de-beta accumulators; published, never paid.
+LIQUIDITY_STATE = ("debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size",
+                   "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist",
+                   "debeta_best_size_hist")
+
+
+def init_liquidity_state(self):
+    for _name in ("debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size"):
+        if not hasattr(self, _name):
+            setattr(self, _name, defaultdict(lambda: defaultdict(float)))
+    for _name in ("debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist",
+                  "debeta_best_size_hist"):
+        if not hasattr(self, _name):
+            setattr(self, _name, {})
+
+
+def accumulate_maker_notional(self, book_id, trades, ts=None):
+    """The maker side's notional of each fill with a miner maker, by the side the maker took (side 0: the taker
+    bought, so the maker sold)."""
+    for t in trades:
+        ma = t.get('Ma') if isinstance(t, dict) else getattr(t, 'Ma', None)
+        if ma is None or int(ma) < 0:
+            continue
+        p = float(t.get('p') if isinstance(t, dict) else getattr(t, 'p'))
+        q = float((t.get('q') if isinstance(t, dict) else getattr(t, 'q')) or 0.0)
+        s = int(t.get('s') if isinstance(t, dict) else getattr(t, 's'))
+        sums, hist = ((self.debeta_maker_sell_notional, self.debeta_maker_sell_notional_hist) if s == 0
+                      else (self.debeta_maker_buy_notional, self.debeta_maker_buy_notional_hist))
+        sums[int(ma)][book_id] = sums[int(ma)].get(book_id, 0.0) + p * q
+        if ts is not None:
+            _hadd2(hist, int(ma), book_id, ts, p * q)
+
+
+def _level_price(levels):
+    if not levels:
+        return None
+    lv = levels[0]
+    return float(lv.get('p') if isinstance(lv, dict) else getattr(lv, 'p'))
+
+
+def accumulate_at_best(self, uid_item, books, accounts_uid, ts=None):
+    """One state: on each book where the uid has an order resting at the best bid (buy, side 0) or the best ask
+    (sell, side 1), one more state at the best and the size resting there."""
+    for book_id, account in (accounts_uid or {}).items():
+        book = books.get(book_id) if isinstance(books, dict) else None
+        if book is None:
+            continue
+        orders = (account.get('o') if isinstance(account, dict) else getattr(account, 'o', None)) or []
+        if not orders:
+            continue
+        bb = _level_price(book.get('b') if isinstance(book, dict) else getattr(book, 'b', None))
+        ba = _level_price(book.get('a') if isinstance(book, dict) else getattr(book, 'a', None))
+        size = 0.0
+        for o in orders:
+            p = o.get('p') if isinstance(o, dict) else getattr(o, 'p', None)
+            if p is None:
+                continue
+            s = int(o.get('s') if isinstance(o, dict) else getattr(o, 's'))
+            q = float((o.get('q') if isinstance(o, dict) else getattr(o, 'q')) or 0.0)
+            if (s == 0 and bb is not None and float(p) == bb) or (s == 1 and ba is not None and float(p) == ba):
+                size += q
+        if size > 0.0:
+            self.debeta_at_best[uid_item][book_id] = self.debeta_at_best[uid_item].get(book_id, 0.0) + 1
+            self.debeta_best_size[uid_item][book_id] = self.debeta_best_size[uid_item].get(book_id, 0.0) + size
+            if ts is not None:
+                _hadd2(self.debeta_at_best_hist, uid_item, book_id, ts, 1.0)
+                _hadd2(self.debeta_best_size_hist, uid_item, book_id, ts, size)
+
+
+def init_alt_mark_state(self):
+    for _name in ("debeta_mtm_alt", "debeta_invsum_alt", "debeta_inv_alt"):
+        if not hasattr(self, _name):
+            setattr(self, _name, defaultdict(lambda: defaultdict(float)))
+    for _name in ("debeta_invn_alt", "debeta_pfirst_alt", "debeta_plast_alt", "debeta_drift_alt", "debeta_mark_state_alt",
+                  "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist"):
+        if not hasattr(self, _name):
+            setattr(self, _name, {})
+
+
+def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=None):
+    """One book's batch into the alternative mark's leg: the paid leg's accumulate_book_mtm on its own state."""
+    accumulate_book_mtm(
+        self.debeta_mtm_alt, self.debeta_invsum_alt, self.debeta_invn_alt, self.debeta_inv_alt,
+        self.debeta_pfirst_alt, self.debeta_plast_alt, book_id, trades,
+        mtm_hist=self.debeta_mtm_alt_hist, invsum_hist=self.debeta_invsum_alt_hist, invn_hist=self.debeta_invn_alt_hist,
+        drift=self.debeta_drift_alt, drift_hist=self.debeta_drift_alt_hist, ts=ts,
+        mark_state=self.debeta_mark_state_alt, mark_mode=mark_mode, mark_window=mark_window,
+        mark_mid=book_mid(book) if mark_mode == 'mid' else None,
+    )
+
+
+def book_mid(book):
+    """The mid-quote of a state's book, the mean of its best bid and ask; None without both sides or when they cross
+    (a stand-in book is no mark)."""
+    bids = book.get('b') if isinstance(book, dict) else getattr(book, 'b', None)
+    asks = book.get('a') if isinstance(book, dict) else getattr(book, 'a', None)
+    if not bids or not asks:
+        return None
+
+    def px(level):
+        return float(level.get('p') if isinstance(level, dict) else getattr(level, 'p'))
+    bb, ba = px(bids[0]), px(asks[0])
+    if ba <= bb:
+        return None
+    return 0.5 * (bb + ba)
 
 
 def _min_order_size(self, book_id):
@@ -457,24 +592,34 @@ def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timesta
             for book_id, book in books.items()
             if book_id in accounts_uid
         }
-        if uid_item not in self.inventory_history:
-            self.inventory_history[uid_item] = {}
-        hist = self.inventory_history[uid_item]
-        if not hist:
-            hist[timestamp] = current_inventory
-        else:
-            timestamps = sorted(hist.keys())
-            if len(timestamps) == 1:
-                hist[timestamp] = current_inventory
-            else:
-                first_ts = timestamps[0]
-                self.inventory_history[uid_item] = {
-                    first_ts: hist[first_ts],
-                    timestamps[-1]: hist[timestamps[-1]],
-                    timestamp: current_inventory
-                }
+        if hasattr(self, 'debeta_at_best'):
+            accumulate_at_best(self, uid_item, books, accounts_uid, ts=sampled_timestamp)
     else:
-        self.inventory_history[uid_item][timestamp] = {book_id: 0.0 for book_id in books}
+        current_inventory = {book_id: 0.0 for book_id in books}
+    # The first, the previous and the newest entry, whether or not the uid has an account this update.
+    hist = self.inventory_history.setdefault(uid_item, {})
+    if len(hist) < 2:
+        hist[timestamp] = current_inventory
+    else:
+        timestamps = sorted(hist.keys())
+        self.inventory_history[uid_item] = {
+            timestamps[0]: hist[timestamps[0]],
+            timestamps[-1]: hist[timestamps[-1]],
+            timestamp: current_inventory
+        }
+    # ONE QUOTE BALANCE IS SHARED BY EVERY BOOK ON THE EXCHANGE, so each book's inventory value carries every move of
+    # it. The balance at each kept timestamp lets the report count that move once (report.exchange_inventory); the
+    # history scoring reads is unchanged. Spot accounts carry no quote loan or collateral.
+    _sim = getattr(self, 'simulation', None)
+    if _sim is not None and not hasattr(_sim, 'block_count') and uid_item in accounts and accounts[uid_item]:
+        _acct = next(iter(accounts[uid_item].values()))
+        _q = (_acct.get('qb') or {}).get('t', 0.0) - _acct.get('ql', 0.0) + _acct.get('qc', 0.0)
+        _rec = getattr(self, 'inventory_quote', None)
+        if _rec is None:
+            _rec = self.inventory_quote = {}
+        _kept = self.inventory_history[uid_item]
+        _rec[uid_item] = {ts: q for ts, q in (_rec.get(uid_item) or {}).items() if ts in _kept}
+        _rec[uid_item][timestamp] = _q
 
 
 def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
@@ -573,6 +718,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 setattr(self, _name, {})  # invn/drift running (per book); pfirst/plast STATE
         if not hasattr(self, 'debeta_mark_state'):
             self.debeta_mark_state = {}  # STATE (M1 rolling settlement-mark window; re-based at boundary, not persisted)
+        init_alt_mark_state(self)
+        init_liquidity_state(self)
         if not hasattr(self, 'debeta_capture_mid'):
             # STATE {book: rolling print window + pending fills}: carries the capture mid ACROSS
             # state updates (median 4 prints/update live, so a batch-local mid degrades to the batch
@@ -580,14 +727,16 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             # sim boundary, not persisted.
             self.debeta_capture_mid = {}
         _debeta_cfg = getattr(self.config.scoring, 'debeta', None)
-        _mark_mode = str(getattr(_debeta_cfg, 'mark_mode', 'last') or 'last')
-        _mark_window = int(getattr(_debeta_cfg, 'mark_window', 0) or 0)
+        _mark_mode = str(debeta_dial(_debeta_cfg, 'mark_mode'))
+        _mark_window = int(debeta_dial(_debeta_cfg, 'mark_window'))
+        _mark_alt = str(debeta_dial(_debeta_cfg, 'mark_mode_alt'))
         # realized spread (2 Oct 2026): the horizon a fill is marked at, sim seconds; accumulated at every making_basis
-        _realized_ns = int(float(getattr(_debeta_cfg, 'making_horizon_s', 20.0) or 20.0) * 1e9)
+        _realized_ns = int(float(debeta_dial(_debeta_cfg, 'making_horizon_s')) * 1e9)
         # fee-aware making (0.6.4): the share of each maker fee netted from the maker's captured and realized spread
-        _fee_w = float(getattr(_debeta_cfg, 'making_fee_weight', 0.0) or 0.0)
+        _fee_w = float(debeta_dial(_debeta_cfg, 'making_fee_weight'))
         # capture mid votes (0.6.4): 1 lets only background-sided prints vote in a fill's capture mid
-        _market_votes = bool(int(getattr(_debeta_cfg, 'capture_market_votes', 0) or 0))
+        _market_votes = bool(int(debeta_dial(_debeta_cfg, 'capture_market_votes')))
+        _capture_w = _centered_window(self)
         if not hasattr(self, 'debeta_cp'):
             self.debeta_cp = {}  # {maker_uid: {taker_uid: vol}} for P11 (running sum)
             self.debeta_cpc = {}  # {class: {maker_uid: {taker_uid: vol}}}: the same rows per asset class
@@ -618,7 +767,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             de_trades = _et_batches.get(bookId, []) if _debeta_exchange else trades
             if de_trades:
                 accumulate_book_capture(
-                    self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, CAPTURE_W,
+                    self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, _capture_w,
                     buy_hist=self.debeta_capbuy_hist, sell_hist=self.debeta_capsell_hist,
                     ts=sampled_timestamp, mid_state=self.debeta_capture_mid,
                     real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
@@ -634,11 +783,15 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     drift_hist=self.debeta_drift_hist, ts=sampled_timestamp,
                     mark_state=self.debeta_mark_state, mark_mode=_mark_mode,
                     mark_window=_mark_window,
+                    mark_mid=book_mid(book) if _mark_mode == 'mid' else None,
                     heldn=self.debeta_heldn, heldinv=self.debeta_heldinv, helddrift=self.debeta_helddrift,
                     notional=self.debeta_notional, heldn_hist=self.debeta_heldn_hist,
                     heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
                     notional_hist=self.debeta_notional_hist,
                 )
+                if _mark_alt not in ('none', _mark_mode):
+                    accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp)
+                accumulate_maker_notional(self, bookId, de_trades, ts=sampled_timestamp)
                 accumulate_counterparty_rows(self, bookId, de_trades, ts=sampled_timestamp)  # P11, pooled and per class
         if trades:
             if bookId not in self.recent_trades:
@@ -664,7 +817,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     # forward window, then finalizes truncated).
     if _debeta_on and getattr(self, 'debeta_capture_mid', None):
         flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
-                            CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
+                            _capture_w, buy_hist=self.debeta_capbuy_hist,
                             sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp,
                             real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
                             real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
@@ -695,6 +848,16 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         prune_hist_2level(self.debeta_notional_hist, self.debeta_notional, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _debeta_prune_threshold)
+        if hasattr(self, 'debeta_mtm_alt_hist'):
+            prune_hist_2level(self.debeta_mtm_alt_hist, self.debeta_mtm_alt, _debeta_prune_threshold)
+            prune_hist_2level(self.debeta_invsum_alt_hist, self.debeta_invsum_alt, _debeta_prune_threshold)
+            prune_hist_1level(self.debeta_invn_alt_hist, self.debeta_invn_alt, _debeta_prune_threshold)
+            prune_hist_1level(self.debeta_drift_alt_hist, self.debeta_drift_alt, _debeta_prune_threshold)
+        if hasattr(self, 'debeta_at_best_hist'):
+            prune_hist_2level(self.debeta_maker_buy_notional_hist, self.debeta_maker_buy_notional, _debeta_prune_threshold)
+            prune_hist_2level(self.debeta_maker_sell_notional_hist, self.debeta_maker_sell_notional, _debeta_prune_threshold)
+            prune_hist_2level(self.debeta_at_best_hist, self.debeta_at_best, _debeta_prune_threshold)
+            prune_hist_2level(self.debeta_best_size_hist, self.debeta_best_size, _debeta_prune_threshold)
         if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the same window
             self._debeta_seen_tids = {k: v for k, v in self._debeta_seen_tids.items()
                                       if v >= _debeta_prune_threshold}
@@ -881,6 +1044,10 @@ def shift_simulation_histories(
         old_ts: The previous simulation's time base.
         new_ts: The new simulation's time base.
     """
+    # A load restores the alternative mark's and the liquidity legs' histories, but their accumulators are created
+    # by the trade update; a start that arrives before the first update needs them here.
+    init_alt_mark_state(self)
+    init_liquidity_state(self)
     _log = log or (lambda m: None)
     book_ids = list(book_ids) if book_ids is not None else list(range(book_count))
     new_threshold = new_ts - lookback
@@ -1025,7 +1192,7 @@ def shift_simulation_histories(
         # histories); the mid window must never span the boundary price jump, so the stream resets.
         if getattr(self, 'debeta_capture_mid', None):
             flush_capture_state(self.debeta_capture_mid, self.capture_buy_sums, self.capture_sell_sums,
-                                CAPTURE_W, buy_hist=self.debeta_capbuy_hist,
+                                _centered_window(self), buy_hist=self.debeta_capbuy_hist,
                                 sell_hist=self.debeta_capsell_hist, ts=old_ts, force=True,
                                 real_buy_sums=getattr(self, 'realized_buy_sums', None), real_sell_sums=getattr(self, 'realized_sell_sums', None),
                                 real_buy_hist=getattr(self, 'debeta_realbuy_hist', None), real_sell_hist=getattr(self, 'debeta_realsell_hist', None),
@@ -1048,11 +1215,25 @@ def shift_simulation_histories(
         shift_hist_2level(self.debeta_notional_hist, self.debeta_notional, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_invn_hist, self.debeta_invn, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_drift_hist, self.debeta_drift, old_ts, new_ts, new_threshold)
+        if hasattr(self, 'debeta_mtm_alt_hist'):
+            shift_hist_2level(self.debeta_mtm_alt_hist, self.debeta_mtm_alt, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_invsum_alt_hist, self.debeta_invsum_alt, old_ts, new_ts, new_threshold)
+            shift_hist_1level(self.debeta_invn_alt_hist, self.debeta_invn_alt, old_ts, new_ts, new_threshold)
+            shift_hist_1level(self.debeta_drift_alt_hist, self.debeta_drift_alt, old_ts, new_ts, new_threshold)
+        if hasattr(self, 'debeta_at_best_hist'):
+            shift_hist_2level(self.debeta_maker_buy_notional_hist, self.debeta_maker_buy_notional, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_maker_sell_notional_hist, self.debeta_maker_sell_notional, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_at_best_hist, self.debeta_at_best, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_best_size_hist, self.debeta_best_size, old_ts, new_ts, new_threshold)
         # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
         self.debeta_inv = defaultdict(lambda: defaultdict(float))
         self.debeta_pfirst = {}
         self.debeta_plast = {}
         self.debeta_mark_state = {}
+        self.debeta_inv_alt = defaultdict(lambda: defaultdict(float))
+        self.debeta_pfirst_alt = {}
+        self.debeta_plast_alt = {}
+        self.debeta_mark_state_alt = {}
 
     _log("Clearing open positions...")
     self.open_positions = defaultdict(lambda: defaultdict(lambda: {
@@ -1106,8 +1287,9 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
     limit = int(now) + tolerance
     two_level = ("debeta_mtm_hist", "debeta_invsum_hist", "debeta_capbuy_hist", "debeta_capsell_hist",
                  "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
-                 "debeta_notional_hist")
-    one_level = ("debeta_invn_hist", "debeta_drift_hist")
+                 "debeta_notional_hist", "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
+                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist")
+    one_level = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist")
     other = ("realized_pnl_history", "inventory_history", "trade_volumes", "roundtrip_volumes")
 
     def stamps(d):
@@ -1174,7 +1356,11 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
                ("debeta_realbuy_hist", "realized_buy_sums"), ("debeta_realsell_hist", "realized_sell_sums"),
                ("debeta_cp_hist", "debeta_cp"), ("debeta_heldn_hist", "debeta_heldn"),
                ("debeta_heldinv_hist", "debeta_heldinv"), ("debeta_helddrift_hist", "debeta_helddrift"),
-               ("debeta_notional_hist", "debeta_notional"))
+               ("debeta_notional_hist", "debeta_notional"),
+               ("debeta_mtm_alt_hist", "debeta_mtm_alt"), ("debeta_invsum_alt_hist", "debeta_invsum_alt"),
+               ("debeta_maker_buy_notional_hist", "debeta_maker_buy_notional"),
+               ("debeta_maker_sell_notional_hist", "debeta_maker_sell_notional"),
+               ("debeta_at_best_hist", "debeta_at_best"), ("debeta_best_size_hist", "debeta_best_size"))
     for hist_name, sum_name in running:
         sums = sum_hist_2level(getattr(self, hist_name, None) or {})
         setattr(self, sum_name, defaultdict(lambda: defaultdict(float), {u: defaultdict(float, b) for u, b in sums.items()}))
@@ -1189,7 +1375,8 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
             if not _h[k1]:
                 del _h[k1]
         self.debeta_cpc[_c] = sum_hist_2level(_h)
-    for hist_name, sum_name in (("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift")):
+    for hist_name, sum_name in (("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift"),
+                                ("debeta_invn_alt_hist", "debeta_invn_alt"), ("debeta_drift_alt_hist", "debeta_drift_alt")):
         setattr(self, sum_name, defaultdict(float, sum_hist_1level(getattr(self, hist_name, None) or {})))
     inv = getattr(self, "debeta_inv", None)
     inv_note = ""
@@ -1221,6 +1408,10 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
             self.debeta_pfirst = {}
             self.debeta_plast = {}
             self.debeta_mark_state = {}
+            self.debeta_inv_alt = defaultdict(lambda: defaultdict(float))
+            self.debeta_pfirst_alt = {}
+            self.debeta_plast_alt = {}
+            self.debeta_mark_state_alt = {}
             inv_note = "; fill-stream inventory, last print and mark state reset as the run change would have (no correction supplied)"
     if log:
         log(f"HISTORIES AHEAD OF THE CLOCK: {moved} entries stamped up to {old_end} moved onto the clock at {now} "
@@ -1288,6 +1479,8 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     self.activity_factors[uid] = {bookId: 0.0 for bookId in book_ids}
     self.pnl_factors[uid] = {bookId: 1.0 for bookId in book_ids}
     self.inventory_history[uid] = {}
+    if getattr(self, 'inventory_quote', None) is not None:
+        self.inventory_quote.pop(uid, None)
     self.trade_volumes[uid] = {
         bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
         for bookId in book_ids
@@ -1307,14 +1500,17 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     for _n in ('capture_buy_sums', 'capture_sell_sums', 'realized_buy_sums', 'realized_sell_sums', 'debeta_mtm', 'debeta_invsum',
                'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional',
                'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist',
-               'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
+               'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist',
+               'debeta_mtm_alt', 'debeta_invsum_alt', 'debeta_mtm_alt_hist', 'debeta_invsum_alt_hist',
+               'debeta_maker_buy_notional', 'debeta_maker_sell_notional', 'debeta_at_best', 'debeta_best_size',
+               'debeta_maker_buy_notional_hist', 'debeta_maker_sell_notional_hist', 'debeta_at_best_hist', 'debeta_best_size_hist'):
         _d = getattr(self, _n, None)
         if _d is not None:
             _d.pop(uid, None)
-    _inv = getattr(self, 'debeta_inv', None)
-    if _inv is not None:
-        for _b in list(_inv.keys()):
-            _inv[_b].pop(uid, None)
+    for _inv in (getattr(self, 'debeta_inv', None), getattr(self, 'debeta_inv_alt', None)):
+        if _inv is not None:
+            for _b in list(_inv.keys()):
+                _inv[_b].pop(uid, None)
     clear_counterparty_rows(self, uid)    # UID as a maker AND as a counterparty of other makers, pooled and per class
     self.realized_pnl_history[uid] = {}
     if hasattr(self, 'agent_pnl_by_book'):

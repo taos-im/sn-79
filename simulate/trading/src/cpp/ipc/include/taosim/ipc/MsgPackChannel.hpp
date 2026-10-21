@@ -136,7 +136,7 @@ inline std::uint64_t hashRequestBytes(const void* data, std::size_t size) noexce
         return 0u;
     }
     const auto* p = static_cast<const unsigned char*>(data);
-    std::uint64_t h = 1469598103934665603ull;
+    std::uint64_t h = 14695981039346656037ull;
     for (std::size_t i = 0; i < size; ++i) {
         h ^= static_cast<std::uint64_t>(p[i]);
         h *= 1099511628211ull;

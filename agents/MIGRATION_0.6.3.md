@@ -1,4 +1,23 @@
-# Agents on a multi-asset layout (0.6.3)
+# Agents on a multi-asset layout (0.6.3, 0.6.5)
+
+> **0.6.5 changes the default layout.** The default wrapper, `multiasset_simulation_0.xml`, now carries three
+> asset classes over the same 128 books, eight realizations of sixteen books each:
+>
+> | Books | Class | Realizations | Initial price | Price / volume decimals | Minimum order |
+> |---|---|---|---|---|---|
+> | 0 to 63 | `simulation_0` | 4 | 300.0 | 2 / 4 | 0.25 |
+> | 64 to 95 | `simulation_1` | 2 | 29.57 | 2 / 4 | 2.5364 |
+> | 96 to 127 | `simulation_2` | 2 | 313.0114 | 4 / 4 | 0.2396 |
+>
+> `simulation_2` is a higher-priced asset on a finer price grid. Books 64 to 95 now belong to `simulation_1`
+> and books 96 to 127 to `simulation_2`, so an agent that maps book ids to classes by the 0.6.3 ranges below
+> trades both on the wrong limits. Take the class from the state instead: the configuration carried in every
+> state update (`state.config`, held by the agent base class as `self.simulation_config`) lists the layout's
+> classes in its `classes` field, one `AssetClass` per class with its `name`, `books`, `priceDecimals`,
+> `volumeDecimals` and `config`, and the calls under [Telling the classes apart](#telling-the-classes-apart)
+> read it for the book in hand. Under the default class weights each class is weighted by its share of the
+> books: 0.50, 0.25 and 0.25. The rest of this note describes the 0.6.3 two-class layout; its per-book calls
+> and the changes it asks of an agent still apply.
 
 From 0.6.3 a simulation may carry more than one asset class: a multi-asset layout runs one background
 market per class (each as one or more realizations), and every class quotes on its own price and volume
@@ -20,7 +39,7 @@ it. Everything is one call, keyed by the book id you already have in hand:
 
 ```python
 self.asset_classes()           # [AssetClass(name, books, priceDecimals, volumeDecimals, config), ...]
-self.class_of(book_id)         # "simulation_0" or "simulation_1" ("market" on a single market,
+self.class_of(book_id)         # the class name, e.g. "simulation_0" ("market" on a single market,
                                #  "exchange" on the exchange mechanism)
 self.config_for(book_id)       # the market configuration governing that book (grids, agents, limits)
 self.price_decimals(book_id)   # the book's price grid

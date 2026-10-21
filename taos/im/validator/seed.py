@@ -7,6 +7,7 @@ written to CSV files accessible by the simulator.
 import os
 import argparse
 import signal
+import threading
 import traceback
 import time
 
@@ -23,8 +24,10 @@ def _flag_sigusr1(signum, frame):
 
 
 # Installed before the slow imports below: the validator signals about two seconds after spawning this
-# process, and SIGUSR1's default disposition kills it (exit -10, 7 October 2026).
-signal.signal(signal.SIGUSR1, _flag_sigusr1)
+# process, and SIGUSR1's default disposition kills it (exit -10, 7 October 2026). Only the main thread
+# may install a handler, and an importer on another thread (the proxy's seed thread) does not need it.
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGUSR1, _flag_sigusr1)
 
 import bittensor as bt
 

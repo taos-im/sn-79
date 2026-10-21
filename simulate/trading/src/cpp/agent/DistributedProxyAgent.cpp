@@ -87,31 +87,44 @@ void DistributedProxyAgent::handleMessageForExchangeService(Message::Ptr msg)
     // Terminal placement failures are reported as rejects instead, which the validator matches to its
     // external-order registry to mark the originating order REJECTED and turns into the miner's refusal
     // notice. Forwarding the response as a notice as well would refuse the same order twice.
+    //
+    // A placement that could not be decoded is refused with its reason alone. It names no book, side or
+    // order to match a reject to, so it goes to its agent as a refusal notice.
     if (msg->type.starts_with("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER")) {
-        const auto pld = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-        const bool isLimit = msg->type.contains("LIMIT");
-        if (isLimit) {
-            const auto errPld =
-                std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(pld->payload);
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto limitErr = pld != nullptr
+            ? std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(pld->payload)
+            : nullptr;
+        const auto marketErr = pld != nullptr
+            ? std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(pld->payload)
+            : nullptr;
+        if (limitErr && limitErr->requestPayload && limitErr->errorPayload) {
             m_orderRejects.push_back({
                 .agentId = pld->agentId,
-                .bookId = errPld->requestPayload->bookId,
-                .direction = errPld->requestPayload->direction,
-                .reason = errPld->errorPayload->message,
-                .clientOrderId = errPld->requestPayload->clientOrderId,
-                .volume = errPld->requestPayload->volume,
-                .price = errPld->requestPayload->price});
-        } else {
-            const auto errPld =
-                std::static_pointer_cast<PlaceOrderMarketErrorResponsePayload>(pld->payload);
+                .bookId = limitErr->requestPayload->bookId,
+                .direction = limitErr->requestPayload->direction,
+                .reason = limitErr->errorPayload->message,
+                .clientOrderId = limitErr->requestPayload->clientOrderId,
+                .volume = limitErr->requestPayload->volume,
+                .price = limitErr->requestPayload->price});
+        }
+        else if (marketErr && marketErr->requestPayload && marketErr->errorPayload) {
             m_orderRejects.push_back({
                 .agentId = pld->agentId,
-                .bookId = errPld->requestPayload->bookId,
-                .direction = errPld->requestPayload->direction,
-                .reason = errPld->errorPayload->message,
-                .clientOrderId = errPld->requestPayload->clientOrderId,
-                .volume = errPld->requestPayload->volume,
+                .bookId = marketErr->requestPayload->bookId,
+                .direction = marketErr->requestPayload->direction,
+                .reason = marketErr->errorPayload->message,
+                .clientOrderId = marketErr->requestPayload->clientOrderId,
+                .volume = marketErr->requestPayload->volume,
                 .price = std::nullopt});
+        }
+        else if (pld != nullptr && std::dynamic_pointer_cast<ErrorResponsePayload>(pld->payload)) {
+            m_messages.push_back(msg);
+        }
+        else {
+            fmt::println(
+                "{} | PROXY : DROPPED A MESSAGE OF TYPE '{:.64}' ({} CHARS) : not a placement refusal",
+                simulation()->currentTimestamp(), msg->type, msg->type.size());
         }
         return;
     }
@@ -124,8 +137,16 @@ void DistributedProxyAgent::handleMessageForExchangeService(Message::Ptr msg)
         return;
     }
 
-    const auto pld = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-    const auto subPld = std::static_pointer_cast<EventTradePayload>(pld->payload);
+    // ONLY AN AGENT'S TRADE IS READ AS ONE: an EVENT_TRADE whose payload is not an agent's EventTradePayload is
+    // dropped and logged, as a placement refusal of the wrong shape already is.
+    const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+    const auto subPld = pld != nullptr ? std::dynamic_pointer_cast<EventTradePayload>(pld->payload) : nullptr;
+    if (subPld == nullptr) {
+        fmt::println(
+            "{} | PROXY : DROPPED A MESSAGE OF TYPE 'EVENT_TRADE' : its payload is not an agent's trade",
+            simulation()->currentTimestamp());
+        return;
+    }
 
     if (subPld->isResting) {
         m_tradeSignal(subPld);

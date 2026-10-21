@@ -55,7 +55,8 @@ struct convert<Message>
                 v.targets = val.as<std::vector<std::string>>();
             }
             else if (key == "payload") {
-                v.payload = PayloadFactory::createFromMessagePack(val, *type);
+                v.payload = PayloadFactory::createFromMessagePack(
+                    val, *type, PayloadFactory::UnknownType::EMPTY_PAYLOAD);
             }
         }
 

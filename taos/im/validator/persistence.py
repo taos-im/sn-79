@@ -128,8 +128,10 @@ def _snap_hist2(h):
 
 
 _DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist",
-                 "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist")
-_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist")
+                 "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
+                 "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
+                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist")
+_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist")
 
 
 def build_debeta_state(self) -> dict:
@@ -146,6 +148,9 @@ def build_debeta_state(self) -> dict:
     out.update({name: _snap_hist2(getattr(self, name, {})) for name in _DEBETA_HIST2})
     out["debeta_inv"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv', {}) or {}).items()}
     out["debeta_plast"] = dict(getattr(self, 'debeta_plast', {}) or {})
+    # the alternative mark's leg (0.6.5): its own inventory and last mark, so its path continues after a restart
+    out["debeta_inv_alt"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv_alt', {}) or {}).items()}
+    out["debeta_plast_alt"] = dict(getattr(self, 'debeta_plast_alt', {}) or {})
     return out
 
 
@@ -734,19 +739,14 @@ async def save_state_async(self: Validator) -> bool:
 
         async def wait_for_query_and_receive(process):
             """
-            Wait for both query completion AND state reception before continuing.
-            This prevents IO contention between mmap reads and msgpack serialization.
+            Wait for the miner query to complete before continuing.
+            This prevents IO contention between the query and msgpack serialization.
             """
             wait_start = time.time()
             waited = False
             while self.querying:
                 if not waited:
                     bt.logging.debug(f"Waiting for query to complete before {process}...")
-                    waited = True
-                await asyncio.sleep(0.05)
-            while self._receiving_state:
-                if not waited:
-                    bt.logging.debug(f"Waiting for state reception to complete before {process}...")
                     waited = True
                 await asyncio.sleep(0.05)
             wait_time = time.time() - wait_start
@@ -1303,6 +1303,14 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_realsell_hist = _load_hist3("debeta_realsell_hist")
     self.debeta_mtm_hist = _load_hist3("debeta_mtm_hist")
     self.debeta_invsum_hist = _load_hist3("debeta_invsum_hist")
+    # the alternative mark's leg (0.6.5); absent from an older snapshot, so it warms from empty
+    self.debeta_mtm_alt_hist = _load_hist3("debeta_mtm_alt_hist")
+    self.debeta_invsum_alt_hist = _load_hist3("debeta_invsum_alt_hist")
+    # the liquidity a maker provides (0.6.5); absent from an older snapshot, so it warms from empty
+    self.debeta_maker_buy_notional_hist = _load_hist3("debeta_maker_buy_notional_hist")
+    self.debeta_maker_sell_notional_hist = _load_hist3("debeta_maker_sell_notional_hist")
+    self.debeta_at_best_hist = _load_hist3("debeta_at_best_hist")
+    self.debeta_best_size_hist = _load_hist3("debeta_best_size_hist")
     self.debeta_cp_hist = _load_hist3("debeta_cp_hist")
     self.debeta_cpc_hist, self.debeta_cpc = load_class_counterparty_rows(validator_state)
     # 0.6.2 skill-leg histories; absent from a snapshot written before them, so they warm from empty.
@@ -1312,6 +1320,8 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_notional_hist = _load_hist3("debeta_notional_hist")
     self.debeta_invn_hist = _load_hist2("debeta_invn_hist")
     self.debeta_drift_hist = _load_hist2("debeta_drift_hist")
+    self.debeta_invn_alt_hist = _load_hist2("debeta_invn_alt_hist")
+    self.debeta_drift_alt_hist = _load_hist2("debeta_drift_alt_hist")
     # rebuild running sums from the histories
     self.capture_buy_sums = _dd2(sum_hist_2level(self.debeta_capbuy_hist))
     self.capture_sell_sums = _dd2(sum_hist_2level(self.debeta_capsell_hist))
@@ -1333,6 +1343,22 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
         int(b): defaultdict(float, {int(u): float(v) for u, v in (us or {}).items()})
         for b, us in (validator_state.get("debeta_inv") or {}).items()
     })
+    self.debeta_plast_alt = {int(b): float(v) for b, v in (validator_state.get("debeta_plast_alt") or {}).items()}
+    self.debeta_inv_alt = defaultdict(lambda: defaultdict(float), {
+        int(b): defaultdict(float, {int(u): float(v) for u, v in (us or {}).items()})
+        for b, us in (validator_state.get("debeta_inv_alt") or {}).items()
+    })
+    # the alternative mark's and the liquidity legs' running sums, rebuilt from their histories as the paid leg's are
+    self.debeta_mtm_alt = _dd2(sum_hist_2level(self.debeta_mtm_alt_hist))
+    self.debeta_invsum_alt = _dd2(sum_hist_2level(self.debeta_invsum_alt_hist))
+    self.debeta_maker_buy_notional = _dd2(sum_hist_2level(self.debeta_maker_buy_notional_hist))
+    self.debeta_maker_sell_notional = _dd2(sum_hist_2level(self.debeta_maker_sell_notional_hist))
+    self.debeta_at_best = _dd2(sum_hist_2level(self.debeta_at_best_hist))
+    self.debeta_best_size = _dd2(sum_hist_2level(self.debeta_best_size_hist))
+    self.debeta_invn_alt = sum_hist_1level(self.debeta_invn_alt_hist)
+    self.debeta_drift_alt = sum_hist_1level(self.debeta_drift_alt_hist)
+    self.debeta_pfirst_alt = {}
+    self.debeta_mark_state_alt = {}
 
     bt.logging.info("Processing roundtrip volumes...")
     self.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
@@ -1547,8 +1573,8 @@ def _load_validator_state(self):
             num_scores_to_copy = min(len(loaded_scores), self.effective_max_uids)
             self.scores[:num_scores_to_copy] = torch.tensor(loaded_scores[:num_scores_to_copy])
             # The moving average now takes each round at unit mass (update_scores). A state saved before that
-            # carries the Pareto ladder's scale (a sum in the hundreds), which would outweigh every new round for
-            # hours; at unit sum it carries the same weights, since weights are L1-normalised downstream.
+            # carries the Pareto ladder's scale (a sum in the hundreds), which would outweigh many new rounds;
+            # at unit sum it carries the same weights, since weights are L1-normalised downstream.
             _ssum = float(self.scores.sum())
             if _ssum > 1.0 + 1e-6:
                 bt.logging.info(f"Rescaled the carried trading scores from sum {_ssum:.3f} to 1 (weights unchanged)")

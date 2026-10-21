@@ -28,7 +28,11 @@ FuturesSignal::FuturesSignal(const FuturesSignalDesc& desc) noexcept
     // Guarded: resolving the path unconditionally dereferenced the simulation in the
     // constructor, which made the class unconstructible without one -- the same shape as the
     // ProcessFactory null-deref, and the reason this had no unit test.
-    if (m_simulation != nullptr) {
+    // The validator writes the file at the run root, which a multi-asset realization holds above its own
+    // log dir.
+    if (const auto sim = dynamic_cast<Simulation*>(m_simulation)) {
+        m_seedfile = (sim->runDir() / "external_seed_sampled.csv").generic_string();
+    } else if (m_simulation != nullptr) {
         m_seedfile = (m_simulation->logDir() / "external_seed_sampled.csv").generic_string();
     }
 }

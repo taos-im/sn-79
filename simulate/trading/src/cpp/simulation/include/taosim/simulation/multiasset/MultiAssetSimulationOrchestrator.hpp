@@ -52,6 +52,7 @@ public:
     // file sizes (every realization has its own log directory).
     [[nodiscard]] bool warmingUp() const override;
     [[nodiscard]] std::span<const std::unique_ptr<Simulation>> checkpointBlocks() const override;
+    [[nodiscard]] uint64_t checkpointTimestamp() const override;
     [[nodiscard]] boost::asio::thread_pool& checkpointExecutor() const override;
     void writeCommonCheckpoint(const std::filesystem::path& commonFile) const override;
 

@@ -506,7 +506,8 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.class_weights",
         type=str,
         help="Per-asset-class emission weights under a multi-asset layout: 'books' (the default) weighs each class by "
-             "its share of the layout's books, 96 and 32 giving 0.75 and 0.25; or one weight per background in document "
+             "its share of the layout's books, 64, 32 and 32 giving 0.50, 0.25 and 0.25; or one weight per "
+             "background in document "
              "order, comma separated, normalised to sum 1. Each class's making and skill shares are normalised within the "
              "class and mixed at these weights. Empty is the flat rule: a class weighs whatever share of the field's "
              "credit and alpha it produces. Ignored on a single market; on a layout whose background count differs from "
@@ -606,13 +607,14 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.mark_mode",
         type=str,
-        choices=["last", "vwap", "median"],
+        choices=["last", "vwap", "median", "mid"],
         help="M1 settlement-style marking: value inventory MTM on a rolling reference over the "
              "last mark_window prints instead of the last trade (the settlement-window analogue "
              "used by real venues), so a single manufactured print cannot revalue a position. "
              "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
-             "'median' = window median (robust: moving it needs a sustained majority of prints). "
-             "Default 'last': last-trade marking, byte-identical to 0.6.0.",
+             "'median' = window median (robust: moving it needs a sustained majority of prints); "
+             "'mid' = the book's mid-quote from each state (no bounce, one state of lag, no window, so a "
+             "sparse book marks as well as a dense one). Default 'last': last-trade marking, byte-identical to 0.6.0.",
         default="last",
     )
 
@@ -622,6 +624,16 @@ def add_im_validator_args(cls, parser):
         help="Window length in prints for the rolling settlement mark (mark_mode vwap/median). "
              "Inert while mark_mode=last.",
         default=200,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.mark_mode_alt",
+        type=str,
+        choices=["none", "last", "vwap", "median", "mid"],
+        help="A second mark accumulated beside the paid one, its skill published per uid "
+             "(debeta_skill_mark_alt, debeta_skill_net_alpha_mark_alt) so a change of mark is judged on live data "
+             "before it pays; 'none', or the paid mark's own name, skips the leg. Pay reads mark_mode alone.",
+        default="mid",
     )
 
     parser.add_argument(
@@ -957,3 +969,29 @@ def add_im_validator_args(cls, parser):
         add_exchange_args(cls, parser)
     else:
         add_simulation_args(cls, parser)
+
+
+_DEBETA_PREFIX = "--scoring.debeta."
+_DEBETA_DEFAULTS = None
+
+
+def debeta_defaults() -> dict:
+    """The parser's default for every scoring.debeta dial, keyed by the dial's short name. Read once per process."""
+    global _DEBETA_DEFAULTS
+    if _DEBETA_DEFAULTS is None:
+        p = argparse.ArgumentParser(add_help=False)
+        add_im_validator_args(None, p)
+        _DEBETA_DEFAULTS = {
+            o[len(_DEBETA_PREFIX):]: a.default
+            for a in p._actions
+            for o in a.option_strings
+            if o.startswith(_DEBETA_PREFIX)
+        }
+    return _DEBETA_DEFAULTS
+
+
+def debeta_dial(cfg, name: str):
+    """A de-beta dial's configured value, or the parser's default when the config does not set it. An explicit
+    falsy value (0, '') is kept: only an absent dial or None falls back."""
+    value = cfg.get(name) if isinstance(cfg, dict) else getattr(cfg, name, None)
+    return debeta_defaults()[name] if value is None else value

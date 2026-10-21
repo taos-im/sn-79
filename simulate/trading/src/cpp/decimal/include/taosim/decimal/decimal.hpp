@@ -9,11 +9,13 @@
 #include <bdldfp_decimalutil.h>
 #include <fmt/format.h>
 
+#include <charconv>
 #include <cstring>
 #include <iomanip>
 #include <span>
 #include <spanstream>
 #include <string_view>
+#include <system_error>
 
 //-------------------------------------------------------------------------
 
@@ -62,6 +64,32 @@ inline constexpr uint32_t kDefaultDecimalPlaces = 8;
     double val, uint32_t decimalPlaces = kDefaultDecimalPlaces)
 {
     return round(decimal_t{val}, decimalPlaces);
+}
+
+//-------------------------------------------------------------------------
+
+// Convert a double that arrived on the wire, such as a limit price or size a sender wrote as a decimal.
+//
+// The double is read as the shortest decimal that converts back to it, and then truncated as
+// double2decimal truncates. double2decimal starts from the double's exact binary value, which can sit
+// just below the decimal that was written: 29.56 is 29.559999999999998721..., and truncating that loses
+// a whole unit in the last place. The shortest decimal is 29.56 itself, while a value with more places
+// than are kept still truncates.
+[[nodiscard]] inline decimal_t wire2decimal(
+    double val, uint32_t decimalPlaces = kDefaultDecimalPlaces)
+{
+    // The shortest round-trip form of any double fits in 24 characters.
+    char buf[32];
+    const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf) - 1, val);
+    if (ec != std::errc{}) [[unlikely]] {
+        return double2decimal(val, decimalPlaces);
+    }
+    *end = '\0';
+    decimal_t shortest;
+    if (BloombergLP::bdldfp::DecimalUtil::parseDecimal128(&shortest, buf) != 0) [[unlikely]] {
+        return double2decimal(val, decimalPlaces);
+    }
+    return round(shortest, decimalPlaces);
 }
 
 //-------------------------------------------------------------------------

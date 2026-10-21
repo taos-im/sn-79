@@ -37,14 +37,18 @@ def test_anything_else_is_still_forwarded():
     assert validator._notice_is_forwarded_to_miners("EVENT_TRADE")
 
 
-def test_the_consumed_set_is_exactly_the_lifecycle_pair():
-    """A set that grows silently would turn 'inert' into 'deaf'. Changing it should fail this test."""
+def test_the_consumed_set_is_exactly_the_lifecycle_events():
+    """A set that grows silently would turn 'inert' into 'deaf'. Changing it should fail this test.
+
+    EVENT_SIMULATION_FAILED is the validator's own: it pages the operator, and an agent has no use for it.
+    """
     assert set(validator._NOTICES_CONSUMED_NOT_FORWARDED) == {
         "EVENT_SIMULATION_START",
         "EVENT_SIMULATION_END",
+        "EVENT_SIMULATION_FAILED",
     }
 
 
-@pytest.mark.parametrize("mtype", ["EVENT_SIMULATION_START", "EVENT_SIMULATION_END"])
+@pytest.mark.parametrize("mtype", ["EVENT_SIMULATION_START", "EVENT_SIMULATION_END", "EVENT_SIMULATION_FAILED"])
 def test_the_predicate_and_the_set_agree(mtype):
     assert not validator._notice_is_forwarded_to_miners(mtype)

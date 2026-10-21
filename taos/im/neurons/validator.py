@@ -70,7 +70,7 @@ if __name__ != "__mp_main__":
     from taos.im.utils import duration_from_timestamp
     from taos.im.utils.affinity import get_core_allocation
 
-    from taos.im.config import add_im_validator_args
+    from taos.im.config import add_im_validator_args, debeta_dial
     from taos.im.protocol.simulator import SimulatorResponseBatch
     from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification
     from taos.im.protocol.events import SimulationStartEvent
@@ -117,14 +117,58 @@ if __name__ != "__mp_main__":
     #
     # The channel itself stays live: an unrecognised type still falls through and is forwarded, so
     # whatever we choose to send over it next needs no change here.
+    #
+    # EVENT_SIMULATION_FAILED is the validator's alone: a multi-asset run that stopped on a failed
+    # realization says so before it exits, so the operator is paged. No agent has a use for it.
+    SIMULATION_FAILED_NOTICE = "EVENT_SIMULATION_FAILED"
+
     _NOTICES_CONSUMED_NOT_FORWARDED = frozenset({
         "EVENT_SIMULATION_START",
         "EVENT_SIMULATION_END",
+        SIMULATION_FAILED_NOTICE,
     })
 
     def _notice_is_forwarded_to_miners(message_type: str) -> bool:
         """Whether a notice this validator received should also be pushed to miners."""
         return message_type not in _NOTICES_CONSUMED_NOT_FORWARDED
+
+    def _simulator_restart_is_held(failed_at: float | None, last_state_time: float | None) -> bool:
+        """Whether the simulator monitor must leave a stopped engine alone.
+
+        After a failure notice the engine is stopped on purpose, and resuming it would only replay the
+        failure: the operator relaunches it once the cause is fixed. A state received after the notice
+        is that relaunch, and the monitor watches the engine again.
+        """
+        if failed_at is None:
+            return False
+        return last_state_time is None or last_state_time <= failed_at
+
+    def _simulation_failure_page(message: dict) -> tuple[str, dict]:
+        """The page text and details for an engine's failure notice; a field it lacks reads as unknown."""
+        payload = message.get("payload") or {}
+        details = {
+            "realization": payload.get("realization"),
+            "background": payload.get("background"),
+            "time": payload.get("time", message.get("timestamp")),
+            "error": payload.get("error"),
+        }
+        text = (
+            f"SIMULATION FAILED: realization {details['realization']} (background {details['background']}) "
+            f"failed at simulation time {details['time']}: {details['error']}. The engine has stopped the run "
+            f"and is not restarted; relaunch it from the kept checkpoint once the cause is fixed."
+        )
+        return text, details
+
+    def _settled_ingest_books(settled_books: dict, fill_events: dict) -> dict:
+        """The books an exchange ingest push publishes: the books receive() reconciled with the chain, with this
+        block's settled fills appended to each book's events. The engine's post-match prediction is never
+        published, so a trade the chain declines never shows on a public surface."""
+        books = dict(settled_books)
+        for nid, events in fill_events.items():
+            book = dict(books.get(nid) or {"b": [], "a": []})
+            book["e"] = list(book.get("e") or []) + list(events)
+            books[nid] = book
+        return books
 
     async def _push_fill_notifications(trade_events: list, url: str) -> None:
         """Fire-and-forget: push fill notifications directly to the data service
@@ -577,7 +621,7 @@ if __name__ != "__mp_main__":
             # child no matter what the validator was started with (found live). Forwarded with an
             # explicit value in BOTH directions: the option defaults on, so an operator's `false`
             # must reach the child too or parent and child disagree about what is published.
-            _book_gauges = bool(getattr(getattr(self.config.scoring, 'debeta', None), 'publish_book_gauges', True))
+            _book_gauges = bool(debeta_dial(getattr(self.config.scoring, 'debeta', None), 'publish_book_gauges'))
             cmd += ['--scoring.debeta.publish_book_gauges', 'true' if _book_gauges else 'false']
             # Same reason, and the same class of bug found live on obs-mainnet: the child
             # gated report() solely on validator_config.observe carried in each payload, so
@@ -645,6 +689,10 @@ if __name__ != "__mp_main__":
                         # or restart. Skip to avoid false PagerDuty alerts and the
                         # no-op "restart" log noise. (Thread stays alive on purpose:
                         # returning would trip the post-launch is_alive() check.)
+                        continue
+                    if _simulator_restart_is_held(self.simulation_failed_at, self.last_state_time):
+                        bt.logging.error("The simulation stopped on a failed realization; the simulator is left "
+                                         "stopped until it is relaunched.")
                         continue
                     bt.logging.info("Checking simulator state...")
                     check_start = time.time()
@@ -815,7 +863,7 @@ if __name__ != "__mp_main__":
             burn_ratio = getattr(self.config.neuron, 'burn_ratio', 0.0) or 0.0
             tolerance = 1e-6
 
-            debeta_w = float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0) or 0.0)
+            debeta_w = float(debeta_dial(getattr(self.config.scoring, 'debeta', None), 'weight'))
             trading_sum = kappa_w + pnl_w + debeta_w
             if abs(trading_sum - 1.0) > tolerance:
                 error_msg = (
@@ -860,11 +908,15 @@ if __name__ != "__mp_main__":
             self.start_time = None
             self.start_timestamp = None
             self.last_state_time = None
+            self.simulation_failed_at = None
             self.step_rates = []
             self._last_defrag_hour = -1
             self._last_prune_timestamp = None
 
             self.main_loop = asyncio.new_event_loop()
+            fdwatch.install_close_tracer()
+            fdwatch.watch_loop(self.main_loop, "main")
+            fdwatch.install_loop_handler(self.main_loop, "main")
             self._main_loop_ready = Event()
 
             core_allocation = get_core_allocation(
@@ -983,9 +1035,14 @@ if __name__ != "__mp_main__":
             self.miner_net_lock = asyncio.Lock()
             # Background GTX round-check/delivery task (single-flight).
             self._gentrx_task = None
-            self._receiving_state = False
             self._rewarding = False
             self._pending_reward_tasks = 0
+            # round timing for the report: wall seconds between states, the query service's wait per
+            # round and the waits for the reward lock; the last thousand of each
+            self.round_gaps = []
+            self.query_waits = []
+            self.reward_gate_waits = []
+            self._round_clock = None
             self._saving = False
             self._reporting = False
             self._rewarding_lock = Lock()
@@ -1938,7 +1995,10 @@ if __name__ != "__mp_main__":
                     self.sync(save_state=False)
                 finally:
                     self.subtensor = primary
-            if not check_simulator(self):
+            if _simulator_restart_is_held(self.simulation_failed_at, self.last_state_time):
+                bt.logging.error("The simulation stopped on a failed realization; the simulator is left stopped "
+                                 "until it is relaunched.")
+            elif not check_simulator(self):
                 restart_simulator(self)
             # Re-pin the simulator each cycle (also re-applies after a restart above).
             self._pin_simulator()
@@ -1966,7 +2026,8 @@ if __name__ != "__mp_main__":
                 self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._maintain()))
 
         def _prepare_reporting_data(self):
-            from taos.im.validator.debeta import capture_floor_stats
+            from taos.im.validator.debeta import capture_floor_stats, capture_settle_by_class, capture_settle_counts
+            from taos.im.validator.reward import class_map
             from taos.im.validator.fundamental import reported as reported_fundamental
             start = time.time()
             # The fundamental the metrics publish is the one the reported state carried to miners.
@@ -2137,6 +2198,7 @@ if __name__ != "__mp_main__":
             bt.logging.debug("Assembling final data structure...")
             final_start = time.time()
 
+            _dcfg = getattr(self.config.scoring, 'debeta', None)
             data = {
                 'metagraph_data': metagraph_data,
                 # Per-book de-beta accumulators for the opt-in book gauges: the reporting child has
@@ -2154,11 +2216,20 @@ if __name__ != "__mp_main__":
                 ),
                 # A run change that was not applied leaves stamps ahead of the clock; the gauge says so.
                 'history_clock': _history_clock_health(self),
+                # Exchange settlement counters for the validator gauges.
+                'exchange_settlement': (
+                    self.engine.settlement_health()
+                    if callable(getattr(getattr(self, 'engine', None), 'settlement_health', None)) else None
+                ),
                 'simulation': self.simulation.model_dump(),
                 'last_state': minimal_state,
                 'simulation_timestamp': self.simulation_timestamp,
                 'step': self.step,
                 'step_rates': list(self.step_rates[-100:]),
+                'round_gaps': list(self.round_gaps[-100:]),
+                'query_waits': list(self.query_waits[-100:]),
+                'reward_gate_waits': list(self.reward_gate_waits[-100:]),
+                'pending_reward_tasks': self._pending_reward_tasks,
                 'volume_sums': volume_sums_flat,
                 'maker_volume_sums': maker_volume_sums_flat,
                 'taker_volume_sums': taker_volume_sums_flat,
@@ -2166,6 +2237,9 @@ if __name__ != "__mp_main__":
                 'fee_sums': fee_sums_flat,
                 'roundtrip_volume_sums': roundtrip_volume_sums_flat,
                 'inventory_history': minimal_inventory,
+                # The shared quote at each kept timestamp, on the exchange only (trade.py); the report counts it once.
+                'inventory_quote': {uid: {ts: q for ts, q in rec.items() if ts in minimal_inventory.get(uid, {})}
+                                    for uid, rec in (getattr(self, 'inventory_quote', None) or {}).items()},
                 'total_realized_pnl': total_realized_pnl,
                 'realized_pnl_by_book': realized_pnl_by_book,
                 'book_count': book_count,
@@ -2173,6 +2247,8 @@ if __name__ != "__mp_main__":
                 'debeta_class_summary': getattr(self, '_debeta_class_summary', None) or {},
                 'debeta_class_details': getattr(self, '_debeta_class_details', None) or {},
                 'capture_floor_stats': capture_floor_stats(getattr(self, 'debeta_capture_mid', None)),
+                'capture_settle_by_class': capture_settle_by_class(
+                    capture_settle_counts(getattr(self, 'debeta_capture_mid', None)), class_map(self)),
                 'pnl_factors': self.pnl_factors,
                 'kappa_values': self.kappa_values,
                 'unnormalized_scores': self.unnormalized_scores,
@@ -2235,22 +2311,22 @@ if __name__ != "__mp_main__":
                         # De-beta (P8): the whitelist above predates it, so none of these reached the
                         # neuron_info labels and the dashboards' Scoring Config table could not show
                         # the parameters that will actually drive emissions under 0.6.1.
-                        'debeta_weight': float(getattr(getattr(self.config.scoring, 'debeta', None), 'weight', 0.0)),
-                        'debeta_w_make': getattr(getattr(self.config.scoring, 'debeta', None), 'w_make', 0.0),
-                        'debeta_floor_scale': getattr(getattr(self.config.scoring, 'debeta', None), 'floor_scale', 0.0),
-                        'debeta_p11_strength': getattr(getattr(self.config.scoring, 'debeta', None), 'p11_strength', 0.0),
-                        'debeta_min_books': getattr(getattr(self.config.scoring, 'debeta', None), 'min_books', 0),
-                        'debeta_centered_window': getattr(getattr(self.config.scoring, 'debeta', None), 'centered_window', 0),
+                        'debeta_weight': float(debeta_dial(_dcfg, 'weight')),
+                        'debeta_w_make': debeta_dial(_dcfg, 'w_make'),
+                        'debeta_floor_scale': debeta_dial(_dcfg, 'floor_scale'),
+                        'debeta_p11_strength': debeta_dial(_dcfg, 'p11_strength'),
+                        'debeta_min_books': debeta_dial(_dcfg, 'min_books'),
+                        'debeta_centered_window': debeta_dial(_dcfg, 'centered_window'),
                         # 0.6.3: the dials that decide pay on this release, so the Scoring Config table can show them
-                        'debeta_making_basis': str(getattr(getattr(self.config.scoring, 'debeta', None), 'making_basis', 'captured') or 'captured'),
-                        'debeta_making_horizon_s': getattr(getattr(self.config.scoring, 'debeta', None), 'making_horizon_s', 0.0),
-                        'debeta_s3_k': getattr(getattr(self.config.scoring, 'debeta', None), 's3_k', 0.0),
-                        'debeta_class_weights': str(getattr(getattr(self.config.scoring, 'debeta', None), 'class_weights', '') or ''),
-                        'debeta_skill_min_books_share': getattr(getattr(self.config.scoring, 'debeta', None), 'skill_min_books_share', 0.0),
-                        'debeta_skill_hurdle_bps': getattr(getattr(self.config.scoring, 'debeta', None), 'skill_hurdle_bps', 0.0),
-                        'debeta_making_fee_weight': float(getattr(getattr(self.config.scoring, 'debeta', None), 'making_fee_weight', 0.0) or 0.0),
-                        'debeta_capture_market_votes': int(getattr(getattr(self.config.scoring, 'debeta', None), 'capture_market_votes', 0) or 0),
-                        'debeta_skill_share_ema': int(getattr(getattr(self.config.scoring, 'debeta', None), 'skill_share_ema', 0) or 0),
+                        'debeta_making_basis': str(debeta_dial(_dcfg, 'making_basis')),
+                        'debeta_making_horizon_s': debeta_dial(_dcfg, 'making_horizon_s'),
+                        'debeta_s3_k': debeta_dial(_dcfg, 's3_k'),
+                        'debeta_class_weights': str(debeta_dial(_dcfg, 'class_weights')),
+                        'debeta_skill_min_books_share': debeta_dial(_dcfg, 'skill_min_books_share'),
+                        'debeta_skill_hurdle_bps': debeta_dial(_dcfg, 'skill_hurdle_bps'),
+                        'debeta_making_fee_weight': float(debeta_dial(_dcfg, 'making_fee_weight')),
+                        'debeta_capture_market_votes': int(debeta_dial(_dcfg, 'capture_market_votes')),
+                        'debeta_skill_share_ema': int(debeta_dial(_dcfg, 'skill_share_ema')),
                     }
                 }
             }
@@ -2464,6 +2540,8 @@ if __name__ != "__mp_main__":
             try:
                 async with self._reward_lock:
                     waited = time.time() - start_wait
+                    self.reward_gate_waits.append(waited)
+                    del self.reward_gate_waits[:-1000]
                     if waited > 0:
                         bt.logging.debug(f"Acquired reward lock after waiting {waited:.3f}s")
 
@@ -2923,13 +3001,14 @@ if __name__ != "__mp_main__":
             _sim_live_triggers = dict(getattr(getattr(self, 'engine', None), '_live_triggers', {}))
             if hasattr(self.engine, '_sltp_changed'):
                 self.engine._sltp_changed = False
+            _sim_network = getattr(getattr(self.config, 'simulation', None), 'network', None)
             return {
                 "mode":                "simulation",
                 "simulation_id":       getattr(self.simulation, 'simulation_id', None),
-                # data-service uses this to attribute lifecycle events per
-                # validator; NOT adding payload "network" here (the ingest
-                # INGEST_NETWORK filter would reject a mismatch — the service
-                # stamps its own network on events).
+                # The network is declared only when --simulation.network is set, as the launcher's
+                # NETWORK; unset, the payload carries no network key.
+                **({"network": _sim_network} if _sim_network else {}),
+                # The data service attributes lifecycle events per validator by this key.
                 "validator_hotkey":    self.wallet.hotkey.ss58_address if getattr(self, 'wallet', None) else None,
                 "timestamp":           state.timestamp,
                 "block":               state.block,
@@ -3056,6 +3135,11 @@ if __name__ != "__mp_main__":
                 self.start_time = time.time()
                 self.start_timestamp = state.timestamp
 
+            _now = time.time()
+            if self._round_clock is not None:
+                self.round_gaps.append(_now - self._round_clock)
+                del self.round_gaps[:-1000]
+            self._round_clock = _now
             self.step_rates.append((state.timestamp - (self.last_state.timestamp if self.last_state else self.start_timestamp)) / (time.time() - (self.last_state_time if self.last_state_time else self.start_time)))
             self.last_state = state
             self.step += 1
@@ -3093,6 +3177,7 @@ if __name__ != "__mp_main__":
 
             # Process deregistration notices
             self.process_resets(state)
+            update_placement_stats(self, state.notices)
 
             # GenTRX: enqueue the raw state for the background packager.
             # As of PR-1 of the GenTRX isolation plan, push_state() does
@@ -3153,6 +3238,10 @@ if __name__ != "__mp_main__":
             if self.engine.mode == 'exchange':
                 start = time.time()
                 _trade_events: list = []  # preserved for nexus book event injection
+                # The ingest push publishes this settled state; execute() leaves the engine holding its prediction.
+                _settled_books = dict(getattr(state, 'books', {}) or {})
+                _settled_accounts = getattr(state, 'accounts', {}) or {}
+                _settled_fill_events: dict = {}
                 try:
                     trade_events = await self.engine.execute(state, miner_responses)
                     if trade_events:
@@ -3181,9 +3270,8 @@ if __name__ != "__mp_main__":
                         # match.
                 except Exception as _exc:
                     bt.logging.error(f"ExchangeEngine.execute failed: {_exc}")
-                # Refresh state.books/accounts from post-execute LOB state so the
-                # ingest payload carries fill events from this block (not just the
-                # reconciliation snapshot from receive()).
+                # state.books/accounts from the post-execute LOB state, for GenTRX and the reward path below.
+                # The ingest push does not read them: it publishes the settled snapshot taken before execute().
                 try:
                     _cs = getattr(self.engine, '_last_chain_state', None)
                     if _cs is not None and hasattr(self.engine, '_normalize'):
@@ -3237,6 +3325,7 @@ if __name__ != "__mp_main__":
                             'Ma': _ma,
                             't':  _fill_ts_ns,
                         }
+                        _settled_fill_events.setdefault(int(_nid), []).append(_ev)
                         _bk = state.books.get(_nid)
                         if _bk is None:
                             state.books[_nid] = {'b': [], 'a': [], 'e': [_ev]}
@@ -3307,13 +3396,12 @@ if __name__ != "__mp_main__":
                     except Exception as _gex:
                         bt.logging.warning(f"[GTX] push_state error (exchange): {_gex}")
 
-                # Push post-execution state to MVTRX data service on every block
-                # Build open-order detail from LOB account state (state.accounts[uid][nid]['o'])
-                # which is populated by the C++ engine's packAccounts() on every block.
+                # Push the settled state to the MVTRX data service on every block. Open-order detail comes from
+                # the settled accounts ([uid][nid]['o']), which the C++ engine's packAccounts() fills every block.
                 _agent_open_orders: dict = {}
                 _agent_orders_detail: dict = {}
                 _ext_detail = getattr(getattr(self, 'engine', None), '_external_order_detail', {}) or {}
-                for _uid_str, _uid_data in (getattr(state, 'accounts', {}) or {}).items():
+                for _uid_str, _uid_data in (_settled_accounts or {}).items():
                     try:
                         _uid = int(_uid_str)
                         if not isinstance(_uid_data, dict):
@@ -3424,8 +3512,8 @@ if __name__ != "__mp_main__":
                     "network":             getattr(getattr(self.config, 'exchange', None), 'network', '') or '',
                     "timestamp":           int(time.time() * 1e9),
                     "block":               _ingest_block,
-                    "books":               getattr(state, 'books', {}) or {},
-                    "accounts":            getattr(state, 'accounts', {}) or {},
+                    "books":               _settled_ingest_books(_settled_books, _settled_fill_events),
+                    "accounts":            _settled_accounts,
                     # Pools carry whether the subnet can settle at all. Without it the UI
                     # cannot mark a staking-disabled subnet or stop a miner trading one, and the
                     # only feedback is a failed settlement reporting SubtokenDisabled after the
@@ -3543,6 +3631,8 @@ if __name__ != "__mp_main__":
             """
             Thin event loop: delegates IPC receive/respond to the engine.
             """
+            fdwatch.watch_loop(asyncio.get_running_loop(), "listener")
+            fdwatch.install_loop_handler(asyncio.get_running_loop(), "listener")
             # Startup push — fetch full exchange state (chain + LOB) and push to
             # the data service immediately, before waiting for the first block.
             if self.engine.mode == 'exchange':
@@ -3706,8 +3796,9 @@ if __name__ != "__mp_main__":
                         raw_message, normalized_state, receive_start = await self.engine.receive()
                         if normalized_state is not None:
                             if isinstance(raw_message, (bytes, bytearray)):
-                                # opt-in record of the stream for the scoring acceptance's replay harness (STATE_CAPTURE_DIR)
-                                capture_state(raw_message, normalized_state.timestamp)
+                                # opt-in record of the stream for the scoring acceptance's replay harness (STATE_CAPTURE_DIR);
+                                # queued for a writer thread, so the loop never waits on the compress and write
+                                submit_capture(raw_message, normalized_state.timestamp)
                             if self._scoring_shadow is not None and isinstance(raw_message, (bytes, bytearray)):
                                 self._scoring_shadow.tee(raw_message, normalized_state.timestamp)
                                 if self._scoring_proc_cutover and \
@@ -3823,6 +3914,7 @@ if __name__ != "__mp_main__":
             Responsibilities:
             - Immediately forward simulation‑start events to miners.
             - Handle simulation‑end markers.
+            - Page the operator on a simulation-failure notice, which ends nothing and reaches no miner.
             - Record and persist error‑report batches.
             - Forward all other event notifications to miners.
             - Trigger alerting for msgpack or simulation integrity errors.
@@ -3843,9 +3935,13 @@ if __name__ != "__mp_main__":
             ended = False
             for message in batch['messages']:
                 if message['type'] == 'EVENT_SIMULATION_START':
+                    self.simulation_failed_at = None
                     self.engine.on_start(message['timestamp'], FinanceEventNotification.from_json(message).event)
                 elif message['type'] == 'EVENT_SIMULATION_END':
                     ended = True
+                elif message['type'] == SIMULATION_FAILED_NOTICE:
+                    # Not a run end: no on_end, no repository update, no new simulation.
+                    self.on_simulation_failed(message)
                 elif message['type'] == 'RESPONSES_ERROR_REPORT':
                     dump_file = self.config.neuron.full_path + f"/{self.last_state.config.simulation_id}.{message['timestamp']}.responses.json"
                     with open(dump_file, "w") as f:
@@ -3873,6 +3969,21 @@ if __name__ != "__mp_main__":
             await notify(self, notices)
             if ended:
                 self.engine.on_end()
+
+        def on_simulation_failed(self, message: dict) -> None:
+            """Page the operator for a run the engine stopped on a failed realization, and hold the
+            simulator monitor so the stopped engine stays stopped until it is relaunched."""
+            text, details = _simulation_failure_page(message)
+            self.simulation_failed_at = time.time()
+            bt.logging.error(text)
+            self.pagerduty_alert(
+                text,
+                method="simulation",
+                dedup_key=f"simulation-failed:{details['background']}:{details['realization']}:{details['time']}",
+                details=details,
+                event_class="simulator",
+                severity="critical",
+            )
 
         async def sltp_records(self, request: Request):
             """Delegate to the active engine; return [] when no extension installed."""
@@ -3914,7 +4025,7 @@ if __name__ != "__mp_main__":
             cleanup(self)
 
     from taos.im.validator.trade import match_trade_fifo, update_trade_volumes
-    from taos.im.validator.state_capture import capture_state
+    from taos.im.validator.state_capture import submit_capture
     from taos.im.validator.cleanup import (
         cleanup_ipc, cleanup_executors, cleanup_event_loop, cleanup
     )
@@ -3927,6 +4038,7 @@ from taos.im.validator.persistence import (
         construct_save_data_sync, defragment_histories, schedule_save,
         save_state_sync, migrate_sampling_interval,
     )
+from taos.im.validator import fdwatch
 
 if __name__ == "__main__":
     # Make an unlocatable warning locatable.
@@ -3959,7 +4071,7 @@ if __name__ == "__main__":
     _warnings.showwarning = _showwarning_with_stack
 
     from taos.im.validator.update import check_repo, classify_changes, update_validator, check_simulator, rebuild_simulator, restart_simulator
-    from taos.im.validator.forward import forward, notify, deliver_gentrx
+    from taos.im.validator.forward import forward, notify, deliver_gentrx, update_placement_stats
     from taos.im.validator.reward import get_rewards, compute_debeta_scores
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:

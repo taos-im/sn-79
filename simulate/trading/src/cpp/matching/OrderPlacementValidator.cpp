@@ -232,6 +232,10 @@ OrderPlacementValidator::ExpectedResult
 
         volumeWeightedPrice = util::round(volumeWeightedPrice, m_params.quoteIncrementDecimals);
         if (volumeWeightedPrice > 0_dec) instantTrade = true;
+        // An order let past the size floors still has to find something it may take.
+        if (payload->skipMinSizeCheck && volumeWeightedPrice <= 0_dec) {
+            return std::unexpected{OrderErrorCode::EMPTY_BOOK};
+        }
 
         // Both currency branches above have accumulated the quote total this buy would consume, which
         // is the amount that has to settle on chain. A walk that consumed nothing settles nothing, so
@@ -345,6 +349,9 @@ OrderPlacementValidator::ExpectedResult
 
         volume = util::round(volume, m_params.baseIncrementDecimals);
         if (volume > 0_dec) instantTrade = true;
+        if (payload->skipMinSizeCheck && volume <= 0_dec) {
+            return std::unexpected{OrderErrorCode::EMPTY_BOOK};
+        }
 
         if (payload->leverage == 0_dec){
             if (!baseBalance.canReserve(volume)) {

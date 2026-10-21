@@ -446,7 +446,7 @@ The gradient server's collect path runs sequentially today, which keeps the loca
 | `--keep-version-deltas` | 24 | Hot-bucket retention for `deltas/<uid>/v*.grad`. Must exceed `--checkpoint-interval`. |
 | `--publish-state-hash` | (off) | Publish a per-version model hash for the optional miner drift check. |
 | `--keep-proposals` | 10 | Hot-bucket retention for `proposals/<own-uid>/{round_id:08d}.grad`. Set `0` to disable. |
-| `--no-is-aggregator` | (on) | Sibling mode: score + propose only |
+| `--is-aggregator` | (off) | uid-0 aggregator: aggregate and publish the canonical model. Without it (or with `--no-is-aggregator`) the server is a sibling: score + propose only, model synced from uid 0 |
 | `--wandb-project` | (empty) | Enable wandb dashboard - see [`wandb.md`](wandb.md) |
 
 ### Validator (CLI)

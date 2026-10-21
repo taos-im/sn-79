@@ -97,20 +97,25 @@ class VerifyScheduler:
 # reconstruction state, the capture-mid print windows, the P11 counterparty sums and the
 # timestamped histories every sum is pruned from.
 _DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
-               "debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional"]
+               "debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional",
+               "debeta_mtm_alt", "debeta_invsum_alt", "debeta_inv_alt",
+               "debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size"]
 _DEBETA_PLAIN = [
     "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
     "debeta_capture_mid", "debeta_cp", "debeta_cpc", "debeta_cpc_hist",
     "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
     "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
     "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
+    "debeta_invn_alt", "debeta_pfirst_alt", "debeta_plast_alt", "debeta_drift_alt", "debeta_mark_state_alt",
+    "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist",
+    "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
 ]
 
 _STRUCT_NAMES = [
     "trade_volumes", "volume_sums", "maker_volume_sums", "taker_volume_sums",
     "self_volume_sums", "fee_sums", "roundtrip_volumes", "roundtrip_volume_sums",
     "realized_pnl_history", "agent_pnl_by_book", "agent_pnl_total",
-    "open_positions", "inventory_history", "initial_balances",
+    "open_positions", "inventory_history", "inventory_quote", "initial_balances",
     "recent_trades", "recent_miner_trades",
     # Shadow-reward inputs: mutated in place by score_uids each interval, so
     # once initialized the child's own scoring keeps them in lockstep with main.
@@ -223,7 +228,7 @@ def _rebuild_structs(parts: dict) -> dict:
     for name in _DEBETA_PLAIN + ["_debeta_seen_tids", "_volume_seen_tids"]:
         out[name] = parts.get(name, {})
 
-    for name in ("trade_volumes", "inventory_history", "initial_balances",
+    for name in ("trade_volumes", "inventory_history", "inventory_quote", "initial_balances",
                  "recent_trades", "recent_miner_trades",
                  "kappa_values", "activity_factors", "pnl_factors"):
         out[name] = parts.get(name, {})
@@ -391,8 +396,9 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     Returns:
         The shadow's scoring result for parity comparison.
     """
+    from taos.im.config import debeta_dial
     from taos.im.validator.reward import (apply_track_record_ema, compute_debeta_scores, making_pool_inputs,
-                                          pool_pay_vector, score_uids, smoothed_skill_share)
+                                          pool_pay_vector, score_uids, skill_bar, smoothed_skill_share)
 
     shadow.deregistered_uids = list(deregs)
     # The presence gate's absent set is main-side knowledge (query outcomes), shipped with the inputs.
@@ -448,13 +454,13 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     # (The floor was missing here — a pre-existing divergence whenever
     # rewarding.floor.enabled is on; a no-op when it is off.)
     _dcfg = ((shadow.scoring_config.get('scoring', {}) or {}).get('debeta') or {})
-    _pool_mode = str(_dcfg.get('making_pool', 'rank') or 'rank')
-    _pool = max(0.0, min(1.0, float(_dcfg.get('weight', 0.0) or 0.0) * float(_dcfg.get('w_make', 0.0) or 0.0)))
+    _pool_mode = str(debeta_dial(_dcfg, 'making_pool'))
+    _pool = max(0.0, min(1.0, float(debeta_dial(_dcfg, 'weight')) * float(debeta_dial(_dcfg, 'w_make'))))
     # computed, smoothed and published under BOTH settings, exactly as main does, so the state main
     # adopts in cutover mode stays warm and the gauges exist whichever way the dial is set
     _ladder, _term, _share = making_pool_inputs(
         getattr(shadow, 'debeta_detail', {}) or {}, all_uids, trading_scores,
-        float(_dcfg.get('weight', 0.0) or 0.0), float(_dcfg.get('w_make', 0.0) or 0.0))
+        float(debeta_dial(_dcfg, 'weight')), float(debeta_dial(_dcfg, 'w_make')))
     # as in main: under a per-class dial the class-mixed making vector is the one smoothed and paid
     _class_shares = getattr(shadow, '_debeta_class_shares', None)
     if _class_shares:
@@ -477,10 +483,11 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     _skill_sm = None
     if _hl and _hl > 0 and _pool > 0.0 and _pool_mode == "proportional_both":
         _skill_sm = smoothed_skill_share(_dcfg, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _class_shares,
-                                         _pema, shadow.deregistered_uids, sim_ts, _hl, _n_snap, _last_snap, _scorable)
+                                         _pema, shadow.deregistered_uids, sim_ts, _hl, _n_snap, _last_snap, _scorable,
+                                         skill_min_books=skill_bar(shadow))
     distributed = pool_pay_vector(
         _pool_mode, _pool, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _ladder, trading_scores, _share,
-        shadow.scoring_config, int(_dcfg.get('skill_min_books', 4) or 4), class_shares=_class_shares,
+        shadow.scoring_config, skill_bar(shadow), class_shares=_class_shares,
         skill_share=_skill_sm)
     return {
         'trading': [float(x) for x in distributed.tolist()],
@@ -1618,6 +1625,15 @@ def _num(v, default, cast):
         return cast(default)
 
 
+def _debeta_duck(d):
+    """Every scoring.debeta dial the parser declares, read off main's config, cast to the parser default's type.
+    `is None` decides absence, never `or`: a configured zero (floor_scale 0, w_make 0) reaches the child as zero."""
+    from types import SimpleNamespace
+    from taos.im.config import debeta_defaults, debeta_dial
+    return SimpleNamespace(**{name: _num(debeta_dial(d, name), default, type(default))
+                              for name, default in debeta_defaults().items()})
+
+
 def _config_duck(config):
     """Minimal picklable stand-in exposing exactly the config paths trade.py reads."""
     from types import SimpleNamespace
@@ -1629,56 +1645,9 @@ def _config_duck(config):
                 trade_volume_sampling_interval=config.scoring.activity.trade_volume_sampling_interval,
             ),
             kappa=SimpleNamespace(lookback=config.scoring.kappa.lookback),
-            # De-beta gates BOTH the trade.py accumulators and compute_debeta_scores. Omitting it
-            # here silently pinned the CUTOVER child (the authoritative scorer) to the legacy path
-            # while main's flags said enabled - de-beta could never activate in cutover mode.
-            # `is None` tests, never `or default`: a legitimate ZERO must survive the trip to the
-            # child. floor_scale=0 is documented as "disables the floor", w_make=0 means "skill
-            # only", and `or` silently turned both into the default, so the child scored on
-            # parameters the operator had not asked for and no log said so.
-            debeta=SimpleNamespace(
-                enabled=bool(getattr(_d, 'enabled', False)),
-                # read by the fallback that carries the previous map through a warming or failed cycle at weight 1.0
-                weight=_num(getattr(_d, 'weight', None), 0.0, float),
-                w_make=_num(getattr(_d, 'w_make', None), 0.30, float),
-                floor_scale=_num(getattr(_d, 'floor_scale', None), 0.5, float),
-                centered_window=_num(getattr(_d, 'centered_window', None), 15, int),
-                min_books=_num(getattr(_d, 'min_books', None), 4, int),
-                p11_strength=_num(getattr(_d, 'p11_strength', None), 0.0, float),
-                p11_topk=_num(getattr(_d, 'p11_topk', None), 2, int),
-                s3_k=_num(getattr(_d, 's3_k', None), 0.0, float),
-                making_basis=str(getattr(_d, 'making_basis', None) or 'captured'),
-                making_horizon_s=_num(getattr(_d, 'making_horizon_s', None), 20.0, float),
-                making_floor_scale=_num(getattr(_d, 'making_floor_scale', None), 0.0, float),
-                skill_rank_scope=str(_d_scope if (_d_scope := getattr(_d, 'skill_rank_scope', None)) is not None
-                                     else 'positives'),
-                making_rank_scope=str(_d_mscope if (_d_mscope := getattr(_d, 'making_rank_scope', None)) is not None
-                                      else 'positives'),
-                making_pool=str(_d_pool if (_d_pool := getattr(_d, 'making_pool', None)) is not None
-                                else 'rank'),
-                presence_gate=_num(getattr(_d, 'presence_gate', None), 1, int),
-                presence_window=_num(getattr(_d, 'presence_window', None), 50, int),
-                skill_variant=str(_d_var if (_d_var := getattr(_d, 'skill_variant', None)) is not None else 'drift'),
-                skill_subwindows=_num(getattr(_d, 'skill_subwindows', None), 1, int),
-                skill_subwindow_form=str(_d_form if (_d_form := getattr(_d, 'skill_subwindow_form', None)) is not None
-                                         else 'sign_gated'),
-                skill_subwindow_min_agree=_num(getattr(_d, 'skill_subwindow_min_agree', None), 2, int),
-                skill_hurdle_bps=_num(getattr(_d, 'skill_hurdle_bps', None), 0.0, float),
-                skill_hurdle_books=_num(getattr(_d, 'skill_hurdle_books', None), 4, int),
-                skill_pool_scaling=_num(getattr(_d, 'skill_pool_scaling', None), 0, int),
-                skill_max_inactive_books=_num(getattr(_d, 'skill_max_inactive_books', None), 0.0, float),
-                skill_min_books=_num(getattr(_d, 'skill_min_books', None), 0, int),
-                skill_min_books_share=_num(getattr(_d, 'skill_min_books_share', None), 20 / 128, float),
-                class_weights=str(getattr(_d, 'class_weights', '') or ''),
-                making_fee_weight=_num(getattr(_d, 'making_fee_weight', None), 0.0, float),
-                capture_market_votes=_num(getattr(_d, 'capture_market_votes', None), 0, int),
-                skill_p11_strength=_num(getattr(_d, 'skill_p11_strength', None), 0.0, float),
-                presence_share_weighting=_num(getattr(_d, 'presence_share_weighting', None), 0, int),
-                presence_min_share=_num(getattr(_d, 'presence_min_share', None), 0.0, float),
-                mark_mode=str(_d_mark if (_d_mark := getattr(_d, 'mark_mode', None)) is not None
-                              else 'last'),
-                mark_window=_num(getattr(_d, 'mark_window', None), 200, int),
-            ),
+            # De-beta gates both the trade.py accumulators and compute_debeta_scores, so the child carries every
+            # dial main's config holds; a dial main lacks takes the parser default, as main's own reads do.
+            debeta=_debeta_duck(_d),
         )
     )
 

@@ -122,7 +122,7 @@ To test, follow the below procedure:
 ../build/src/cpp/taosim -f config/simulation_0.xml
 ```
 
-To test against the production two-class layout instead, point `simulation_xml` at `multiasset_simulation_0.xml`, as `config.multiasset.example.json` does, and start the simulator with the same file (`../build/src/cpp/taosim -f config/multiasset_simulation_0.xml`). The proxy builds the layout's configuration from the state it is sent, so each book arrives with its own asset class and grid.
+To test against the production three-class layout instead, point `simulation_xml` at `multiasset_simulation_0.xml`, as `config.multiasset.example.json` does, and start the simulator with the same file (`../build/src/cpp/taosim -f config/multiasset_simulation_0.xml`). The proxy builds the layout's configuration from the state it is sent, so each book arrives with its own asset class and grid.
 
 You should observe logs from the proxy indicating start of the simulation, receipt of state updates and responses from agents.   The agent logs received data, events and the instructions submitted.  Note that the simulator only starts publishing state updates to the proxy after the grace period (`Simulation.Agents.MultiBookExchangeAgent.gracePeriod`) has elapsed, so will not see state updates arriving immediately on simulation start.
 

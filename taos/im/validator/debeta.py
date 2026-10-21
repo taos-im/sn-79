@@ -312,14 +312,13 @@ def _forward_complete(st, idx, W):
 def capture_floor_stats(mid_state):
     """The dust floor's footprint per book, read off the live capture window the scorer keeps: the share of the
     window's prints that fall below their floor (what the floor excludes), the floor's current level and the
-    window's print count. The reporting payload ships it,
-    the report publishes it as book_gauges capture_dust_share and capture_floor, the board monitor flags a book
-    over its share threshold and the injected acceptance rows assert the same share under the same dust."""
+    window's print count. The reporting payload ships it, and the report publishes it as book_gauges
+    capture_dust_share and capture_floor."""
     out = {}
     for book, st in (mid_state or {}).items():
         sizes, floors = (st or {}).get("sizes") or [], (st or {}).get("floors") or []
         # read from W prints before the oldest pending fill, not over the backward reach the window also keeps, so
-        # the share means what the board monitor's flag was set on
+        # the share reflects the prints around the fills still pending, not the window's older history
         pend, rpend = (st or {}).get("pend") or [], (st or {}).get("rpend") or []
         end = int((st or {}).get("n", len(sizes)))
         oldest = min((pend[0][0] if pend else end), (rpend[0][0] if rpend else end))
@@ -330,6 +329,31 @@ def capture_floor_stats(mid_state):
             continue
         dust = sum(1 for s, f in zip(sizes, floors) if s < f)
         out[int(book)] = {"floor": float(floors[-1]), "dust_share": dust / n, "n": n}
+    return out
+
+
+def capture_settle_counts(mid_state):
+    """Per book, the capture fills settled with a complete forward side and those settled cut (stale or drained
+    before W later prints cleared their floor), counted since the book's live window began."""
+    out = {}
+    for book, st in (mid_state or {}).items():
+        full, cut = int((st or {}).get("n_full", 0)), int((st or {}).get("n_cut", 0))
+        if full or cut:
+            out[int(book)] = {"full": full, "cut": cut}
+    return out
+
+
+def capture_settle_by_class(counts, class_of):
+    """capture_settle_counts summed per asset class (class_of: {book: class}; a book it lacks, or a single market,
+    is class 0), with the cut share: the quantity the class gauges publish."""
+    out = {}
+    for book, c in (counts or {}).items():
+        row = out.setdefault(int((class_of or {}).get(int(book), 0)), {"full": 0, "cut": 0})
+        row["full"] += int(c.get("full", 0))
+        row["cut"] += int(c.get("cut", 0))
+    for row in out.values():
+        tot = row["full"] + row["cut"]
+        row["cut_share"] = row["cut"] / tot if tot else 0.0
     return out
 
 
@@ -438,7 +462,9 @@ def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist
             _hadd2(sell_hist, seller, book_id, ts, v)
 
 
-CAPTURE_FLUSH_NS = 60_000_000_000  # force-finalize a pending fill after 60 sim-s without W forward prints
+# A pending fill settles on a cut forward side once it has waited this long without W forward prints: long enough
+# that a quiet book's fills are judged on the prints after them, short against the scoring lookback.
+CAPTURE_FLUSH_NS = 300_000_000_000
 REALIZED_HORIZON_NS_DEFAULT = 20_000_000_000  # realized spread: a fill is marked against the mid this far after it (sim time)
 
 
@@ -459,13 +485,16 @@ def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts
                     now_ns, flush_ns, force=False, fee_weight=0.0):
     """Finalize every pending fill whose forward window is complete (W prints that clear its floor arrived after it,
     or its whole reach did), stale (older than flush_ns of sim time, so a quiet book cannot hold capture hostage), or
-    force-flushed. The window truncates only at genuine stream edges, never at batch edges."""
+    force-flushed. The window truncates only at genuine stream edges, never at batch edges. Each settled fill is
+    counted in the book's state as settled full (n_full) or cut (n_cut), the counts capture_settle_counts reads."""
     pend = st["pend"]
     while pend:
         idx, arrive_ns, t = pend[0]
-        if not (force or _forward_complete(st, idx, W)
-                or (now_ns is not None and arrive_ns is not None and now_ns - arrive_ns >= flush_ns)):
+        full = _forward_complete(st, idx, W)
+        if not (force or full or (now_ns is not None and arrive_ns is not None and now_ns - arrive_ns >= flush_ns)):
             break
+        key = "n_full" if full else "n_cut"
+        st[key] = st.get(key, 0) + 1
         mid = _floored_mid_at(st, idx, W)
         _attribute_capture(buy_sums, sell_sums, book_id, t, mid if mid is not None else float(t["p"]),
                            buy_hist, sell_hist, ts, fee_weight=fee_weight)
@@ -1223,9 +1252,9 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
         skill = [kappa_floored(book_alphas_by_uid.get(u, []), floor, skill_min_books) for u in uids]
     else:
         skill = [float(skill_values.get(u, 0.0)) for u in uids]
-    # TWO different book counts, and conflating them was a real defect (22 September): `skill_books`
+    # TWO different book counts, which must not be conflated: `skill_books`
     # is post-floor, the books whose alpha was big enough to carry skill, and it falls with SIZE per
-    # book, not with coverage. From the tape: agents that filled in all 128 books at modest
+    # book, not with coverage. Agents that fill in all 128 books at modest
     # size qualify on 1 to 5 of them, while the large makers qualify on 55 to 59 per cent. Feeding
     # the post-floor count to the coverage rule would therefore punish an agent quoting the whole
     # field for being small, which is the opposite of the rule's purpose. Coverage reads the books
@@ -1331,7 +1360,7 @@ def combined_reward(making, skill, w_make=0.65):
 def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades, *,
                         mtm_hist=None, invsum_hist=None, invn_hist=None,
                         drift=None, drift_hist=None, ts=None,
-                        mark_state=None, mark_mode="last", mark_window=0,
+                        mark_state=None, mark_mode="last", mark_window=0, mark_mid=None,
                         heldn=None, heldinv=None, helddrift=None, notional=None,
                         heldn_hist=None, heldinv_hist=None, helddrift_hist=None, notional_hist=None):
     """Accumulate the drift-strip inputs for kappa-of-alpha over ONE book's ordered trade batch,
@@ -1362,6 +1391,10 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
             volume-weighted mean of the last mark_window prints) or ``"median"`` (rolling window
             median, robust to both price and volume outliers).
         mark_window: Window length in prints for vwap/median marking; <=0 disables.
+        mark_mid: With ``mark_mode="mid"``, the book's mid-quote from the state this batch came with (the mean of
+            the best bid and ask), the mark for every trade of the batch; None (a state without both sides) keeps
+            the previous mark. No bounce by construction, one state of lag, no window, so a sparse book marks as
+            well as a dense one.
     None means the first new-sim trade emits no dp, so the boundary jump never enters drift.
 
     M1 settlement-style marking (mark_mode != "last"): the marked series is a rolling reference
@@ -1376,8 +1409,14 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
     mark_state is NOT persisted: after a restart the window re-warms and the first trade emits
     no dp - it can miss a marking move, never invent one."""
     binv = inv[book_id]  # {uid: current signed inventory in this book}, carried across batches
-    use_mark = mark_mode != "last" and mark_window > 0 and mark_state is not None
-    if use_mark:
+    use_mid = mark_mode == "mid" and mark_state is not None
+    use_mark = (not use_mid) and mark_mode != "last" and mark_window > 0 and mark_state is not None
+    if use_mid:
+        st = mark_state.get(book_id)
+        if st is None:
+            st = mark_state[book_id] = {"prev": None}
+        prev = st["prev"]
+    elif use_mark:
         st = mark_state.get(book_id)
         if st is None:
             st = mark_state[book_id] = {"pv": deque(), "vv": deque(), "pvs": 0.0, "vvs": 0.0,
@@ -1389,7 +1428,9 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
         p = float(t["p"])
         fill_p = p
         q = float(t["q"])
-        if use_mark:
+        if use_mid:
+            p = float(mark_mid) if mark_mid is not None else (prev if prev is not None else p)
+        elif use_mark:
             if mark_mode == "vwap":
                 st["pv"].append(p * q)
                 st["vv"].append(q)
@@ -1460,7 +1501,7 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
             p_first[book_id] = p
         prev = p
     p_last[book_id] = prev
-    if use_mark:
+    if use_mark or use_mid:
         st["prev"] = prev
 
 
@@ -1652,7 +1693,7 @@ def book_alphas_by_subwindow(mtm_hist, invsum_hist, invn_hist, drift_hist, t_sta
     return out
 
 
-def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor):
+def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor, min_books=MIN_SKILL_BOOKS_DEFAULT):
     """Skill assessed with temporal consistency inside the window.
 
     ``weakest``: skill is the smallest floored kappa across the sub-windows, each assessed over the
@@ -1667,6 +1708,8 @@ def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor):
         form: ``weakest`` or ``sign_gated``.
         min_agree: Sub-windows that must agree in sign (sign_gated).
         floor: The magnitude floor passed to kappa_floored.
+        min_books: The skill bar passed to kappa_floored, as the single-window path applies it
+            (``scoring.debeta.skill_min_books``).
 
     Returns:
         tuple: (``{uid: skill}``, ``{uid: {"books": n, "weakest": v}}``) with n the books that
@@ -1680,7 +1723,7 @@ def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor):
             ks = []
             for i in range(k):
                 vals = [subs[b][i] for b in by_book if b in subs and subs[b][i] is not None]
-                ks.append(kappa_floored(vals, floor))
+                ks.append(kappa_floored(vals, floor, min_books))
             skills[uid] = min(ks) if ks else 0.0
             info[uid] = {"books": len(by_book), "weakest": skills[uid]}
         else:
@@ -1692,7 +1735,7 @@ def subwindow_skill(alphas_by_book, sub_alphas, form, min_agree, floor):
                 agree = sum(1 for x in sw if x is not None and x != 0.0 and (x > 0) == (a > 0))
                 if agree >= int(min_agree):
                     kept.append(a)
-            skills[uid] = kappa_floored(kept, floor)
+            skills[uid] = kappa_floored(kept, floor, min_books)
             info[uid] = {"books": len(kept), "weakest": None}
     return skills, info
 

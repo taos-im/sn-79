@@ -72,6 +72,8 @@ def test_the_history_key_stays_the_sampled_timestamp_so_pruning_and_re_basing_ar
 
 
 def test_a_quiet_book_releases_the_fill_on_the_true_clock():
-    _cb, rb, _hrb, booked_at = _run(120, quiet_after=5)
+    from taos.im.validator.debeta import CAPTURE_FLUSH_NS
+    grace = CAPTURE_FLUSH_NS // S
+    _cb, rb, _hrb, booked_at = _run(20 + grace + 30, quiet_after=5)
     assert booked_at is not None, "a fill on a book that went quiet is released after horizon plus the flush grace of true sim time"
-    assert booked_at <= 1 + (20 + 60) + 1, f"released at {booked_at} s; the grace is 60 s past the horizon"
+    assert booked_at <= 1 + (20 + grace) + 1, f"released at {booked_at} s; the grace is {grace} s past the horizon"

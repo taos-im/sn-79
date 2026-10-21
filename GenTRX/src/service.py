@@ -38,6 +38,30 @@ import msgpack
 from GenTRX.src.bt_log import gtx_log
 
 
+# One SSL context for every HTTP client this service builds: httpx otherwise builds a context, reading the CA bundle
+# from disk, for each client it creates, even for a plain HTTP URL. Sync calls reuse one client per thread.
+_HTTP_SSL_CONTEXT = None
+_HTTP_SSL_LOCK = threading.Lock()
+_HTTP = threading.local()
+
+
+def _http_ssl_context():
+    global _HTTP_SSL_CONTEXT
+    with _HTTP_SSL_LOCK:
+        if _HTTP_SSL_CONTEXT is None:
+            import httpx
+            _HTTP_SSL_CONTEXT = httpx.create_ssl_context()
+        return _HTTP_SSL_CONTEXT
+
+
+def _sync_http_client():
+    client = getattr(_HTTP, "client", None)
+    if client is None:
+        import httpx
+        client = _HTTP.client = httpx.Client(verify=_http_ssl_context())
+    return client
+
+
 class _TxSpool:
     """Append-only WAL for outbound state packets; survives validator restart."""
 
@@ -953,8 +977,7 @@ class GenTRXService:
         bucket keys: endpoint_url, bucket_name, access_key_id, secret_access_key
         """
         try:
-            import httpx
-            r = httpx.post(
+            r = _sync_http_client().post(
                 f"{self._server_url}/register_bucket/{uid}",
                 json=bucket,
                 headers=self._headers(),
@@ -968,8 +991,7 @@ class GenTRXService:
     def is_healthy(self, timeout: float = 3.0) -> bool:
         """GET /health on the gradient server. Returns True if reachable and status=ok."""
         try:
-            import httpx
-            r = httpx.get(f"{self._server_url}/health", headers=self._headers(), timeout=timeout)
+            r = _sync_http_client().get(f"{self._server_url}/health", headers=self._headers(), timeout=timeout)
             return r.status_code == 200 and r.json().get("status") == "ok"
         except Exception:
             return False
@@ -1004,7 +1026,7 @@ class GenTRXService:
 
     async def _http_get_async(self, path: str, timeout: float = 5.0):
         import httpx
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=_http_ssl_context()) as client:
             return await client.get(
                 f"{self._server_url}{path}", headers=self._headers()
             )
@@ -1015,7 +1037,7 @@ class GenTRXService:
     ):
         import httpx
         headers = {"Content-Type": content_type, **self._headers()}
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=_http_ssl_context()) as client:
             return await client.post(
                 f"{self._server_url}{path}", content=data, headers=headers
             )
@@ -1024,9 +1046,8 @@ class GenTRXService:
         self, path: str, data: bytes,
         content_type: str = "application/octet-stream", timeout: float = 5.0,
     ):
-        import httpx
         headers = {"Content-Type": content_type, **self._headers()}
-        return httpx.post(
+        return _sync_http_client().post(
             f"{self._server_url}{path}",
             content=data, headers=headers, timeout=timeout,
         )

@@ -79,3 +79,12 @@ TEST(RequestFingerprint, TwoBatchesDifferingOnlyInASequenceNumberDiffer)
     const auto b = batch(0x11223345u);
     EXPECT_NE(hashRequestBytes(a.data(), a.size()), hashRequestBytes(b.data(), b.size()));
 }
+
+TEST(RequestFingerprint, IsTheStandardFnv1a64)
+{
+    // The published FNV-1a 64 test vectors.
+    const std::string a = "a";
+    const std::string foobar = "foobar";
+    EXPECT_EQ(hashRequestBytes(a.data(), a.size()), 0xaf63dc4c8601ec8cull);
+    EXPECT_EQ(hashRequestBytes(foobar.data(), foobar.size()), 0x85944171f73967e8ull);
+}

@@ -28,7 +28,7 @@ struct convert<taosim::decimal_t>
     const msgpack::object& operator()(const msgpack::object& o, taosim::decimal_t& v) const
     {
         if (o.type == msgpack::type::FLOAT64) {
-            v = taosim::util::double2decimal(o.as<double>());
+            v = taosim::util::wire2decimal(o.as<double>());
         }
         else if (o.type == msgpack::type::BIN) {
             v = taosim::util::unpackDecimal(o.as<taosim::PackedDecimal>());

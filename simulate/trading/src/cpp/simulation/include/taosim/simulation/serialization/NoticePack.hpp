@@ -28,6 +28,44 @@ namespace taosim::simulation::serialization
 
 //-------------------------------------------------------------------------
 
+namespace detail
+{
+
+// The typed error an error notice names, when its payload is that error with the request it refuses.
+template<typename T>
+[[nodiscard]] std::shared_ptr<T> typedError(const Message::Ptr& msg)
+{
+    const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+    const auto err = pld != nullptr ? std::dynamic_pointer_cast<T>(pld->payload) : nullptr;
+    return err != nullptr && err->requestPayload != nullptr && err->errorPayload != nullptr ? err : nullptr;
+}
+
+// The reason the refusal of an undecoded instruction carries, empty when its payload has none.
+[[nodiscard]] inline std::string refusalReason(const Message::Ptr& msg)
+{
+    const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+    const auto err = pld != nullptr ? std::dynamic_pointer_cast<ErrorResponsePayload>(pld->payload) : nullptr;
+    return err != nullptr ? err->message : std::string{};
+}
+
+}  // namespace detail
+
+//-------------------------------------------------------------------------
+
+// A LIFECYCLE NOTICE IS NAMED BY ITS TYPE AND ITS PAYLOAD TOGETHER. The start and the end of a simulation
+// are the only notices that are not an agent's response, and each carries a payload of its own; a payload
+// alone does not say which notice a message is, so a message of any other type that is not an agent's
+// response is not one an agent can be told.
+[[nodiscard]] inline bool isLifecycleNotice(const Message::Ptr& msg)
+{
+    return (msg->type == "EVENT_SIMULATION_START"
+            && std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr)
+        || (msg->type == "EVENT_SIMULATION_END"
+            && std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr);
+}
+
+//-------------------------------------------------------------------------
+
 // bookIdOffset is the canonical id of the notice's source block's local book 0
 // (Simulation::bookIdBase); it is applied to the book ids as they are written,
 // leaving the buffered payload objects untouched.
@@ -97,16 +135,12 @@ void packNotice(
             // Only the lifecycle pair is switched to arrival, deliberately: a fill notice's timestamp
             // is a documented quantity and is not this change's business.
             {
-                const bool lifecycle =
-                    std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                    || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr;
-                o.pack(lifecycle ? msg->arrival : msg->occurrence);
+                o.pack(isLifecycleNotice(msg) ? msg->arrival : msg->occurrence);
             }
 
             o.pack("a"s);
             [&] {
-                if (std::dynamic_pointer_cast<StartSimulationPayload>(msg->payload) != nullptr
-                    || std::dynamic_pointer_cast<EmptyPayload>(msg->payload) != nullptr) {
+                if (isLifecycleNotice(msg)) {
                     o.pack_nil();
                     return;
                 }
@@ -121,6 +155,51 @@ void packNotice(
                     o.pack_nil();
                 }
             }();
+
+            // An error notice whose payload is not the typed error its type names refuses an instruction
+            // that could not be decoded. It carries the reason, if it has one, and names no book, order,
+            // client order id or agent. The side, size, leverage and limit a placement refusal must carry
+            // are written as zero, and the settlement as unset; a cancel, close or reset refusal is one
+            // entry.
+            auto packUndecodedPlacementRefusal = [&] {
+                o.pack("b"s);
+                o.pack_nil();
+                o.pack("o"s);
+                o.pack_nil();
+                o.pack("c"s);
+                o.pack_nil();
+                o.pack("s"s);
+                o.pack(0);
+                o.pack("q"s);
+                o.pack(0.0);
+                o.pack("u"s);
+                o.pack(false);
+                o.pack("m"s);
+                o.pack(detail::refusalReason(msg));
+                o.pack("l"s);
+                o.pack(0.0);
+                o.pack("f"s);
+                o.pack(-2);
+            };
+            auto packUndecodedEntryRefusal = [&](const std::string& entriesKey) {
+                o.pack("b"s);
+                o.pack_nil();
+                o.pack(entriesKey);
+                o.pack_array(1);
+                o.pack_map(6);
+                o.pack("t"s);
+                o.pack(msg->occurrence);
+                o.pack("b"s);
+                o.pack_nil();
+                o.pack("o"s);
+                o.pack_nil();
+                o.pack("q"s);
+                o.pack_nil();
+                o.pack("u"s);
+                o.pack(false);
+                o.pack("m"s);
+                o.pack(detail::refusalReason(msg));
+            };
 
             if (msg->type == "EVENT_SIMULATION_START") {
                 o.pack("l"s);
@@ -160,6 +239,12 @@ void packNotice(
 
                 o.pack("p"s);
                 o.pack(reqPld->price);
+            }
+            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"
+                && detail::typedError<PlaceOrderLimitErrorResponsePayload>(msg) == nullptr) {
+                packUndecodedPlacementRefusal();
+                o.pack("p"s);
+                o.pack(0.0);
             }
             else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
@@ -231,6 +316,12 @@ void packNotice(
 
                 o.pack("r"s);
                 o.pack(reqPld->currency);
+            }
+            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"
+                && detail::typedError<PlaceOrderMarketErrorResponsePayload>(msg) == nullptr) {
+                packUndecodedPlacementRefusal();
+                o.pack("r"s);
+                o.pack(Currency::BASE);
             }
             else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
@@ -351,6 +442,10 @@ void packNotice(
                     o.pack(""s);
                 }
             }
+            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS"
+                && detail::typedError<CancelOrdersErrorResponsePayload>(msg) == nullptr) {
+                packUndecodedEntryRefusal("c"s);
+            }
             else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
                 const auto subPld = std::dynamic_pointer_cast<CancelOrdersErrorResponsePayload>(pld->payload);
@@ -419,6 +514,10 @@ void packNotice(
                     o.pack(""s);
                 }
             }
+            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS"
+                && detail::typedError<ClosePositionsErrorResponsePayload>(msg) == nullptr) {
+                packUndecodedEntryRefusal("o"s);
+            }
             else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
                 const auto subPld = std::dynamic_pointer_cast<ClosePositionsErrorResponsePayload>(pld->payload);
@@ -474,6 +573,20 @@ void packNotice(
                     o.pack("m"s);
                     o.pack(""s);
                 }
+            }
+            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT"
+                && detail::typedError<ResetAgentsErrorResponsePayload>(msg) == nullptr) {
+                o.pack("r"s);
+                o.pack_array(1);
+                o.pack_map(4);
+                o.pack("a"s);
+                o.pack_nil();
+                o.pack("t"s);
+                o.pack(msg->occurrence);
+                o.pack("u"s);
+                o.pack(false);
+                o.pack("m"s);
+                o.pack(detail::refusalReason(msg));
             }
             else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT") {
                 const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);

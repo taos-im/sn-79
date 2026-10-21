@@ -19,6 +19,10 @@ Run standalone:
         --val-data $REPO/data/server \\
         --subtensor-network local --netuid 1
 
+The server runs as a sibling validator unless --is-aggregator is given;
+run_gradients.sh passes the role. A uid-0 aggregator started without
+run_gradients.sh needs --is-aggregator.
+
 All filesystem paths are resolved to absolute at construction. Pass
 absolute paths or `$VAR`-expanded paths to keep the invocation
 independent of the launching shell's CWD.
@@ -414,6 +418,13 @@ class GradientAggregator:
         self._miner_buckets_queried_at: float = 0.0
         self._miner_buckets_refresh_s: float = 30.0
         self._version = 0
+        # Siblings: the uid-0 version the local checkpoint was synced to. Kept
+        # apart from _version, which a sibling's local aggregation bumps.
+        self._canonical_version = 0
+        self._canonical_synced_round: int | None = None
+        self._canonical_retry_round: int | None = None
+        self._canonical_retry_at: float = 0.0
+        self._canonical_retry_s: float = 15.0
         self._agg_round = 0
         self._last_round_log_ts: float = 0.0
         self._last_push_block: int | None = (
@@ -1676,16 +1687,89 @@ class GradientAggregator:
         except Exception:
             pass  # rotation must never break the caller
 
+    @property
+    def _canonical_version_path(self) -> Path:
+        return self.checkpoint_path.with_name(self.checkpoint_path.name + ".uid0.json")
+
+    def _load_canonical_version(self) -> int:
+        """uid-0 version recorded for the local checkpoint; 0 if unknown."""
+        if not self.checkpoint_path.exists():
+            return 0
+        try:
+            data = _json.loads(self._canonical_version_path.read_text())
+            return max(0, int(data.get("version", 0)))
+        except Exception:
+            return 0
+
+    def _set_canonical_version(self, version: int) -> None:
+        self._canonical_version = version
+        try:
+            if version > 0:
+                self._canonical_version_path.write_text(
+                    _json.dumps({"version": version})
+                )
+            else:
+                self._canonical_version_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Could not record uid-0 checkpoint version: %s", exc)
+
+    def _sync_sibling_for_round(self) -> bool:
+        """Sync a sibling from uid 0 each round, after the closing round drains.
+
+        Waits while rounds are still queued for aggregation: they are scored
+        against the model their miners trained on, which the sync replaces.
+        Until a sync installs a new uid-0 version in this round, it is retried
+        every _canonical_retry_s, so a uid 0 that publishes after our drain,
+        or a transient error, does not leave the round on the old model.
+        """
+        if self.is_aggregator or self._pending_aggregation_rounds:
+            return False
+        if self._canonical_synced_round == self._agg_round:
+            return False
+        now = time.time()
+        if self._canonical_retry_round == self._agg_round and now < self._canonical_retry_at:
+            return False
+        if self._sync_from_uid0():
+            self._canonical_synced_round = self._agg_round
+            return True
+        self._canonical_retry_round = self._agg_round
+        self._canonical_retry_at = now + self._canonical_retry_s
+        return False
+
+    def _load_uid0_model(self, ckpt: Any):
+        """Build the model from a uid-0 checkpoint dict; raise if it is unusable."""
+        from GenTRX.src.gradient import validate_state_dict
+        from GenTRX.src.model import ModelConfig, OrderModel
+
+        if not isinstance(ckpt, dict) or not isinstance(ckpt.get("model_state_dict"), dict):
+            raise ValueError("checkpoint has no model_state_dict")
+        raw_cfg = ckpt.get("model_config") or {}
+        if not isinstance(raw_cfg, dict):
+            raise ValueError("model_config must be a dict")
+        model_cfg = ModelConfig(**{k: v for k, v in raw_cfg.items() if k in ModelConfig.__dataclass_fields__})
+        if model_cfg.n_types != ModelConfig().n_types:
+            raise ValueError(f"n_types={model_cfg.n_types}, build uses n_types={ModelConfig().n_types}")
+        model = OrderModel(model_cfg)
+        validate_state_dict(ckpt["model_state_dict"], model.state_dict())
+        model.load_state_dict(ckpt["model_state_dict"])
+        return model
+
     def _sync_from_uid0(self) -> bool:
-        """Download the latest checkpoint from uid 0's chain-committed bucket.
+        """Bring checkpoint_path to uid 0's head version.
 
-        Called at startup (bootstrap) and at the start of each aggregation round
-        (model sync).  Keeps sibling validators and their scoring aligned with
-        the canonical model published by the aggregator.
+        Called at every sibling startup and each round from the aggregation
+        loop. Keeps sibling validators and their scoring aligned with the
+        canonical model published by the aggregator. uid 0 uploads a full
+        checkpoint (latest.json) only every --checkpoint-interval versions and
+        a delta + head.json for each version, so the head is reached by
+        replaying deltas: from the local checkpoint when it holds an earlier
+        canonical version, otherwise from the last full checkpoint.
 
-        Returns True if a new checkpoint was downloaded, False otherwise.
-        No-op if this server IS the aggregator, chain is not set, uid 0 has
-        no bucket commitment, or the latest version is not newer than local.
+        Returns True if a different uid-0 version was installed, False
+        otherwise. No-op if this server IS the aggregator, uid 0 has no
+        bucket, or uid 0's version equals the one last synced
+        (_canonical_version). The result is loaded and validated before it
+        replaces checkpoint_path.
         """
         if self.is_aggregator:
             return False  # we ARE uid 0 — we publish, not pull
@@ -1717,11 +1801,12 @@ class GradientAggregator:
                 region=bucket_info.region,
                 prefix=self._bucket_prefix,
             )
-            version = store.get_latest_version(0)
-            if version <= 0:
+            latest = store.get_latest_version(0)
+            target = max(store.get_head_version(0), latest)
+            if target <= 0:
                 logger.debug("uid-0 bucket has no checkpoint yet")
                 return False
-            if version <= self._version:
+            if target == self._canonical_version:
                 return False  # already current
             try:
                 uid0_meta = store.get_latest_meta(0)
@@ -1729,27 +1814,65 @@ class GradientAggregator:
                     logger.warning(
                         "uid-0 checkpoint v%d predates train regime %d — "
                         "not syncing onto a newer-regime sibling",
-                        version,
+                        latest,
                         TRAIN_REGIME_VERSION,
                     )
                     return False
             except Exception as exc:
                 logger.warning("Could not read uid-0 regime stamp: %s", exc)
 
+            import io
+
+            import torch
+
+            from GenTRX.src.distributed import apply_version_deltas
+            from GenTRX.src.gradient import safe_torch_load
+
             logger.info(
-                "Syncing from uid-0 checkpoint v%d → v%d at %s/%s",
-                self._version,
-                version,
+                "Syncing from uid-0 v%d → v%d at %s/%s",
+                self._canonical_version,
+                target,
                 bucket_info.endpoint_url,
                 bucket_info.bucket_name,
             )
-            ckpt_bytes = store.get_checkpoint(0, version)
+            ckpt = model = None
+            reached = 0
+            if 0 < self._canonical_version < target and self.checkpoint_path.exists():
+                # Fast path: the local file holds an earlier canonical version.
+                ckpt = safe_torch_load(str(self.checkpoint_path))
+                model = self._load_uid0_model(ckpt)
+                expected = {n: p.shape for n, p in model.named_parameters()}
+                reached = apply_version_deltas(model, store, 0, self._canonical_version, target, expected)
+                if reached < target:
+                    logger.info("uid-0 delta gap after v%d; reloading full checkpoint", reached)
+                    ckpt = model = None
+            if model is None:
+                if latest <= 0:
+                    logger.warning("uid-0 head v%d has no full checkpoint to replay from", target)
+                    return False
+                ckpt = safe_torch_load(io.BytesIO(store.get_checkpoint(0, latest)))
+                model = self._load_uid0_model(ckpt)
+                expected = {n: p.shape for n, p in model.named_parameters()}
+                reached = apply_version_deltas(model, store, 0, latest, target, expected)
+                if reached < target:
+                    logger.warning("uid-0 deltas end at v%d, head is v%d", reached, target)
+            if reached == self._canonical_version:
+                return False
+
+            ckpt["model_state_dict"] = model.state_dict()
             self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            self.checkpoint_path.write_bytes(ckpt_bytes)
-            self._version = version
+            tmp_path = self.checkpoint_path.with_name(self.checkpoint_path.name + ".sync.tmp")
+            with self._lock:
+                torch.save(ckpt, tmp_path)
+                os.replace(tmp_path, self.checkpoint_path)
+                self._version = reached
+                self._set_canonical_version(reached)
+            # The cached scoring model is the pre-sync one; the next scoring
+            # pass must load the synced checkpoint.
+            self._clear_scoring_cache()
             logger.info(
-                "Model sync complete: checkpoint v%d written to %s",
-                version,
+                "Model sync complete: uid-0 v%d written to %s",
+                reached,
                 self.checkpoint_path,
             )
             return True
@@ -1845,14 +1968,20 @@ class GradientAggregator:
             self._fresh_start = True
 
         # Ensure a checkpoint exists.
-        # Priority: (1) local file, (2) bucket head, (3) fresh model.
-        if not self.checkpoint_path.exists():
-            # Siblings pull uid-0's chain-committed head; the aggregator pulls
-            # its own bucket head (its _sync_from_uid0 is a publish-side no-op),
-            # so a missing/quarantined seed self-heals to the trained baseline
+        # Siblings: (1) uid-0 head if newer than the local file, (2) local
+        # file, (3) fresh model. Aggregator: (1) local file, (2) its own bucket
+        # head, (3) fresh model.
+        if not self.is_aggregator:
+            # Checked on every start, not only without a local file: a
+            # checkpoint left by an earlier run would otherwise be scored on
+            # until the next round's sync.
+            self._set_canonical_version(self._load_canonical_version())
+            self._version = self._canonical_version
+            self._sync_from_uid0()
+        elif not self.checkpoint_path.exists():
+            # A missing/quarantined seed self-heals to the trained baseline
             # instead of scoring on a fresh-init model.
-            if not self._sync_from_uid0():
-                self._bootstrap_from_own_bucket()
+            self._bootstrap_from_own_bucket()
 
         if not self.checkpoint_path.exists():
             logger.info(
@@ -1894,8 +2023,13 @@ class GradientAggregator:
         # Upload initial checkpoint to aggregator bucket so agents can bootstrap.
         # On restart, scan for the highest existing version rather than always
         # resetting to v1 (which prune would immediately delete, leaving
-        # latest.json pointing at a non-existent file).
-        if self.validator_store is not None and self.checkpoint_path.exists():
+        # latest.json pointing at a non-existent file). Aggregator only: a
+        # sibling's model and version come from uid 0, never its own bucket.
+        if (
+            self.is_aggregator
+            and self.validator_store is not None
+            and self.checkpoint_path.exists()
+        ):
             try:
                 existing_version = self.validator_store.get_latest_existing_version(
                     self._validator_uid
@@ -2393,6 +2527,11 @@ class GradientAggregator:
                         if a.get("round", -1) in draining:
                             self._prev_round_assignments.pop(uid, None)
 
+                # Siblings: pull uid-0's canonical model once per round, after
+                # the closing round has drained, so the new round is scored
+                # on it.
+                self._sync_sibling_for_round()
+
                 # State arrives over HTTP (POST /state) and is processed in
                 # the FastAPI handler — this loop only manages the assignment
                 # state machine + gradient collection.
@@ -2550,8 +2689,7 @@ class GradientAggregator:
                     self._agg_round += 1
                     # Siblings: sync canonical model from uid-0 before the new
                     # round so scoring uses the latest checkpoint. Once per round.
-                    if not self.is_aggregator:
-                        self._sync_from_uid0()
+                    self._sync_sibling_for_round()
                     self._create_round_assignments()
 
             except Exception as exc:
@@ -3005,6 +3143,45 @@ class GradientAggregator:
         except Exception as exc:
             logger.warning("Scoring model load failed for round %d: %s", rnd, exc)
             return None
+
+    def _save_published_checkpoint(self, ckpt_dict: dict) -> None:
+        """Write a published version to output_path and, when that names another file, to checkpoint_path too.
+
+        The next round's scoring model and a restart load checkpoint_path, so it must hold what was published; with
+        the two paths apart, every round would otherwise start again from the boot checkpoint. Each file is replaced
+        atomically. Callers hold self._lock, as _get_scoring_cache does when it reads checkpoint_path.
+        """
+        import torch
+
+        targets = [self.output_path]
+        if self.checkpoint_path != self.output_path:
+            targets.append(self.checkpoint_path)
+        for path in targets:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            torch.save(ckpt_dict, tmp)
+            os.replace(tmp, path)
+
+    def _save_local_checkpoint(self, ckpt_dict: dict) -> None:
+        """Write the post-round model. Caller holds _lock.
+
+        The aggregator's save is a new version: it goes to output_path and to checkpoint_path, so the next round's
+        scoring model and a restart load what was published. A sibling's save goes to output_path only and makes no
+        version: its _version stays uid 0's (served by /data-status) and its checkpoint_path holds uid 0's model; a
+        sibling whose output_path is its checkpoint_path has just written over that model and must pull uid 0's again.
+        """
+        if self.is_aggregator:
+            self._save_published_checkpoint(ckpt_dict)
+            self._version += 1
+            return
+        import torch
+
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.output_path.with_suffix(".tmp")
+        torch.save(ckpt_dict, tmp_path)
+        os.replace(tmp_path, self.output_path)
+        if self.output_path == self.checkpoint_path:
+            self._set_canonical_version(0)
 
     def _clear_scoring_cache(self) -> None:
         """Drop the cached scoring model. Called after aggregation."""
@@ -3847,10 +4024,7 @@ class GradientAggregator:
                 "epoch": 0,
                 **checkpoint_stamp(self.label_smooth_sigma),
             }
-            tmp_path = self.output_path.with_suffix(".tmp")
-            torch.save(ckpt_dict, tmp_path)
-            os.rename(tmp_path, self.output_path)
-            self._version += 1
+            self._save_local_checkpoint(ckpt_dict)
             t_local_save = time.time() - t_save_start
 
             # Only the aggregator (uid 0) publishes the canonical model. Every
@@ -5756,17 +5930,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--is-aggregator",
         action="store_true",
-        default=True,
+        default=False,
         help="This server is the uid-0 aggregator: aggregates gradients and "
-        "publishes canonical checkpoints. Use --no-is-aggregator for sibling "
-        "validators that only score and publish scores.",
+        "publishes canonical checkpoints. Default is sibling: score miners, "
+        "publish scores, and sync the model from uid 0.",
     )
     parser.add_argument(
         "--no-is-aggregator",
         dest="is_aggregator",
         action="store_false",
-        help="Run as a sibling validator: score miners and publish scores only, "
-        "no gradient aggregation or checkpoint publish.",
+        help="Run as a sibling validator (the default): score miners and "
+        "publish scores only, no gradient aggregation or checkpoint publish.",
     )
     parser.add_argument(
         "--validator-uid",

@@ -55,3 +55,11 @@ def add_simulation_args(cls, parser):
              "Set to empty string to disable external order fetching.",
         default="http://localhost:8080",
     )
+
+    parser.add_argument(
+        "--simulation.network",
+        type=str,
+        help="Network identifier declared in ingest payloads to the data service (e.g. 'local', 'testnet', "
+             "'mainnet'), so the service can refuse payloads meant for another network. Unset: none is declared.",
+        default=None,
+    )
