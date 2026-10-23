@@ -55,7 +55,11 @@ def test_the_block_publish_carries_and_resets_the_counts():
         assert g in src, g
     block = src[src.index("_ms = self.miner_stats.get(agentId)"):]
     block = block[:block.index("_set_if_changed_metric")]
-    assert "'placed': 0" in block and "'refused': 0" in block and "'refused_contract': 0" in block
+    # the reset row comes from the shared factory, which holds every counter at zero
+    assert "empty_block_stats()" in block
+    from taos.im.validator.block_stats import empty_block_stats
+    fresh = empty_block_stats()
+    assert (fresh['placed'], fresh['refused'], fresh['refused_contract']) == (0, 0, 0)
 
 
 def test_the_validator_counts_each_state_once():

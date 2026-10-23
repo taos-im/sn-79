@@ -316,6 +316,9 @@ class QueryService:
             volume_decimals = request_data.get('volume_decimals', 2)
             book_count = request_data.get('book_count', len(request_data['books']))
             capital_turnover_cap = request_data.get('capital_turnover_cap', 10.0)
+            dropped = {}
+            if self is not None:   # the method is also called unbound, with no service, by the book-id and skip tests
+                self._dropped_instructions = dropped   # per uid, the instructions the caps drop this round
             max_instructions_per_book = request_data.get('max_instructions_per_book', 100)
             max_reply_instructions, max_reply_bytes = reply_bounds(book_count, max_instructions_per_book)
 
@@ -409,6 +412,7 @@ class QueryService:
                                     f"(capital_turnover_cap x miner_wealth"
                                     f"{', accrued for a new uid' if uid_cap != volume_cap else ''}); instruction DROPPED")
                                 volume_cap_logged = True
+                            dropped[uid] = dropped.get(uid, 0) + 1
                             continue
 
                         # delegate exists only on placements (stake moves); cancels/closes have no
@@ -421,6 +425,8 @@ class QueryService:
 
                         if instructions_per_book[instruction.bookId] <= max_instructions_per_book:
                             valid_instructions.append(instruction)
+                        else:
+                            dropped[uid] = dropped.get(uid, 0) + 1
                             
                     except Exception as ex:
                         bt.logging.warning(f"Error processing instruction by agent {uid}: {ex}\n{instruction}\n{traceback.format_exc()}")
@@ -883,6 +889,7 @@ class QueryService:
                     "timeouts": timeouts,
                     "failures": failures,
                     "wait": getattr(self, "_last_wait_s", None),
+                    "dropped": dict(getattr(self, "_dropped_instructions", None) or {}),
                 }
             }
 
@@ -1304,13 +1311,13 @@ class QueryService:
             bt.logging.error(f"Error cleaning up IPC: {e}\n{traceback.format_exc()}")
 
 
-if __name__ == '__main__':
+def service_parser():
+    """The query process's own arguments: the validator starts it with the subset it needs (neurons/validator.py)."""
     parser = argparse.ArgumentParser()
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
     bt.Axon.add_args(parser)
-    bt.logging.set_info()
 
     parser.add_argument('--netuid', type=int, default=1)
     parser.add_argument('--logging.level', type=str, default="info")
@@ -1323,8 +1330,14 @@ if __name__ == '__main__':
     parser.add_argument('--notify-fd', type=int, default=None)
     parser.add_argument('--ipc-prefix', type=str, default='validator',
                         help='Prefix for POSIX IPC resource names — "validator" for simulation, "exchange" for exchange mode')
-    
+    # The dendrite lives here, so 0.6.5's kept connections are read here: the validator passes the switch on.
+    parser.add_argument('--neuron.reuse_connections', action='store_true', default=False)
+    return parser
 
+
+if __name__ == '__main__':
+    parser = service_parser()
+    bt.logging.set_info()
     config = bt.Config(parser)
     bt.logging(config=config)
 

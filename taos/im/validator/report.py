@@ -23,6 +23,7 @@ from typing import Dict
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from taos.im.protocol.models import TradeInfo, MarketSimulationConfig
+from taos.im.validator.block_stats import empty_block_stats
 from taos.im.protocol.events import TradeEvent
 
 from taos.common.utils.prometheus import prometheus
@@ -1058,8 +1059,10 @@ def round_quantile(values, q):
 
 
 def round_block_gauges(ms) -> list:
-    """A uid's published block of rounds as (gauge, value): the counts, the mean response time of the answered rounds
-    and, from 0.6.5, the block's 5th percentile (the uid's floor) and median, which the round lines read."""
+    """A uid's published block of rounds as (gauge, value): the request counts, the mean response time of the answered
+    rounds with the block's 5th percentile (the uid's floor) and median, which the round lines read, and the engine's
+    view of the uid's instructions: placements and cancels sent, placed and refused, cancels honoured and failed, fills,
+    and instructions dropped under the caps."""
     times = ms.get('call_time') or []
     return [
         ("requests", ms['requests']),
@@ -1073,6 +1076,12 @@ def round_block_gauges(ms) -> list:
         ("placed", ms.get('placed', 0)),
         ("refused", ms.get('refused', 0)),
         ("refused_contract", ms.get('refused_contract', 0)),
+        ("placements_sent", ms.get('placements_sent', 0)),
+        ("cancels_sent", ms.get('cancels_sent', 0)),
+        ("cancels_ok", ms.get('cancels_ok', 0)),
+        ("cancels_failed", ms.get('cancels_failed', 0)),
+        ("fills", ms.get('fills', 0)),
+        ("dropped", ms.get('dropped', 0)),
     ]
 
 
@@ -2399,8 +2408,7 @@ async def report(self: ReportingService) -> None:
             if _ms and _ms['requests'] >= 100:
                 for _name, _value in round_block_gauges(_ms):
                     updates.append((miner_gauges, _value, wallet_addr, netuid, simid, agentId, _name))
-                self.miner_stats[agentId] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': [],
-                                             'placed': 0, 'refused': 0, 'refused_contract': 0}
+                self.miner_stats[agentId] = empty_block_stats()
 
             _set_if_changed_metric(
                 self.prometheus_miners,

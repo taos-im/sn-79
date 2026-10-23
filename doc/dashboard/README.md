@@ -35,7 +35,7 @@ This document serves to provide details on the data displayed at the [MVTRX dash
   - [Trades Table](#trades-table-2)
   - [Score Plot](#score-plot)
   - [Performance Plot](#performance-plot)
-  - [Requests Plot](#requests-plot)
+  - [Requests and Instructions Plots](#requests-and-instructions-plots)
   - [GenTRX Plots](#gentrx-plots)
   - [Daily Volume Plot](#daily-volume-plot)
   - [Round-Trip Volume Plot](#round-trip-volume-plot)
@@ -70,61 +70,53 @@ The third row displays the current resource usage of the validator hosting insta
 
 ![alt text](validator_scoring_config.png)
 
-The first config table displays the parameters that govern how miners are scored.  See the [scoring note](https://github.com/taos-im/mvtrx-docs/blob/main/notes/2026-09-incentive-metric/notes-on-the-incentive-metric-of-mvtrx.md) for the formulas.
+The first config table displays the parameters that govern how miners are scored. This table shows every published dial scoring reads at the shipped weights. Kappa3 Weight and PnL Score Weight are 0, so the Kappa3 and PnL Score computations do not run, and the dials only they read are left out: Kappa3 Tau, Min Window, Norm Min and Max and Min PnL Obs, the PnL Window and daily-return bounds, and the activity factor's impact and decay. Every published dial, including those, the response delays and the per-book instruction limit, is in **All scoring parameters** in the Diagnostics row at the bottom of the page.
 
 - **Scoring Interval** - How often (in simulation time) the validator runs a scoring and weight-update cycle.
 
-- **Kappa3 Weight** - Weight of the Kappa3 Score in the trading score.  Kappa3 Weight + PnL Score Weight + De-beta Weight = 1.  0 since 0.6.2.
+- **Kappa3 Weight** - Weight of the Kappa3 Score in the trading score; at 0 the Kappa3 Score is not computed.
 
-- **Kappa3 Window** - Rolling window (simulation time) over which Kappa3 is computed; the de-beta legs use the same window.
+- **Kappa3 Window** - Rolling window (simulation time) the de-beta legs are measured over, and the Kappa3 window when its weight is above 0.
 
-- **Min PnL Obs** - Minimum non-zero realized PnL observations a book needs to carry a Kappa3 value.
-
-- **PnL Score Weight** - Weight of the PnL Score in the trading score.
-
-- **PnL Window** - Rolling window over which realized PnL is evaluated for the PnL Score.
+- **PnL Score Weight** - Weight of the PnL Score in the trading score; at 0 the PnL Score is not computed.
 
 - **GenTRX Share** - Fraction of the overall weight allocated to GenTRX; the remainder is the trading side.  Same value as **Pool Share** on the [GenTRX Page](#gentrx-page).
 
-- **Activity Impact** - How much traded volume raises a book's activity factor above 1.  At 0 the factor is 0 before a book's first round trip and 1 after it.
+- **Activity Sampling Interval** - Simulation time interval at which miners' traded volume is sampled for the volume cap.
 
-- **Activity Window** - Rolling window of round-trip volume used by the activity factor.
+- **Activity Window** - Rolling window over which a miner's traded volume on a book counts toward Max 24H Vol.
 
-- **Activity Decay Grace** - Time after a book's last round trip before activity decay starts.
+- **Capital Turnover Cap** - Times per Activity Window a miner may trade the value of its initial capital on a book.
 
-- **Activity Decay Rate** - Rate at which an inactive book's activity factor decays; 0 disables decay.
+- **Max 24H Vol** - Capital Turnover Cap x miner wealth, the volume cap per book: once it is exceeded the agent's further instructions on that book are dropped for the rest of the window.
 
-- **Max 24H Vol** - Cap on an agent's 24-hour traded volume per book; once exceeded, the agent's further instructions on that book are dropped for the rest of the window.
-
-- **Max Instr / Book** - Maximum order instructions an agent may submit per book per scoring step; the excess is rejected.
-
-The **De-beta** parameters follow.  Since 0.6.2 the trading pool is paid from the two de-beta legs directly: the making half in proportion to each miner's making credit, and the skill half in proportion to net alpha among the miners that qualify.  The published De-beta Score, `w_make x rank+(making) + (1 - w_make) x rank+(skill)` where `rank+` ranks positive values among themselves and gives non-positive values 0, summarises the two legs.
-
-- **De-beta Weight** - Share of the trading score carried by de-beta: `trading = Kappa3 Weight x Kappa3 Score + PnL Score Weight x PnL Score + De-beta Weight x De-beta Score`.  0 is the rehearsal rung (legacy emissions, decomposition published); 1.0 is full replacement, the only value at which the Kappa3 computation is skipped.  1.0 has been the default since 0.6.2.
+- **De-beta Weight** - Share of the trading score carried by de-beta: `trading = Kappa3 Weight x Kappa3 Score + PnL Score Weight x PnL Score + De-beta Weight x De-beta Score`.  1.0, the shipped value, is full replacement.
 
 - **De-beta Making Weight** - `w_make`: the making leg's share of the de-beta score; the skill leg takes the remainder.
 
-- **De-beta Skill Floor Scale** - Scale on the board-wide median |alpha| over books with fills that sets the floor below which a book does not count toward the skill leg.  0, the default since 0.6.2: a size-neutral hurdle (`scoring.debeta.skill_hurdle_bps`) decides which books count instead.
+- **Skill Floor Scale** - Scale on the board-wide median |alpha| over books with fills that sets the floor below which a book does not count toward the skill leg.  At 0, the shipped value, the Skill Hurdle decides which books count instead.
 
 - **De-beta CP Discount** - Strength of the counterparty-concentration discount on the making leg (1.0 = full strength).
 
-- **De-beta Min Books** - Activation guard: when fewer than this many miners have a positive de-beta score in a cycle, that cycle falls back instead of scoring the board.  The bar a miner must clear to be paid from the skill half is the Skill Bar Share below.
+- **De-beta Min Books** - Activation guard: a cycle in which fewer than this many miners receive a positive de-beta score scores on the legacy path.  The bar a miner must clear to be paid from the skill half is the Skill Bar Share.
 
-- **De-beta Mid Window** - Half-window, in prints, of the centred mid used as the spread-capture reference (15 means 31 prints).
+- **Capture Market Votes** - 1: only prints with the background market on one side vote in a fill's capture mid; 0: every print that clears the dust floor votes.
 
-- **Making Basis** - From 0.6.3: the basis the making half pays on, `realized` (captured credit scaled by markout quality, the default) or `captured`.
+- **Making Basis** - The basis the making pool pays on: `captured`, the two-sided spread of a uid's maker fills against the centred mid at each fill, or `realized`, that captured credit scaled by markout quality, the share of the spread the fills still hold Making Horizon later.
 
-- **Making Horizon (s)** - From 0.6.3: simulation seconds after a fill at which its realized spread is read (20 by default).
+- **Making Horizon (s)** - Simulation seconds after a fill at which its realized spread is read for markout quality.
 
-- **Tether Multiple** - From 0.6.3: how many times a maker's credit from the background market its credit from other miners may count for (4 by default).
+- **Making Fee Weight** - The share of each maker fee netted from the maker's captured and realized spread on that fill (a rebate adds); 0 books the gross spread.
 
-- **Class Weights** - From 0.6.3: each asset class's share of each half of the trading pool, in book order (`0.95,0.05` at launch).
+- **Tether Multiple** - `k` in the tether on miner-sourced making credit: a maker's credit is scaled by (background + min(miner-sourced, k x background)) / total.
 
-- **Skill Bar Share** - The skill bar as a share of the books scored (`0.15625`: 20 of 128, and from 0.6.3 15 of 96 and 5 of 32 per class).
+- **Class Weights** - Per-asset-class emission weights: `books` weighs each class by its share of the layout's books; a comma-separated list gives one weight per background, normalised to sum 1; empty is the flat rule.
 
-- **Skill Hurdle (bps)** - The alpha a book needs, in basis points of the miner's traded notional on it, to count toward skill (2.3 by default).
+- **Skill Bar Share** - The skill bar as a share of the books the validator scores, rounded up and never below four books.
 
-The remaining columns (Duration, Publish Interval, Init Period, precisions, agent counts and weights, Start Wealth) mirror the simulation config table.
+- **Skill Hurdle (bps)** - Absolute skill hurdle in basis points of the agent's filled notional on a book; a book's alpha counts toward skill only above it.
+
+- **Skill Share EMA** - 1: the skill half's share passes the same track-record EMA as the making term before allocation; 0: it is smoothed only after allocation.
 
 ### Simulation Config
 
@@ -132,9 +124,9 @@ The remaining columns (Duration, Publish Interval, Init Period, precisions, agen
 
 The second config table covers the simulation setup, one row per asset class (a single row on a single-market simulation).
 
-- **Class** - The asset class the row describes (`simulation_0`, `simulation_1`).
+- **Class** - The asset class the row describes (`simulation_0`, `simulation_1`, `simulation_2`).
 
-- **Books** - The range of book ids the class covers (`0-95`, `96-127`).
+- **Books** - The range of book ids the class covers (`0-63`, `64-95`, `96-127`).
 
 - **Duration** - Total simulation runtime in simulation time.
 
@@ -162,7 +154,7 @@ The second config table covers the simulation setup, one row per asset class (a 
 
 - **HFT Agents** - Number of high-frequency trading agents.
 
-- **HFT Kappa** - Quoting intensity of the class's high-frequency background market makers; a lower value quotes further from the mid.  It is the most visible of the background parameters that differ between the classes: `simulation_1`'s market makers quote far less tightly.
+- **HFT Kappa** - Quoting intensity of the class's high-frequency background market makers; a lower value quotes further from the mid.  It is the most visible of the background parameters that differ between the classes: 260 on `simulation_0`, 22 on `simulation_1` and 78 on `simulation_2`.
 
 - **HFT Wealth (QUOTE)** - Total initial capital allocated to each HFT agent.
 
@@ -174,7 +166,7 @@ The second config table covers the simulation setup, one row per asset class (a 
 
 - **FT Wealth (QUOTE)** - Total initial capital allocated to each fundamental trader.
 
-- **Min Order Size** - Smallest order quantity the engine accepts, in BASE; smaller orders are refused.  It differs by class: 0.25 on `simulation_0`, 2.5364 on `simulation_1`.
+- **Min Order Size** - Smallest order quantity the engine accepts, in BASE; smaller orders are refused.  It differs by class: 0.25 on `simulation_0`, 2.5364 on `simulation_1`, 0.2396 on `simulation_2`.
 
 The **asset** selector at the top of the page limits the Trade Price plot to the books of one class.
 
@@ -332,6 +324,16 @@ The Agents table above carries the de-beta columns that decide pay: Scored Books
 
 - **Asset classes: making weight, makers and making credit** - Per asset class: its effective making weight, the number of makers with credit, and the making credit it carries (right axis).  A single-market simulation shows one class.
 
+- **Asset classes: capture dust share (mean, max) and median dust floor** - Per asset class, over the class's books: the mean and the largest share of the live capture window's prints below the dust floor (left axis, percent), and the median dust floor (right axis, a base-quantity size on a log scale, since each class's base differs).
+
+In the collapsed Diagnostics row below the de-beta panels, from 0.6.5:
+
+- **Round timing: round period and query wait** - The validator's own round clock, published since 0.6.5: the period between rounds (5th percentile, median, 95th percentile) and the wait for the query service (median, 95th percentile), in seconds. A rising period or wait means the validator's rounds are slowing.
+
+- **Reward tasks pending and the longest wait for the reward lock** - The scoring work the validator has queued: reward tasks pending at the read, and the longest wait any round had for the reward lock (seconds). A rising count or wait means scoring is falling behind the state stream.
+
+- **Asset classes: capture fills settled on a full window, settled cut, and the cut share** - Per asset class, the capture fills whose making credit settled with a complete forward window of prints and those settled short when the window did not fill within the flush (300 simulated seconds from 0.6.5), with the cut share on its own axis. A cut share above about 5 per cent on a class with many settled fills is worth a look.
+
 ### Incentives Plot
 
 ![alt text](validator_incentives.png)
@@ -468,6 +470,8 @@ Three per-miner series on the selected book over the Kappa3 window (3 simulated 
 
 - **Alpha (drift-stripped MTM)** - Per miner, on this book: the drift-stripped mark-to-market over the skill lookback, in QUOTE.  It is the MTM PnL minus the miner's average inventory times the book's price move over the window, so a position that only rode the drift scores zero.  A book whose alpha is under the skill hurdle does not count toward the skill leg.
 
+- **Capture dust floor and dust share** - This book's capture dust floor (left axis, a base-quantity size: a print below it does not vote in a fill's capture mid) and the share of the live capture window's prints that fall below it (right axis, percent).
+
 ### Dynamic Fee Rates Plot
 
 ![alt text](book_fee_rates.png)
@@ -517,7 +521,7 @@ The Trades table sits to the right of the agent info at the top of the page and 
 
 ![alt text](agent_score.png)
 
-The topmost left plot displays the total score for the agent as assigned by the selected validator(s) on the right y-axis, and the incentive of the agent on the left y-axis.
+The topmost left plot displays the total score for the agent as assigned by the selected validator(s), with its GenTRX score; the agent's incentive is on the Performance plot below.
 
 ### Performance Plot
 
@@ -525,17 +529,34 @@ The topmost left plot displays the total score for the agent as assigned by the 
 
 The Performance plot illustrates the ranking in terms of score of the agent over time as assigned by the selected validator(s), as well as an average ranking taken over all selected validators.  The ranking indicates where among the subnet miners this agent places; higher ranking indicates outperformance of others.
 
-### Requests Plot
+### Requests and Instructions Plots
 
 ![alt text](agent_requests.png)
 
-This plot illustrates statistics related to communication with validators; the left hand y-axis shows the average response time of the miner via the dotted blue line, while the right y-axis indicates counts of requests completed with different status:
+This plot illustrates statistics related to communication with validators; the left hand y-axis shows the miner's response time in seconds (the mean as the dotted blue line, the 5th percentile and the median as dotted green and yellow lines), while the right y-axis indicates counts of requests completed with different status, every point a total over 100 consecutive queries to the agent:
 
-- **Requests** - Total count of requests received in the observation window.
+- **Requests** - Total count of requests received over the 100 rounds.
 - **Success** - Responses successfully received by validators from the selected miner.
 - **Failures** - Responses which failed to be received by the validator due to reasons other than timeout (e.g. network configuration issue).
 - **Timeouts** - Responses not received by the validator due to exceeding the response timeout.
 - **Rejections** - Responses not sent to validator due to blacklisting rules.
+- **Response time p5 and median** - The 5th percentile and the median of the agent's response time to the validator's query over the 100 rounds, beside the mean this plot shows. The floor (p5) is the network and the agent's fixed cost; the median is what a typical round pays; a mean far above the median is a tail of slow answers.
+
+#### Instructions Plot
+
+Beside it, the engine's view of the agent's instructions, per 100 rounds (the validator's publishing unit for a miner's round statistics: every point is a total over 100 consecutive queries to the agent, the counters reset after each):
+
+- **Placed** - Limit and market placements the engine accepted.
+- **Refused** - Placements the engine refused, for any reason.
+- **Refused: contract violation** - The refusals for a contract violation: a post-only order that would cross, or a time in force the book does not hold.
+- **Placements sent** - Placements the validator sent to the engine for the agent, after validation and the delays.
+- **Cancels sent** - Cancel instructions the validator sent for the agent.
+- **Cancels honoured** - The engine's success answers to the agent's cancels. They are answers, not instructions: an instruction whose orders are partly gone gets a success and a failure answer, and a self-trade-prevention cancel counts as honoured with no instruction behind it.
+- **Cancels failed** - The engine's failure answers: orders already filled or gone when the cancel arrived.
+- **Fills** - Fills the agent took part in, as maker or taker.
+- **Dropped under the caps** - Instructions dropped before the engine under the validator's caps (the volume cap, the per-book instruction cap).
+
+A refusal or a drop costs the agent the placement; a rising share of either against what was sent is worth checking against the book's own price grid, minimum order and the agent's turnover.
 
 ### GenTRX Plots
 
@@ -569,21 +590,19 @@ Realized PnL of the agent over the Kappa3 window (the last 3 simulated hours by 
 
 ![alt text](agent_debeta.png)
 
-The de-beta decomposition of the agent's score, in seven panels.
+The de-beta decomposition of the agent's score, in six panels. The dials the validator applied (`w_make`, the skill floor, the De-beta Weight and which making basis pays) are on the Validator page's Scoring Config table.
 
 - **De-beta score and its two legs** - The score in bold, with the two ranked legs it is built from: `w_make x rank+(making) + (1 - w_make) x rank+(skill)`.  The legs recombine exactly to the score.  Dashed: the agent's making and skill ranks within each asset class, from the class run the pools are built from; they follow the asset-class selector.
 
 - **Eligibility and factors: presence, coverage, counterparty, tether** - Whether the agent is scorable and present this cycle, its presence share over the query window, the skill coverage factor, the counterparty factor and, from 0.6.3, the tether factor with the background market's share of its fill volume beside it.  All are bounded 0 to 1; 1.0 is no discount.  Dashed: the counterparty, tether and coverage factors and the background share within each asset class; they follow the asset-class selector.
 
-- **Making credit: paid, realized and captured** - The making credit the agent is paid on, after the counterparty factor and the tether, in bold; beside it the credit on each basis, captured (the spread at the moment of the fill) and realized (the spread its fills still hold 20 simulation seconds later).  From 0.6.3 the paid credit is the captured credit scaled by the ratio of the two, held between 0 and 1.  Dashed: the making credit within each asset class, as the class pool reads it; it follows the asset-class selector.
+- **Making credit: paid, realized and captured, with the pool share and ladder input** - The making credit the agent is paid on, after the counterparty factor and the tether, in bold; beside it the credit on each basis, captured (the spread at the moment of the fill) and realized (the spread its fills still hold 20 simulation seconds later).  From 0.6.3 the paid credit is the captured credit scaled by the ratio of the two, held between 0 and 1.  Dashed: the making credit within each asset class, as the class pool reads it; it follows the asset-class selector. The agent's share of the making half is on the right axis, with the score entering the Pareto ladder, which pays the skill half only in a cycle where no miner qualifies for it.
 
-- **Skill: kappa, net alpha and notional** - The agent's floored kappa, the consistency of its alpha across qualifying books; its net alpha, which the skill half pays in proportion to; and the traded notional behind those books, which the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads.
+- **Skill: floored kappa and net alpha under the paying and the mid-quote marks** - The agent's skill leg: the floored kappa that is ranked, the consistency of its alpha across qualifying books, and the drift-stripped net alpha behind it, which the skill half pays in proportion to, under the last-trade mark that pays; and the same two under the book's mid-quote mark, which 0.6.5 accumulates beside it and publishes without paying it. The mid-quote mark carries no bid-ask bounce: the gap between the two readings on a maker is the bounce the last-trade mark pays as skill. The traded notional is on the books panel; per-book alpha is on the [Book Page](#book-page).
 
-- **Books filled vs books scored** - Books the agent filled in, which the coverage rule reads, against books whose alpha cleared the hurdle, which the skill bar counts.  Breadth and size per book are different things: an agent can fill many books and have few qualify.  Dashed: books filled, books scored and notional within each asset class, and each class's skill bar in red from the class summaries; they follow the asset-class selector.
+- **Liquidity provided: two-sided filled notional, states at the best, size at the best** - The liquidity the agent provides, published since 0.6.5 and not paid: its two-sided filled resting notional (2 x the smaller of its buy-side and sell-side maker notional per book, summed over books, in QUOTE), the number of states in which it had an order resting at the best bid or ask, and the size resting there (BASE).
 
-- **Pool pay: making share and ladder input** - The agent's share of the making half on the left; on the right the score entering the Pareto ladder, which pays the skill half only in a cycle where no miner qualifies for it.
-
-- **Scoring parameters** - The `w_make`, skill floor and De-beta Weight values the validator applied that cycle and, from 0.6.3, which making basis pays (1 = realized).
+- **Books filled, books scored and notional** - Books the agent filled in, which the coverage rule reads, against books whose alpha cleared the hurdle, which the skill bar counts, with the traded notional behind them, which the skill hurdle (`scoring.debeta.skill_hurdle_bps`) reads.  Breadth and size per book are different things: an agent can fill many books and have few qualify.  Dashed: books filled, books scored and notional within each asset class, and each class's skill bar in red from the class summaries; they follow the asset-class selector.
 
 ### Unrealized Profit & Loss Plots
 

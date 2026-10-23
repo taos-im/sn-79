@@ -509,6 +509,10 @@ if __name__ != "__mp_main__":
                 '--notify-fd', str(self.query_notify_write),
                 '--ipc-prefix', self._query_ipc_prefix,
             ]
+            # The query process holds the dendrite, so 0.6.5's kept connections only take effect if the switch reaches
+            # it: unpassed, the child reads it unset and opens fresh connections every round.
+            if getattr(self.config.neuron, 'reuse_connections', False):
+                cmd.append('--neuron.reuse_connections')
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
 

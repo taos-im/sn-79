@@ -143,7 +143,17 @@ def _encoded_cap(max_bytes: int) -> int:
 
 def bounded_decompress(data: bytes, engine: str, max_bytes: int) -> bytes:
     """Decompress data, refusing it as soon as the output passes max_bytes. A size declared inside the data (a
-    zstd frame's content size) is never used to allocate."""
+    zstd frame's content size) is never used to allocate. Data that is not a frame of the engine is refused like any
+    other unreadable reply, rather than raising the engine's own error (RuntimeError, zlib.error, ZstdError)."""
+    try:
+        return _bounded_decompress(data, engine, max_bytes)
+    except ReplyRefused:
+        raise
+    except (RuntimeError, ValueError, zlib.error, zstd.ZstdError) as ex:
+        raise ReplyRefused(f"does not decompress as {engine}: {ex}")
+
+
+def _bounded_decompress(data: bytes, engine: str, max_bytes: int) -> bytes:
     if engine == "zlib":
         d = zlib.decompressobj()
         out = d.decompress(data, max_bytes + 1)

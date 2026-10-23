@@ -36,20 +36,46 @@ from taos.im.neurons.validator import Validator
 from taos.im.protocol import FinanceAgentResponse, FinanceEventNotification, MarketSimulationStateUpdate
 from taos.im.protocol.instructions import *
 from taos.im.validator.reward import set_delays
+from taos.im.validator.block_stats import block_row, bump
 from taos.im.utils import duration_from_timestamp
 
 _PLACEMENT_ANSWERS = frozenset({"RDPOL", "RDPOM", "ERDPOL", "ERDPOM"})
+_CANCEL_ANSWERS = frozenset({"RDCO", "ERDCO"})
+_FILL_EVENTS = frozenset({"ET", "EVENT_TRADE"})
+_FILL_SEEN_CAP = 200000   # (uid, book, trade id) keys kept to count a redelivered exchange fill once; the oldest half goes when full
+_PLACEMENT_TYPES = frozenset({"PLACE_ORDER_LIMIT", "PLACE_ORDER_MARKET"})
 
 
 def update_placement_stats(self: Validator, notices: dict | None) -> None:
-    """Counts each miner's limit and market placements the engine answered in a state, accepted and refused, into its
-    request stats, so they publish and reset with them per block; a refusal for CONTRACT_VIOLATION (post-only, time
-    in force) is also counted apart."""
+    """Counts, into each miner's request stats so they publish and reset with them per block: its limit and market
+    placements the engine answered in a state, accepted and refused (a refusal for CONTRACT_VIOLATION, post-only or
+    time in force, also apart), its cancel instructions the engine answered, honoured and failed, and the fills it took
+    part in. The exchange redelivers a settled fill on every update for a window, so there a fill is counted once by
+    (uid, book, trade id); the simulation delivers each fill once."""
+    dedup = getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
+    seen = self.__dict__.setdefault('_fill_notice_seen', {}) if dedup else None
     for uid, uid_notices in (notices or {}).items():
-        st = self.miner_stats.setdefault(uid, {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0,
-                                               'call_time': []})
+        st = block_row(self.miner_stats, uid)
         for n in uid_notices or ():
             y = n.get('y') if isinstance(n, dict) else getattr(n, 'y', None)
+            if y in _FILL_EVENTS:
+                if seen is not None:
+                    tid = n.get('i') if isinstance(n, dict) else getattr(n, 'i', None)
+                    book = n.get('b') if isinstance(n, dict) else getattr(n, 'b', None)
+                    if tid is not None:
+                        key = (uid, book, tid)
+                        if key in seen:
+                            continue
+                        if len(seen) >= _FILL_SEEN_CAP:
+                            for old in list(seen)[:len(seen) // 2]:
+                                del seen[old]
+                        seen[key] = True
+                st['fills'] = st.get('fills', 0) + 1
+                continue
+            if y in _CANCEL_ANSWERS:
+                key = 'cancels_failed' if y.startswith('E') else 'cancels_ok'
+                st[key] = st.get(key, 0) + 1
+                continue
             if y not in _PLACEMENT_ANSWERS:
                 continue
             if y.startswith('E'):
@@ -59,6 +85,30 @@ def update_placement_stats(self: Validator, notices: dict | None) -> None:
                     st['refused_contract'] = st.get('refused_contract', 0) + 1
             else:
                 st['placed'] = st.get('placed', 0) + 1
+
+
+def update_sent_stats(self: Validator, responses) -> None:
+    """Counts, per miner, the placements and the cancel instructions the validator sends to the engine this round,
+    after validation and the delays, so the engine's answers can be read against what was asked."""
+    for response in responses or ():
+        uid = getattr(response, 'agent_id', None)
+        if uid is None:
+            continue
+        for instruction in getattr(response, 'instructions', None) or ():
+            t = getattr(instruction, 'type', None)
+            if t in _PLACEMENT_TYPES:
+                bump(self.miner_stats, uid, 'placements_sent')
+            elif t == 'CANCEL_ORDERS':
+                bump(self.miner_stats, uid, 'cancels_sent')
+
+
+def update_dropped_stats(self: Validator, result: dict | None) -> None:
+    """Adds the instructions the query service dropped this round under its caps (the volume cap, the per-book
+    instruction cap) to each miner's block, from the service's validation stats."""
+    dropped = ((result or {}).get('validation_stats') or {}).get('dropped') or {}
+    for uid, n in dropped.items():
+        if n:
+            bump(self.miner_stats, uid, 'dropped', int(n))
 
 
 def update_query_wait(self: Validator, result: dict | None) -> None:
@@ -86,8 +136,7 @@ def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpd
         None
     """
     for uid, synapse in synapses.items():
-        if uid not in self.miner_stats:
-            self.miner_stats[uid] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': []}
+        block_row(self.miner_stats, uid)
         self.miner_stats[uid]['requests'] += 1
         if synapse.is_timeout:
             self.miner_stats[uid]['timeouts'] += 1
@@ -369,13 +418,16 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         
         bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
         update_query_wait(self, result)
+        update_dropped_stats(self, result)
         
         start = time.time()
         update_stats(self, synapse_responses)
         bt.logging.info(f"Updated Stats ({time.time()-start:.4f}s).")
 
         start = time.time()
-        responses.extend(set_delays(self, synapse_responses))
+        delayed = set_delays(self, synapse_responses)
+        responses.extend(delayed)
+        update_sent_stats(self, delayed)
         bt.logging.info(f"Set Delays ({time.time()-start:.4f}s).")
 
         bt.logging.trace(f"Responses: {responses}")
