@@ -7,8 +7,6 @@ Run: pytest GenTRX/tests/test_gradient_store.py -v
 """
 
 import io
-import json
-from unittest.mock import MagicMock, patch
 
 import pytest
 

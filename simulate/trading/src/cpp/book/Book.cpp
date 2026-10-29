@@ -1040,8 +1040,11 @@ taosim::book::TickContainer* Book::preventSelfTrade(
     // through no channel at all: the order is narrated as cancelled, no RDCO is emitted, and the
     // owner's cancellation handler is never invoked. Miner-initiated cancels already deliver their
     // RESPONSE_DISTRIBUTED_CANCEL_ORDERS through the same buffer in both modes, so there is nothing to
-    // fire twice. The only reason not to dispatch is having no proxy to dispatch through.
+    // fire twice. Nothing is dispatched with no proxy to dispatch through, or for a local agent (a negative id):
+    // the proxy serves remote agents, and a local agent's notice rode every validator request (background agents
+    // self-cross under the default CO) only to be dropped there.
     auto notifyOwnerCancelled = [&](OrderID orderId, AgentId ownerId, taosim::decimal_t volume) {
+        if (ownerId < 0) return;
         auto* proxy = m_simulation->proxy();
         // DIAGNOSTIC: say whether the notice is dispatched or dropped. "Did it fire" has to be answered
         // from the engine rather than inferred from the miner's silence.
@@ -1086,6 +1089,7 @@ taosim::book::TickContainer* Book::preventSelfTrade(
             // cancel gets, addressed to the owner, delivered through the proxy like every other notice.
             // In BOTH mechanisms: see notifyOwnerCancelled above for why the exchange-service gate that
             // used to sit here was wrong, and why nothing fires twice without it.
+            if (agentId < 0) return true;  // a local agent's: see notifyOwnerCancelled
             auto* proxy = m_simulation->proxy();
             if (proxy == nullptr) {
                 m_simulation->logDebug("{} | AGENT #{} BOOK {} : STP RESTING CANCEL NOTICE SUPPRESSED for order {} (no proxy)",

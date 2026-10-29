@@ -849,6 +849,15 @@ void MultiBookExchangeAgent::handleDistributedMessage(const Message::Ptr& msg)
         if (*bookId >= account.holdings().size() || *bookId >= account.activeOrders().size()) {
             return OrderErrorCode::NONEXISTENT_ACCOUNT;
         }
+        // A delayed instruction reaches the exchange when its delay ends, so this reads the cap as it stands at
+        // execution. The exchange's own orders on the account (a margin call, a stop-loss or take-profit close)
+        // reduce a position and pass.
+        const bool placement = *request == PLACE_ORDER_LIMIT
+            || (*request == PLACE_ORDER_MARKET && !msg->type.ends_with("_MC")
+                && std::static_pointer_cast<PlaceOrderMarketPayload>(payload->payload)->closeReason == 0);
+        if (placement && m_cappedPairs.contains({payload->agentId, *bookId})) {
+            return OrderErrorCode::VOLUME_CAP_REACHED;
+        }
         return std::nullopt;
     }();
     if (refusal) {
@@ -1090,6 +1099,13 @@ void MultiBookExchangeAgent::handleDistributedAgentReset(const Message::Ptr& msg
             payload->agentId,
             MessagePayload::create<ResetAgentsResponsePayload>(valid, subPayload)));
     simulation()->logDebug("{} | RESET COMPLETE", simulation()->currentTimestamp());
+}
+
+//-------------------------------------------------------------------------
+
+void MultiBookExchangeAgent::setCappedPairs(std::vector<std::pair<AgentId, BookId>> pairs)
+{
+    m_cappedPairs = std::set<std::pair<AgentId, BookId>>(pairs.begin(), pairs.end());
 }
 
 //-------------------------------------------------------------------------
@@ -1771,12 +1787,15 @@ void MultiBookExchangeAgent::handleLocalCancelOrders(const Message::Ptr& msg)
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
     if (!cancellations.empty()) {
+        // The ids first: built as an argument beside the move below, they were read after it, in the order the
+        // compiler chose, and the response named no order.
+        auto ids = cancellations
+            | views::transform([](const auto& c) { return c.id; })
+            | ranges::to<std::vector>();
         respondToMessage(
             msg,
             MessagePayload::create<CancelOrdersResponsePayload>(
-                cancellations
-                    | views::transform([](const auto& c) { return c.id; })
-                    | ranges::to<std::vector>(),
+                std::move(ids),
                 MessagePayload::create<CancelOrdersPayload>(
                     std::move(cancellations), payload->bookId)),
             0);
@@ -1829,12 +1848,14 @@ void MultiBookExchangeAgent::handleLocalClosePositions(const Message::Ptr& msg)
     if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
 
     if (!closes.empty()) {
+        // The ids first, as in handleLocalCancelOrders.
+        auto ids = closes
+            | views::transform([](const ClosePosition& c) { return c.id; })
+            | ranges::to<std::vector>();
         respondToMessage(
             msg,
             MessagePayload::create<ClosePositionsResponsePayload>(
-                closes
-                    | views::transform([](const ClosePosition& c) { return c.id; })
-                    | ranges::to<std::vector>(),
+                std::move(ids),
                 MessagePayload::create<ClosePositionsPayload>(
                     std::move(closes), bookId)),
             0);

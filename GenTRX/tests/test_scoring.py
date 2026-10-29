@@ -19,7 +19,6 @@ submitter's assignment and calls `_deliver_scores` directly.
 Run: pytest GenTRX/tests/test_scoring.py -v
 """
 
-import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 

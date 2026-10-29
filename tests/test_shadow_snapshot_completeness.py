@@ -40,6 +40,9 @@ KNOBS = {
     "pagerduty_alert",
     "engine", "kappa_cache", "deregistered_uids", "scoring_config", "simulation_config",
     "scoring_interval", "validator_uid",
+    # the conjunction's interval (0.6.6): set from the state clock at the start of every update, before any reader,
+    # and the previous state's time it is measured from (working state: a child's first state counts no interval)
+    "_conj_dt",
     # derived cache: the book-to-class map keyed by the simulation object's identity, rebuilt on first use in
     # whichever process reads it (the ids differ in the child, so a snapshot of it could only be stale)
     "_debeta_class_map_cache",
@@ -109,6 +112,11 @@ def _fill_state(ts, fills):
             "Ti": 10 * n, "Ta": taker, "Tf": qty * price * 0.002,
             "Mi": 10 * n + 1, "Ma": maker, "Mf": qty * price * 0.001,
         })
+    # a best bid and ask round each book's last print, the levels the mid-quote mark (the paid mark since 0.6.6)
+    # reads from a state: without them the mark never moves and the accumulators below stay empty
+    for b in books.values():
+        last = float(b["e"][-1]["p"])
+        b["b"], b["a"] = [{"p": last * 0.999, "q": 1.0}], [{"p": last * 1.001, "q": 1.0}]
     st.books = dict(books)
     return st
 
@@ -235,7 +243,10 @@ def test_the_child_save_writes_every_key_main_save_writes():
     child = SHADOW.read_text()
     child = child[child.index("def child_save_validator_state("):]
     child = child[:child.index("\ndef ", 1)]
-    keys = lambda src: set(re.findall(r'^\s+"(\w+)":', src, re.M))
+
+    def keys(src):
+        return set(re.findall(r'^\s+"(\w+)":', src, re.M))
+
     assert keys(main) - keys(child) == set(), f"the child save lacks {sorted(keys(main) - keys(child))}"
 
 

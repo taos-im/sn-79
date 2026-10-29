@@ -17,7 +17,6 @@ from collections import defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 from taos.im.validator import forward
 from taos.im.validator.debeta import absent_uids
@@ -74,10 +73,13 @@ def _fake_validator(presence=None, gate=1, window=50, absent=None):
         accumulate_book_mtm(mtm, invsum, invn, inv, pf, pl, b, trades, drift=drift)
     v.debeta_mtm, v.debeta_invsum, v.debeta_invn, v.debeta_drift = mtm, invsum, invn, drift
     v.debeta_pfirst, v.debeta_plast = pf, pl
-    cb = defaultdict(lambda: defaultdict(float)); cs = defaultdict(lambda: defaultdict(float))
+    cb = defaultdict(lambda: defaultdict(float))
+    cs = defaultdict(lambda: defaultdict(float))
     for b in range(6):
-        cb[1][b] = 3.0 + 0.1 * b; cs[1][b] = 3.0
-        cb[2][b] = 1.0; cs[2][b] = 1.0
+        cb[1][b] = 3.0 + 0.1 * b
+        cs[1][b] = 3.0
+        cb[2][b] = 1.0
+        cs[2][b] = 1.0
     v.capture_buy_sums, v.capture_sell_sums = cb, cs
     v.miner_presence = presence if presence is not None else {}
     if absent is not None:

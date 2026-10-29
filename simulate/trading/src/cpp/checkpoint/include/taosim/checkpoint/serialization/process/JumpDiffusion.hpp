@@ -5,6 +5,7 @@
 #pragma once
 
 #include <taosim/process/JumpDiffusion.hpp>
+#include <taosim/checkpoint/serialization/process/Distribution.hpp>
 #include <taosim/checkpoint/serialization/process/RNG.hpp>
 
 //-------------------------------------------------------------------------
@@ -45,6 +46,16 @@ struct convert<taosim::process::JumpDiffusion>
             else if (key == "value") {
                 val.convert(v.state().value);
             }
+            // Absent from a checkpoint written before they were kept: the distributions then start afresh, as they did.
+            else if (key == "gaussian") {
+                taosim::checkpoint::serialization::restoreDistribution(v.gaussian(), val.as<std::string_view>());
+            }
+            else if (key == "jump") {
+                taosim::checkpoint::serialization::restoreDistribution(v.jump(), val.as<std::string_view>());
+            }
+            else if (key == "poisson") {
+                taosim::checkpoint::serialization::restoreDistribution(v.poisson(), val.as<std::string_view>());
+            }
         }
         
         return o;
@@ -58,7 +69,7 @@ struct pack<taosim::process::JumpDiffusion>
     msgpack::packer<Stream>& operator()(
         msgpack::packer<Stream>& o, const taosim::process::JumpDiffusion& v) const
     {
-        o.pack_map(5);
+        o.pack_map(8);
 
         o.pack("rng");
         o.pack(v.state().rng);
@@ -73,7 +84,16 @@ struct pack<taosim::process::JumpDiffusion>
         o.pack(v.state().W);
 
         o.pack("value");
-        o.pack(v.val());
+        o.pack(v.state().value);
+
+        o.pack("gaussian");
+        o.pack(taosim::checkpoint::serialization::distributionState(v.gaussian()));
+
+        o.pack("jump");
+        o.pack(taosim::checkpoint::serialization::distributionState(v.jump()));
+
+        o.pack("poisson");
+        o.pack(taosim::checkpoint::serialization::distributionState(v.poisson()));
 
         return o;
     }

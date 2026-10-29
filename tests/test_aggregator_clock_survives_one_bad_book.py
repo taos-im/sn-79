@@ -6,7 +6,6 @@ MAX, so all 128 were 1,528,085s "behind" a 300s interval and flushed on every lo
 1-3 second pages of ~217 rows against train_seq_len=512, which surfaces downstream as
 "no trainable pages" with nothing actually wrong with training.
 """
-import statistics
 
 
 INTERVAL_NS = 300_000_000_000          # parquet_interval_ns: 5 sim-minutes

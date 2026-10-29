@@ -66,11 +66,13 @@ protected:
         simulation->configure(nodes.simulation);
         exchange = simulation->exchange();
         exchange->accounts().registerLocal("maker");
+        exchange->accounts().registerLocal("taker");
         hub = exchange->statsHub().get();
         ASSERT_NE(hub, nullptr);
     }
 
     static constexpr AgentId kMaker = -1;
+    static constexpr AgentId kTaker = -2;
     static constexpr BookId kBookId{};
 
     taosim::util::Nodes nodes;
@@ -111,5 +113,29 @@ TEST_F(StatsHubTest, L1ReadsThroughToTheLiveTopOfBook)
 }
 
 //-------------------------------------------------------------------------
+
+// A resting order that fills completely stays on its level, at zero, until the step clears filled
+// orders. The matcher skips such a level, and so must every agent reading the book through the hub:
+// it is not a price anyone can trade at.
+TEST_F(StatsHubTest, ALevelWhoseOrdersHaveAllFilledIsNotTheTouch)
+{
+    placeLimit(exchange, kMaker, kBookId, OrderDirection::BUY, 1_dec, 297_dec);
+    placeLimit(exchange, kMaker, kBookId, OrderDirection::SELL, 2_dec, 303_dec);
+    placeLimit(exchange, kMaker, kBookId, OrderDirection::SELL, 8_dec, 307_dec);
+    placeLimit(exchange, kTaker, kBookId, OrderDirection::BUY, 2_dec, 303_dec);
+    ASSERT_FALSE(exchange->books()[kBookId]->sellQueue().front().hasActiveOrders())
+        << "the fixture needs the 303 level filled and not yet cleared";
+
+    const auto l1 = hub->l1(kBookId);
+    EXPECT_EQ(l1.bestAskPrice, 307_dec);
+    EXPECT_EQ(l1.bestAskVolume, 8_dec);
+    EXPECT_EQ(l1.bestBidPrice, 297_dec);
+
+    const auto l2 = hub->l2(kBookId, 5);
+    ASSERT_FALSE(l2.asks.empty());
+    EXPECT_EQ(l2.asks.front().price, 307_dec);
+    EXPECT_EQ(l2.asks.front().quantity, 8_dec);
+    EXPECT_EQ(l2.asks.size(), 1u);
+}
 
 //-------------------------------------------------------------------------

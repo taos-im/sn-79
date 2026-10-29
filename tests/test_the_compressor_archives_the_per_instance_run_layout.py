@@ -7,6 +7,7 @@ under the window's label with members by basename, because book ids are global a
 and every window reader keep the layout they already expect. The flat layout of a single-market run is unchanged."""
 import zipfile
 from types import SimpleNamespace
+from unittest import mock
 
 from taos.im.validator.engines.simulation import SimulationEngine
 
@@ -35,7 +36,10 @@ def _compress(active_run, now, start=False):
         compressing=False,
         pagerduty_alert=lambda *a, **k: None,
     )
-    SimulationEngine._compress_outputs(SimpleNamespace(validator=v), start=start)
+    # the disk cleanup after compression deletes old run directories while the real disk is over 85 per cent full,
+    # this test's own run among them, so the disk is held under the threshold
+    with mock.patch("psutil.disk_usage", return_value=SimpleNamespace(percent=50.0)):
+        SimulationEngine._compress_outputs(SimpleNamespace(validator=v), start=start)
     assert v.compressing is False
 
 

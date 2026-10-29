@@ -30,12 +30,13 @@ import struct
 import traceback
 import pickle
 from collections import deque
+from types import SimpleNamespace
 from typing import List
 
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import FinanceAgentResponse, FinanceEventNotification, MarketSimulationStateUpdate
 from taos.im.protocol.instructions import *
-from taos.im.validator.reward import set_delays
+from taos.im.validator.delays import latency_profile, set_delays
 from taos.im.validator.block_stats import block_row, bump
 from taos.im.utils import duration_from_timestamp
 
@@ -43,15 +44,51 @@ _PLACEMENT_ANSWERS = frozenset({"RDPOL", "RDPOM", "ERDPOL", "ERDPOM"})
 _CANCEL_ANSWERS = frozenset({"RDCO", "ERDCO"})
 _FILL_EVENTS = frozenset({"ET", "EVENT_TRADE"})
 _FILL_SEEN_CAP = 200000   # (uid, book, trade id) keys kept to count a redelivered exchange fill once; the oldest half goes when full
+_CANCEL_PENDING_CAP = 200000   # (uid, book, order id) of cancels sent and not yet answered; the oldest half goes when full
 _PLACEMENT_TYPES = frozenset({"PLACE_ORDER_LIMIT", "PLACE_ORDER_MARKET"})
+
+
+def _field(obj, name):
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _remember(keys: dict, key, cap: int) -> None:
+    if len(keys) >= cap:
+        for old in list(keys)[:len(keys) // 2]:
+            del keys[old]
+    keys[key] = True
+
+
+def _count_cancel_answer(self: Validator, st: dict, uid, notice, seen) -> None:
+    """One answer's orders by outcome. An order a cancel instruction named is cancelled or not found; a success for an
+    order no instruction named is a self-trade-prevention cancel. Until the first round is sent (after a restart) the
+    answers belong to cancels sent before it, so an unmatched success is counted as a cancel."""
+    pending = self.__dict__.get('_cancel_pending')
+    y = _field(notice, 'y')
+    book = _field(notice, 'b')
+    for c in _field(notice, 'c') or ():
+        oid = _field(c, 'o')
+        if seen is not None:
+            key = ('cancel', y, uid, book, oid)
+            if key in seen:
+                continue
+            _remember(seen, key, _FILL_SEEN_CAP)
+        asked = pending is not None and pending.pop((uid, book, oid), None) is not None
+        if y.startswith('E'):
+            name = 'orders_not_found'
+        elif asked or pending is None:
+            name = 'orders_cancelled'
+        else:
+            name = 'stp_cancels'
+        st[name] = st.get(name, 0) + 1
 
 
 def update_placement_stats(self: Validator, notices: dict | None) -> None:
     """Counts, into each miner's request stats so they publish and reset with them per block: its limit and market
     placements the engine answered in a state, accepted and refused (a refusal for CONTRACT_VIOLATION, post-only or
-    time in force, also apart), its cancel instructions the engine answered, honoured and failed, and the fills it took
-    part in. The exchange redelivers a settled fill on every update for a window, so there a fill is counted once by
-    (uid, book, trade id); the simulation delivers each fill once."""
+    time in force, also apart), the orders its cancels named by outcome, and the fills it took part in. The exchange
+    redelivers a settled fill on every update for a window, so there a fill is counted once by (uid, book, trade id),
+    and a cancel answer once per order; the simulation delivers each once."""
     dedup = getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
     seen = self.__dict__.setdefault('_fill_notice_seen', {}) if dedup else None
     for uid, uid_notices in (notices or {}).items():
@@ -66,15 +103,11 @@ def update_placement_stats(self: Validator, notices: dict | None) -> None:
                         key = (uid, book, tid)
                         if key in seen:
                             continue
-                        if len(seen) >= _FILL_SEEN_CAP:
-                            for old in list(seen)[:len(seen) // 2]:
-                                del seen[old]
-                        seen[key] = True
+                        _remember(seen, key, _FILL_SEEN_CAP)
                 st['fills'] = st.get('fills', 0) + 1
                 continue
             if y in _CANCEL_ANSWERS:
-                key = 'cancels_failed' if y.startswith('E') else 'cancels_ok'
-                st[key] = st.get(key, 0) + 1
+                _count_cancel_answer(self, st, uid, n, seen)
                 continue
             if y not in _PLACEMENT_ANSWERS:
                 continue
@@ -88,8 +121,10 @@ def update_placement_stats(self: Validator, notices: dict | None) -> None:
 
 
 def update_sent_stats(self: Validator, responses) -> None:
-    """Counts, per miner, the placements and the cancel instructions the validator sends to the engine this round,
-    after validation and the delays, so the engine's answers can be read against what was asked."""
+    """Counts, per miner, the placements, the cancel instructions and the orders they name that the validator sends to
+    the engine this round, after validation and the delays, and keeps each named order until its answer, so the
+    engine's answers can be read against what was asked."""
+    pending = self.__dict__.setdefault('_cancel_pending', {})
     for response in responses or ():
         uid = getattr(response, 'agent_id', None)
         if uid is None:
@@ -100,6 +135,11 @@ def update_sent_stats(self: Validator, responses) -> None:
                 bump(self.miner_stats, uid, 'placements_sent')
             elif t == 'CANCEL_ORDERS':
                 bump(self.miner_stats, uid, 'cancels_sent')
+                book = getattr(instruction, 'bookId', None)
+                ids = [getattr(c, 'orderId', None) for c in getattr(instruction, 'cancellations', None) or ()]
+                bump(self.miner_stats, uid, 'cancel_orders_sent', len(ids))
+                for oid in ids:
+                    _remember(pending, (uid, book, oid), _CANCEL_PENDING_CAP)
 
 
 def update_dropped_stats(self: Validator, result: dict | None) -> None:
@@ -122,6 +162,20 @@ def update_query_wait(self: Validator, result: dict | None) -> None:
         waits = self.query_waits = []
     waits.append(float(wait))
     del waits[:-1000]
+
+
+def delay_settings(self: Validator) -> SimpleNamespace:
+    """What set_delays reads from the validator, for the query process to apply it (neuron.orders_packed)."""
+    scoring = self.config.scoring
+    return SimpleNamespace(
+        config=SimpleNamespace(neuron=SimpleNamespace(timeout=self.config.neuron.timeout), scoring=SimpleNamespace(
+            min_delay=scoring.min_delay, max_delay=scoring.max_delay,
+            min_instruction_delay=scoring.min_instruction_delay, max_instruction_delay=scoring.max_instruction_delay,
+            delay_policy=getattr(scoring, 'delay_policy', None), delay_jitter=getattr(scoring, 'delay_jitter', None),
+            delay_prompt_cutoff=getattr(scoring, 'delay_prompt_cutoff', None))),
+        simulation=SimpleNamespace(time_unit=getattr(self.simulation, 'time_unit', 'ns')),
+        # main's loaded profile, so the query process applies it without reading the file each round
+        _latency_profile=latency_profile(self))
 
 
 def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpdate]) -> None:
@@ -158,6 +212,13 @@ def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpd
             window = int(getattr(dcfg, 'presence_window', None) or 50)
             outcomes = presence[uid] = deque(maxlen=max(window, 1))
         outcomes.append(ok)
+
+def max_instruction_delay_ns(config) -> int:
+    """The longest delay a miner's instruction may ask for, --neuron.max_instruction_delay_s in nanoseconds; the
+    query service refuses a longer one at acceptance and the engine holds the same bound."""
+    seconds = float(getattr(getattr(config, 'neuron', None), 'max_instruction_delay_s', 600.0) or 0.0)
+    return int(seconds * 1_000_000_000)
+
 
 async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAgentResponse]:
     """
@@ -238,7 +299,10 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
             'max_instructions_per_book': self.config.scoring.max_instructions_per_book,
             'exchange_volume_cap': getattr(getattr(self.config, 'exchange', None), 'volume_cap', 50000.0),
+            'max_instruction_delay_ns': max_instruction_delay_ns(self.config),
         }
+        if getattr(self.config.neuron, 'orders_packed', False) and self.engine.mode != 'exchange':
+            request_data['delays'] = delay_settings(self)  # the query process delays and encodes the orders
         bt.logging.info(f"Request Data Prepared ({time.time()-data_start:.4f}s).")
 
         if getattr(self.config.neuron, 'observe', False):
@@ -309,6 +373,14 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
                 bt.logging.warning(f"Drained {drained_pipe} stale pipe notification(s) before query")
 
             write_start = time.time()
+            if getattr(self.config.neuron, 'query_prepayload', False) and request_data['engine_mode'] != 'exchange':
+                # The miners' requests built here, so the query process unpickles strings, not the decoded state.
+                from taos.im.validator.query import prebuild_request
+                compression = self.config.compression
+                request_data = prebuild_request(request_data, self.wallet.hotkey.ss58_address, compression.level,
+                                                compression.engine, compression.parallel_workers)
+                bt.logging.info(f"Prebuilt miner payloads ({time.time()-write_start:.4f}s).")
+                write_start = time.time()
             data_bytes = pickle.dumps(request_data, protocol=5)
             bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
             
@@ -415,6 +487,9 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             return responses
 
         synapse_responses = result['responses']
+        # the (uid, book) pairs at or over the volume cap at this round's snapshot, for the engine to refuse their
+        # placements on arrival (row 67); None when the query service did not say, so the engine keeps its last set
+        self._capped_pairs = result.get('capped')
         
         bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
         update_query_wait(self, result)
@@ -425,9 +500,17 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         bt.logging.info(f"Updated Stats ({time.time()-start:.4f}s).")
 
         start = time.time()
-        delayed = set_delays(self, synapse_responses)
-        responses.extend(delayed)
-        update_sent_stats(self, delayed)
+        if 'orders' in result:  # neuron.orders_packed: already delayed and encoded by the query process
+            responses.append(result['orders'])
+            self.engine.response_pack_drops = getattr(self.engine, 'response_pack_drops', 0) + result['pack_drops']
+            for uid, row in result['sent'].items():  # update_sent_stats' counts, taken where the orders were packed
+                for name, n in row.items():
+                    if n:
+                        bump(self.miner_stats, uid, name, n)
+        else:
+            delayed = set_delays(self, synapse_responses)
+            responses.extend(delayed)
+            update_sent_stats(self, delayed)
         bt.logging.info(f"Set Delays ({time.time()-start:.4f}s).")
 
         bt.logging.trace(f"Responses: {responses}")

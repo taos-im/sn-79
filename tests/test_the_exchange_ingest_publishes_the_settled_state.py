@@ -59,7 +59,7 @@ def test_the_snapshot_is_taken_before_the_engine_executes():
 def test_every_settled_fill_is_recorded_for_the_push():
     src = _handle_state_source()
     loop = src[src.index("for _ef in _recon_now.get("):]
-    assert "_settled_fill_events.setdefault(int(_nid), []).append(_ev)" in loop[:loop.index("NormalizedTradeEvent(")]
+    assert "_settled_fill_events.setdefault(int(_nid), []).append(_ev)" in loop[:loop.index("_settled_fill_notice(")]
 
 
 def test_the_push_publishes_the_settled_books_accounts_and_open_orders():

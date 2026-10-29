@@ -24,7 +24,6 @@ Three independent faults had to line up, and each is guarded here:
 properties are asserted structurally. `_ensure_log_dir` is module-level and tested for real.
 """
 import ast
-import os
 import sys
 
 _REPO_ROOT = str(__import__("pathlib").Path(__file__).resolve().parents[1])

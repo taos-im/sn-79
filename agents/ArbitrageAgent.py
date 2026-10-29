@@ -116,8 +116,6 @@ class ArbitrageAgent(GenTRXAgent):
         self._round += 1
         if self.resp_delay > 0.0:
             time.sleep(self.resp_delay)   # inflate response time (latency study only)
-        cfg = self.simulation_config
-        min_size = float(getattr(cfg, "min_order_size", 0.0) or 0.0)
         takes = 0
 
         for book_id, book in (state.books or {}).items():

@@ -1,4 +1,4 @@
-"""The validator compresses each miner's state update on its batch path by default (compression.parallel_workers -1),
+"""The validator compresses each miner's state update on its batch path when compression.parallel_workers is not 0,
 and a miner decompresses it with the engine the synapse names. So the batch path names the engine it used: with zstd
 or zlib a miner decompresses what it was sent, and with lz4, the default, nothing changes."""
 import types

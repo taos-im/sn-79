@@ -11,6 +11,7 @@ add_library(util STATIC
     Flags.hpp
     InstructionLogger.cpp
     L3Fmt.cpp
+    FatalSignal.cpp
 )
 add_library(taosim::util ALIAS util)
 

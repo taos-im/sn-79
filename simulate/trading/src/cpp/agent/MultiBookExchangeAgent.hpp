@@ -163,6 +163,11 @@ public:
 
     [[nodiscard]] const taosim::config::ExchangeAgentConfig& config() const noexcept { return m_config; }
 
+    // The validator's (agent, book) pairs at or over its volume cap, local book ids, replaced with each reply
+    // batch that carries them. A placement from a pair in the set is refused when it reaches the exchange.
+    void setCappedPairs(std::vector<std::pair<AgentId, BookId>> pairs);
+    [[nodiscard]] const auto& cappedPairs() const noexcept { return m_cappedPairs; }
+
 private:
     void handleException();
 
@@ -225,6 +230,7 @@ private:
     std::unique_ptr<taosim::stats::StatsHub> m_statsHub;
     std::unique_ptr<taosim::book::BookProcessManager> m_bookProcessManager;
     std::unique_ptr<taosim::matching::ClearingManager> m_clearingManager;
+    std::set<std::pair<AgentId, BookId>> m_cappedPairs;
     taosim::event::L3RecordContainer m_L3Record;
     uint64_t m_marginCallCounter{};
     taosim::util::SubscriptionRegistry<LocalAgentId> m_localMarketOrderSubscribers;

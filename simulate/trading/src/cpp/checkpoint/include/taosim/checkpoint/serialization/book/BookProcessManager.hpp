@@ -10,6 +10,8 @@
 #include <taosim/process/FuturesSignal.hpp>
 #include <taosim/checkpoint/serialization/process/FundamentalPrice.hpp>
 #include <taosim/checkpoint/serialization/process/FuturesSignal.hpp>
+#include <taosim/checkpoint/serialization/process/GBM.hpp>
+#include <taosim/checkpoint/serialization/process/JumpDiffusion.hpp>
 #include <taosim/checkpoint/serialization/process/MagneticField.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
 
@@ -58,6 +60,12 @@ struct convert<taosim::book::BookProcessManager>
                     }
                     else if (auto* mf = dynamic_cast<taosim::process::MagneticField*>(p)) {
                         obj.convert(*mf);
+                    }
+                    else if (auto* gbm = dynamic_cast<taosim::process::GBM*>(p)) {
+                        obj.convert(*gbm);
+                    }
+                    else if (auto* jd = dynamic_cast<taosim::process::JumpDiffusion*>(p)) {
+                        obj.convert(*jd);
                     }
                 }
             }
@@ -110,8 +118,17 @@ struct pack<taosim::book::BookProcessManager>
                 else if (auto* mf = dynamic_cast<taosim::process::MagneticField*>(proc)) {
                     o.pack(*mf);
                 }
+                // GBM and JumpDiffusion were packed nil, so a resume restarted them at X0 with a fresh generator and
+                // their paths jumped at every resume. Their adaptors carry the generator, the path state
+                // and the distributions' held draws.
+                else if (auto* gbm = dynamic_cast<taosim::process::GBM*>(proc)) {
+                    o.pack(*gbm);
+                }
+                else if (auto* jd = dynamic_cast<taosim::process::JumpDiffusion*>(proc)) {
+                    o.pack(*jd);
+                }
                 else {
-                    // No checkpoint adaptor for this process type (e.g. JumpDiffusion):
+                    // No checkpoint adaptor for this process type:
                     // pack nil so the checkpoint stays loadable; restore then keeps the
                     // freshly-constructed process state for it.
                     o.pack_nil();

@@ -15,6 +15,7 @@
 
 #include <deque>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <random>
 #include <string_view>
@@ -44,6 +45,19 @@ enum class ALGOSliceLiquidityMode : uint32_t
     double drawnQuantity,
     double topLevelVolume,
     ALGOSliceLiquidityMode mode) noexcept;
+
+// The market order a slice becomes under the exchange's size floor: raised to the floor, then
+// capped by what remains of the parent and what the agent can fund. Empty when either cap is
+// below the floor, since the exchange refuses every order under it.
+[[nodiscard]] std::optional<decimal_t> fitALGOSliceToFloor(
+    decimal_t slice,
+    decimal_t remaining,
+    decimal_t affordable,
+    decimal_t sizeFloor) noexcept;
+
+// A parent is done once what remains is at most one unit, or below the floor where the floor is
+// higher: such a remainder can never be sent.
+[[nodiscard]] bool algoParentIsDone(decimal_t remaining, decimal_t sizeFloor) noexcept;
 
 struct TimestampedVolume
 {
@@ -216,6 +230,7 @@ private:
     void scheduleExecuteTick(BookId bookId, Timestamp delay);
 
     void execute(BookId bookId, ALGOTraderState& state);
+    void finishParent(BookId bookId, ALGOTraderState& state);
     decimal_t drawNewVolume(BookId bookId, uint32_t baseDecimals);
     double getProcessValue(BookId bookId, const std::string& name);
     uint64_t getProcessCount(BookId bookId, const std::string& name);

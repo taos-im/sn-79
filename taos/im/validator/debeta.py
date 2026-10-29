@@ -433,11 +433,13 @@ def _capped_mark(t, mark, cap_mid):
 
 
 def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts, maker_only=False,
-                       fee_weight=0.0):
+                       fee_weight=0.0, taker=None):
     """Book one fill's capture against `mid`: buyer gets (mid-price)*q, seller the negation
     (zero-sum per fill under ANY mid, so a degraded mid can shift capture between counterparties
     but never mint it). The maker's side is booked net of `fee_weight` times the maker fee it paid (Mf; a rebate is a
-    negative fee and adds): the spread a maker earns after the venue's charge. The taker's side is unchanged."""
+    negative fee and adds): the spread a maker earns after the venue's charge. The taker's side is unchanged.
+    `taker` (buy_sums, sell_sums, buy_hist, sell_hist) also receives each taker leg booked here, so the making pool can
+    take the taker legs back out of the captured pair: taking never earns making credit."""
     buy_cap = (mid - float(t["p"])) * float(t["q"])
     fee = fee_weight * float(t.get("Mf") or 0.0) if fee_weight else 0.0
     ma = t.get("Ma", -1)
@@ -455,11 +457,22 @@ def _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist
         buy_sums[buyer][book_id] = buy_sums[buyer].get(book_id, 0.0) + v
         if buy_hist is not None:
             _hadd2(buy_hist, buyer, book_id, ts, v)
+        if taker is not None and buyer == ta and buyer != ma:
+            _book_taker_leg(taker[0], taker[2], buyer, book_id, ts, v)
     if seller is not None and seller >= 0:
         v = -buy_cap - (fee if seller == ma else 0.0)
         sell_sums[seller][book_id] = sell_sums[seller].get(book_id, 0.0) + v
         if sell_hist is not None:
             _hadd2(sell_hist, seller, book_id, ts, v)
+        if taker is not None and seller == ta and seller != ma:
+            _book_taker_leg(taker[1], taker[3], seller, book_id, ts, v)
+
+
+def _book_taker_leg(sums, hist, uid, book_id, ts, v):
+    sums.setdefault(uid, {})
+    sums[uid][book_id] = sums[uid].get(book_id, 0.0) + v
+    if hist is not None:
+        _hadd2(hist, uid, book_id, ts, v)
 
 
 # A pending fill settles on a cut forward side once it has waited this long without W forward prints: long enough
@@ -482,7 +495,7 @@ def _print_time(t, ts):
 
 
 def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
-                    now_ns, flush_ns, force=False, fee_weight=0.0):
+                    now_ns, flush_ns, force=False, fee_weight=0.0, taker=None):
     """Finalize every pending fill whose forward window is complete (W prints that clear its floor arrived after it,
     or its whole reach did), stale (older than flush_ns of sim time, so a quiet book cannot hold capture hostage), or
     force-flushed. The window truncates only at genuine stream edges, never at batch edges. Each settled fill is
@@ -497,7 +510,7 @@ def _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts
         st[key] = st.get(key, 0) + 1
         mid = _floored_mid_at(st, idx, W)
         _attribute_capture(buy_sums, sell_sums, book_id, t, mid if mid is not None else float(t["p"]),
-                           buy_hist, sell_hist, ts, fee_weight=fee_weight)
+                           buy_hist, sell_hist, ts, fee_weight=fee_weight, taker=taker)
         pend.pop(0)
     _trim_window(st, W)
 
@@ -564,7 +577,8 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
                             buy_hist=None, sell_hist=None, ts=None,
                             mid_state=None, flush_ns=CAPTURE_FLUSH_NS,
                             real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
-                            horizon_ns=None, now_ns=None, min_size=0.0, fee_weight=0.0, market_votes=False):
+                            horizon_ns=None, now_ns=None, min_size=0.0, fee_weight=0.0, market_votes=False,
+                            taker=None):
     """Accumulate per-uid two-sided spread capture for ONE book's ordered trade batch into
     buy_sums / sell_sums ({uid: {book: cap}}), in place. Each `trade` is dict-like with keys
     p (price), q (quantity), s (side), Ma (maker uid), Ta (taker uid). side==0 => taker buys /
@@ -606,7 +620,8 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
         for t, mid in zip(trades, mids):
             if t.get("Ma", -1) == t.get("Ta", -1):
                 continue
-            _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts, fee_weight=fee_weight)
+            _attribute_capture(buy_sums, sell_sums, book_id, t, mid, buy_hist, sell_hist, ts, fee_weight=fee_weight,
+                               taker=taker)
         if real_buy_sums is not None:
             times = [_print_time(t, ts if ts is not None else 0) for t in trades]
             marks = centered_mark(prices, [_mark_weight(t) for t in trades], W)
@@ -658,18 +673,42 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
             if real_buy_sums is not None and ((t.get("Ma") or -1) >= 0 or (t.get("Ta") or -1) >= 0):
                 st["rpend"].append((st["n"], pt, t))
         st["n"] += 1
-    _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, _now, flush_ns, fee_weight=fee_weight)
+    _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts, _now, flush_ns, fee_weight=fee_weight,
+                    taker=taker)
     if real_buy_sums is not None:
         _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts, _now, _h,
                                  flush_ns, fee_weight=fee_weight)
         _trim_window(st, W)
 
 
+def drop_uid_from_pending(mid_state, uid):
+    """At a reset, the departed uid's side of every fill still queued for its capture mark (`pend`) or its realized
+    mark (`rpend`) is dropped, so the next miner on the slot does not settle the departed miner's last fills; the
+    counterparty's side stays queued. The fill is copied, not edited, since both queues hold the same object."""
+    u = int(uid)
+    for st in (mid_state or {}).values():
+        for key in ("pend", "rpend"):
+            queue = st.get(key)
+            if not queue:
+                continue
+            out = []
+            for item in queue:
+                t = item[2]
+                if t.get("Ma") == u or t.get("Ta") == u:
+                    t = dict(t)
+                    for side in ("Ma", "Ta"):
+                        if t.get(side) == u:
+                            t[side] = -1
+                    item = type(item)((item[0], item[1], t)) if isinstance(item, tuple) else [item[0], item[1], t]
+                out.append(item)
+            st[key] = out
+
+
 def flush_capture_state(mid_state, buy_sums, sell_sums, W, *,
                         buy_hist=None, sell_hist=None, ts=None,
                         flush_ns=CAPTURE_FLUSH_NS, force=False,
                         real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
-                        horizon_ns=None, now_ns=None, fee_weight=0.0):
+                        horizon_ns=None, now_ns=None, fee_weight=0.0, taker=None):
     """Finalize stale pending fills on EVERY book (books with no new trades never reach
     accumulate_book_capture, so the live loop calls this each cycle; force=True drains everything,
     for offline end-of-run and the sim-boundary re-base). With the realized arguments, the realized
@@ -679,7 +718,7 @@ def flush_capture_state(mid_state, buy_sums, sell_sums, W, *,
     _now = int(now_ns) if now_ns is not None else ts
     for book_id, st in mid_state.items():
         _finalize_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
-                        _now, flush_ns, force=force, fee_weight=fee_weight)
+                        _now, flush_ns, force=force, fee_weight=fee_weight, taker=taker)
         if real_buy_sums is not None and st.get("rpend"):
             st.setdefault("times", [])
             _finalize_realized_ready(st, book_id, real_buy_sums, real_sell_sums, W, real_buy_hist, real_sell_hist, ts,
@@ -718,7 +757,8 @@ def balanced_reward_per_book(capture_buy_sums, capture_sell_sums, uids):
 def markout_quality(capture_buy_sums, capture_sell_sums, real_buy_sums, real_sell_sums, uids):
     """The realized basis's quality factor per uid: the share of its captured spread a maker still holds at the
     horizon, clamp(R / C, 0, 1), with R the uid's realized spread over its maker fills (the realized pair is booked
-    maker-side only) and C its captured spread over all its fills, both summed over every book. 0 when C <= 0.
+    maker-side only) and C its captured spread over the same maker fills (the making pool passes the captured pair
+    with its taker legs taken out), both summed over every book. 0 when C <= 0.
 
     The making pool keeps the captured basis's two-sided test and multiplies each uid's captured credit by this
     factor, so it can only discount: a maker whose quotes the market runs over keeps none of its credit, one that
@@ -784,6 +824,71 @@ def kappa_floored(book_alphas, floor, min_books=MIN_SKILL_BOOKS_DEFAULT):
     """
     q = [float(x) for x in book_alphas if abs(float(x)) >= floor]
     return kappa_of_alpha(q) if len(q) >= max(4, int(min_books or 4)) else 0.0
+
+
+def _mean_se2(book_alphas):
+    """(mean, squared standard error) of one agent's per-book alphas, the sample variance over the book count; None
+    under two books."""
+    v = [float(x) for x in book_alphas]
+    k = len(v)
+    if k < 2:
+        return None
+    m = sum(v) / k
+    return m, sum((x - m) ** 2 for x in v) / (k - 1) / k
+
+
+def shrunk_skill_self(book_alphas):
+    """Self-normalising shrinkage of an agent's mean per-book alpha toward zero by its own standard error.
+
+    skill = alpha_hat * alpha_hat^2 / (alpha_hat^2 + se^2), alpha_hat the mean of the per-book alphas and se their
+    sample standard deviation over the square root of the book count. An agent whose books agree keeps nearly all of
+    its mean; one whose mean rests on books of opposite sign keeps little of it. The sign is kept, nothing is floored
+    and the only bar is the two books a standard error needs. Published beside the present skill; never paid.
+
+    Args:
+        book_alphas: Per-book alphas for one agent, the pool the present skill reads.
+    Returns:
+        float: the shrunk mean, or 0.0 under two books.
+    """
+    s = _mean_se2(book_alphas)
+    if s is None:
+        return 0.0
+    m, se2 = s
+    den = m * m + se2
+    return m * m * m / den if den > 0 else 0.0
+
+
+def shrunk_skill_eb(book_alphas_by_uid):
+    """Empirical Bayes shrinkage of each agent's mean per-book alpha toward zero by the pool's between-agent variance.
+
+    tau2 = max(0, Var_i(alpha_hat_i) - mean_i(se_i^2)) over the agents of the pool with two books or more (the sample
+    variance of their means less their mean squared standard error), B_i = tau2 / (tau2 + se_i^2) and skill_i =
+    B_i * alpha_hat_i. The factor depends on the pool rather than on the agent alone, so the caller passes the pool
+    the present skill is ranked in: one asset class under a multi-asset layout. Means that vary no more than their
+    own noise explains give tau2 = 0 and every skill 0. Published beside the present skill; never paid.
+
+    Args:
+        book_alphas_by_uid: ``{uid: [per-book alpha]}``, the pool.
+    Returns:
+        dict: ``{uid: skill}``; 0.0 for an agent under two books, and for every agent of a pool of fewer than two.
+    """
+    pool = book_alphas_by_uid or {}
+    out = {u: 0.0 for u in pool}
+    est = {}
+    for u, a in pool.items():
+        s = _mean_se2(a)
+        if s is not None:
+            est[u] = s
+    n = len(est)
+    if n < 2:
+        return out
+    means = [m for m, _ in est.values()]
+    mu = sum(means) / n
+    tau2 = max(0.0, sum((m - mu) ** 2 for m in means) / (n - 1) - sum(se2 for _, se2 in est.values()) / n)
+    for u, (m, se2) in est.items():
+        den = tau2 + se2
+        out[u] = tau2 / den * m if den > 0 else 0.0
+    return out
 
 
 def _rank01(vals):
@@ -1658,35 +1763,39 @@ def book_alphas_by_subwindow(mtm_hist, invsum_hist, invn_hist, drift_hist, t_sta
     if k <= 1 or t_end <= t_start:
         return None
     span = float(t_end - t_start)
+    t0 = float(t_start)
+    # Each timestamp's sub-window, computed once per call: the (uid, book) histories sample the same timestamps, so
+    # the per-entry arithmetic was a few thousand values recomputed for every entry. Same arithmetic
+    # and the same summation order, so the output is unchanged.
+    index = {}
 
-    def bucket(ts):
-        i = int((float(ts) - float(t_start)) * k / span)
-        return min(max(i, 0), k - 1)
-
-    invn_k, drift_k = {}, {}
-    for b, tsd in (invn_hist or {}).items():
-        row = invn_k.setdefault(b, [0.0] * k)
+    def sums(tsd, row):
+        get = index.get
         for ts, v in tsd.items():
             if t_start <= ts <= t_end:
-                row[bucket(ts)] += v
-    for b, tsd in (drift_hist or {}).items():
-        row = drift_k.setdefault(b, [0.0] * k)
-        for ts, v in tsd.items():
-            if t_start <= ts <= t_end:
-                row[bucket(ts)] += v
+                i = get(ts)
+                if i is None:
+                    i = min(max(int((float(ts) - t0) * k / span), 0), k - 1)
+                    index[ts] = i
+                row[i] += v
+        return row
+
+    invn_k = {b: sums(tsd, [0.0] * k) for b, tsd in (invn_hist or {}).items()}
+    drift_k = {b: sums(tsd, [0.0] * k) for b, tsd in (drift_hist or {}).items()}
+    mtm_hist = mtm_hist or {}
+    invsum_hist = invsum_hist or {}
+    empty = {}
+    zeros = [0.0] * k
     out = {}
-    for uid in set(mtm_hist or {}) | set(invsum_hist or {}):
+    for uid in set(mtm_hist) | set(invsum_hist):
+        m_u = mtm_hist.get(uid, empty)
+        s_u = invsum_hist.get(uid, empty)
         by_book = {}
-        for b in set((mtm_hist or {}).get(uid, {})) | set((invsum_hist or {}).get(uid, {})):
-            m_k, s_k = [0.0] * k, [0.0] * k
-            for ts, v in (mtm_hist or {}).get(uid, {}).get(b, {}).items():
-                if t_start <= ts <= t_end:
-                    m_k[bucket(ts)] += v
-            for ts, v in (invsum_hist or {}).get(uid, {}).get(b, {}).items():
-                if t_start <= ts <= t_end:
-                    s_k[bucket(ts)] += v
-            n_row = invn_k.get(b, [0.0] * k)
-            d_row = drift_k.get(b, [0.0] * k)
+        for b in set(m_u) | set(s_u):
+            m_k = sums(m_u.get(b, empty), [0.0] * k)
+            s_k = sums(s_u.get(b, empty), [0.0] * k)
+            n_row = invn_k.get(b, zeros)
+            d_row = drift_k.get(b, zeros)
             by_book[b] = [(m_k[i] - (s_k[i] / n_row[i]) * d_row[i]) if n_row[i] > 0 else None
                           for i in range(k)]
         out[uid] = by_book

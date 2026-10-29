@@ -138,3 +138,34 @@ TEST(ALGOTraderTest, SliceLiquidityModeRejectsUnknownValues)
 }
 
 //-------------------------------------------------------------------------
+
+// What the exchange will take of a slice: at least its floor, at most what the parent has left and
+// what the agent can fund. The floor here is class 1's.
+TEST(ALGOTraderTest, ASliceIsFittedToTheFloorOrNotSentAtAll)
+{
+    const auto classOneFloor = DEC(2.5364);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), 10_dec, 100_dec, classOneFloor), DEC(5.0));
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(0.05), 10_dec, 100_dec, classOneFloor), classOneFloor);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), DEC(3.0), 100_dec, classOneFloor), DEC(3.0));
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), 10_dec, DEC(4.0), classOneFloor), DEC(4.0));
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), classOneFloor, 100_dec, classOneFloor), classOneFloor);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), DEC(1.5), 100_dec, classOneFloor), std::nullopt);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), 0_dec, 100_dec, classOneFloor), std::nullopt);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), 10_dec, DEC(2.0), classOneFloor), std::nullopt);
+    EXPECT_EQ(fitALGOSliceToFloor(DEC(5.0), 10_dec, 0_dec, classOneFloor), std::nullopt);
+}
+
+// The one-unit retirement size is kept where it is above the floor, as in classes 0 and 2, so a
+// parent there finishes exactly as before.
+TEST(ALGOTraderTest, AParentIsDoneAtOneUnitOrBelowAHigherFloor)
+{
+    EXPECT_TRUE(algoParentIsDone(DEC(0.8), DEC(0.25)));
+    EXPECT_TRUE(algoParentIsDone(1_dec, DEC(0.25)));
+    EXPECT_FALSE(algoParentIsDone(DEC(1.4), DEC(0.25)));
+    EXPECT_TRUE(algoParentIsDone(DEC(1.4), DEC(2.5364)));
+    EXPECT_TRUE(algoParentIsDone(DEC(2.5), DEC(2.5364)));
+    EXPECT_FALSE(algoParentIsDone(DEC(2.5364), DEC(2.5364)));
+    EXPECT_TRUE(algoParentIsDone(0_dec, DEC(0.25)));
+}
+
+//-------------------------------------------------------------------------

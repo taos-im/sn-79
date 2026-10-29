@@ -10,7 +10,6 @@ of lambda-defaultdicts + deques, and frame IO over a socketpair.
 """
 import pickle
 import socket
-import struct
 from collections import defaultdict, deque
 from types import SimpleNamespace
 
@@ -670,9 +669,14 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         # the alternative mark's leg and the liquidity a maker provides (0.6.5)
         "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
         "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
+        "debeta_conj_hist",  # the conjunction (0.6.6)
+        "debeta_captkbuy_hist", "debeta_captksell_hist",  # the captured pair's taker legs (0.6.6)
         "debeta_cpc_hist",  # the per-asset-class counterparty rows (0.6.3), after the pooled histories
-        "debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_inv", "debeta_plast",
+        "debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist",
+        "debeta_inv", "debeta_plast",
         "debeta_inv_alt", "debeta_plast_alt",
+        "debeta_conj_ref", "debeta_conj_clock",  # the conjunction's references and clock (0.6.6)
+        "debeta_class_vectors", "debeta_handover",  # the run-boundary handover (0.6.6)
         "miner_stats",
         "miner_presence",
     ]

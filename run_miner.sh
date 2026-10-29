@@ -431,8 +431,12 @@ print(m.group(1) if m else '')
     tmux kill-session -t miner 2>/dev/null || true
     tmux new-session -d -s miner -n 'miner' 'htop -F miner.py'
     tmux set-option -t miner mouse on
-    tmux split-window -v -p 50 -t miner:miner.0 "pm2 logs miner"
-    tmux split-window -h -p 50 -t miner:miner.1 "echo 'Waiting for training log...'; tail -F '$TRAIN_LOG' 2>/dev/null"
+    # Each pane is a shell with its command typed in: a pane started with its command runs it in a non-interactive
+    # shell, which may not find pm2 (installed under nvm), and the pane then closes at once.
+    _P=$(tmux split-window -v -l 50% -t miner:miner.0 -P -F '#{pane_id}')
+    tmux send-keys -t "$_P" "pm2 logs miner" Enter
+    _P=$(tmux split-window -h -l 50% -t "$_P" -P -F '#{pane_id}')
+    tmux send-keys -t "$_P" "echo 'Waiting for training log...'; tail -F '$TRAIN_LOG' 2>/dev/null" Enter
     tmux select-pane -t miner:miner.0
     tmux attach-session -t miner
 else

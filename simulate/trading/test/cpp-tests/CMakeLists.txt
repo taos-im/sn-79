@@ -40,17 +40,21 @@ add_executable(taosim-tests
     WakeupPayloadContractTests.cpp
     WakeupCheckpointRoundTripTests.cpp
     RNGCheckpointResumeTests.cpp
+    ProcessDistributionResumeTests.cpp
     CheckpointFormat063Tests.cpp
     FuturesTraderActivityTests.cpp
     ProcessLogLocationTests.cpp
     MultiAssetSeedTests.cpp
     LifecycleNoticeTests.cpp
     ValidatorQueuePairingTests.cpp
+    InstructionDelayBoundTests.cpp
+    CappedPairsTests.cpp
     RunDirSelectionTests.cpp
     PublishStopTests.cpp
     ResumeLogFilesTests.cpp
     CheckpointFormatVersionTests.cpp
     RealizationFailureTests.cpp
+    PublishedStateTests.cpp
     FundamentalSeedTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the

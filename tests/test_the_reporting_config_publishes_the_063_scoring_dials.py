@@ -1,7 +1,8 @@
 """The validator publishes the scoring dials that decide 0.6.3 and 0.6.4 pay in its reporting config (neuron_info), so
 the dashboards' Scoring Config table can show them: the making basis and its horizon, the tether multiple, the class
 weights, the skill bar share and the skill hurdle, and from 0.6.4 the making fee weight, the capture market votes
-switch and the skill share EMA switch. The whitelist is hand-built in the validator's report payload, so a dial
+switch and the skill share EMA switch, and from 0.6.6 the skill leg's mark and the alternative mark it publishes beside
+it, so the board can expect the mark that pays. The whitelist is hand-built in the validator's report payload, so a dial
 missing from it never reaches a dashboard however it is set. The PnL Score's daily-return bounds are published from
 the dials the PnL Score reads, scoring.pnl.normalization, not from a path the config does not carry."""
 import argparse
@@ -20,6 +21,8 @@ EXPECTED = {
     "debeta_making_fee_weight": 0.005,
     "debeta_capture_market_votes": 0,
     "debeta_skill_share_ema": 0,
+    "debeta_mark_mode": "mid",
+    "debeta_mark_mode_alt": "last",
 }
 
 

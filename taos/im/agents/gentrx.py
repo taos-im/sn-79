@@ -113,9 +113,15 @@ import bittensor as bt
 
 from fastapi import Request
 from taos.im.agents import FinanceAgent, UnifiedAgentResponse, ExchangeStateUpdate
+from typing import TYPE_CHECKING
+
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.instructions import OrderDirection
 from taos.im.protocol.events import SimulationEndEvent
+
+if TYPE_CHECKING:
+    from taos.im.protocol.exchange.response import ExchangeAgentResponse
+    from taos.im.protocol.response import FinanceAgentResponse
 
 # Light GenTRX helpers (no heavy deps) — safe on a core install; default_output_dir
 # is used in initialize() (the basic, non-training path).

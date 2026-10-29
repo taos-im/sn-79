@@ -161,6 +161,14 @@ def add_miner_args(cls, parser):
         help="Arbitrary user-defined parameters relevant to their specific agent implementation.  Pass in format `--agent.params p_0=x p_1=y ...`"
     )
 
+    parser.add_argument(
+        "--neuron.no_gc_freeze",
+        action="store_true",
+        help="Keep the garbage collector scanning the whole heap. By default the miner freezes the heap it has loaded "
+             "before it serves, so full collections over the agent's long-lived state do not run inside a request.",
+        default=False,
+    )
+
 
 def add_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""
@@ -190,8 +198,16 @@ def add_validator_args(cls, parser):
         "--neuron.reuse_connections",
         action="store_true",
         help="Keep one session to the miners across rounds, so their connections stay open, instead of a new one "
-             "every round.",
-        default=False,
+             "every round. On by default; --neuron.no_reuse_connections turns it off.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.no_reuse_connections",
+        action="store_false",
+        dest="neuron.reuse_connections",
+        help="Open a new session to the miners every round instead of keeping their connections open.",
+        default=True,
     )
 
     parser.add_argument(

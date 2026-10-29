@@ -29,7 +29,7 @@
 namespace taosim::xml
 {
 
-inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
+inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
     "GBM_X0",
     "GBM_mu",
     "GBM_seed",
@@ -114,6 +114,7 @@ inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
     "marginNoiseSTD",
     "maxDMD",
     "maxDepth",
+    "maxInstructionDelay",
     "maxLeverage",
     "maxLoan",
     "maxMakerRate",
@@ -145,6 +146,7 @@ inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
     "ownRng",
     "pO_alpha",
     "parentOrderAdvFraction",
+    "path",
     "port",
     "price",
     "priceDecimals",
@@ -203,6 +205,7 @@ inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
     "statsBarPeriod",
     "step",
     "stepDelay",
+    "stopOnRealizationFailure",
     "symbol",
     "tag",
     "takerFee",
@@ -211,6 +214,7 @@ inline constexpr std::array<std::string_view, 212> kKnownAttributes{{
     "tauF",
     "tauFRegime",
     "tauHist",
+    "threads",
     "timescale",
     "total",
     "traceTime",

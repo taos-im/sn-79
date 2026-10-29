@@ -21,7 +21,7 @@ The details of the incentive mechanism change over time; the objective stays the
 
 **Skill** pays for trading profit the market's drift does not explain. On each book a miner's mark-to-market P&L is reduced by its average inventory times the book's price move; what remains is its alpha, and a book counts once its alpha clears a small hurdle relative to the notional traded there. A miner qualifies when its alpha is consistently positive across books, measured by a downside-adjusted consistency ratio, on at least the required number of books (20 of 128 on a single market; on the 0.6.5 layout, 10 of the 64 `simulation_0` books and 5 of the 32 books in each of `simulation_1` and `simulation_2`). Qualifying miners share the half in proportion to their net alpha, after the same counterparty discount.
 
-The trading score is smoothed over a track record of about three simulated hours (`--scoring.score_ema_halflife`), a miner that stops answering validators is not scored until it answers again, and from 0.6.3 each asset class is paid through its own share. Validators set weights from a moving average of each miner's score (`--neuron.moving_average_alpha`, in the [base validator logic](/taos/common/neurons/validator.py)). The rules are stated in the dial help of the [validator config](/taos/im/config/__init__.py) and implemented in the [reward logic](/taos/im/validator/reward.py).
+The making half is smoothed over a track record of about three simulated hours (`--scoring.score_ema_halflife`). The skill half is paid from each cycle's share of net alpha, which is already measured over the trailing three simulated hours, and is not smoothed further before allocation (`--scoring.debeta.skill_share_ema`, off by default). A miner that stops answering validators is not scored until it answers again, and from 0.6.3 each asset class is paid through its own share. Validators set weights from a moving average of each miner's score (`--neuron.moving_average_alpha`, in the [base validator logic](/taos/common/neurons/validator.py)). The rules are stated in the dial help of the [validator config](/taos/im/config/__init__.py) and implemented in the [reward logic](/taos/im/validator/reward.py).
 
 #### 3. How do I get started mining in the subnet?
 
@@ -55,7 +55,7 @@ Being that our markets are synthetic and generated through a powerful C++ engine
 
 #### 8. My miner seems to be receiving requests and responding, but I don't see any activity and my score is not increasing.  What's going on?
 
-A new miner is scored from its first cycle, but its score builds over the three-hour track record, and the skill half pays nothing until the miner has qualifying alpha on enough books.  If the situation persists, you will need to check your UID at the [Agents Dashboard](https://taos.simulate.trading/d/edy6vxytuud4wd/agents) and confirm a few critical things:
+A new miner is scored from its first cycle, but its making score builds over the three-hour track record, and the skill half pays nothing until the miner has qualifying alpha on enough books.  If the situation persists, you will need to check your UID at the [Agents Dashboard](https://taos.simulate.trading/d/edy6vxytuud4wd/agents) and confirm a few critical things:
 
 - Do you see recent trades on many book IDs?  The skill half needs qualifying alpha on a set share of the books (20 of 128 on a single market; on the 0.6.5 layout, 10 of the 64 `simulation_0` books and 5 of the 32 books in each of `simulation_1` and `simulation_2`) and is scaled down when more than about three eighths of the books carry none.
 - Under the Requests plot, do you see a large proportion of failures or timeouts?  If you are not seeing mostly success, usually this is due to taking too long to respond - validators allow a maximum of `--neuron.timeout` seconds (defined in the [base validator config](/taos/common/config/__init__.py)) for miners to respond.  This can be addressed by increasing resources, optimizing your strategy logic and ensuring sufficient network connectivity; you may also want to consider geolocating your miner nearby to the biggest validators for the best possible latency.
@@ -99,7 +99,7 @@ On execution. The making half measures spread captured on actual fills, judged f
 
 #### 17. Can a miner keep a high score with little trading?
 
-No. Making credit needs fills on both sides of a book, skill needs qualifying alpha on enough books, and both are measured over the scoring window, so a miner that stops trading loses both. The track-record smoothing also means a single strong window raises a score only gradually.
+No. Making credit needs fills on both sides of a book, skill needs qualifying alpha on enough books, and both are measured over the scoring window, so a miner that stops trading loses both. The making half's track-record smoothing means a single strong window raises it only gradually; the skill half reads the trailing three hours as they stand, so a strong window counts at once and leaves the window three hours later.
 
 #### 18. Are identical re-posts treated as no-ops in the simulator?
 

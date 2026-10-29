@@ -61,7 +61,7 @@ def test_the_service_reports_the_wait_and_the_validator_ships_the_lists():
     from taos.im.neurons import validator
 
     qsrc = inspect.getsource(query)
-    assert qsrc.count("self._last_wait_s = elapsed") == 2, "both query paths record the wait"
+    assert qsrc.count("self._last_wait_s = elapsed") == 3, "the threaded, fanout and prebuilt paths record the wait"
     assert '"wait": getattr(self, "_last_wait_s", None)' in qsrc
     vsrc = inspect.getsource(validator)
     for key in ("'round_gaps': list(self.round_gaps[-100:])", "'query_waits': list(self.query_waits[-100:])",

@@ -759,18 +759,19 @@ TEST_F(SelfTradePreventionTest, StpRestingCancelIsAnnouncedToTheOwnerInSimulatio
     ASSERT_FALSE(proxy->exchangeServiceMode()) << "the stepped simulation is the mechanism that heard nothing";
     proxy->clearMessages();
 
-    // The same sequence as LimitOrderBuyCO up to the STP step: agent2 rests a SELL at 301, then buys
-    // through its own price. CANCEL_OLDEST removes the resting SELL.
+    // The same sequence as LimitOrderBuyCO up to the STP step, with a miner in agent2's place: it rests a
+    // SELL at 301, then buys through its own price. CANCEL_OLDEST removes the resting SELL.
+    const AgentId miner = exchange->accounts().registerRemote();
     placeLimitOrder(exchange, agent1, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
-    auto [resting, restingEc] = placeLimitOrder(exchange, agent2, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
+    auto [resting, restingEc] = placeLimitOrder(exchange, miner, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
     ASSERT_NE(resting, nullptr);
     const OrderID restingId = resting->id();
     placeLimitOrder(exchange, agent3, bookId, OrderDirection::SELL, 2_dec, 301_dec, DEC(.5));
-    placeLimitOrder(exchange, agent2, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
+    placeLimitOrder(exchange, miner, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
 
-    const auto notice = findCancelNotice(proxy, agent2, restingId);
+    const auto notice = findCancelNotice(proxy, miner, restingId);
     ASSERT_NE(notice, nullptr)
-        << "STP cancelled resting order " << restingId << " of agent " << agent2
+        << "STP cancelled resting order " << restingId << " of miner " << miner
         << " and no RESPONSE_DISTRIBUTED_CANCEL_ORDERS naming it reached the proxy";
 }
 
@@ -780,18 +781,45 @@ TEST_F(SelfTradePreventionTest, StpIncomingCancelIsAnnouncedToTheOwnerInSimulati
     ASSERT_NE(proxy, nullptr);
     proxy->clearMessages();
 
-    auto [resting, restingEc] = placeLimitOrder(exchange, agent2, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
+    const AgentId miner = exchange->accounts().registerRemote();
+    auto [resting, restingEc] = placeLimitOrder(exchange, miner, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
     ASSERT_NE(resting, nullptr);
     // CANCEL_NEWEST: the incoming BUY is the one that goes.
     auto [incoming, incomingEc] = placeLimitOrder(
-        exchange, agent2, bookId, false, taosim::TimeInForce::GTC, std::nullopt, STPFlag::CN,
+        exchange, miner, bookId, false, taosim::TimeInForce::GTC, std::nullopt, STPFlag::CN,
         OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
     ASSERT_NE(incoming, nullptr);
 
-    ASSERT_NE(findCancelNotice(proxy, agent2, incoming->id()), nullptr)
+    ASSERT_NE(findCancelNotice(proxy, miner, incoming->id()), nullptr)
         << "STP cancelled the incoming order " << incoming->id() << " and its owner was not told";
-    EXPECT_EQ(findCancelNotice(proxy, agent2, resting->id()), nullptr)
+    EXPECT_EQ(findCancelNotice(proxy, miner, resting->id()), nullptr)
         << "the resting order survived CANCEL_NEWEST and must not be announced as cancelled";
+}
+
+// A local agent's STP cancel is not the proxy's to forward: the
+// notice went out under the local agent's negative id, every background self-cross added one to the validator
+// request, and the validator dropped it. A miner's notice above is unchanged.
+TEST_F(SelfTradePreventionTest, ALocalAgentsStpCancelIsNotPushedToTheProxy)
+{
+    auto* proxy = simulation->proxy();
+    ASSERT_NE(proxy, nullptr);
+    proxy->clearMessages();
+
+    auto [resting, restingEc] = placeLimitOrder(exchange, agent2, bookId, OrderDirection::SELL, 4_dec, 301_dec, DEC(1.));
+    ASSERT_NE(resting, nullptr);
+    placeLimitOrder(exchange, agent2, bookId, OrderDirection::BUY, 5_dec, 301_dec, DEC(0.));
+    auto [rest2, rest2Ec] = placeLimitOrder(exchange, agent3, bookId, OrderDirection::SELL, 4_dec, 302_dec, DEC(1.));
+    ASSERT_NE(rest2, nullptr);
+    auto [incoming, incomingEc] = placeLimitOrder(
+        exchange, agent3, bookId, false, taosim::TimeInForce::GTC, std::nullopt, STPFlag::CN,
+        OrderDirection::BUY, 5_dec, 302_dec, DEC(0.));
+    ASSERT_NE(incoming, nullptr);
+
+    for (const auto& msg : proxy->messages()) {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        EXPECT_FALSE(pld != nullptr && pld->agentId < 0)
+            << msg->type << " for local agent " << pld->agentId << " was pushed to the proxy";
+    }
 }
 
 TEST_F(SelfTradePreventionTest, GttExpiryIsScheduledAtTheDeadlineSoItsAnswerIsNotDelayed)

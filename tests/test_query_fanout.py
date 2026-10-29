@@ -11,7 +11,6 @@ dendrite stands in for Dendrite.call so the test is deterministic and offline.
 import asyncio
 from types import SimpleNamespace
 
-import pytest
 
 from taos.im.validator.query import QueryService
 

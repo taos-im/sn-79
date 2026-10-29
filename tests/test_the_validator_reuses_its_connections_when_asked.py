@@ -5,8 +5,8 @@
 Every round built a new Dendrite and closed its session after the round, and the miner's axon closed an idle
 connection after 5 s, shorter than the time between rounds, so every round paid a TCP handshake and slow start on
 the request body. The flag keeps the Dendrite and its session, clearing the synapse history it would otherwise grow
-by every round, and the miner keeps an idle connection for 120 s. The flag is off by default, so a deploy can measure
-response times before and after on one build.
+by every round, and the miner keeps an idle connection for 120 s. Kept connections are the default;
+--neuron.no_reuse_connections turns them off.
 """
 import argparse
 import asyncio
@@ -78,11 +78,24 @@ def test_the_cleanup_keeps_a_reused_session_open(monkeypatch):
         assert len(closes) == want, (reuse, closes)
 
 
-def test_the_flag_is_off_by_default():
+def _reuse(args):
     p = argparse.ArgumentParser()
     add_validator_args(None, p)
-    assert p.parse_args([]).__dict__["neuron.reuse_connections"] is False
-    assert p.parse_args(["--neuron.reuse_connections"]).__dict__["neuron.reuse_connections"] is True
+    strict = p.parse_args(args).__dict__["neuron.reuse_connections"]
+    assert bt.Config(p, args=args).neuron.reuse_connections is strict
+    return strict
+
+
+def test_kept_connections_are_on_by_default():
+    assert _reuse([]) is True
+
+
+def test_a_validator_can_turn_them_off():
+    assert _reuse(["--neuron.no_reuse_connections"]) is False
+
+
+def test_the_old_switch_still_parses():
+    assert _reuse(["--neuron.reuse_connections"]) is True
 
 
 def test_the_query_round_takes_its_dendrite_from_the_one_place():

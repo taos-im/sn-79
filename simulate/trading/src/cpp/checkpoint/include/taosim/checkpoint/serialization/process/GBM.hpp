@@ -5,6 +5,7 @@
 #pragma once
 
 #include <taosim/process/GBM.hpp>
+#include <taosim/checkpoint/serialization/process/Distribution.hpp>
 #include <taosim/checkpoint/serialization/process/RNG.hpp>
 
 //-------------------------------------------------------------------------
@@ -42,6 +43,10 @@ struct convert<taosim::process::GBM>
             else if (key == "value") {
                 v.val() = val.as<double>();
             }
+            // Absent from a checkpoint written before it was kept: the distribution then starts afresh, as it did.
+            else if (key == "gaussian") {
+                taosim::checkpoint::serialization::restoreDistribution(v.gaussian(), val.as<std::string_view>());
+            }
         }
         
         return o;
@@ -55,7 +60,7 @@ struct pack<taosim::process::GBM>
     msgpack::packer<Stream>& operator()(
         msgpack::packer<Stream>& o, const taosim::process::GBM& v) const
     {
-        o.pack_map(4);
+        o.pack_map(5);
 
         o.pack("rng");
         o.pack(v.state().rng);
@@ -68,6 +73,9 @@ struct pack<taosim::process::GBM>
 
         o.pack("value");
         o.pack(v.val());
+
+        o.pack("gaussian");
+        o.pack(taosim::checkpoint::serialization::distributionState(v.gaussian()));
 
         return o;
     }

@@ -41,6 +41,8 @@ public:
 
     [[nodiscard]] Fees calculateFees(const TradeDesc& trade);
     [[nodiscard]] Fees getRates(BookId bookId, AgentId agentId) const;
+    // The agent's base name has a policy of its own, so its rates may differ from the default policy's.
+    [[nodiscard]] bool hasOwnPolicy(AgentId agentId) const;
     [[nodiscard]] decimal_t agentVolume(BookId bookId, AgentId agentId) const noexcept;
     [[nodiscard]] decimal_t makerTakerRatio(BookId bookId, AgentId agentId) const noexcept;
     [[nodiscard]] auto&& isTiered(this auto&& self) noexcept { return self.m_isTiered; }

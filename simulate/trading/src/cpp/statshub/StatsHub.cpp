@@ -92,17 +92,17 @@ L1Snapshot StatsHub::l1(BookId bookId) const
 {
     const auto& book = *m_impl->slots.at(bookId).book;
 
+    // The best levels are the book's own, the first with an order left on it: a level whose orders
+    // have all filled stays in the queue until the step clears it, and the matcher skips it.
     L1Snapshot snapshot{};
-    if (!book.sellQueue().empty()) {
-        const auto& bestSellLevel = book.sellQueue().front();
-        snapshot.bestAskPrice = bestSellLevel.price();
-        snapshot.bestAskVolume = bestSellLevel.volume();
+    if (const auto bestSellLevel = book.bestSellLevel()) {
+        snapshot.bestAskPrice = bestSellLevel->get().price();
+        snapshot.bestAskVolume = bestSellLevel->get().volume();
         snapshot.askTotalVolume = book.sellQueue().volume();
     }
-    if (!book.buyQueue().empty()) {
-        const auto& bestBuyLevel = book.buyQueue().back();
-        snapshot.bestBidPrice = bestBuyLevel.price();
-        snapshot.bestBidVolume = bestBuyLevel.volume();
+    if (const auto bestBuyLevel = book.bestBuyLevel()) {
+        snapshot.bestBidPrice = bestBuyLevel->get().price();
+        snapshot.bestBidVolume = bestBuyLevel->get().volume();
         snapshot.bidTotalVolume = book.buyQueue().volume();
     }
     return snapshot;
@@ -114,13 +114,14 @@ L2Snapshot StatsHub::l2(BookId bookId, size_t depth) const
 {
     const auto& book = *m_impl->slots.at(bookId).book;
 
+    auto isActive = [](const auto& level) { return level.hasActiveOrders(); };
     auto toLevel = [](const auto& level) -> L2Level {
         return {.price = level.price(), .quantity = level.volume()};
     };
     return {
-        .bids = book.buyQueue() | views::reverse | views::take(depth)
+        .bids = book.buyQueue() | views::reverse | views::filter(isActive) | views::take(depth)
             | views::transform(toLevel) | ranges::to<std::vector>,
-        .asks = book.sellQueue() | views::take(depth)
+        .asks = book.sellQueue() | views::filter(isActive) | views::take(depth)
             | views::transform(toLevel) | ranges::to<std::vector>
     };
 }

@@ -52,7 +52,37 @@ def trade_event_from_wire(json: dict) -> "TradeEvent":
     """
     if "cr" in json:
         json = {**json, "cr": _close_reason_str(json.get("cr"))}
-    return TradeEvent.model_construct(**json)
+    return _build_trade_event(json)
+
+
+def _constructor(cls):
+    """cls.model_construct for wire dicts, its field map and defaults worked out once instead of on every call: the
+    same object (fields by name or alias, the rest kept as extra, defaults filled, fields_set as given). Scoring builds
+    one per trade notice. Falls back to model_construct for a model with a post-init hook or private attributes."""
+    if cls.__pydantic_post_init__ or cls.__private_attributes__:
+        return lambda values: cls.model_construct(**values)
+    fields = cls.model_fields
+    by_key = {**{f.alias: name for name, f in fields.items() if f.alias}, **{name: name for name in fields}}
+    defaults = {name: f.get_default(call_default_factory=True) for name, f in fields.items() if not f.is_required()}
+    allow_extra = cls.model_config.get("extra") == "allow"
+    setattr_ = object.__setattr__
+
+    def build(values):
+        given, extra = {}, {}
+        for key, value in values.items():
+            name = by_key.get(key)
+            if name is None or name in given:
+                extra[key] = value
+            else:
+                given[name] = value
+        m = cls.__new__(cls)
+        setattr_(m, "__dict__", {n: given[n] if n in given else defaults[n]
+                                 for n in fields if n in given or n in defaults})
+        setattr_(m, "__pydantic_fields_set__", set(given))
+        setattr_(m, "__pydantic_extra__", extra if allow_extra else None)
+        setattr_(m, "__pydantic_private__", None)
+        return m
+    return build
 
 
 class FinanceEvent(SimulationEvent):
@@ -659,6 +689,9 @@ class TradeEvent(FinanceEvent):
     def __str__(self):
         return f"{'BUY ' if self.side == 0 else 'SELL'} TRADE #{self.tradeId} : AGGRESSIVE ORDER #{self.takerOrderId} (AGENT {self.takerAgentId}) MATCHED AGAINST #{self.makerOrderId} (AGENT {self.makerAgentId}) FOR {self.quantity}@{self.price} AT {duration_from_timestamp(self.timestamp)} (T={self.timestamp})"
     
+
+_build_trade_event = _constructor(TradeEvent)
+
 
 class ResetAgentEvent(FinanceEvent):
     """

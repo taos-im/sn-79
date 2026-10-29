@@ -177,6 +177,24 @@ class NormalizedState:
 # Protocol ABC
 # ─────────────────────────────────────────────────────────────────────────────
 
+class RepeatedState:
+    """When an answer takes longer than the engine's receive timeout, the engine sends the state's notification
+    again. Handled and answered a second time, it leaves the engine one answer behind for the rest of the run. The
+    first repeat is skipped, unanswered; a further copy means the engine is still waiting (e.g. resumed from a
+    checkpoint) and is answered."""
+
+    def __init__(self):
+        self.last, self.skipped = None, False
+
+    def skip(self, timestamp) -> bool:
+        if timestamp == self.last and not self.skipped:
+            self.skipped = True
+            return True
+        self.skipped = timestamp == self.last
+        self.last = timestamp
+        return False
+
+
 class MarketEngine(ABC):
     """
     Abstracts the three mode-specific operations in the validator loop.

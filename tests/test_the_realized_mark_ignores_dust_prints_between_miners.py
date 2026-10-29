@@ -34,13 +34,16 @@ def _tape(pump):
 
 
 def _realized_offline(trades):
-    cb, cs = _sums(); rb, rs = _sums()
+    cb, cs = _sums()
+    rb, rs = _sums()
     accumulate_book_capture(cb, cs, 0, trades, W, real_buy_sums=rb, real_sell_sums=rs, horizon_ns=H)
     return rb[1].get(0, 0.0)
 
 
 def _realized_live(trades):
-    cb, cs = _sums(); rb, rs = _sums(); st = {}
+    cb, cs = _sums()
+    rb, rs = _sums()
+    st = {}
     for t in trades:
         accumulate_book_capture(cb, cs, 0, [t], W, ts=t["ts"], mid_state=st,
                                 real_buy_sums=rb, real_sell_sums=rs, horizon_ns=H)

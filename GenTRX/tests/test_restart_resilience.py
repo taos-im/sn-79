@@ -8,7 +8,6 @@ of either is "unknown lineage" and the default is preserve.
 Run: pytest GenTRX/tests/test_restart_resilience.py -v
 """
 
-import pytest
 
 
 def _make_aggregator(tmp_path, validator_store=None):
@@ -170,11 +169,12 @@ def test_wipe_on_staged_sim_id_mismatch(tmp_path):
     assert agg._data_cleanup_pending is True
 
 
-def test_startup_mismatch_preserves_by_default(tmp_path):
+def test_startup_mismatch_preserves_under_default_no_startup_cleanup(tmp_path):
     """Default (--no-startup-cleanup): a positive sim_id mismatch at STARTUP
     (first bind, _sim_id is None) preserves data — only a rollover detected
     while running wipes. Pins the data-preservation default."""
-    agg = _make_aggregator(tmp_path)  # no_startup_cleanup defaults True
+    agg = _make_aggregator(tmp_path)
+    agg._no_startup_cleanup = True  # the constructor and CLI default
     agg._restored_sim_id = "OLD_SIM"
 
     agg._process_tick(_tick(1000, sim_id="NEW_SIM"))

@@ -194,8 +194,8 @@ std::string describe(const std::exception_ptr& error)
 // the realizations' canonical bases let decanonize() recover (realization, book) even
 // though realizations hold different numbers of books.
 
-// THE PER-STEP WALL-CLOCK BREAKDOWN, in SimulationManager's PROCESSED format and meaning: STATE packs the
-// request, PARSE waits for the validator and unpacks its answer, PROC dispatches it. Printed on every way
+// THE PER-STEP WALL-CLOCK BREAKDOWN, in SimulationManager's PROCESSED format and meaning: STATE joins the
+// realizations' packed parts into the request (the workers packed them), PARSE waits for the validator and unpacks its answer, PROC dispatches it. Printed on every way
 // out of publishState, with a phase the step never reached counted as nothing.
 struct StepWallClock
 {
@@ -220,7 +220,7 @@ struct StepWallClock
     }
 };
 
-void publishState(Impl& impl)
+void publishState(Impl& impl, std::span<const taosim::serialization::HumanReadableStream> packed)
 {
     const auto& sims = impl.simulations;
     const auto& clock = clockOf(impl);
@@ -232,7 +232,8 @@ void publishState(Impl& impl)
     msgpack::pack(stream, serialization::MultiAssetValidatorRequest{
         .simulations = sims,
         .config = &impl.config,
-        .logDir = impl.config.baseDir
+        .logDir = impl.config.baseDir,
+        .instances = packed
     });
 
     bipc::shared_memory_object shmReq{
@@ -281,6 +282,7 @@ void publishState(Impl& impl)
     // exchange are named identically across realizations, so the routed realization
     // resolves them all the same.
     const auto& reprSimu = sims.front();
+    const Timestamp maxInstructionDelay = reprSimu->config().maxInstructionDelay();
     auto unpackResponse = [&](const msgpack::object& o) -> Message::Ptr {
         if (o.type != msgpack::type::MAP) {
             throw taosim::serialization::MsgPackError{};
@@ -297,6 +299,7 @@ void publishState(Impl& impl)
         if (!agentId || !delay || type.empty()) {
             throw taosim::serialization::MsgPackError{};
         }
+        taosim::simulation::checkInstructionDelay(*delay, maxInstructionDelay);
         MessagePayload::Ptr payload;
         for (const auto& [k, val] : o.via.map) {
             if (k.as<std::string_view>() == "payload") {
@@ -325,17 +328,39 @@ void publishState(Impl& impl)
         return msg;
     };
 
-    if (obj.type != msgpack::type::MAP || obj.via.map.size != 1) return;
-    const auto& responsesObj = obj.via.map.ptr[0].val;
-    if (responsesObj.type != msgpack::type::ARRAY || responsesObj.via.array.size == 0) return;
+    if (obj.type != msgpack::type::MAP) return;
+    // Before the responses, so a round with none still updates the set.
+    if (const auto capped = taosim::simulation::readCappedPairs(obj)) {
+        const auto split = taosim::simulation::splitCappedPairs(*capped, impl.bookIdBases, impl.bookCounts);
+        for (const auto& [simIdx, sim] : views::enumerate(sims)) {
+            sim->exchange()->setCappedPairs(split[simIdx]);
+        }
+    }
+    // The member named "responses", or the only member, as SimulationManager reads it.
+    const msgpack::object* responsesObj{};
+    for (const auto& [k, v] : obj.via.map) {
+        if (obj.via.map.size == 1 || (k.type == msgpack::type::STR && k.as<std::string_view>() == "responses")) {
+            responsesObj = &v;
+        }
+    }
+    if (responsesObj == nullptr) return;
+    if (responsesObj->type != msgpack::type::ARRAY || responsesObj->via.array.size == 0) return;
 
     std::vector<Message::Ptr> responses;
-    for (const auto& response : responsesObj.via.array) {
+    size_t refusedForDelay{};
+    for (const auto& response : responsesObj->via.array) {
         try {
             responses.push_back(unpackResponse(response));
+        } catch (const taosim::simulation::InstructionDelayRefused&) {
+            ++refusedForDelay;
         } catch (const std::exception& e) {
             fmt::println("Error unpacking a validator response: {}", e.what());
         }
+    }
+    if (refusedForDelay > 0) {
+        fmt::println(
+            "Refused {} validator instruction(s) delayed beyond maxInstructionDelay {}",
+            refusedForDelay, maxInstructionDelay);
     }
     for (const auto& response : responses) {
         const auto [msg, simIdx, unrouted] = decanonize(response, impl.bookIdBases, impl.bookCounts);
@@ -819,9 +844,9 @@ void MultiAssetSimulationOrchestrator::run()
         : uint64_t{};
 
     // Each worker thread drives a contiguous cohort of Simulations: per global step
-    // it steps every Simulation in its cohort in order, then meets the others at the
-    // barrier (sized to the worker count). The completion runs single-threaded once all
-    // have stepped, in the single-config manager's order: purge the filled orders, publish
+    // it steps every Simulation in its cohort in order and purges its filled orders, then
+    // meets the others at the barrier (sized to the worker count). The completion runs
+    // single-threaded once all have stepped, in the single-config manager's order: publish
     // the collective state to the validator (if enabled, past the grace period), clear
     // the per-step L3 log that publishing just consumed, then take a checkpoint (last, so
     // it captures the cleared step boundary — its writes run on the dedicated ckpt pool
@@ -836,10 +861,15 @@ void MultiAssetSimulationOrchestrator::run()
     std::signal(SIGTERM, onMultiAssetStopSignal);
     std::atomic_bool leaving{false};
     bool stoppedOnFailure{false};
+    // Each realization's part of the published state, packed by its own worker once it has stepped, so the
+    // completion only joins them instead of packing every realization on one thread while the others wait.
+    std::vector<taosim::serialization::HumanReadableStream> packed(sims.size());
+    // A part that failed to pack skips that step's publish, as a failure inside publishState always has.
+    std::atomic_bool packFailed{false};
     boost::asio::thread_pool pool{alloc.workerCount};
     std::barrier barrier{
         static_cast<std::ptrdiff_t>(alloc.workerCount),
-        [&sims, &impl, &leaving, &stoppedOnFailure, publish]() noexcept {
+        [&sims, &impl, &leaving, &stoppedOnFailure, &packed, &packFailed, publish]() noexcept {
             // A failed realization stops the run here, with nothing published or checkpointed for this
             // step, unless the run asked to go on without it and some realization is still stepping.
             if (const auto failures = static_cast<size_t>(std::ranges::count(impl.failed, uint8_t{1}))) {
@@ -860,10 +890,9 @@ void MultiAssetSimulationOrchestrator::run()
             // simulation run reads them, and publishing them left a consumed best level
             // at the head of the book, so the validator's midquote (and every miner's view
             // of the top levels) differed from the single-config run on the same events.
-            // The L3 record IS what publishing consumes, so that is cleared after.
-            for (const auto& sim : sims) {
-                sim->clearFilledOrders();
-            }
+            // The L3 record IS what publishing consumes, so that is cleared after. Each worker clears its own
+            // realizations before it arrives (below), in parallel, instead of this completion clearing all of
+            // them on one thread while the others wait.
             if (impl.config.traceTime) {
                 const auto total = clockOf(impl).time().current;
                 const auto secs = total / 1'000'000'000;
@@ -871,8 +900,28 @@ void MultiAssetSimulationOrchestrator::run()
                     secs / 3600, (secs / 60) % 60, secs % 60, total % 1'000'000'000);
             }
             if (publish && clockOf(impl).currentTimestamp() >= impl.config.gracePeriod) {
+                // A failed realization no longer steps, so its worker packs no part for it: pack it here, its
+                // ghosts cleared first, as this completion packed and cleared every realization before the
+                // workers took that over.
+                for (size_t i = 0; i < sims.size(); ++i) {
+                    if (!impl.failed[i]) continue;
+                    try {
+                        sims[i]->clearFilledOrders();
+                        packed[i] = taosim::serialization::HumanReadableStream{1uz << 22};
+                        msgpack::pack(packed[i], taosim::simulation::serialization::ValidatorRequest{
+                            .simulations = std::span{sims}.subspan(i, 1),
+                            .logDir = sims[i]->logDir()
+                        });
+                    } catch (const std::exception& e) {
+                        fmt::println("publishState error (continuing): {}", e.what());
+                        packFailed.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
+            if (publish && clockOf(impl).currentTimestamp() >= impl.config.gracePeriod
+                && !packFailed.exchange(false)) {
                 try {
-                    publishState(impl);
+                    publishState(impl, packed);
                 } catch (const std::exception& e) {
                     fmt::println("publishState error (continuing): {}", e.what());
                 }
@@ -948,7 +997,27 @@ void MultiAssetSimulationOrchestrator::run()
                     }
                     for (uint64_t s = 0; s < stepCount; ++s) {
                         for (uint32_t idx = begin; idx < end; ++idx) {
-                            isolate(idx, [](Simulation& sim) { sim.step(); });
+                            isolate(idx, [](Simulation& sim) {
+                                sim.step();
+                                sim.clearFilledOrders();  // before the barrier, so before publishing
+                            });
+                            // The completion publishes on the same condition; the grid is shared. A failed
+                            // realization's part is packed by the completion.
+                            const auto& sim = sims[idx];
+                            if (!impl.failed[idx] && publish && sim->currentTimestamp() >= impl.config.gracePeriod) {
+                                // Caught here, not by isolate: a part that cannot be packed skips this step's
+                                // publish and does not fail the realization.
+                                try {
+                                    packed[idx] = taosim::serialization::HumanReadableStream{1uz << 22};
+                                    msgpack::pack(packed[idx], taosim::simulation::serialization::ValidatorRequest{
+                                        .simulations = std::span{sims}.subspan(idx, 1),
+                                        .logDir = sim->logDir()
+                                    });
+                                } catch (const std::exception& e) {
+                                    fmt::println("publishState error (continuing): {}", e.what());
+                                    packFailed.store(true, std::memory_order_relaxed);
+                                }
+                            }
                         }
                         barrier.arrive_and_wait();
                         if (leaving.load(std::memory_order_acquire)) break;

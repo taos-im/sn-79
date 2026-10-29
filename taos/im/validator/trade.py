@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import traceback
 from collections import defaultdict, deque
@@ -10,12 +12,12 @@ from typing import TYPE_CHECKING
 import bittensor as bt
 
 from taos.im.protocol.models import TradeInfo
-from taos.im.protocol.events import TradeEvent, trade_event_from_wire
+from taos.im.protocol.events import trade_event_from_wire
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.config import debeta_dial
 from taos.im.validator.debeta import (
-    _hadd2, accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
-    flush_capture_state,
+    _hadd1, _hadd2, accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
+    drop_uid_from_pending, flush_capture_state,
     prune_hist_2level, prune_hist_1level, shift_hist_2level, shift_hist_1level,
 )
 
@@ -117,6 +119,149 @@ def accumulate_at_best(self, uid_item, books, accounts_uid, ts=None):
             if ts is not None:
                 _hadd2(self.debeta_at_best_hist, uid_item, book_id, ts, 1.0)
                 _hadd2(self.debeta_best_size_hist, uid_item, book_id, ts, size)
+
+
+# The conjunction (0.6.6): each miner's two-sided resting presence near the touch, per uid and book, with the farm
+# reference per book (what a quote at the gate's size on both sides would score). Windowed on the kappa lookback,
+# pruned, shifted, persisted and reset with the other de-beta accumulators; published per miner and per class, never
+# paid. The per-book references (a running mean of the quoted spread in bps of the mid, and of the fill size) and the
+# previous state's time are working state: not persisted, they warm again from the first states after a start.
+CONJUNCTION_STATE = ("debeta_conj", "debeta_conj_hist", "debeta_conj_farm", "debeta_conj_farm_hist")
+CONJ_REF_WEIGHT = 1.0 / 64.0
+CONJ_MAX_INTERVAL_S = 60.0
+CONJ_FALLBACK_BOUND = 5.0
+
+
+def init_conjunction_state(self):
+    if not hasattr(self, 'debeta_conj'):
+        self.debeta_conj = defaultdict(lambda: defaultdict(float))
+    if not hasattr(self, 'debeta_conj_farm'):
+        self.debeta_conj_farm = defaultdict(float)
+    for _name in ('debeta_conj_hist', 'debeta_conj_farm_hist', 'debeta_conj_ref', 'debeta_conj_clock'):
+        if not hasattr(self, _name):
+            setattr(self, _name, {})
+
+
+def conjunction_interval(self, ts):
+    """Seconds since the previous state, capped, and 0 for the first state this process sees."""
+    clock = getattr(self, 'debeta_conj_clock', None)
+    if not isinstance(clock, dict):
+        clock = self.debeta_conj_clock = {}
+    prev = clock.get('prev')
+    clock['prev'] = int(ts)
+    if not isinstance(prev, (int, float)) or int(ts) <= int(prev):
+        return 0.0
+    return min((int(ts) - int(prev)) / 1e9, CONJ_MAX_INTERVAL_S)
+
+
+def _conj_touch(book):
+    bb = _level_price(book.get('b') if isinstance(book, dict) else getattr(book, 'b', None))
+    ba = _level_price(book.get('a') if isinstance(book, dict) else getattr(book, 'a', None))
+    if bb is None or ba is None or ba <= bb:
+        return None
+    return bb, ba, 0.5 * (bb + ba)
+
+
+def conjunction_book_refs(self, book_id, book, trades):
+    """One state's update of the book's references: the quoted spread in bps of the mid when the book has a bid and an
+    ask that do not cross, and the size of each fill; the first sample sets each, then a running mean."""
+    ref = self.debeta_conj_ref.get(book_id)
+    spread, size = (ref if ref else (None, None))
+    touch = _conj_touch(book)
+    if touch is not None:
+        s = (touch[1] - touch[0]) / touch[2] * 1e4
+        spread = s if spread is None else spread + CONJ_REF_WEIGHT * (s - spread)
+    for t in trades or ():
+        q = float((t.get('q') if isinstance(t, dict) else getattr(t, 'q', 0.0)) or 0.0)
+        if q > 0.0:
+            size = q if size is None else size + CONJ_REF_WEIGHT * (q - size)
+    if spread is not None or size is not None:
+        self.debeta_conj_ref[book_id] = (spread, size)
+
+
+def _conj_dials(self):
+    """The bound per class name from 'name:bound' pairs, and the size gate."""
+    dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
+    bounds = {}
+    for part in str(debeta_dial(dcfg, 'conjunction_bounds')).split(','):
+        name, _, value = part.partition(':')
+        try:
+            bounds[name.strip()] = float(value)
+        except ValueError:
+            continue
+    frac = float(debeta_dial(dcfg, 'conjunction_min_size_frac'))
+    return bounds, frac
+
+
+def _class_name(self, cls):
+    """The asset class's name for a class index on the running layout, None when there is no layout."""
+    try:
+        classes = self.simulation.asset_classes()
+        return str(classes[int(cls)].name)
+    except Exception:
+        return None
+
+
+def _conj_band(self, book_id, book):
+    """(mid, low, high, gate) for a book this state, or None when it has no two-sided touch or no references."""
+    touch = _conj_touch(book)
+    ref = self.debeta_conj_ref.get(book_id)
+    if touch is None or not ref or ref[0] is None or ref[1] is None:
+        return None
+    bounds, frac = _conj_dials(self)
+    cls = class_of_book(self, book_id)
+    b = bounds.get(_class_name(self, cls), CONJ_FALLBACK_BOUND) if cls is not None else CONJ_FALLBACK_BOUND
+    width = b * ref[0] / 1e4 * touch[2]
+    return touch[2], touch[2] - width, touch[2] + width, frac * ref[1]
+
+
+def accumulate_conjunction(self, uid_item, books, accounts_uid, dt, ts=None):
+    """One state: on each book, the uid's resting buy volume at or above the band's low edge and sell volume at or
+    below its high edge; when both reach the gate, the smaller of the two times the interval is its presence."""
+    if not dt:
+        return
+    for book_id, account in (accounts_uid or {}).items():
+        book = books.get(book_id) if isinstance(books, dict) else None
+        if book is None:
+            continue
+        orders = (account.get('o') if isinstance(account, dict) else getattr(account, 'o', None)) or []
+        if not orders:
+            continue
+        band = _conj_band(self, book_id, book)
+        if band is None:
+            continue
+        _mid, low, high, gate = band
+        bid = ask = 0.0
+        for o in orders:
+            p = o.get('p') if isinstance(o, dict) else getattr(o, 'p', None)
+            if p is None:
+                continue
+            s = int(o.get('s') if isinstance(o, dict) else getattr(o, 's'))
+            q = float((o.get('q') if isinstance(o, dict) else getattr(o, 'q')) or 0.0)
+            if s == 0 and float(p) >= low:
+                bid += q
+            elif s == 1 and float(p) <= high:
+                ask += q
+        if bid >= gate and ask >= gate and min(bid, ask) > 0.0:
+            val = min(bid, ask) * float(dt)
+            self.debeta_conj[uid_item][book_id] = self.debeta_conj[uid_item].get(book_id, 0.0) + val
+            if ts is not None:
+                _hadd2(self.debeta_conj_hist, uid_item, book_id, ts, val)
+
+
+def accumulate_conjunction_farm(self, books, dt, ts=None):
+    """One state: on each book with a band, the gate's size times the interval, what a quote at the gate's size on
+    both sides would score."""
+    if not dt:
+        return
+    for book_id, book in (books or {}).items():
+        band = _conj_band(self, book_id, book)
+        if band is None:
+            continue
+        val = band[3] * float(dt)
+        self.debeta_conj_farm[book_id] = self.debeta_conj_farm.get(book_id, 0.0) + val
+        if ts is not None:
+            _hadd1(self.debeta_conj_farm_hist, book_id, ts, val)
 
 
 def init_alt_mark_state(self):
@@ -594,6 +739,8 @@ def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timesta
         }
         if hasattr(self, 'debeta_at_best'):
             accumulate_at_best(self, uid_item, books, accounts_uid, ts=sampled_timestamp)
+        if hasattr(self, 'debeta_conj'):
+            accumulate_conjunction(self, uid_item, books, accounts_uid, dt=self._conj_dt, ts=sampled_timestamp)
     else:
         current_inventory = {book_id: 0.0 for book_id in books}
     # The first, the previous and the newest entry, whether or not the uid has an account this update.
@@ -708,7 +855,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     if _debeta_on:
         # Running SUMS (what the score reads).
         for _name in ('capture_buy_sums', 'capture_sell_sums', 'realized_buy_sums', 'realized_sell_sums', 'debeta_mtm', 'debeta_invsum',
-                      'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional'):
+                      'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional',
+                      'capture_taker_buy_sums', 'capture_taker_sell_sums'):
             if not hasattr(self, _name):
                 setattr(self, _name, defaultdict(lambda: defaultdict(float)))
         if not hasattr(self, 'debeta_inv'):
@@ -720,6 +868,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             self.debeta_mark_state = {}  # STATE (M1 rolling settlement-mark window; re-based at boundary, not persisted)
         init_alt_mark_state(self)
         init_liquidity_state(self)
+        init_conjunction_state(self)
         if not hasattr(self, 'debeta_capture_mid'):
             # STATE {book: rolling print window + pending fills}: carries the capture mid ACROSS
             # state updates (median 4 prints/update live, so a batch-local mid degrades to the batch
@@ -745,7 +894,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         # sim boundary exactly like trade_volumes. Invariant: running == sum(history within window).
         for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist',
                       'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist',
-                      'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist'):
+                      'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist',
+                      'debeta_captkbuy_hist', 'debeta_captksell_hist'):
             if not hasattr(self, _name):
                 setattr(self, _name, {})
 
@@ -759,9 +909,12 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             self._debeta_seen_tids = {}  # {trade_id: ts} carried + windowed-pruned; redelivery dedupe
         _et_batches = et_book_batches(notices, self._debeta_seen_tids, sampled_timestamp)
 
+    _conj_dt = conjunction_interval(self, timestamp) if _debeta_on else 0.0
+    self._conj_dt = _conj_dt
     for bookId, book in books.items():
         trades = [event for event in book.get('e', []) if event['y'] == 't']
         if _debeta_on:
+            conjunction_book_refs(self, bookId, book, trades)
             # sim: the book 't' events; exchange: the ET batch for this book (same accumulators). Never
             # both, so a fill is not double-counted between the parallel 't' copy and the ET notice.
             de_trades = _et_batches.get(bookId, []) if _debeta_exchange else trades
@@ -774,6 +927,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
                     horizon_ns=_realized_ns, now_ns=timestamp,
                     min_size=_min_order_size(self, bookId), fee_weight=_fee_w, market_votes=_market_votes,
+                    taker=(self.capture_taker_buy_sums, self.capture_taker_sell_sums, self.debeta_captkbuy_hist, self.debeta_captksell_hist),
                 )
                 accumulate_book_mtm(
                     self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
@@ -812,6 +966,9 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             ])
             del recent_trades_book[:-25]
 
+    if _debeta_on:
+        accumulate_conjunction_farm(self, books, dt=_conj_dt, ts=sampled_timestamp)
+
     # A book with no fills this update never reaches accumulate_book_capture, so drain its stale
     # pending capture fills here (bounded lag: a fill waits at most CAPTURE_FLUSH_NS for its
     # forward window, then finalizes truncated).
@@ -821,7 +978,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                             sell_hist=self.debeta_capsell_hist, ts=sampled_timestamp,
                             real_buy_sums=self.realized_buy_sums, real_sell_sums=self.realized_sell_sums,
                             real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
-                            horizon_ns=_realized_ns, now_ns=timestamp, fee_weight=_fee_w)
+                            horizon_ns=_realized_ns, now_ns=timestamp, fee_weight=_fee_w,
+                            taker=(self.capture_taker_buy_sums, self.capture_taker_sell_sums, self.debeta_captkbuy_hist, self.debeta_captksell_hist),)
 
     # De-beta live prune. BOTH legs share ONE window, the kappa lookback. Pruning making on the
     # 24h volume-assessment window, each leg inheriting the retention of the legacy leg it
@@ -837,6 +995,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         prune_hist_2level(self.debeta_capsell_hist, self.capture_sell_sums, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_realbuy_hist, self.realized_buy_sums, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_realsell_hist, self.realized_sell_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_captkbuy_hist, self.capture_taker_buy_sums, _debeta_prune_threshold)
+        prune_hist_2level(self.debeta_captksell_hist, self.capture_taker_sell_sums, _debeta_prune_threshold)
         prune_hist_2level(self.debeta_cp_hist, self.debeta_cp, _debeta_prune_threshold)
         for _c, _h in (getattr(self, 'debeta_cpc_hist', None) or {}).items():
             prune_hist_2level(_h, self.debeta_cpc.setdefault(_c, {}), _debeta_prune_threshold)
@@ -858,6 +1018,9 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             prune_hist_2level(self.debeta_maker_sell_notional_hist, self.debeta_maker_sell_notional, _debeta_prune_threshold)
             prune_hist_2level(self.debeta_at_best_hist, self.debeta_at_best, _debeta_prune_threshold)
             prune_hist_2level(self.debeta_best_size_hist, self.debeta_best_size, _debeta_prune_threshold)
+        if hasattr(self, 'debeta_conj_hist'):
+            prune_hist_2level(self.debeta_conj_hist, self.debeta_conj, _debeta_prune_threshold)
+            prune_hist_1level(self.debeta_conj_farm_hist, self.debeta_conj_farm, _debeta_prune_threshold)
         if hasattr(self, '_debeta_seen_tids'):  # bound the exchange dedup ledger to the same window
             self._debeta_seen_tids = {k: v for k, v in self._debeta_seen_tids.items()
                                       if v >= _debeta_prune_threshold}
@@ -1017,11 +1180,190 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s ({uid_count} UIDs)")
 
 
+# A class's market across two runs: every field of its configuration, the price process
+# and the agents included, but the run's own bookkeeping, so any change of the market clears its books' records.
+_MARKET_EXCLUDE = frozenset(("simulation_id", "logDir", "remoteAgentCount", "block_count", "duration", "grace_period",
+                             "publish_interval", "log_window", "books_per_block", "book_count", "classes",
+                             "book_levels", "detailed_book_levels"))
+
+
+def _market_digest(cfg):
+    dump = getattr(cfg, 'model_dump', None)
+    if not callable(dump):
+        return cfg.label() if callable(getattr(cfg, 'label', None)) else str(cfg)
+    fields = {k: v for k, v in dump().items() if k not in _MARKET_EXCLUDE}
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _book_signature(sim, book_id):
+    """What makes a book the same market across two layouts: its class's name and its whole market configuration
+    (the price process, the agents, the grids, the fees), its decimals and its minimum order size."""
+    cls = None
+    for c in (sim.asset_classes() if hasattr(sim, 'asset_classes') else []):
+        if c.books and c.books[0] <= book_id <= c.books[-1]:
+            cls = c
+            break
+    cfg = cls.config if cls is not None else sim.config_for_book(book_id)
+    return (getattr(cls, 'name', 'market'), _market_digest(cfg),
+            getattr(cfg, 'priceDecimals', None), getattr(cfg, 'volumeDecimals', None),
+            getattr(cfg, 'min_order_size', None))
+
+
+def layout_book_changes(old_sim, new_sim) -> dict:
+    """The disposition of every book at a run boundary whose layout may differ from the one scored before it (0.6.6
+    row 64): ``{"books": {id: "keep" | "clear" | "drop" | "new"}, "classes": [class indices whose pool restarts]}``.
+    A book keeps its histories when its class signature is the same market in both layouts; it starts fresh
+    ("clear") when its class or instrument changed; a book the new layout no longer has is dropped; a book the old
+    one did not have is new. A class whose book set holds anything but kept books restarts its class pool. With no
+    old layout there is nothing to compare and nothing changes."""
+    if old_sim is None or new_sim is None:
+        return {"books": {}, "classes": []}
+    try:
+        old_ids = [int(b) for b in old_sim.book_ids]
+        new_ids = [int(b) for b in new_sim.book_ids]
+        old_sig = {b: _book_signature(old_sim, b) for b in old_ids}
+        new_sig = {b: _book_signature(new_sim, b) for b in new_ids}
+    except (AttributeError, KeyError, TypeError):
+        # a configuration without the layout surface (single-market stubs, older configs): nothing to compare
+        return {"books": {}, "classes": []}
+    books = {}
+    for b in new_ids:
+        if b not in old_sig:
+            books[b] = "new"
+        else:
+            books[b] = "keep" if new_sig[b] == old_sig[b] else "clear"
+    for b in old_ids:
+        if b not in books:
+            books[b] = "drop"
+    classes = []
+    for i, c in enumerate(new_sim.asset_classes() if hasattr(new_sim, 'asset_classes') else []):
+        if any(books.get(int(b)) != "keep" for b in c.books):
+            classes.append(i)
+    return {"books": books, "classes": classes, "names_old": _class_names(old_sim), "names_new": _class_names(new_sim)}
+
+
+def _class_names(sim):
+    try:
+        return [str(c.name) for c in sim.asset_classes()]
+    except (AttributeError, TypeError):
+        return []
+
+
+def begin_class_handover(self, book_changes, start_ts, span):
+    """At a run boundary that changes the layout or a class's market: each class's
+    end-of-run making and skill shares, by class name, are carried into the new run and blended into the shares it
+    earns there over one lookback; a class new to the layout ramps its weight in over the same span. The books'
+    records follow the change map; the standing follows the class."""
+    names_old = list(book_changes.get("names_old") or [])
+    names_new = list(book_changes.get("names_new") or [])
+    vectors = getattr(self, "_debeta_class_vectors", None) or {}
+    carried = {n: {"making": {int(u): float(x) for u, x in (v.get("making") or {}).items()},
+                   "skill": {int(u): float(x) for u, x in (v.get("skill") or {}).items()}}
+               for n, v in vectors.items() if n in names_new}
+    self._debeta_handover = {"start": int(start_ts), "span": int(span), "carried": carried,
+                             "new": [n for n in names_new if n not in names_old]}
+
+
+_TWO_LEVEL_HISTS = (
+    ("debeta_capbuy_hist", "capture_buy_sums"), ("debeta_capsell_hist", "capture_sell_sums"),
+    ("debeta_realbuy_hist", "realized_buy_sums"), ("debeta_realsell_hist", "realized_sell_sums"),
+    ("debeta_captkbuy_hist", "capture_taker_buy_sums"), ("debeta_captksell_hist", "capture_taker_sell_sums"),
+    ("debeta_mtm_hist", "debeta_mtm"), ("debeta_invsum_hist", "debeta_invsum"),
+    ("debeta_heldn_hist", "debeta_heldn"), ("debeta_heldinv_hist", "debeta_heldinv"),
+    ("debeta_helddrift_hist", "debeta_helddrift"), ("debeta_notional_hist", "debeta_notional"),
+    ("debeta_mtm_alt_hist", "debeta_mtm_alt"), ("debeta_invsum_alt_hist", "debeta_invsum_alt"),
+    ("debeta_maker_buy_notional_hist", "debeta_maker_buy_notional"),
+    ("debeta_maker_sell_notional_hist", "debeta_maker_sell_notional"),
+    ("debeta_at_best_hist", "debeta_at_best"), ("debeta_best_size_hist", "debeta_best_size"),
+    ("debeta_conj_hist", "debeta_conj"),
+)
+_ONE_LEVEL_HISTS = (
+    ("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift"),
+    ("debeta_invn_alt_hist", "debeta_invn_alt"), ("debeta_drift_alt_hist", "debeta_drift_alt"),
+    ("debeta_conj_farm_hist", "debeta_conj_farm"),
+)
+
+
+def strip_books_at_boundary(self, reset_books, reset_classes, log=None):
+    """Remove the given books from every book-keyed history and running sum, and restart the given classes' pools:
+    the part of a run change that a layout change adds (row 64). Runs before the shift, so what is shifted is what
+    the new layout keeps."""
+    _log = log or (lambda m: None)
+    reset_books = {int(b) for b in reset_books}
+    if not reset_books and not reset_classes:
+        return
+    _log(f"Layout change at the boundary: {len(reset_books)} book(s) start fresh or are dropped, "
+         f"{len(reset_classes)} class pool(s) restart")
+    for vols in (getattr(self, 'trade_volumes', None), getattr(self, 'roundtrip_volumes', None)):
+        if vols is None:
+            continue
+        for uid in list(vols.keys()):
+            for b in reset_books:
+                if b in vols[uid]:
+                    del vols[uid][b]
+    for name in ('volume_sums', 'maker_volume_sums', 'taker_volume_sums', 'self_volume_sums', 'roundtrip_volume_sums'):
+        sums = getattr(self, name, None)
+        if sums is None:
+            continue
+        for uid in list(sums.keys()):
+            for b in reset_books:
+                if b in sums[uid]:
+                    sums[uid][b] = 0.0
+    pnl = getattr(self, 'realized_pnl_history', None)
+    if pnl is not None:
+        for uid in list(pnl.keys()):
+            for ts in list(pnl[uid].keys()):
+                books = pnl[uid][ts]
+                for b in reset_books:
+                    if b in books:
+                        del books[b]
+                if not books:
+                    del pnl[uid][ts]
+    for hist_name, sum_name in _TWO_LEVEL_HISTS:
+        hist, running = getattr(self, hist_name, None), getattr(self, sum_name, None)
+        if hist is None:
+            continue
+        for uid in list(hist.keys()):
+            for b in reset_books:
+                hist[uid].pop(b, None)
+                if running is not None and uid in running:
+                    running[uid].pop(b, None)
+    for hist_name, sum_name in _ONE_LEVEL_HISTS:
+        hist, running = getattr(self, hist_name, None), getattr(self, sum_name, None)
+        if hist is None:
+            continue
+        for b in reset_books:
+            hist.pop(b, None)
+            if running is not None:
+                running.pop(b, None)
+    # the pending capture state is flushed into the histories at the boundary: a reset book's goes with it, as do the
+    # per-book marks and inventories the shift resets anyway
+    for name in ('debeta_capture_mid', 'debeta_pfirst', 'debeta_plast', 'debeta_mark_state',
+                 'debeta_pfirst_alt', 'debeta_plast_alt', 'debeta_mark_state_alt', 'debeta_inv', 'debeta_inv_alt',
+                 'debeta_conj_ref'):
+        d = getattr(self, name, None)
+        if not isinstance(d, dict):
+            continue
+        for key in list(d.keys()):
+            book = key[1] if isinstance(key, tuple) and len(key) == 2 else key
+            if isinstance(book, int) and book in reset_books:
+                del d[key]
+            elif isinstance(d[key], dict) and name in ('debeta_inv', 'debeta_inv_alt'):
+                for b in reset_books:
+                    d[key].pop(b, None)
+    cpc_hist, cpc = getattr(self, 'debeta_cpc_hist', None), getattr(self, 'debeta_cpc', None)
+    for c in reset_classes:
+        if cpc_hist is not None and c in cpc_hist:
+            cpc_hist[c] = {}
+        if cpc is not None and c in cpc:
+            cpc[c] = {}
+
+
 def shift_simulation_histories(
     self, old_ts: int, new_ts: int, *,
     book_count: int, volume_decimals: int, lookback: int,
     volume_assessment_period: int, miner_wealth, effective_max_uids: int,
-    log=None, book_ids=None,
+    log=None, book_ids=None, book_changes=None,
 ):
     """Shift every history structure from the old simulation's time base to the
     new one on a simulation restart, pruning entries that fall outside the
@@ -1050,6 +1392,13 @@ def shift_simulation_histories(
     init_liquidity_state(self)
     _log = log or (lambda m: None)
     book_ids = list(book_ids) if book_ids is not None else list(range(book_count))
+    # a layout change between the runs (row 64): the books that changed market or vanished leave every structure
+    # before the shift, so what is shifted is what the new layout keeps; the shadow receives the same map
+    if book_changes:
+        _bk = book_changes.get("books", {}) or {}
+        strip_books_at_boundary(self, {b for b, d in _bk.items() if d in ("clear", "drop")},
+                                list(book_changes.get("classes", []) or []), log=_log)
+        begin_class_handover(self, book_changes, new_ts, lookback)
     new_threshold = new_ts - lookback
     new_volume_threshold = new_ts - volume_assessment_period
 
@@ -1196,6 +1545,7 @@ def shift_simulation_histories(
                                 sell_hist=self.debeta_capsell_hist, ts=old_ts, force=True,
                                 real_buy_sums=getattr(self, 'realized_buy_sums', None), real_sell_sums=getattr(self, 'realized_sell_sums', None),
                                 real_buy_hist=getattr(self, 'debeta_realbuy_hist', None), real_sell_hist=getattr(self, 'debeta_realsell_hist', None),
+                                taker=_taker_pair(self),
                                 fee_weight=float(getattr(getattr(getattr(self, 'config', None), 'scoring', None) and
                                                          self.config.scoring.debeta, 'making_fee_weight', 0.0) or 0.0))
             self.debeta_capture_mid = {}
@@ -1204,6 +1554,9 @@ def shift_simulation_histories(
         if getattr(self, 'debeta_realbuy_hist', None) is not None:
             shift_hist_2level(self.debeta_realbuy_hist, self.realized_buy_sums, old_ts, new_ts, new_threshold)
             shift_hist_2level(self.debeta_realsell_hist, self.realized_sell_sums, old_ts, new_ts, new_threshold)
+        if getattr(self, 'debeta_captkbuy_hist', None) is not None:
+            shift_hist_2level(self.debeta_captkbuy_hist, self.capture_taker_buy_sums, old_ts, new_ts, new_threshold)
+            shift_hist_2level(self.debeta_captksell_hist, self.capture_taker_sell_sums, old_ts, new_ts, new_threshold)
         shift_hist_2level(self.debeta_cp_hist, self.debeta_cp, old_ts, new_ts, new_threshold)
         for _c, _h in (getattr(self, 'debeta_cpc_hist', None) or {}).items():
             shift_hist_2level(_h, self.debeta_cpc.setdefault(_c, {}), old_ts, new_ts, new_threshold)
@@ -1225,6 +1578,9 @@ def shift_simulation_histories(
             shift_hist_2level(self.debeta_maker_sell_notional_hist, self.debeta_maker_sell_notional, old_ts, new_ts, new_threshold)
             shift_hist_2level(self.debeta_at_best_hist, self.debeta_at_best, old_ts, new_ts, new_threshold)
             shift_hist_2level(self.debeta_best_size_hist, self.debeta_best_size, old_ts, new_ts, new_threshold)
+        if hasattr(self, 'debeta_conj_hist'):
+            shift_hist_2level(self.debeta_conj_hist, self.debeta_conj, old_ts, new_ts, new_threshold)
+            shift_hist_1level(self.debeta_conj_farm_hist, self.debeta_conj_farm, old_ts, new_ts, new_threshold)
         # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
         self.debeta_inv = defaultdict(lambda: defaultdict(float))
         self.debeta_pfirst = {}
@@ -1250,6 +1606,21 @@ def shift_simulation_histories(
         uid: {bookId: [] for bookId in book_ids}
         for uid in range(effective_max_uids)
     }
+    # every per-book set follows the new layout's books: the legacy factor sets keep a uid's
+    # value on a book the new layout still has and start a new book at their initial value, and the initial balances,
+    # rebuilt above, are published again for the new run
+    for _name, _init in (('activity_factors', 0.0), ('pnl_factors', 1.0)):
+        _old = getattr(self, _name, None)
+        if isinstance(_old, dict):
+            setattr(self, _name, {uid: {b: (_old.get(uid) or {}).get(b, _init) for b in book_ids}
+                                  for uid in range(effective_max_uids)})
+    for _uid, _kv in (getattr(self, 'kappa_values', None) or {}).items():
+        if isinstance(_kv, dict):
+            for _key in ('books', 'books_weighted'):
+                if isinstance(_kv.get(_key), dict):
+                    _kv[_key] = {b: _kv[_key].get(b) for b in book_ids}
+    if isinstance(getattr(self, 'initial_balances_published', None), dict):
+        self.initial_balances_published = {uid: False for uid in range(effective_max_uids)}
 
 
 def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inventory_correction=None) -> int:
@@ -1286,10 +1657,12 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
     tolerance = 600_000_000_000
     limit = int(now) + tolerance
     two_level = ("debeta_mtm_hist", "debeta_invsum_hist", "debeta_capbuy_hist", "debeta_capsell_hist",
-                 "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
+                 "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_captkbuy_hist", "debeta_captksell_hist",
+                 "debeta_cp_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
                  "debeta_notional_hist", "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
-                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist")
-    one_level = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist")
+                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
+                 "debeta_conj_hist")
+    one_level = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist")
     other = ("realized_pnl_history", "inventory_history", "trade_volumes", "roundtrip_volumes")
 
     def stamps(d):
@@ -1354,13 +1727,15 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
     running = (("debeta_mtm_hist", "debeta_mtm"), ("debeta_invsum_hist", "debeta_invsum"),
                ("debeta_capbuy_hist", "capture_buy_sums"), ("debeta_capsell_hist", "capture_sell_sums"),
                ("debeta_realbuy_hist", "realized_buy_sums"), ("debeta_realsell_hist", "realized_sell_sums"),
+               ("debeta_captkbuy_hist", "capture_taker_buy_sums"), ("debeta_captksell_hist", "capture_taker_sell_sums"),
                ("debeta_cp_hist", "debeta_cp"), ("debeta_heldn_hist", "debeta_heldn"),
                ("debeta_heldinv_hist", "debeta_heldinv"), ("debeta_helddrift_hist", "debeta_helddrift"),
                ("debeta_notional_hist", "debeta_notional"),
                ("debeta_mtm_alt_hist", "debeta_mtm_alt"), ("debeta_invsum_alt_hist", "debeta_invsum_alt"),
                ("debeta_maker_buy_notional_hist", "debeta_maker_buy_notional"),
                ("debeta_maker_sell_notional_hist", "debeta_maker_sell_notional"),
-               ("debeta_at_best_hist", "debeta_at_best"), ("debeta_best_size_hist", "debeta_best_size"))
+               ("debeta_at_best_hist", "debeta_at_best"), ("debeta_best_size_hist", "debeta_best_size"),
+               ("debeta_conj_hist", "debeta_conj"))
     for hist_name, sum_name in running:
         sums = sum_hist_2level(getattr(self, hist_name, None) or {})
         setattr(self, sum_name, defaultdict(lambda: defaultdict(float), {u: defaultdict(float, b) for u, b in sums.items()}))
@@ -1376,7 +1751,8 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
                 del _h[k1]
         self.debeta_cpc[_c] = sum_hist_2level(_h)
     for hist_name, sum_name in (("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift"),
-                                ("debeta_invn_alt_hist", "debeta_invn_alt"), ("debeta_drift_alt_hist", "debeta_drift_alt")):
+                                ("debeta_invn_alt_hist", "debeta_invn_alt"), ("debeta_drift_alt_hist", "debeta_drift_alt"),
+                                ("debeta_conj_farm_hist", "debeta_conj_farm")):
         setattr(self, sum_name, defaultdict(float, sum_hist_1level(getattr(self, hist_name, None) or {})))
     inv = getattr(self, "debeta_inv", None)
     inv_note = ""
@@ -1436,7 +1812,9 @@ def missed_run_change(previous_ts, incoming_ts, *, fresh_threshold) -> bool:
 def history_clock_health(self) -> dict:
     """What a dashboard needs to see a run change that was not applied: how far the furthest de-beta stamp sits
     ahead of the clock (0 when clean; every book's history carries the same stamps, so the per-book inventory
-    history is the sentinel), and the counters of the two repairs."""
+    history is the sentinel), and the counters of the two repairs. A resume to an engine checkpoint is counted
+    apart: reloaded from the validator's snapshot there, or re-opened without one (the replayed stretch then counts
+    twice in every window and the positions held at the checkpoint are reset)."""
     now = int(getattr(self, "simulation_timestamp", 0) or 0)
     ahead = 0
     for tsd in (getattr(self, "debeta_invn_hist", None) or {}).values():
@@ -1448,7 +1826,17 @@ def history_clock_health(self) -> dict:
         "history_stamp_ahead_ns": int(ahead),
         "run_changes_recovered": int(getattr(self, "_run_changes_recovered", 0) or 0),
         "histories_rebased_at_load": int(getattr(self, "_histories_rebased_at_load", 0) or 0),
+        "resumes_restored": int(getattr(self, "_resumes_restored", 0) or 0),
+        "resumes_unrestored": int(getattr(self, "_resumes_unrestored", 0) or 0),
     }
+
+
+def _taker_pair(self):
+    """The taker-leg pair the captured basis also books into, or None when the validator carries none (a state saved
+    before 0.6.6); the making pool subtracts it from the captured pair."""
+    names = ('capture_taker_buy_sums', 'capture_taker_sell_sums', 'debeta_captkbuy_hist', 'debeta_captksell_hist')
+    parts = tuple(getattr(self, n, None) for n in names)
+    return None if any(p is None for p in parts) else parts
 
 
 def reset_agent_histories(self, uid: int, book_ids: list) -> None:
@@ -1498,19 +1886,30 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     # de-beta is enabled; getattr guards the off/shadow case).
     # uid-keyed running sums + their timestamped histories (invn/drift are book-keyed, not per-uid).
     for _n in ('capture_buy_sums', 'capture_sell_sums', 'realized_buy_sums', 'realized_sell_sums', 'debeta_mtm', 'debeta_invsum',
+               'capture_taker_buy_sums', 'capture_taker_sell_sums', 'debeta_captkbuy_hist', 'debeta_captksell_hist',
                'debeta_heldn', 'debeta_heldinv', 'debeta_helddrift', 'debeta_notional',
                'debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist', 'debeta_invsum_hist',
                'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist',
                'debeta_mtm_alt', 'debeta_invsum_alt', 'debeta_mtm_alt_hist', 'debeta_invsum_alt_hist',
                'debeta_maker_buy_notional', 'debeta_maker_sell_notional', 'debeta_at_best', 'debeta_best_size',
-               'debeta_maker_buy_notional_hist', 'debeta_maker_sell_notional_hist', 'debeta_at_best_hist', 'debeta_best_size_hist'):
+               'debeta_maker_buy_notional_hist', 'debeta_maker_sell_notional_hist', 'debeta_at_best_hist', 'debeta_best_size_hist',
+               'debeta_conj', 'debeta_conj_hist'):
         _d = getattr(self, _n, None)
         if _d is not None:
             _d.pop(uid, None)
+    # the run-boundary handover's carried shares and the classes' kept vectors lose the uid too (0.6.6)
+    for _vecs in ((getattr(self, '_debeta_class_vectors', None) or {}),
+                  ((getattr(self, '_debeta_handover', None) or {}).get('carried') or {})):
+        for _legs in _vecs.values():
+            for _leg in (_legs or {}).values():
+                if isinstance(_leg, dict):
+                    _leg.pop(uid, None)
     for _inv in (getattr(self, 'debeta_inv', None), getattr(self, 'debeta_inv_alt', None)):
         if _inv is not None:
             for _b in list(_inv.keys()):
                 _inv[_b].pop(uid, None)
+    # fills still queued for their mark settle after the reset, so the uid's side of each is dropped from the queues
+    drop_uid_from_pending(getattr(self, 'debeta_capture_mid', None), uid)
     clear_counterparty_rows(self, uid)    # UID as a maker AND as a counterparty of other makers, pooled and per class
     self.realized_pnl_history[uid] = {}
     if hasattr(self, 'agent_pnl_by_book'):

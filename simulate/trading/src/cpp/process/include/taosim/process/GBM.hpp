@@ -44,6 +44,7 @@ public:
 
     [[nodiscard]] auto&& state(this auto&& self) noexcept { return self.m_state; }
     [[nodiscard]] auto&& val(this auto&& self) noexcept { return self.m_value; }
+    [[nodiscard]] auto&& gaussian(this auto&& self) noexcept { return self.m_gaussian; }
 
     virtual double value() const override { return m_value; }
 

@@ -68,7 +68,8 @@ enum class OrderErrorCode : uint32_t
     INVALID_PRICE,
     EXCEEDING_MAX_ORDERS,
     DUAL_POSITION,
-    MINIMUM_ORDER_SIZE_VIOLATION
+    MINIMUM_ORDER_SIZE_VIOLATION,
+    VOLUME_CAP_REACHED
 };
 
 [[nodiscard]] constexpr std::string_view OrderErrorCode2StrView(OrderErrorCode ec) noexcept

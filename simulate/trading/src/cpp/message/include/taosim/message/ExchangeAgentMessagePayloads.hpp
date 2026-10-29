@@ -937,7 +937,9 @@ struct EventTradePayload : public MessagePayload
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(trade, context, bookId, clientOrderId, delegate, currency);
+    // isResting is kept so a trade restored from a checkpoint reaches the proxy's trade signal as its resting leg;
+    // a checkpoint written before it restores false, as every restored trade read before.
+    MSGPACK_DEFINE_MAP(trade, context, bookId, clientOrderId, delegate, currency, isResting);
 };
 
 //-------------------------------------------------------------------------

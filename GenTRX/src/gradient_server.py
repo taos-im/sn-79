@@ -255,6 +255,22 @@ def normalize_seed_checkpoint(
     return "current"
 
 
+def _aggregate_delta(agg, n_inputs: int):
+    """An aggregate as a dense delta, skipping the decompress round trip where it can be skipped.
+
+    aggregate() keeps every index, in position order, when it averages two or more gradients, so its values are the
+    dense tensors and need only a reshape (decompress would allocate and scatter a zero tensor per parameter). A lone
+    gradient comes back as it was sent, top-k and in magnitude order, and is decompressed."""
+    from GenTRX.src.gradient import GradientDelta, decompress
+
+    if n_inputs < 2:
+        return decompress(agg)
+    return GradientDelta(
+        delta={name: vals.reshape(shape) for name, (_indices, vals, shape) in agg.sparse.items()},
+        metadata=agg.metadata,
+    )
+
+
 class GradientAggregator:
     """Thread-safe gradient accumulator + periodic aggregation.
 
@@ -269,6 +285,11 @@ class GradientAggregator:
 
     # Default training window: 5 minutes of sim time
     DEFAULT_WINDOW_NS = 300_000_000_000
+
+    # Rollback-rate alarm: warn once a full window of recent rounds has rolled
+    # back at or above the threshold. A single noisy round stays quiet.
+    _ROLLBACK_RATE_WINDOW = 10
+    _ROLLBACK_RATE_THRESHOLD = 0.8
 
     def __init__(
         self,
@@ -583,12 +604,9 @@ class GradientAggregator:
         self._processed_grad_keys: set[str] = set()
         # Negative cache: keys that returned 404/error — skip until next round
         self._failed_grad_keys: set[str] = set()
-        # Per-miner boto3 S3 client cache. Constructing a boto3.client costs
-        # ~50-100 ms (TLS handshake, signer load, endpoint resolution); under
-        # the per-tick miner-gradient poll loop we'd otherwise build one per
-        # miner per tick. Keyed by (endpoint, bucket, access_key) so a miner
-        # rotating credentials yields a fresh client. Cleared on
-        # `_refresh_miner_buckets` when the bucket map changes.
+        # Per-miner boto3 S3 client cache. Building a boto3.client costs ~50-100 ms (TLS handshake, signer load,
+        # endpoint resolution), once per miner per gradient poll without it. Keyed by (endpoint, bucket, access
+        # key) so a rotated credential gets a fresh client; stale keys are evicted on `_refresh_miner_buckets`.
         self._miner_s3_clients: dict[tuple, Any] = {}
 
         # Price/volume scaling from simulator config (set from first state packet)
@@ -880,28 +898,33 @@ class GradientAggregator:
         Returns None if data is not ready yet (PENDING state).
         Returns the assignment dict when state is DATA_READY.
         Also transitions to DELIVERED and stamps `_delivered_at`.
+
+        Thread safety: the create-then-transition block runs under `_assignments_lock`, so a concurrent
+        `_create_round_assignments`, `_check_data_readiness` or second `get_assignment` cannot interleave
+        check-then-act on the same uid. Page resolution stays inside it, so PENDING -> DATA_READY is atomic.
         """
-        a = self._assignments.get(miner_uid)
+        with self._assignments_lock:
+            a = self._assignments.get(miner_uid)
 
-        # Create on demand if no assignment exists for this UID
-        if a is None or a.get("round") != self._agg_round:
-            self._create_assignment_for(miner_uid)
+            # Create on demand if no assignment exists for this UID
+            if a is None or a.get("round") != self._agg_round:
+                self._create_assignment_for(miner_uid)
 
-        # Retry page resolution for an assignment still waiting on data.
-        a = self._assignments.get(miner_uid)
-        if a is not None and a.get("_state") == "PENDING":
-            self._apply_pages(a, miner_uid)
+            # Retry page resolution for an assignment still waiting on data.
+            a = self._assignments.get(miner_uid)
+            if a is not None and a.get("_state") == "PENDING":
+                self._apply_pages(a, miner_uid)
 
-        a = self._assignments.get(miner_uid)
-        if a is None:
-            return None
-        if a.get("_state") != "DATA_READY":
-            return None
+            a = self._assignments.get(miner_uid)
+            if a is None:
+                return None
+            if a.get("_state") != "DATA_READY":
+                return None
 
-        # Transition to DELIVERED, stamp the delivery time. Used by the
-        # heartbeat-loss fallback in _round_complete.
-        a["_state"] = "DELIVERED"
-        a["_delivered_at"] = time.time()
+            # Transition to DELIVERED, stamp the delivery time. Used by the
+            # heartbeat-loss fallback in _round_complete.
+            a["_state"] = "DELIVERED"
+            a["_delivered_at"] = time.time()
         logger.info(
             "[GTX] Assignment delivered: miner=%d round=%d books=%s ts=[%d,%d] data=%d files",
             miner_uid,
@@ -1044,17 +1067,21 @@ class GradientAggregator:
         # empty-cache cooldown so this is cheap even when none have committed.
         self._refresh_miner_buckets()
         n_miners = max(len(self._miner_buckets), len(self._assignments), 2)
+        # A new round's assignments, on either round path (the loop's own advance or the validator's POST /round),
+        # so the dedup sets are pruned here once per round.
+        self._prune_dedup_keys()
 
         created = ready = 0
-        for miner_uid in range(n_miners):
-            books = self._select_books_for_miner(miner_uid)
-            if not books:
-                continue
-            a = self._make_assignment_dict(books)
-            if self._apply_pages(a, miner_uid):
-                ready += 1
-            self._assignments[miner_uid] = a
-            created += 1
+        with self._assignments_lock:
+            for miner_uid in range(n_miners):
+                books = self._select_books_for_miner(miner_uid)
+                if not books:
+                    continue
+                a = self._make_assignment_dict(books)
+                if self._apply_pages(a, miner_uid):
+                    ready += 1
+                self._assignments[miner_uid] = a
+                created += 1
 
         rolled = self._version > self._last_assigned_version
         self._last_assigned_version = self._version
@@ -1109,16 +1136,17 @@ class GradientAggregator:
         # Snapshot: this runs on the aggregation thread while the event-loop
         # thread (POST /round rollover, get_assignment) can pop/insert keys —
         # iterating the live dict would raise "changed size during iteration".
-        for uid, a in list(self._assignments.items()):
-            if a.get("_state") != "PENDING":
-                continue
-            if self._apply_pages(a, uid):
-                logger.debug(
-                    "Assignment data ready: miner=%d round=%d files=%d",
-                    uid,
-                    a["round"],
-                    len(a.get("data", [])),
-                )
+        with self._assignments_lock:
+            for uid, a in list(self._assignments.items()):
+                if a.get("_state") != "PENDING":
+                    continue
+                if self._apply_pages(a, uid):
+                    logger.debug(
+                        "Assignment data ready: miner=%d round=%d files=%d",
+                        uid,
+                        a["round"],
+                        len(a.get("data", [])),
+                    )
 
     def _get_max_data_timestamp(self) -> int:
         """Maximum sim timestamp (ns) we've observed.
@@ -1646,11 +1674,29 @@ class GradientAggregator:
             if "rolled_back" in event and not event.get("sibling_only"):
                 self._rollback_history.append(bool(event["rolled_back"]))
                 if self._rollback_history:
-                    last10 = list(self._rollback_history)[-10:]
-                    self._last_aggregation["rollback_rate_10w"] = sum(last10) / len(last10)
+                    window = self._ROLLBACK_RATE_WINDOW
+                    recent = list(self._rollback_history)[-window:]
+                    rate_window = sum(recent) / len(recent)
+                    self._last_aggregation["rollback_rate_10w"] = rate_window
                     self._last_aggregation["rollback_rate_50w"] = (
                         sum(self._rollback_history) / len(self._rollback_history)
                     )
+                    # Warn only; halting accepts here would block recovery.
+                    if (
+                        len(recent) >= window
+                        and rate_window >= self._ROLLBACK_RATE_THRESHOLD
+                    ):
+                        logger.warning(
+                            "[GTX] rollback circuit-breaker: %d/%d of last %d "
+                            "rounds rolled back (rate=%.2f >= %.2f). Training "
+                            "signal appears broken: check val data, model "
+                            "version and the accepted gradients.",
+                            sum(recent),
+                            window,
+                            window,
+                            rate_window,
+                            self._ROLLBACK_RATE_THRESHOLD,
+                        )
         try:
             from GenTRX.src import wandb_ops
 
@@ -1977,7 +2023,8 @@ class GradientAggregator:
             # until the next round's sync.
             self._set_canonical_version(self._load_canonical_version())
             self._version = self._canonical_version
-            self._sync_from_uid0()
+            if self._sync_from_uid0():
+                self._fresh_start = False
         elif not self.checkpoint_path.exists():
             # A missing/quarantined seed self-heals to the trained baseline
             # instead of scoring on a fresh-init model.
@@ -2282,9 +2329,20 @@ class GradientAggregator:
         startup here — before uvicorn even binds. Each S3 list runs in an
         abandonable daemon thread (it only reads and returns, so dropping it on
         timeout can't corrupt shared state); once the budget is spent we stop
-        and let the un-scanned pages re-accumulate over the next window.
+        and let the un-scanned pages re-accumulate over the next window. A
+        budget of 0 skips the scan entirely; an unparseable one falls back to
+        the default.
         """
-        budget_s = float(os.environ.get("GENTRX_RESTORE_BUDGET_S", "60") or 60)
+        try:
+            budget_s = float(os.environ.get("GENTRX_RESTORE_BUDGET_S", "60") or 60)
+        except ValueError:
+            budget_s = 60.0
+        if budget_s <= 0:
+            logger.warning(
+                "parquet restore disabled (GENTRX_RESTORE_BUDGET_S=0): pages "
+                "re-accumulate over the next window"
+            )
+            return
         t0 = time.monotonic()
 
         def _bounded(fn, timeout_s: float):
@@ -2697,6 +2755,57 @@ class GradientAggregator:
 
             time.sleep(self._loop_sleep_s)  # short poll — most iterations are cheap
 
+    def _get_miner_s3_client(self, bucket_info) -> Any:
+        """A cached boto3 S3 client for this miner's bucket, keyed by (endpoint, bucket, access key), so a
+        credential rotation produces a fresh client."""
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        key = (bucket_info.endpoint_url, bucket_info.bucket_name, bucket_info.access_key_id)
+        cached = self._miner_s3_clients.get(key)
+        if cached is not None:
+            return cached
+        client = boto3.client(
+            "s3",
+            endpoint_url=bucket_info.endpoint_url,
+            aws_access_key_id=bucket_info.access_key_id,
+            aws_secret_access_key=bucket_info.secret_access_key,
+            region_name=getattr(bucket_info, "region", "auto"),
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                connect_timeout=5,
+                read_timeout=10,
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+            ),
+        )
+        self._miner_s3_clients[key] = client
+        return client
+
+    # Dedup-set retention: a gradient delivered late, in the grace after its round closes, must still be filtered
+    # as a duplicate, so a few rounds are kept, and no more, so the sets stay bounded.
+    _DEDUP_RETENTION_ROUNDS = 5
+
+    def _prune_dedup_keys(self) -> None:
+        """Drop `_processed_grad_keys` / `_failed_grad_keys` entries whose round is older than the retention
+        window. Without it the sets take one key per miner per round for the process's life. A key whose round
+        cannot be read is kept."""
+        cutoff = self._agg_round - self._DEDUP_RETENTION_ROUNDS
+
+        def _stale(k: str) -> bool:
+            # Keys look like "miner_<uid>/round_<round_id>".
+            tail = k.rsplit("_", 1)
+            if len(tail) != 2:
+                return False
+            try:
+                return int(tail[1]) < cutoff
+            except ValueError:
+                return False
+
+        self._processed_grad_keys = {k for k in self._processed_grad_keys if not _stale(k)}
+        self._failed_grad_keys = {k for k in self._failed_grad_keys if not _stale(k)}
+
     def _refresh_miner_buckets(self) -> None:
         """Pull miner bucket commitments from chain, cooldown-rate-limited.
 
@@ -2720,6 +2829,7 @@ class GradientAggregator:
             finally:
                 loop.close()
             t_query = time.time() - t_start
+            old_keys = {(b.endpoint_url, b.bucket_name, b.access_key_id) for b in self._miner_buckets.values()}
             if fresh:
                 self._miner_buckets = fresh
             elif not self._miner_buckets:
@@ -2727,6 +2837,11 @@ class GradientAggregator:
             # Static buckets (benchmark miners not on-chain) always win.
             if self._static_buckets:
                 self._miner_buckets.update(self._static_buckets)
+            # Evict cached clients whose bucket triple left the map (deregistration, credential rotation); live
+            # triples keep theirs, so a refresh does not reconnect every miner.
+            new_keys = {(b.endpoint_url, b.bucket_name, b.access_key_id) for b in self._miner_buckets.values()}
+            for stale in old_keys - new_keys:
+                self._miner_s3_clients.pop(stale, None)
             self._miner_buckets_queried_at = now
             logger.info(
                 "[GTX] miner_buckets_refresh n=%d (static=%d) t=%.2fs",
@@ -2801,25 +2916,9 @@ class GradientAggregator:
                 return None
 
             try:
-                import boto3
-                from botocore.config import Config as BotoConfig
                 from botocore.exceptions import ClientError
 
-                client = boto3.client(
-                    "s3",
-                    endpoint_url=bucket_info.endpoint_url,
-                    aws_access_key_id=bucket_info.access_key_id,
-                    aws_secret_access_key=bucket_info.secret_access_key,
-                    region_name=getattr(bucket_info, "region", "auto"),
-                    config=BotoConfig(
-                        signature_version="s3v4",
-                        s3={"addressing_style": "path"},
-                        connect_timeout=5,
-                        read_timeout=10,
-                        request_checksum_calculation="when_required",
-                        response_checksum_validation="when_required",
-                    ),
-                )
+                client = self._get_miner_s3_client(bucket_info)
                 key = f"{self._bucket_prefix}gradients/{uid}/{round_id:08d}.grad"
                 logger.debug(
                     "[GTX] gradient_get uid=%d round=%d bucket=%s key=%s",
@@ -3014,7 +3113,7 @@ class GradientAggregator:
 
         self._score_and_aggregate(pending, round_assignments)
 
-        for uid, a in round_assignments:
+        for _uid, a in round_assignments:
             a["_state"] = "SCORED"
 
     def _score_and_aggregate(self, pending: list, round_assignments: list) -> None:
@@ -3100,49 +3199,54 @@ class GradientAggregator:
         don't each pay the checkpoint-load cost. Evicted at aggregation
         boundaries (`_clear_scoring_cache`) because aggregation mutates
         the model in place.
+
+        Thread safety: held under `_scoring_cache_lock`, so a concurrent `_clear_scoring_cache` cannot null the cache
+        mid-read, and two callers racing on a cold cache do not both pay the checkpoint load. Lock order: this lock,
+        then `_lock` for the checkpoint read; nothing holding `_lock` takes this one.
         """
-        if self._scoring_cache is not None and self._scoring_cache.get("round") == rnd:
-            return self._scoring_cache
+        with self._scoring_cache_lock:
+            if self._scoring_cache is not None and self._scoring_cache.get("round") == rnd:
+                return self._scoring_cache
 
-        try:
-            import torch
+            try:
+                import torch
 
-            from GenTRX.src.model import ModelConfig, OrderModel
-            from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
-            from GenTRX.src.train import load_checkpoint
+                from GenTRX.src.model import ModelConfig, OrderModel
+                from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
+                from GenTRX.src.train import load_checkpoint
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            with self._lock:
-                ckpt = load_checkpoint(str(self.checkpoint_path), device="cpu")
-                raw_cfg = ckpt.get("model_config", {})
-                model_cfg = ModelConfig(
-                    **{
-                        k: v
-                        for k, v in raw_cfg.items()
-                        if k in ModelConfig.__dataclass_fields__
-                    }
-                )
-                tok_dict = ckpt.get("tokenizer_config")
-                tokenizer_cfg = (
-                    TokenizerConfig.from_dict(tok_dict)
-                    if tok_dict
-                    else TokenizerConfig()
-                )
-                model = OrderModel(model_cfg).to(device)
-                model.load_state_dict(ckpt["model_state_dict"])
-            tokenizer = OrderTokenizer(tokenizer_cfg)
-            self._scoring_cache = {
-                "round": rnd,
-                "model": model,
-                "model_cfg": model_cfg,
-                "tokenizer_cfg": tokenizer_cfg,
-                "tokenizer": tokenizer,
-                "device": device,
-            }
-            return self._scoring_cache
-        except Exception as exc:
-            logger.warning("Scoring model load failed for round %d: %s", rnd, exc)
-            return None
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                with self._lock:
+                    ckpt = load_checkpoint(str(self.checkpoint_path), device="cpu")
+                    raw_cfg = ckpt.get("model_config", {})
+                    model_cfg = ModelConfig(
+                        **{
+                            k: v
+                            for k, v in raw_cfg.items()
+                            if k in ModelConfig.__dataclass_fields__
+                        }
+                    )
+                    tok_dict = ckpt.get("tokenizer_config")
+                    tokenizer_cfg = (
+                        TokenizerConfig.from_dict(tok_dict)
+                        if tok_dict
+                        else TokenizerConfig()
+                    )
+                    model = OrderModel(model_cfg).to(device)
+                    model.load_state_dict(ckpt["model_state_dict"])
+                tokenizer = OrderTokenizer(tokenizer_cfg)
+                self._scoring_cache = {
+                    "round": rnd,
+                    "model": model,
+                    "model_cfg": model_cfg,
+                    "tokenizer_cfg": tokenizer_cfg,
+                    "tokenizer": tokenizer,
+                    "device": device,
+                }
+                return self._scoring_cache
+            except Exception as exc:
+                logger.warning("Scoring model load failed for round %d: %s", rnd, exc)
+                return None
 
     def _save_published_checkpoint(self, ckpt_dict: dict) -> None:
         """Write a published version to output_path and, when that names another file, to checkpoint_path too.
@@ -3185,7 +3289,8 @@ class GradientAggregator:
 
     def _clear_scoring_cache(self) -> None:
         """Drop the cached scoring model. Called after aggregation."""
-        self._scoring_cache = None
+        with self._scoring_cache_lock:
+            self._scoring_cache = None
         self._held_baseline_cache.clear()
         # Loader cache lives for one round; cross-round reuse risks stale
         # _written_parquets snapshots when new data arrives.
@@ -3684,7 +3789,7 @@ class GradientAggregator:
         # to the model and published as the version delta, so the two stay
         # consistent for delta-follow reconstruction. Default 1.0 (dense).
         local_agg_dense = aggregate([c for _, _, _, c, _ in accepted])
-        local_agg = compress(decompress(local_agg_dense), top_k_frac=self._agg_top_k_frac)
+        local_agg = compress(_aggregate_delta(local_agg_dense, len(accepted)), top_k_frac=self._agg_top_k_frac)
 
         # Aggregated-delta safety: always log the L2 norm + max |element|
         # so the operator can see the distribution and tune the caps. The
@@ -4132,7 +4237,6 @@ class GradientAggregator:
                 self._latest_scores["round"],
             )
             return
-        scored_uids = {m for m, _, _, _, _ in scored}
         # `accepted` must reflect what actually entered aggregation, not just
         # score > threshold: dedup-dropped duplicates and version-mismatched
         # submitters can carry a positive score but must NOT be rewarded (the
@@ -4143,7 +4247,6 @@ class GradientAggregator:
             score = a.get("_score")
             if score is None:
                 score = 0.0
-            is_submitter = uid in scored_uids
             score_own = a.get("_score_own")
             score_held = a.get("_score_held")
             grad_norm = a.get("_grad_norm")
@@ -5241,7 +5344,6 @@ def create_gradient_router(
             from prometheus_client import (
                 CONTENT_TYPE_LATEST,
                 CollectorRegistry,
-                Counter,
                 Gauge,
                 generate_latest,
             )

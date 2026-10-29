@@ -24,7 +24,8 @@ def compute_reference(qty: np.ndarray, rel_price_ticks: np.ndarray, mid_ticks: n
     median_qty: median of positive order qty. price_scale_bps: the price_scale_pct-th
     percentile of |rel_price in bps| (book half-width); divisor that maps a typical
     book offset to ~1.0 in normalized units (so wide-book assets align with tight-book ones)."""
-    qty = np.asarray(qty, float); m = mid_ticks.astype(float)
+    qty = np.asarray(qty, float)
+    m = mid_ticks.astype(float)
     qpos = qty[qty > 0]
     median_qty = float(np.median(qpos)) if qpos.size else 1.0
     ok = m > 0
@@ -67,9 +68,14 @@ if __name__ == "__main__":  # generic round-trip self-test (no external data, no
         mid = np.full(n, 30000.0)
         rp = rng.normal(0.0, pscale, n) / 1e4 * mid           # rel_price ticks ~ pscale bps
         ref = compute_reference(qty, rp, mid, pdz)
-        vn = vol_to_norm(qty, ref); pn = price_to_norm(rp, mid, ref)
-        q_rt = vol_from_norm(vn, ref); rp_rt = price_from_norm(pn, mid, ref)
+        vn = vol_to_norm(qty, ref)
+        pn = price_to_norm(rp, mid, ref)
+        q_rt = vol_from_norm(vn, ref)
+        rp_rt = price_from_norm(pn, mid, ref)
         rt = np.allclose(q_rt, qty, rtol=1e-6) and np.median(np.abs(rp_rt - rp)) <= 1
-        q = lambda a, p: round(float(np.percentile(a, p)), 2)
+
+        def q(a, p):
+            return round(float(np.percentile(a, p)), 2)
+
         print(f"{med:>12.4g}{pscale:>11.2f}{f'[{q(vn,1)},{q(vn,50)},{q(vn,99)}]':>26}"
               f"{q(np.abs(pn),99):>13}{('OK' if rt else 'FAIL'):>11}")

@@ -250,6 +250,54 @@ void queueValidatorResponse(
 
 //-------------------------------------------------------------------------
 
+std::optional<std::vector<CappedPair>> readCappedPairs(const msgpack::object& batch)
+{
+    if (batch.type != msgpack::type::MAP) return std::nullopt;
+    const msgpack::object* capped{};
+    for (const auto& [k, v] : batch.via.map) {
+        if (k.type == msgpack::type::STR && k.as<std::string_view>() == "capped") capped = &v;
+    }
+    if (capped == nullptr) return std::nullopt;
+    std::vector<CappedPair> pairs;
+    if (capped->type != msgpack::type::ARRAY) return pairs;
+    for (const auto& entry : capped->via.array) {
+        if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) continue;
+        const auto& agent = entry.via.array.ptr[0];
+        const auto& book = entry.via.array.ptr[1];
+        if (agent.type != msgpack::type::POSITIVE_INTEGER || book.type != msgpack::type::POSITIVE_INTEGER) continue;
+        pairs.emplace_back(agent.as<AgentId>(), book.as<BookId>());
+    }
+    return pairs;
+}
+
+//-------------------------------------------------------------------------
+
+std::vector<std::vector<CappedPair>> splitCappedPairs(
+    std::span<const CappedPair> pairs, std::span<const uint32_t> bases, std::span<const uint32_t> counts)
+{
+    std::vector<std::vector<CappedPair>> split(bases.size());
+    for (const auto& [agent, book] : pairs) {
+        if (const auto route = routeCanonicalBookId(static_cast<uint32_t>(book), bases, counts)) {
+            split[route->idx].emplace_back(agent, route->local);
+        }
+    }
+    return split;
+}
+
+//-------------------------------------------------------------------------
+
+std::vector<std::vector<CappedPair>> splitCappedPairs(
+    std::span<const CappedPair> pairs, uint32_t blockDim, uint32_t blockCount)
+{
+    std::vector<std::vector<CappedPair>> split(blockCount);
+    for (const auto& [agent, book] : pairs) {
+        if (book / blockDim < blockCount) split[book / blockDim].emplace_back(agent, book % blockDim);
+    }
+    return split;
+}
+
+//-------------------------------------------------------------------------
+
 }  // namespace taosim::simulation
 
 //-------------------------------------------------------------------------

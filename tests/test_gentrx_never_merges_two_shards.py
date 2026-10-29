@@ -21,7 +21,6 @@ because it only asks whether SOME shard received a gradient.
 Grouping by bucket_prefix keeps each window shard-pure. Assignments for the other shard are requeued
 rather than dropped, and selection alternates so a slower mechanism is not starved by a faster one.
 """
-import pytest
 
 from taos.im.agents.gentrx import group_assignments_by_shard, pick_shard_group
 

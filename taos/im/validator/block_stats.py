@@ -6,7 +6,8 @@ uid, published and reset together per block of rounds (report.round_block_gauges
 BLOCK_COUNTERS = (
     "requests", "timeouts", "failures", "rejections",
     "placed", "refused", "refused_contract",
-    "placements_sent", "cancels_sent", "cancels_ok", "cancels_failed", "fills", "dropped",
+    "placements_sent", "cancels_sent", "cancel_orders_sent", "orders_cancelled", "orders_not_found", "stp_cancels",
+    "fills", "dropped",
 )
 
 

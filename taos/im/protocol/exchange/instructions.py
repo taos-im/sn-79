@@ -140,9 +140,12 @@ class PlaceMarketOrderInstruction(PlaceOrderInstruction):
             "settleFlag":    self.settleFlag,
             "allowPartial":  self.allow_partial,
         }
-        if self.stop_loss   is not None: d["stopLoss"]   = self.stop_loss
-        if self.take_profit is not None: d["takeProfit"] = self.take_profit
-        if self.sltp_std    is not None: d["sltpStd"]    = self.sltp_std
+        if self.stop_loss is not None:
+            d["stopLoss"] = self.stop_loss
+        if self.take_profit is not None:
+            d["takeProfit"] = self.take_profit
+        if self.sltp_std is not None:
+            d["sltpStd"] = self.sltp_std
         return d
     
     def __str__(self):
@@ -197,9 +200,12 @@ class PlaceLimitOrderInstruction(PlaceOrderInstruction):
             "currency": self.currency,
             "settleFlag": self.settleFlag
         }
-        if self.stop_loss   is not None: d["stopLoss"]   = self.stop_loss
-        if self.take_profit is not None: d["takeProfit"] = self.take_profit
-        if self.sltp_std    is not None: d["sltpStd"]    = self.sltp_std
+        if self.stop_loss is not None:
+            d["stopLoss"] = self.stop_loss
+        if self.take_profit is not None:
+            d["takeProfit"] = self.take_profit
+        if self.sltp_std is not None:
+            d["sltpStd"] = self.sltp_std
         return d
     
     def __str__(self):

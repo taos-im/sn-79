@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import logging
 import os
 import threading
@@ -193,6 +192,7 @@ class MinerTrainingService:
         self._store: "GradientStore | None" = None  # aggregator-bucket fallback (env-var)
         self._data_store: "GradientStore | None" = None  # default data store (== _store unless overridden)
         self._write_store: "GradientStore | None" = None  # per-miner write bucket
+        self._write_stores: "dict[int, GradientStore]" = {}  # per-UID overrides of _write_store
         self._discovered_aggregator_store: "GradientStore | None" = None  # cached chain-based discovery
         # Guards the discovery cache so concurrent training threads don't both
         # walk the metagraph + probe every uid's bucket. In practice the
@@ -514,7 +514,15 @@ class MinerTrainingService:
                         f"uid {uid}: no budget left this round — deferred (registered next round)"
                     )
                     continue
-                spent += self._train_one_uid(uid, by_uid[uid], target_v, budget)
+                t_uid = time.perf_counter()
+                try:
+                    spent += self._train_one_uid(uid, by_uid[uid], target_v, budget)
+                except Exception as exc:
+                    # One UID's failure must not cost the remaining UIDs their round.
+                    spent += time.perf_counter() - t_uid
+                    self._tlog.error(f"uid {uid}: training failed: {exc}")
+                    import traceback
+                    self._tlog.error(traceback.format_exc())
         except Exception as exc:
             self._tlog.error(f"_train_all_uids_background failed: {exc}")
             import traceback

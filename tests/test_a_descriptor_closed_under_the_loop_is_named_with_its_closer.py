@@ -17,21 +17,26 @@ from taos.im.validator import fdwatch
 
 
 def test_a_close_is_recorded_with_its_thread_and_its_caller():
+    # The tracer records every close in the process into a ring of 256, and in the full suite other tests' threads
+    # close descriptors too: the ring is read right after each close, by the thread that closed, and searched newest
+    # first for that thread's record, since a descriptor number is reused.
     fdwatch.install_close_tracer()
     r, w = os.pipe()
-    done = threading.Event()
+    seen = {}
 
     def closer():
         os.close(w)
-        done.set()
+        seen["closes"] = fdwatch.recent_closes()
 
-    threading.Thread(target=closer, name="the-closer").start()
-    done.wait(2)
+    t = threading.Thread(target=closer, name="the-closer")
+    t.start()
+    t.join(10)
+    assert "closes" in seen, "the closing thread did not finish"
+    rec = next((x for x in reversed(seen["closes"]) if x["fd"] == w and x["thread"] == "the-closer"), None)
+    assert rec is not None and "closer" in rec["where"]
     os.close(r)
-    recent = fdwatch.recent_closes()
-    rec = next(x for x in recent if x["fd"] == w)
-    assert rec["thread"] == "the-closer" and "closer" in rec["where"]
-    assert any(x["fd"] == r and x["thread"] == threading.current_thread().name for x in recent)
+    me = threading.current_thread().name
+    assert any(x["fd"] == r and x["thread"] == me for x in reversed(fdwatch.recent_closes()))
 
 
 def test_a_close_of_a_descriptor_a_watched_loop_registers_is_flagged():
@@ -45,7 +50,8 @@ def test_a_close_of_a_descriptor_a_watched_loop_registers_is_flagged():
         loop.add_reader(a.fileno(), lambda: None)
         fd = a.fileno()
         t = threading.Thread(target=a.close, name="other-thread")
-        t.start(); t.join(2)
+        t.start()
+        t.join(2)
         assert flagged and f"fd {fd}" in flagged[0] and "other-thread" in flagged[0] and "listener" in flagged[0]
     finally:
         fdwatch.set_alarm(None)
@@ -73,7 +79,8 @@ def test_a_loop_error_about_a_descriptor_logs_the_snapshot():
     text = "\n".join(logged)
     assert "Bad file descriptor" in text and "open descriptors" in text and "registered" in text
     assert "threads" in text and "recent closes" in text and f"{r} ->" in text, "the open descriptor listing names each fd and its target"
-    os.close(r); os.close(w)
+    os.close(r)
+    os.close(w)
 
 
 def test_the_validator_installs_the_tracer_and_watches_both_loops():

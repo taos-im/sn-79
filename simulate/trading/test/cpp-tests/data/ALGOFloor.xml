@@ -1,0 +1,49 @@
+<!--
+  Fixture for ALGOTraderFloorTests: one book under class 1's size floor (2.5364), the one shipped
+  class whose floor is above the one-unit size the ALGO trader retires a parent at, and one ALGO.
+
+  The tests never run the simulation: they call the agent's handlers and read the message queue.
+  The slice draw is held near 0.05, far below the floor, so a slice the agent does not raise to the
+  floor shows up as an order the exchange would refuse. GBM stands in for the fundamental for the
+  reason WakeupChain.xml gives (FundamentalPrice needs a SimulationManager).
+-->
+<Simulation start="0" duration="60000000000" step="1000000000" timescale="ns" rngSeed="1337">
+    <Agents>
+        <MultiBookExchangeAgent name="EXCHANGE" gracePeriod="10000000000" priceDecimals="2" volumeDecimals="4"
+            baseDecimals="4" quoteDecimals="10" remoteAgentCount="1"
+            maxLeverage="4" maxLoan="10000" maintenanceMargin="0.25"
+            initialPrice="29.57" minOrderSize="2.5364">
+            <Books instanceCount="1" algorithm="PriceTime">
+                <Processes>
+                    <GBM name="fundamental" X0="29.57" mu="0.0" sigma="0.01" dt="0.0001"
+                        seed="1337" updatePeriod="1000000000"/>
+                    <MagneticField name="magneticfield" numRows="32" beta="0.5" alpha="20.0"
+                        updatePeriod="10000000000"/>
+                    <FuturesSignal name="external" lambda="0.001155" seedInterval="10000000000"
+                        updatePeriod="10000000000"/>
+                </Processes>
+            </Books>
+            <Balances>
+                <Base total="100.0" maxLeverage="5" maxLoan="10000"/>
+                <Quote total="5000.0" maxLeverage="5" maxLoan="10000"/>
+            </Balances>
+        </MultiBookExchangeAgent>
+        <ALGOTraderAgent name="ALGO_TRADER_AGENT" instanceCount="1" exchange="EXCHANGE"
+            MFLmean="100000000" MFLstd="25000000"
+            volumeStatsPeriod="2000000000"
+            updateInterval="60000000000" updateSTD="10000000000"
+            minOPLatency="90000000" maxOPLatency="5000000000"
+            depth="21" volumeDrawRayleighScale="2000.0"
+            alpha="0.2" beta="0.7" gammaX="0.2" omega="0.00000001"
+            activationMidpoint="0.025" activationRate="100.0"
+            immediateBase="600.0" wakeDeviationCoef="0.5"
+            wakeupTimeCoef="259200000000000">
+            <VolumeDistribution type="lognormal" mu="-3.0" sigma="0.01"/>
+            <Balances>
+                <Base total="167000.0" maxLeverage="1" maxLoan="10000"/>
+                <Quote total="50000000.0" maxLeverage="1" maxLoan="10000"/>
+            </Balances>
+        </ALGOTraderAgent>
+        <DistributedProxyAgent/>
+    </Agents>
+</Simulation>

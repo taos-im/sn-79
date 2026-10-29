@@ -100,9 +100,7 @@ void SimulationManager::runSimulations()
     std::barrier barrier{
         m_blockInfo.count,
         [&] {
-            for (auto& simulation : m_simulations) {
-                simulation->clearFilledOrders();
-            }
+            // Each block cleared its filled orders before arriving (Simulation::simulate), in parallel.
             publishState();
             m_stepSignal();
             // THE ONE POINT WHERE A CHECKPOINT IS CONSISTENT. Every block has arrived, none has
@@ -535,6 +533,7 @@ void SimulationManager::publishStateMessagePack()
     }
     msgpack::object obj = oh.get();
 
+    const Timestamp maxInstructionDelay = reprSimu->config().maxInstructionDelay();
     auto unpackResponse = [&](const msgpack::object& o) {
         if (o.type != msgpack::type::MAP) {
             throw taosim::serialization::MsgPackError{};
@@ -568,6 +567,7 @@ void SimulationManager::publishStateMessagePack()
         if (res.type.empty()) {
             throw taosim::serialization::MsgPackError{};
         }
+        taosim::simulation::checkInstructionDelay(*res.delay, maxInstructionDelay);
         for (const auto& [k, val] : o.via.map) {
             auto key = k.as<std::string_view>();
             if (key == "payload") {
@@ -597,6 +597,14 @@ void SimulationManager::publishStateMessagePack()
     if (obj.type != msgpack::type::MAP) {
         fmt::println("MAP type check failed for responses");
         return;
+    }
+    // Before the responses, so a round with none still updates the set.
+    if (const auto capped = taosim::simulation::readCappedPairs(obj)) {
+        const auto split = taosim::simulation::splitCappedPairs(
+            *capped, m_blockInfo.dimension, static_cast<uint32_t>(m_simulations.size()));
+        for (const auto& [blockIdx, simulation] : views::enumerate(m_simulations)) {
+            simulation->exchange()->setCappedPairs(split[blockIdx]);
+        }
     }
     // Looked up rather than positional, and no size check. The batch used to be required to
     // hold exactly one member, so ANY future addition alongside the responses would have been

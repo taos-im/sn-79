@@ -319,7 +319,7 @@ class OrderCancellationsEvent(ExchangeEvent):
                 event.cancellations.append(
                     OrderCancellationEvent.model_construct( timestamp=event.timestamp,
                         bookId=event.bookId, orderId=cancellation['orderId'],quantity=cancellation['volume'],
-                        success=False,message=f"Order Id does not exist!"
+                        success=False,message="Order Id does not exist!"
                     )
                 )
         return event

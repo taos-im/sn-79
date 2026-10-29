@@ -3,13 +3,12 @@
 """Descriptor watch: who closes a descriptor an event loop still watches, and what the process looked like when a loop
 error named one.
 
-A watched descriptor closed elsewhere and reused by another file makes the loop's next re-arm fail; under uvloop that
-aborted the process without a message, on the standard loop it is a logged error. The tracer records every close made
-through os.close or socket.close with its thread and caller, and raises an alarm at once when the descriptor is
-registered with a watched loop, which is the closer the fault needs. The loop handler, on an error about a descriptor,
-logs the open descriptors with their targets, each watched loop's registrations, the threads alive and the last closes.
+A watched descriptor closed elsewhere and reused by another file makes the loop's next re-arm fail, which the standard
+asyncio loop the validator runs on reports to its exception handler. The tracer records every close made through
+os.close or socket.close with its thread and caller, and raises an alarm at once when the descriptor is registered with
+a watched loop, which is the closer the fault needs. The loop handler, on an error about a descriptor, logs the open
+descriptors with their targets, each watched loop's registrations, the threads alive and the last closes.
 """
-import asyncio
 import collections
 import errno
 import os

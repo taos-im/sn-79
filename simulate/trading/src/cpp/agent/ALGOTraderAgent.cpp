@@ -44,6 +44,21 @@ double selectALGOSliceQuantity(
         : std::min(draw, touch);
 }
 
+std::optional<decimal_t> fitALGOSliceToFloor(
+    decimal_t slice,
+    decimal_t remaining,
+    decimal_t affordable,
+    decimal_t sizeFloor) noexcept
+{
+    if (remaining < sizeFloor || affordable < sizeFloor) return std::nullopt;
+    return std::min({std::max(slice, sizeFloor), remaining, affordable});
+}
+
+bool algoParentIsDone(decimal_t remaining, decimal_t sizeFloor) noexcept
+{
+    return remaining <= 1_dec || remaining < sizeFloor;
+}
+
 //-------------------------------------------------------------------------
 
 ALGOTraderVolumeStats::ALGOTraderVolumeStats(const ALGOTraderVolumeStatsDesc& desc)
@@ -649,6 +664,10 @@ void ALGOTraderAgent::handleBookTick(Message::Ptr msg)
     const double lastPrice = util::decimal2double(m_lastPrice.at(bookId));
     auto& state = m_state.at(bookId);
     const auto& balances =  simulation()->account(name()).at(bookId);
+    // The touch read here can be a level whose orders have all filled and are not yet cleared
+    // (zero, or a rounding residue), or a remainder below the exchange's floor. Neither is an
+    // order the exchange takes, so the parent is at least the floor.
+    const decimal_t sizeFloor = simulation()->exchange()->config2().minOrderSize;
 
     // Immediate reversion also respects the no-trade band (see wakeupProb).
     if (lastPrice > 0.0
@@ -660,7 +679,8 @@ void ALGOTraderAgent::handleBookTick(Message::Ptr msg)
             && state.volumeStats.askVolume() >= immediateThreshold(state)) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::BUY;
-            state.volumeToBeExecuted = taosim::util::double2decimal(topLevel.ask,balances.m_baseDecimals);
+            state.volumeToBeExecuted = std::max(
+                taosim::util::double2decimal(topLevel.ask, balances.m_baseDecimals), sizeFloor);
             execute(bookId,state);
          }
     }
@@ -669,7 +689,8 @@ void ALGOTraderAgent::handleBookTick(Message::Ptr msg)
             && state.volumeStats.bidVolume() >= immediateThreshold(state)) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::SELL;
-            state.volumeToBeExecuted = taosim::util::double2decimal(topLevel.bid,balances.m_baseDecimals);
+            state.volumeToBeExecuted = std::max(
+                taosim::util::double2decimal(topLevel.bid, balances.m_baseDecimals), sizeFloor);
             execute(bookId,state);
          }
     }
@@ -811,11 +832,8 @@ void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
     state.volumeToBeExecuted -= executedVolume;
 
     simulation()->logDebug("{} EXECUTED {}", name(), executedVolume);
-    if (state.volumeToBeExecuted <= 1_dec) {
-        state.status = ALGOTraderStatus::ASLEEP;
-        state.statusChangeEndTime = simulation()->currentTimestamp();
-        const auto& balances =  simulation()->account(name()).at(bookId);
-        state.volumeToBeExecuted =  drawNewVolume(bookId, balances.m_baseDecimals); 
+    if (algoParentIsDone(state.volumeToBeExecuted, simulation()->exchange()->config2().minOrderSize)) {
+        finishParent(bookId, state);
     } else {
         state.marketFeedLatency = marketFeedLatency();
         scheduleExecuteTick(bookId, state.marketFeedLatency + decisionMakingDelay());
@@ -831,8 +849,13 @@ void ALGOTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    auto& state = m_state.at(bookId);
-    execute(bookId,state);
+    // Not resent: nothing has changed since the order was sent, so a refusal that holds would
+    // repeat every placement latency for the rest of the run, with the parent EXECUTING and both
+    // the wakeup and the immediate path shut off for the book. The next wakeup draws a new parent.
+    simulation()->logDebug(
+        "{} BOOK {} : MARKET ORDER OF {} REFUSED, PARENT FINISHED",
+        name(), bookId, payload->requestPayload->volume);
+    finishParent(bookId, m_state.at(bookId));
 }
 
 //-------------------------------------------------------------------------
@@ -847,16 +870,19 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
         selectALGOSliceQuantity(
             m_volumeDistribution->sample(*m_rng), topLevelVolume, m_sliceLiquidityMode),
         balances.m_baseDecimals);
-    const decimal_t volume = std::min(drawnQty,
-                                         state.volumeToBeExecuted);
-    const decimal_t volumeToExecute = state.direction == OrderDirection::BUY ?
-    std::min(volume, (balances.quote->getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
-        : std::min(volume, (baseBalance.getFree() * (decimal_t{0.99}) ));
-
-    if (volumeToExecute <= 0_dec) {
-        scheduleExecuteTick(bookId, marketFeedLatency() + decisionMakingDelay());
+    const decimal_t affordable = state.direction == OrderDirection::BUY
+        ? (balances.quote->getFree() * decimal_t{0.99}) / m_lastPrice.at(bookId)
+        : baseBalance.getFree() * decimal_t{0.99};
+    // The agent's balance moves only with its own fills, so a parent it cannot send now it
+    // cannot send later either: finished rather than retried.
+    const auto toSend = fitALGOSliceToFloor(
+        drawnQty, state.volumeToBeExecuted, affordable,
+        simulation()->exchange()->config2().minOrderSize);
+    if (!toSend) {
+        finishParent(bookId, state);
         return;
     }
+    const decimal_t volumeToExecute = *toSend;
 
     simulation()->logDebug(
         "{} ATTEMPTING TO EXECUTE {} OF {}, | at {}", name(), state.direction, volumeToExecute, simulation()->currentTimestamp());
@@ -869,6 +895,16 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
         "PLACE_ORDER_MARKET",
         MessagePayload::create<PlaceOrderMarketPayload>(
             state.direction, volumeToExecute, bookId));
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderAgent::finishParent(BookId bookId, ALGOTraderState& state)
+{
+    state.status = ALGOTraderStatus::ASLEEP;
+    state.statusChangeEndTime = simulation()->currentTimestamp();
+    const auto& balances = simulation()->account(name()).at(bookId);
+    state.volumeToBeExecuted = drawNewVolume(bookId, balances.m_baseDecimals);
 }
 
 //-------------------------------------------------------------------------

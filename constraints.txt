@@ -130,7 +130,6 @@ typing-inspection==0.4.2
 tzdata==2026.2
 urllib3==2.7.0
 uvicorn==0.47.0
-uvloop==0.22.1
 websocket-client==1.9.0
 websockets==16.0
 wheel==0.47.0

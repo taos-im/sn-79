@@ -71,7 +71,7 @@ def test_p11_factor_records_the_discount_actually_applied():
     """A fed maker must show a factor below 1, and making_raw must be the POST-discount value."""
     cp = {1: {9: 1000.0}, 2: {8: 1.0, 7: 1.0}, 3: {6: 1.0, 5: 1.0}}
     plain, detail = {}, {}
-    base = debeta_scores(CB, CS, AL, floor=median_abs_floor(AL), w_make=0.30, detail=plain)
+    debeta_scores(CB, CS, AL, floor=median_abs_floor(AL), w_make=0.30, detail=plain)
     disc = debeta_scores(CB, CS, AL, floor=median_abs_floor(AL), w_make=0.30,
                          cp=cp, p11_strength=1.0, detail=detail)
     assert detail[1]["p11_factor"] < 1.0

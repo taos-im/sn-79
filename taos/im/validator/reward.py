@@ -25,7 +25,6 @@ two-pool (trading + training) reward tensors.
 import collections
 import time
 import torch
-import random
 import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
@@ -33,11 +32,10 @@ from typing import TYPE_CHECKING, Dict, Tuple
 from taos.im.validator.debeta import (markout_quality, absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
                                       book_alphas_held_by_book, hurdle_filter, hurdle_skill, kappa_floored, median_abs_floor,
                                       presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas, balanced_reward_per_book,
-                                      debeta_scores)
-from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
-from taos.im.protocol.instructions import MAX_INSTRUCTION_DELAY
+                                      debeta_scores, shrunk_skill_eb, shrunk_skill_self)
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
 from taos.im.config import debeta_dial
+from taos.im.validator.delays import set_delays  # noqa: F401  (moved; imported from here too)
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -943,7 +941,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
         for _k in ('skill_other', 'skill_mark_alt', 'skill_net_alpha_mark_alt', 'maker_notional_two_sided', 'at_best_seconds', 'best_size', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
                    'presence_share', 'skill_coverage_factor', 'coverage_books',
-                   'skill_p11_factor', 'skill_net_alpha'):
+                   'skill_p11_factor', 'skill_net_alpha', 'skill_shrunk_self', 'skill_shrunk_eb', 'conjunction'):
             uid_kappa[_k] = _d.get(_k) if _d else None
         uid_kappa['debeta_w_make'] = validator_data.get('debeta_w_make') if debeta_applied else None
         uid_kappa['debeta_floor'] = validator_data.get('debeta_floor') if debeta_applied else None
@@ -1411,6 +1409,63 @@ def class_map(self) -> dict:
     return {}
 
 
+def class_names_by_index(self) -> list:
+    """The classes' names in index order: from the validator's own multi-asset configuration, or from the simulation
+    config main ships the scoring child; empty on a single market."""
+    sim = getattr(self, 'simulation', None)
+    if hasattr(sim, 'realizations') and getattr(sim, 'backgrounds', None):
+        return [str(bg.name) for bg in sim.backgrounds]
+    sc = getattr(self, 'simulation_config', None)
+    if isinstance(sc, dict) and sc.get('class_names'):
+        return [str(n) for n in sc['class_names']]
+    return []
+
+
+def class_handover_now(self):
+    """The run-boundary handover as it stands at the scorer's clock: ``{'w', 'carried', 'new'}`` with the carried
+    shares and the new classes keyed by this layout's class indices, w the carried shares' weight falling linearly
+    from 1 at the boundary to 0 one lookback later; None once it has run out or when there is none."""
+    h = getattr(self, '_debeta_handover', None)
+    if not h:
+        return None
+    span = int(h.get('span') or 0)
+    now = int(getattr(self, 'simulation_timestamp', 0) or 0)
+    w = 1.0 - (now - int(h.get('start') or 0)) / span if span > 0 else 0.0
+    if w <= 0.0:
+        self._debeta_handover = {}
+        bt.logging.info("[DEBETA-HANDOVER] done: the carried shares and the new classes' ramp ran out")
+        return None
+    idx = {name: i for i, name in enumerate(class_names_by_index(self))}
+    return {'w': min(1.0, w),
+            'carried': {idx[n]: v for n, v in (h.get('carried') or {}).items() if n in idx},
+            'new': [idx[n] for n in (h.get('new') or []) if n in idx]}
+
+
+def handover_log_line(handover, weights, names) -> str:
+    """One line per scoring inside the run-boundary handover: the carried shares' weight w and each class's weight
+    as the mixing applies it (a new class's ramped by 1 - w), so the handover can be followed from the log."""
+    w = float(handover.get('w') or 0.0)
+    new = sorted(int(c) for c in handover.get('new') or ())
+
+    def name(i):
+        return names[i] if 0 <= i < len(names) else str(i)
+    eff = ",".join(f"{name(i)}:{float(x) * ((1.0 - w) if i in new else 1.0):.4f}" for i, x in enumerate(weights))
+    return f"[DEBETA-HANDOVER] w={w:.4f} weights={eff} new={','.join(name(i) for i in new) or '-'}"
+
+
+def _blend_shares(carried, fresh, w, all_uids) -> dict:
+    """w of the carried shares and 1 - w of the fresh ones, each normalised within the class; the carried alone while
+    the class has earned nothing fresh, the fresh alone when nothing was carried."""
+    ct = sum(max(0.0, float(carried.get(u, 0.0))) for u in all_uids)
+    ft = sum(max(0.0, float(fresh.get(u, 0.0))) for u in all_uids)
+    if ct <= 0.0:
+        return fresh
+    if ft <= 0.0:
+        return {u: max(0.0, float(carried.get(u, 0.0))) / ct for u in all_uids}
+    return {u: w * max(0.0, float(carried.get(u, 0.0))) / ct + (1.0 - w) * max(0.0, float(fresh.get(u, 0.0))) / ft
+            for u in all_uids}
+
+
 def split_by_class(capture_buy_sums, capture_sell_sums, pool_by_book, class_of_book) -> dict:
     """The scorer's per-uid per-book inputs restricted to each class's books, keyed by class:
     ``{class: {'capture_buy', 'capture_sell', 'pool', 'n_books'}}``."""
@@ -1427,7 +1482,7 @@ def split_by_class(capture_buy_sums, capture_sell_sums, pool_by_book, class_of_b
     return out
 
 
-def class_pool_shares(details_by_class, weights, all_uids, bars) -> tuple:
+def class_pool_shares(details_by_class, weights, all_uids, bars, handover=None, vectors_out=None) -> tuple:
     """The pool's making and skill share vectors under a per-class emission weight.
 
     Under the flat rule a class weighs whatever share of the field's capture and alpha it produces, so
@@ -1443,6 +1498,9 @@ def class_pool_shares(details_by_class, weights, all_uids, bars) -> tuple:
         weights: Normalised weights per class (class_weights_from), indexed by class.
         all_uids: Uids in emission order.
         bars: ``{class: skill bar}`` (resolve_skill_min_books on the class's book count).
+        handover: the run-boundary handover at this cycle (class_handover_now), or None: each carried class's
+            vectors are blended with its fresh ones, and a class new to the layout ramps its weight in.
+        vectors_out: a dict filled with each class's making and skill vectors as paid this cycle.
 
     Returns:
         ``(making_share, skill_share)``, each ``{uid: share}`` summing to 1 (or all zero).
@@ -1454,6 +1512,19 @@ def class_pool_shares(details_by_class, weights, all_uids, bars) -> tuple:
         tot = sum(raw.values())
         making_by[c] = {u: (raw[u] / tot if tot > 0 else 0.0) for u in all_uids}
         skill_by[c] = skill_pool_share(detail, all_uids, int(bars.get(c, SKILL_MIN_BOOKS_FLOOR)))
+    weights = list(weights)
+    if handover:
+        _w = float(handover.get('w') or 0.0)
+        for c, carried in (handover.get('carried') or {}).items():
+            if c in making_by:
+                making_by[c] = _blend_shares(carried.get('making') or {}, making_by[c], _w, all_uids)
+                skill_by[c] = _blend_shares(carried.get('skill') or {}, skill_by[c], _w, all_uids)
+        for c in handover.get('new') or ():
+            if 0 <= int(c) < len(weights):
+                weights[int(c)] = weights[int(c)] * (1.0 - _w)
+    if vectors_out is not None:
+        for c in making_by:
+            vectors_out[c] = {'making': dict(making_by[c]), 'skill': dict(skill_by[c])}
     mixed = []
     for by in (making_by, skill_by):
         live = {c: w for c, w in enumerate(weights) if c in by and sum(by[c].values()) > 0.0}
@@ -1534,6 +1605,21 @@ def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_sc
     return distribute_rewards(floored, config)
 
 
+def maker_capture_sums(self):
+    """The captured pair with its taker legs taken back out (0.6.6): the making pool is paid on maker fills only, since
+    taking never earns making credit. The captured pair itself keeps every leg, because the skill leg reads it for the
+    books a uid filled on. A state saved before the taker pair existed carries none, so its taker legs stay in the
+    captured pair until they leave the lookback."""
+    cb = getattr(self, 'capture_buy_sums', {}) or {}
+    cs = getattr(self, 'capture_sell_sums', {}) or {}
+    tb = getattr(self, 'capture_taker_buy_sums', {}) or {}
+    ts = getattr(self, 'capture_taker_sell_sums', {}) or {}
+
+    def _less(pair, legs):
+        return {u: {b: v - (legs.get(u) or {}).get(b, 0.0) for b, v in books.items()} for u, books in pair.items()}
+    return _less(cb, tb), _less(cs, ts)
+
+
 def making_basis_sums(self):
     """The capture pair the making pool reads (2 October 2026): realized_buy_sums / realized_sell_sums when
     scoring.debeta.making_basis is 'realized' (each fill marked against the centered mid making_horizon_s of
@@ -1542,8 +1628,7 @@ def making_basis_sums(self):
     whatever the dial says."""
     dcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'debeta', None)
     basis = str(debeta_dial(dcfg, 'making_basis'))
-    cb = getattr(self, 'capture_buy_sums', {}) or {}
-    cs = getattr(self, 'capture_sell_sums', {}) or {}
+    cb, cs = maker_capture_sums(self)
     if basis == 'realized':
         # captured credit scaled by each uid's markout quality (debeta.markout_quality): two-sided on the stable
         # captured sums, judged by the share of spread kept at the horizon; scaling both sides scales the credit
@@ -1554,14 +1639,44 @@ def making_basis_sums(self):
     return (cb, cs)
 
 
-def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
+def conjunction_by_class(self, cmap):
+    """Each uid's conjunction presence per asset class, summed over the class's books, and the farm reference per
+    class (0.6.6), from the windowed per-book sums; published, never paid."""
+    by_class = {}
+    for uid, books in (getattr(self, 'debeta_conj', None) or {}).items():
+        for b, v in (books or {}).items():
+            c = cmap.get(int(b))
+            if c is None or not v:
+                continue
+            row = by_class.setdefault(c, {})
+            row[uid] = row.get(uid, 0.0) + float(v)
+    farm = {}
+    for b, v in (getattr(self, 'debeta_conj_farm', None) or {}).items():
+        c = cmap.get(int(b))
+        if c is None:
+            continue
+        farm[c] = farm.get(c, 0.0) + float(v)
+    return by_class, farm
+
+
+def _shrunk_skills(pool_by_book):
+    """Both shrinkage forms over one skill pool ``{uid: {book: alpha}}``: ``({uid: self-normalising}, {uid: empirical
+    Bayes})``, the second with the pool as its population."""
+    lists = {u: list(b.values()) for u, b in (pool_by_book or {}).items()}
+    return {u: shrunk_skill_self(a) for u, a in lists.items()}, shrunk_skill_eb(lists)
+
+
+def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict[int, float]:
     """Finalize the de-beta (P8) per-uid trading score from the fill-stream accumulators
     (self.capture_buy_sums/capture_sell_sums + self.debeta_mtm/invsum/invn/pfirst/plast, populated
     in trade.update_trade_volumes). making = balanced two-sided spread capture; skill =
     kappa-of-alpha with alpha = MTM_pnl - mean_inventory*drift (drift-beta stripped); rank-combined
     by w_make. Returns {} when disabled, on error, or while the accumulators are still warming
     (coverage guard) so callers fall back to the legacy kappa+pnl path. Computed in-process (this is
-    where the accumulators live) and used by both get_rewards (weights) and the reporting snapshot."""
+    where the accumulators live) and used by both get_rewards (weights) and the reporting snapshot.
+
+    `absent` and `presence`, when given, are the presence gate's absent set and shares to score on in place
+    of the live query windows (the cutover VERIFY passes the ones the child was given)."""
     dcfg = getattr(getattr(self, 'config', None), 'scoring', None)
     dcfg = getattr(dcfg, 'debeta', None)
     # ALWAYS computed and published (weight replaced the enabled boolean): weight 0 means legacy
@@ -1679,7 +1794,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         # Both making bases per uid, two-sided per book as the pool reads them, and which one pays (1.0 = realized),
         # so a board shows what the other basis would pay before any dial moves (the 0.6.2 pattern for new forms).
         _rb, _rs = getattr(self, 'realized_buy_sums', {}) or {}, getattr(self, 'realized_sell_sums', {}) or {}
-        _cb, _cs = getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {}
+        _cb, _cs = maker_capture_sums(self)
         _cap_credit = balanced_reward_per_book(_cb, _cs, sorted(set(_cb) | set(_cs)))
         _q = markout_quality(_cb, _cs, _rb, _rs, sorted(set(_cb) | set(_cs)))
         _real_credit = {u: v * _q.get(u, 0.0) for u, v in _cap_credit.items()}
@@ -1690,6 +1805,8 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
             _dd['making_captured'] = float(_cap_credit.get(_u, 0.0))
             _dd['making_basis'] = _basis_flag
         _notional = getattr(self, 'debeta_notional', {}) or {}
+        # both shrinkage forms of the per-book alphas the present skill reads (0.6.6), published beside it; never paid
+        _shrunk_self, _shrunk_eb = _shrunk_skills(skill_pool)
         for _u, _dd in _detail.items():
             # under the hurdle a qualifying book is one it kept; the pool's bar reads this count
             if _hurdle_books_by_uid is not None:
@@ -1704,10 +1821,14 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                                                         for b in set(_mbn) | set(_msn)))
             _dd['at_best_seconds'] = int(sum(((getattr(self, 'debeta_at_best', None) or {}).get(_u) or {}).values()))
             _dd['best_size'] = float(sum(((getattr(self, 'debeta_best_size', None) or {}).get(_u) or {}).values()))
+            # the conjunction (0.6.6): two-sided resting presence near the touch over all books, published, never paid
+            _dd['conjunction'] = float(sum(((getattr(self, 'debeta_conj', None) or {}).get(_u) or {}).values()))
             _dd['skill_weakest3'] = float(weakest3.get(_u, 0.0)) if weakest3 else None
             _dd['skill_books_kept'] = int(sub_info[_u]['books']) if _u in sub_info else len(skill_pool.get(_u, {}))
             _dd['skill_pool_factor'] = float(pool_factor)
             _dd['notional'] = float(sum((_notional.get(_u) or {}).values()))
+            _dd['skill_shrunk_self'] = float(_shrunk_self.get(_u, 0.0))
+            _dd['skill_shrunk_eb'] = float(_shrunk_eb.get(_u, 0.0))
         # PRESENCE GATE: a uid whose last presence_window queries all failed is not scorable this
         # cycle (dropped from the map, so the blend reads 0 and scorable is False); its legs stay in
         # the detail with present=False and its accumulators keep running. The scoring child gets the
@@ -1715,7 +1836,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
         _gate = int(debeta_dial(dcfg, 'presence_gate'))
         _absent = set()
         if _gate:
-            _shipped = getattr(self, 'debeta_absent', None)
+            _shipped = absent if absent is not None else getattr(self, 'debeta_absent', None)
             if _shipped is not None:
                 _absent = {int(u) for u in _shipped}
             else:
@@ -1723,7 +1844,7 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                                       int(debeta_dial(dcfg, 'presence_window') or 50))
         # Graded presence: the success share over the presence window, shipped from main to the child
         # like the absent set. Weighting and the minimum share are dials that default to off.
-        _shares = getattr(self, 'debeta_presence_shares', None)
+        _shares = presence if presence is not None else getattr(self, 'debeta_presence_shares', None)
         if _shares is None and _gate:
             _shares = presence_shares(getattr(self, 'miner_presence', {}) or {},
                                       int(debeta_dial(dcfg, 'presence_window') or 50))
@@ -1775,14 +1896,37 @@ def compute_debeta_scores(self: 'Validator') -> Dict[int, float]:
                     s3_k=s3_k,
                 )
                 _notional_all = getattr(self, 'debeta_notional', {}) or {}
+                # the empirical Bayes pool is the class's own, as the class's skill is ranked within it
+                _cself, _ceb = _shrunk_skills(_part['pool'])
                 for _u, _dd in _cd.items():
                     if _ckept is not None:
                         _dd['skill_books'] = int(_ckept.get(_u, 0))
                     _dd['present'] = _u not in _absent
                     _dd['notional'] = float(sum(v for b, v in (_notional_all.get(_u) or {}).items() if _cmap.get(b) == _c))
+                    _dd['skill_shrunk_self'] = float(_cself.get(_u, 0.0))
+                    _dd['skill_shrunk_eb'] = float(_ceb.get(_u, 0.0))
                 _details[_c] = _cd
-            self._debeta_class_shares = class_pool_shares(_details, _cw, sorted(_detail), _bars)
+            # the run-boundary handover (0.6.6): carried class shares blended in, a new class ramped in; the vectors
+            # each class pays this cycle are kept by name for the next boundary
+            _vectors = {}
+            _handover = class_handover_now(self)
+            self._debeta_class_shares = class_pool_shares(_details, _cw, sorted(_detail), _bars,
+                                                          handover=_handover, vectors_out=_vectors)
+            _names = class_names_by_index(self)
+            if _handover:
+                bt.logging.info(handover_log_line(_handover, _cw, _names))
+            self._debeta_class_vectors = {(_names[c] if 0 <= int(c) < len(_names) else str(c)): v
+                                          for c, v in _vectors.items()}
             self._debeta_class_summary = class_summary(_details, _cw, _bars, {c: p['n_books'] for c, p in _by_class.items()})
+            # the conjunction per class (0.6.6), after the pools and the summary are built from the scored uids: a uid
+            # resting two-sided with no credit in the class still gets its row, and each class its farm reference
+            _conj_c, _conj_farm = conjunction_by_class(self, _cmap)
+            for _c, _rows in _conj_c.items():
+                _cd = _details.setdefault(_c, {})
+                for _u, _v in _rows.items():
+                    _cd.setdefault(_u, {})['conjunction'] = float(_v)
+            for _c, _v in _conj_farm.items():
+                self._debeta_class_summary.setdefault(int(_c), {})['conjunction_farm'] = float(_v)
             # the per-class per-uid detail the pools were built from, kept for the report (agent_class_gauges)
             self._debeta_class_details = _details
         warm = sum(1 for v in scores.values() if v > 0.0)
@@ -1950,6 +2094,8 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
         # Canonical book id -> background index under a multi-asset layout (empty on a single
         # market); the scoring child pays the per-class dial from this map, as main does.
         'class_of_book': {str(k): int(v) for k, v in class_map(self).items()},
+        # the classes' names in index order, which the run-boundary handover keys its carried shares by
+        'class_names': class_names_by_index(self),
     }
 
 
@@ -2048,7 +2194,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     Calculate per-round trading and gentrx rewards for all UIDs.
 
     pinned_inputs (optional): {'simulation_timestamp', 'deregistered_uids',
-    'gentrx_scores', 'gentrx_ema'} — overrides the live reads. Used by the
+    'gentrx_scores', 'gentrx_ema', 'absent', 'presence', ...} override the live reads. Used by the
     scoring-service VERIFY path so main computes with EXACTLY the inputs the
     child was given: simulation_timestamp advances 1-2 rounds during the
     adoption wait, shifting activity-decay windows and producing false
@@ -2084,7 +2230,8 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         'realized_pnl_history': realized_pnl_history,
         'config': build_scoring_config(self),
         'simulation_config': build_simulation_config_dict(self),
-        'debeta_scores': _pin.get('debeta_scores') if 'debeta_scores' in _pin else compute_debeta_scores(self),
+        'debeta_scores': _pin.get('debeta_scores') if 'debeta_scores' in _pin else compute_debeta_scores(
+            self, absent=_pin.get('absent'), presence=_pin.get('presence')),
         # Read AFTER the line above, which is what populates them. Stashed on self by
         # compute_debeta_scores; empty on any fallback path.
         'debeta_detail': getattr(self, 'debeta_detail', {}) or {},
@@ -2264,59 +2411,3 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     }
 
     return distributed_trading, gentrx_rewards, updated_data, all_uids
-
-def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationStateUpdate]) -> list[FinanceAgentResponse]:
-    """
-    Applies base delay based on process time using an exponential mapping,
-    and adds a per-book Gaussian-distributed random latency instruction_delay to instructions,
-    with zero instruction_delay applied to the first instruction per book.
-
-    Args:
-        self (taos.im.neurons.validator.Validator): Validator instance.
-        synapse_responses (dict[int, MarketSimulationStateUpdate]): Latest state updates.
-
-    Returns:
-        list[FinanceAgentResponse]: Delayed finance responses.
-    """
-    start_time = time.time()
-    responses = []
-    timeout = self.config.neuron.timeout
-    min_delay = self.config.scoring.min_delay
-    max_delay = self.config.scoring.max_delay
-    min_instruction_delay = self.config.scoring.min_instruction_delay
-    max_instruction_delay = self.config.scoring.max_instruction_delay
-
-    def compute_delay(p_time: float) -> int:
-        """Exponential scaling of process time into delay."""
-        t = p_time / timeout
-        exp_scale = 5
-        delay_frac = (np.exp(exp_scale * t) - 1) / (np.exp(exp_scale) - 1)
-        delay = min_delay + delay_frac * (max_delay - min_delay)
-        return int(delay)
-    log_messages = []
-    for _uid, synapse_response in synapse_responses.items():
-        response = synapse_response.response
-        if response:
-            base_delay = compute_delay(synapse_response.dendrite.process_time)
-            seen_books = set()
-            for instruction in response.instructions:
-                book_id = instruction.bookId
-
-                if book_id not in seen_books:
-                    instruction_delay = 0
-                    seen_books.add(book_id)
-                else:
-                    instruction_delay = random.randint(min_instruction_delay, max_instruction_delay)
-                # the model bounds what a miner sends; the validator's own addition must land inside the same bound
-                instruction.delay = min(instruction.delay + base_delay + instruction_delay, MAX_INSTRUCTION_DELAY)
-            responses.append(response)
-            log_messages.append(
-                f"UID {response.agent_id} responded with {len(response.instructions)} instructions "
-                f"after {synapse_response.dendrite.process_time:.4f}s – base delay {base_delay}{self.simulation.time_unit if hasattr(self, 'simulation') else 'ns'}"
-            )
-    if log_messages:
-        bt.logging.info("\n".join(log_messages))    
-    elapsed = time.time() - start_time
-    if elapsed > 0.1:
-        bt.logging.warning(f"set_delays took {elapsed:.4f}s for {len(synapse_responses)} responses")
-    return responses

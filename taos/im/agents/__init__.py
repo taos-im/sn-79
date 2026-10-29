@@ -1243,6 +1243,8 @@ class FinanceAgentBase(SimulationAgent):
                 bt.logging.warning(f"FAILED TO PLACE {'BUY' if event.side == 0 else 'SELL'} ORDER FOR {event.quantity}@{event.price if event.type.endswith('L') else 'MARKET'} ON BOOK {event.bookId} : You have exceeded the maximum allowed loan value ({self.simulation_config.max_loan}) on this book.  You need to close positions using the close_position method to repay some of the loan amount before you can place more leveraged orders.")
             case 'DUAL_POSITION':
                 bt.logging.warning(f"FAILED TO PLACE {'BUY' if event.side == 0 else 'SELL'} ORDER FOR {event.quantity}@{event.price if event.type.endswith('L') else 'MARKET'} ON BOOK {event.bookId} : You already have a margin position in the opposite direction.  You must close this position before you can take leverage on this side of the book.")
+            case 'VOLUME_CAP_REACHED':
+                bt.logging.warning(f"FAILED TO PLACE {'BUY' if event.side == 0 else 'SELL'} ORDER FOR {event.quantity}@{event.price if event.type.endswith('L') else 'MARKET'} ON BOOK {event.bookId} : You have reached the validator's trading volume cap on this book.  New orders on it are refused, including delayed ones as they arrive, until your traded volume over the assessment period falls back below the cap; cancels and position closes still go through.")
             case _:
                 pass
 
@@ -1740,6 +1742,19 @@ FinanceSimulationAgent = FinanceAgentBase
 
 
 from taos.im.utils.history import history, batch_history
+def book_batches(book_ids: list, workers: int) -> list:
+    """The books in contiguous batches for parallel reconstruction, one per worker (no more than the books), their
+    sizes differing by at most one, so any book count goes across any worker count."""
+    n = max(1, min(int(workers), len(book_ids)))
+    size, extra = divmod(len(book_ids), n)
+    out, start = [], 0
+    for i in range(n):
+        end = start + size + (1 if i < extra else 0)
+        out.append(list(book_ids[start:end]))
+        start = end
+    return [b for b in out if b]
+
+
 class StateHistoryManager:
     """
     Manages the state history for market simulations, including reconstruction of L2 states,
@@ -1813,13 +1828,8 @@ class StateHistoryManager:
 
                 # Parallel or sequential history reconstruction
                 if self.parallel:
-                    num_processes = min(self.parallel_workers, len(state.books))
-                    if len(state.books) % num_processes != 0:
-                        raise ValueError(f"`parallel_workers` ({self.parallel_workers}) must divide number of books ({len(state.books)}).")
-
-                    # Divide books into batches for parallel processing
-                    batch_size = len(state.books) // num_processes
-                    batches = [list(state.books.keys())[i:i + batch_size] for i in range(0, len(state.books), batch_size)]
+                    # Divide books into batches for parallel processing, any book count across any worker count
+                    batches = book_batches(list(state.books.keys()), self.parallel_workers)
                     histories = batch_history(
                         {book_id: snapshot.model_dump() for book_id, snapshot in snapshots.items()},
                         {book_id: [event.model_dump() for event in book.events] for book_id, book in state.books.items()},

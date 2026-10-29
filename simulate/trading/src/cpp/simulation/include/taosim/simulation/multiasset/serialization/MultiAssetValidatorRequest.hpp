@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <taosim/serialization/msgpack/common.hpp>
 #include <taosim/simulation/multiasset/MultiAssetConfig.hpp>
 #include <taosim/simulation/serialization/ValidatorRequest.hpp>
 
@@ -36,6 +37,9 @@ struct MultiAssetValidatorRequest
     std::span<const std::unique_ptr<Simulation>> simulations;  // flat, all realizations
     const MultiAssetConfig* config;                            // backgrounds + instanceCount
     std::filesystem::path logDir;                              // run root
+    // Each realization's ValidatorRequest, packed by its own worker as it finished the step, in flat order. Empty:
+    // each realization is packed with the request.
+    std::span<const taosim::serialization::HumanReadableStream> instances;
 };
 
 }  // namespace taosim::simulation::multiasset::serialization
@@ -95,11 +99,17 @@ struct pack<taosim::simulation::multiasset::serialization::MultiAssetValidatorRe
             o.pack("instances"s);
             o.pack_array(bg.instanceCount);
             for (uint32_t instance = 0; instance < bg.instanceCount; ++instance) {
-                const auto& simulation = v.simulations[flatIdx];
-                o.pack(single::ValidatorRequest{
-                    .simulations = v.simulations.subspan(flatIdx, 1),
-                    .logDir = simulation->logDir()
-                });
+                // A part its worker packed is already msgpack, appended as it is; without one (a caller that
+                // packs the request whole) the realization is packed here, to the same bytes.
+                if (flatIdx < v.instances.size()) {
+                    const auto& packed = v.instances[flatIdx];
+                    o.pack_bin_body(packed.data(), static_cast<uint32_t>(packed.size()));
+                } else {
+                    o.pack(single::ValidatorRequest{
+                        .simulations = v.simulations.subspan(flatIdx, 1),
+                        .logDir = v.simulations[flatIdx]->logDir()
+                    });
+                }
                 ++flatIdx;
             }
         }

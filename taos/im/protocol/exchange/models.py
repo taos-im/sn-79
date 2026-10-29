@@ -206,7 +206,7 @@ class LevelInfo(BaseModel):
         Returns:
             The model in synapse format.
         """
-        if not 'o' in json:
+        if 'o' not in json:
             orders = None
         else:
             orders = [Order.model_construct(id=order['i'], timestamp=order['t'],quantity=order['q'],side=order['s'],order_type="limit",price=json['p'],leverage=json['l'] if 'l' in json else 0.0) for order in json['o']]
@@ -495,8 +495,6 @@ class History:
         return sampled
                 
 from typing import Union, Optional
-from itertools import accumulate
-import numpy as np
 
 class EventHistory(History):
     """

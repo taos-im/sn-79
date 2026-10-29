@@ -8,9 +8,8 @@ Tests:
      is gone — we build the GradientDelta directly. Verified by checking
      that the new code path produces a bit-identical top-k result with no
      intermediate `zeros(N)` allocation.
-  2. The per-miner boto3 client is cached: a second call to
-     `_get_miner_s3_client` with the same (endpoint, bucket, key) triple
-     returns the SAME client object.
+  2. A single top-k gradient, which aggregate() returns unchanged, falls
+     back to decompress() instead of the dense reshape fast path.
 """
 
 import torch
@@ -22,7 +21,6 @@ from GenTRX.src.gradient import (
     compress,
     decompress,
 )
-from GenTRX.src.gradient_server import GradientAggregator
 
 
 def _make_cg(values: dict, miner_uid: int = 1):
@@ -65,55 +63,6 @@ def test_dense_aggregate_to_delta_matches_decompress_path():
             old_vals[old_idx.argsort()], new_vals[new_idx.argsort()]
         )
         assert old_shape == new_shape
-
-
-class _StubBucketInfo:
-    def __init__(self, endpoint_url, bucket_name, access_key_id):
-        self.endpoint_url = endpoint_url
-        self.bucket_name = bucket_name
-        self.access_key_id = access_key_id
-        self.secret_access_key = "secret-x"
-        self.region = "auto"
-
-
-def test_miner_s3_client_is_cached(tmp_path, monkeypatch):
-    """Two calls with the same bucket triple must hit the cache and return
-    the SAME boto3 client object (identity, not equality). A third call
-    with a different triple gets a fresh client."""
-    gs = GradientAggregator(
-        checkpoint_path=str(tmp_path / "ckpt.pt"),
-        val_data_path="",
-        output_path=str(tmp_path / "out.pt"),
-        log_path=str(tmp_path / "agg.jsonl"),
-        validator_store=None,
-        is_aggregator=False,
-        no_startup_cleanup=True,
-    )
-
-    # Avoid actually hitting boto3 — replace boto3.client with a stub that
-    # returns a unique object per construction. The test asserts the
-    # cache returns the FIRST stub from a second call with the same key.
-    construction_count = {"n": 0}
-
-    class _StubClient:
-        def __init__(self, *a, **k):
-            construction_count["n"] += 1
-
-    import boto3
-    monkeypatch.setattr(boto3, "client", lambda *a, **k: _StubClient(*a, **k))
-
-    bi_alpha = _StubBucketInfo("https://s3.a", "bucket-a", "key-a")
-    bi_beta = _StubBucketInfo("https://s3.b", "bucket-b", "key-b")
-
-    c1 = gs._get_miner_s3_client(bi_alpha)
-    c2 = gs._get_miner_s3_client(bi_alpha)
-    c3 = gs._get_miner_s3_client(bi_beta)
-
-    assert c1 is c2, "same bucket triple → same client (cache hit)"
-    assert c1 is not c3, "different bucket triple → fresh client"
-    assert construction_count["n"] == 2, (
-        "exactly two real client constructions (one per distinct triple)"
-    )
 
 
 def test_single_gradient_aggregate_survives_direct_reshape_path():
@@ -171,34 +120,3 @@ def test_multi_gradient_aggregate_still_takes_dense_fast_path():
         v.numel() == s.numel() for _, v, s in agg.sparse.values()
     )
     assert dense_ok, "multi-gradient aggregate must remain dense (arange-indexed)"
-
-
-def test_miner_s3_client_evicted_on_credential_rotation(tmp_path, monkeypatch):
-    """Cache key includes access_key_id — rotating the key for the same
-    endpoint+bucket builds a fresh client (so a revoked credential cannot
-    keep authenticating from a cached client)."""
-    gs = GradientAggregator(
-        checkpoint_path=str(tmp_path / "ckpt.pt"),
-        val_data_path="",
-        output_path=str(tmp_path / "out.pt"),
-        log_path=str(tmp_path / "agg.jsonl"),
-        validator_store=None,
-        is_aggregator=False,
-        no_startup_cleanup=True,
-    )
-
-    counter = {"n": 0}
-
-    class _StubClient:
-        def __init__(self, *a, **k):
-            counter["n"] += 1
-
-    import boto3
-    monkeypatch.setattr(boto3, "client", lambda *a, **k: _StubClient(*a, **k))
-
-    bi_v1 = _StubBucketInfo("https://s3.x", "bucket-x", "key-v1")
-    bi_v2 = _StubBucketInfo("https://s3.x", "bucket-x", "key-v2")
-
-    gs._get_miner_s3_client(bi_v1)
-    gs._get_miner_s3_client(bi_v2)
-    assert counter["n"] == 2, "credential rotation must trigger a fresh client"

@@ -8,7 +8,6 @@ prefix and 404'd every file.
 """
 import types
 
-import pytest
 
 from taos.im.agents.gentrx import GenTRXAgent
 

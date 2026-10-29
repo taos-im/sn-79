@@ -20,7 +20,8 @@ extend-exclude = '''
 target-version = "py310"
 line-length = 120
 # Mirror apply_testnet.sh: exclude everything not in the public sn-79 surface
-# protocol/config, and the exchange/dev-only example agents).
+# exchange and dev-only example agents). The exchange protocol, its config and
+# taos/im/agents/exchange are carved, so they are linted here as they are there.
 extend-exclude = [
     "simulate/trading/build",
     "simulate/trading/vcpkg",
@@ -65,9 +66,16 @@ ignore = [
 # Package __init__ files re-export submodule names as the package API; their
 # "unused" imports are intentional re-exports.
 "**/__init__.py" = ["F401"]
+# The protocol packages are star-import facades (see F403/F405 above): a module-level import there is
+# part of the package's exported surface, whether or not the module itself uses it.
+"taos/im/protocol/*" = ["F401"]
+"taos/im/protocol/**/*" = ["F401"]
+"taos/common/protocol/*" = ["F401"]
 # Tests legitimately use asserts and dummy secrets.
-"GenTRX/tests/*" = ["S101", "S105", "S106"]
-"**/tests/*" = ["S101", "S105", "S106"]
+# Tests also exec and eval their own fixture code, unpickle and parse their own files, bind
+# test servers on every interface, write under /tmp and spawn fixed local commands.
+"GenTRX/tests/*" = ["S101", "S105", "S106", "S108"]
+"**/tests/*" = ["S101", "S102", "S104", "S105", "S106", "S108", "S202", "S301", "S307", "S314", "S603", "S607"]
 "simulate/trading/test/*" = ["S603", "S607"]  # integration harness runs fixed local binaries
 # Sim run-helpers (reporting/LaTeX/logging/trader scaffolding): parse trusted
 # local config XML and shell out to fixed local commands.
@@ -82,8 +90,9 @@ ignore = [
 "GenTRX/src/gradient_store.py" = ["S106", "S107"]  # env-var-NAME suffixes, not secrets (review DISPUTED)
 # Validator/sim run fixed local commands (git, pm2, engine binary) and bind
 # service sockets on 0.0.0.0; XML/pickle inputs are trusted local config/checkpoints.
-"taos/im/neurons/validator.py" = ["S603", "S104"]
+"taos/im/neurons/validator.py" = ["S603", "S104", "S314"]  # parses its own simulation config XML
 "taos/im/neurons/miner.py" = ["S606"]
+"taos/im/neurons/*.py" = ["S606"]  # the neuron launchers exec the process they launch
 "taos/im/validator/update.py" = ["S603", "S607"]
 "taos/im/validator/engines/simulation.py" = ["S603", "S104", "S314", "S108"]
 "taos/im/validator/query.py" = ["S104", "S301"]
@@ -98,6 +107,12 @@ ignore = [
 "taos/common/utils/misc.py" = ["S603"]
 "agents/RevengAgent.py" = ["S301"]  # pickle.load of agent's own Optuna study (review DISPUTED)
 "agents/proxy/proxy.py" = ["S314"]  # parses trusted local simulation config XML
+"taos/im/validator/checkpoint_snapshot.py" = ["S301"]  # unpickles the validator's own checkpoint snapshots
+"taos/im/validator/metagraph_worker.py" = ["S301"]  # unpickles its own worker payloads
+"taos/im/validator/scoring_shadow.py" = ["S301", "S324"]  # unpickles its own snapshots; md5 = non-crypto frame digest
+"taos/im/protocol/config.py" = ["S314"]  # parses the trusted simulation config XML
+"taos/im/protocol/*_config.py" = ["S314"]  # the config modules parse the trusted run config XML
+"taos/im/validator/signed_release.py" = ["S603", "S607"]  # runs git and gpg on the validator's own checkout
 
 [tool.mypy]
 python_version = "3.10"
@@ -114,7 +129,6 @@ exclude = [
     '^simulate/trading/run/prof/',
     '^agents/ActiveAgent\.py$',
     '^agents/SimpleAgent\.py$',
-    '^taos/im/config/exchange\.py$',
 ]
 
 [tool.vulture]

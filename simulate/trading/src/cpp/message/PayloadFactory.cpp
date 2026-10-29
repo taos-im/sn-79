@@ -121,21 +121,31 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(
 
     static constexpr auto ctx = std::source_location::current().function_name();
 
-    if (auto prefix = "DISTRIBUTED_"sv; type.starts_with(prefix)) {
+    // A distributed message carries an agent's payload under its own name: DISTRIBUTED_<X> holds the agent's <X>,
+    // and the exchange's reply RESPONSE_DISTRIBUTED_<X> (ERROR_RESPONSE_DISTRIBUTED_<X>) holds RESPONSE_<X>
+    // (ERROR_RESPONSE_<X>). A reply in flight at a checkpoint is restored with its payload, so the agent's notice
+    // survives the resume.
+    auto distributed = [&](std::string_view innerType) {
         try {
             return MessagePayload::create<DistributedAgentResponsePayload>(
                 *taosim::serialization::msgpackFindMap<AgentId>(o, "agentId"),
                 createFromMessagePack(
-                    *taosim::serialization::msgpackFindMapObj(o, "payload"),
-                    type.substr(prefix.size()),
-                    unknownType
-                )
-            );
+                    *taosim::serialization::msgpackFindMapObj(o, "payload"), innerType, unknownType));
         }
         catch (const std::exception& e) {
             throw std::runtime_error{fmt::format(
                 "{}: Error creating payload of type '{}': {}", ctx, type, e.what()
             )};
+        }
+    };
+    if (auto prefix = "DISTRIBUTED_"sv; type.starts_with(prefix)) {
+        return distributed(type.substr(prefix.size()));
+    }
+    for (auto [prefix, inner] : {
+        std::pair{"RESPONSE_DISTRIBUTED_"sv, "RESPONSE_"sv},
+        std::pair{"ERROR_RESPONSE_DISTRIBUTED_"sv, "ERROR_RESPONSE_"sv}}) {
+        if (type.starts_with(prefix)) {
+            return distributed(std::string{inner}.append(type.substr(prefix.size())));
         }
     }
 
@@ -184,6 +194,32 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(
     }
     else if (type == "ERROR_RESPONSE_CANCEL_ORDERS") {
         return makePayload.operator()<CancelOrdersErrorResponsePayload>();
+    }
+    else if (type == "RESPONSE_RETRIEVE_ORDERS") {
+        return makePayload.operator()<RetrieveOrdersResponsePayload>();
+    }
+    else if (type == "RESPONSE_CLOSE_POSITIONS") {
+        return makePayload.operator()<ClosePositionsResponsePayload>();
+    }
+    else if (type == "ERROR_RESPONSE_CLOSE_POSITIONS") {
+        return makePayload.operator()<ClosePositionsErrorResponsePayload>();
+    }
+    else if (type == "EVENT_ORDER_MARKET") {
+        return makePayload.operator()<EventOrderMarketPayload>();
+    }
+    else if (type == "EVENT_ORDER_LIMIT") {
+        return makePayload.operator()<EventOrderLimitPayload>();
+    }
+    // A trade goes to a local subscriber as itself and to the distributed proxy inside the agent's envelope,
+    // under the same type; the envelope is the map with exactly an agentId and a payload.
+    else if (type == "EVENT_TRADE") {
+        const bool enveloped = o.type == msgpack::type::MAP && o.via.map.size == 2
+            && taosim::serialization::msgpackFindMapObj(o, "agentId").has_value()
+            && taosim::serialization::msgpackFindMapObj(o, "payload").has_value();
+        if (enveloped) {
+            return distributed(type);
+        }
+        return makePayload.operator()<EventTradePayload>();
     }
     else if (type == "RETRIEVE_L1") {
         return makePayload.operator()<RetrieveL1Payload>();

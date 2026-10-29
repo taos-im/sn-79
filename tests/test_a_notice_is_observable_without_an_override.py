@@ -17,7 +17,6 @@ the one a miner stands on.
 So the property is asserted here against an agent that overrides NOTHING, which is what a miner
 copying the published examples actually has.
 """
-import importlib.util as ilu
 import pathlib
 import sys
 import types
@@ -70,7 +69,6 @@ def _plain_agent(agents_mod, events):
         pytest.skip("FinanceAgent not exported")
 
     ns = {"initialize": lambda self, *a, **k: None}
-    import abc
     for name in getattr(cls, "__abstractmethods__", ()):
         ns.setdefault(name, lambda self, *a, **k: None)
     Plain = type("PlainMinerAgent", (cls,), ns)

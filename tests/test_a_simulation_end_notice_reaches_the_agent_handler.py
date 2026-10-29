@@ -140,7 +140,10 @@ def _agent_driving_update(recorder_cls, events, book_ids=(5,)):
     a.simulation_config = _t.SimpleNamespace(book_ids=list(book_ids), simulation_id="probe")
     # One empty account per declared book: `update` indexes self.accounts[book_id] as it walks
     # simulation_config.book_ids, and an empty mapping raises KeyError before it ever reaches onEnd.
-    _bal = lambda: _t.SimpleNamespace(free=0.0, reserved=0.0, total=0.0)
+
+    def _bal():
+        return _t.SimpleNamespace(free=0.0, reserved=0.0, total=0.0)
+
 
     def _acct():
         return _t.SimpleNamespace(orders=[], loans={}, fees=None,

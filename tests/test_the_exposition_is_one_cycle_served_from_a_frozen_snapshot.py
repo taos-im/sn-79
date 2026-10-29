@@ -9,7 +9,6 @@ own renderer, and the two bulk registries can be left off /metrics without losin
 import os
 import sys
 import threading
-import types
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Info, generate_latest
 

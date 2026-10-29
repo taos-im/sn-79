@@ -383,8 +383,6 @@ def generate_with_engine_open_loop(
 
     seqs = {k: v.to(device) for k, v in prompt.items()}
     T_prompt = seqs["order_types"].shape[1]
-    init_snap = engine.snapshot()
-    session_open_mid = init_snap.mid_price if init_snap.mid_price > 0 else None
     fixed_lob = seqs["lob_volumes"][:, -1:, :]
     fixed_tod = seqs["time_of_day"][:, -1:]
     fixed_md = seqs["mid_deltas"][:, -1:]
@@ -654,8 +652,10 @@ def generate_trajectories_batched(
             new_tod_rows: list[torch.Tensor] = []
             new_md_rows: list[torch.Tensor] = []
             for k in range(K):
-                otype = int(otype_b[k]); p_bin = int(p_bin_b[k])
-                vi_bin = int(vi_bin_b[k]); vd_bin = int(vd_bin_b[k])
+                otype = int(otype_b[k])
+                p_bin = int(p_bin_b[k])
+                vi_bin = int(vi_bin_b[k])
+                vd_bin = int(vd_bin_b[k])
                 i_bin = int(i_bin_b[k])
 
                 snap = engines[k].snapshot()

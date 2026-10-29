@@ -52,6 +52,14 @@ Fees FeePolicyWrapper::getRates(BookId bookId, AgentId agentId) const
 
 //-------------------------------------------------------------------------
 
+bool FeePolicyWrapper::hasOwnPolicy(AgentId agentId) const
+{
+    const auto agentBaseName = m_accountRegistry->getAgentBaseName(agentId);
+    return agentBaseName.has_value() && m_agentBaseNameFeePolicies.contains(agentBaseName.value());
+}
+
+//-------------------------------------------------------------------------
+
 decimal_t FeePolicyWrapper::agentVolume(BookId bookId, AgentId agentId) const noexcept
 {
     if (!isTiered()) return {};

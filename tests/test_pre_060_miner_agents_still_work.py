@@ -25,7 +25,6 @@ Three separate things in that snippet can break, and each has its own test below
 class, and the raw response object crossing handle() without being coerced.
 """
 
-import pytest
 
 
 def test_the_old_base_class_name_still_imports():

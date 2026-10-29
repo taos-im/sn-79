@@ -43,6 +43,10 @@ SHADOW_PARITY_NS = int(os.environ.get("SHADOW_PARITY_NS", "10000000000"))
 SHADOW_SIDE_BUFFER_MAX = int(os.environ.get("SHADOW_SIDE_BUFFER_MAX", "64"))
 SHADOW_REINIT_STORM_N = int(os.environ.get("SHADOW_REINIT_STORM_N", "3"))
 SHADOW_REINIT_STORM_S = float(os.environ.get("SHADOW_REINIT_STORM_S", "900"))
+# A re-INIT waits until main has applied every state the dropped replica consumed (see init_waits). Main's lag
+# behind the listener is held to a few rounds by the query block on pending reward tasks, so the wait is a few
+# rounds; past this many the INIT runs regardless, so a clock that never reaches the floor still re-initialises.
+SHADOW_REINIT_WAIT_MAX = int(os.environ.get("SHADOW_REINIT_WAIT_MAX", "16"))
 # Cutover VERIFY (main recomputes every SCORING_PROC_VERIFY_EVERY-th boundary and cross-checks the
 # child) is a second full get_rewards under the reward lock. A due check runs only while at most
 # MAX_PENDING reward tasks are queued (the running one included); otherwise it is deferred to the
@@ -99,16 +103,19 @@ class VerifyScheduler:
 _DEBETA_DD2 = ["capture_buy_sums", "capture_sell_sums", "realized_buy_sums", "realized_sell_sums", "debeta_mtm", "debeta_invsum", "debeta_inv",
                "debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional",
                "debeta_mtm_alt", "debeta_invsum_alt", "debeta_inv_alt",
-               "debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size"]
+               "debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size",
+               "debeta_conj", "capture_taker_buy_sums", "capture_taker_sell_sums"]
 _DEBETA_PLAIN = [
     "debeta_invn", "debeta_pfirst", "debeta_plast", "debeta_drift", "debeta_mark_state",
     "debeta_capture_mid", "debeta_cp", "debeta_cpc", "debeta_cpc_hist",
     "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
-    "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist",
+    "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist", "debeta_captkbuy_hist", "debeta_captksell_hist",
     "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
     "debeta_invn_alt", "debeta_pfirst_alt", "debeta_plast_alt", "debeta_drift_alt", "debeta_mark_state_alt",
     "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist",
     "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
+    "debeta_conj_hist", "debeta_conj_farm", "debeta_conj_farm_hist", "debeta_conj_ref", "debeta_conj_clock",
+    "_debeta_class_vectors", "_debeta_handover",
 ]
 
 _STRUCT_NAMES = [
@@ -401,6 +408,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
                                           pool_pay_vector, score_uids, skill_bar, smoothed_skill_share)
 
     shadow.deregistered_uids = list(deregs)
+    # the scorer's clock: the run-boundary handover's weight is read against it, as in main
+    shadow.simulation_timestamp = int(sim_ts)
     # The presence gate's absent set is main-side knowledge (query outcomes), shipped with the inputs.
     shadow.debeta_absent = (set(int(u) for u in absent) if absent is not None else None)
     # The graded presence share, main-side knowledge too, shipped the same way.
@@ -839,7 +848,8 @@ def _shadow_child_main(sock, cores, parity_ns):
                     continue
                 _apply_one(ts, raw)
             elif kind == "sim_start":
-                old_ts, new_ts = payload
+                old_ts, new_ts, *_rest = payload
+                _book_changes = _rest[0] if _rest else None  # the layout change's per-book map (row 64)
                 if shadow is not None:
                     # States teed before this shift are the old run's, and main applied them before shifting: the
                     # child applies them first too. A boundary awaited among them is void, no score follows a run
@@ -850,6 +860,13 @@ def _shadow_child_main(sock, cores, parity_ns):
                         _apply_one(ts, raw)
                         awaiting_score_at = None
                     from taos.im.validator.trade import shift_simulation_histories
+                    # a layout change: the new run's books, classes and names before the shift, as main has them
+                    _new_layout = (_book_changes or {}).get("layout") if isinstance(_book_changes, dict) else None
+                    if _new_layout:
+                        shadow.simulation_config.update(
+                            {k: _new_layout[k] for k in ("book_ids", "book_count", "class_of_book", "class_names")
+                             if k in _new_layout})
+                        shadow._debeta_class_map_cache = None
                     shift_simulation_histories(
                         shadow, old_ts, new_ts,
                         book_count=shadow.simulation_config['book_count'],
@@ -859,6 +876,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         miner_wealth=shadow.simulation.miner_wealth,
                         effective_max_uids=shadow.effective_max_uids,
                         book_ids=shadow.simulation_config.get('book_ids'),
+                        book_changes=_book_changes,
                     )
                     # The new run restarts near ts=0, so the old-run guard must not drop its frames; the state that
                     # triggered this shift, if main noticed the run change while handling it, follows the shift.
@@ -988,6 +1006,14 @@ class ScoringShadow:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scoring_shadow")
         self._pending = 0
         self._pending_lock = threading.Lock()
+        # Orders a state's submission against the reinit frame's, so the re-INIT floor is exactly the last state
+        # the dropped replica received (tee runs on the listener thread, request_reinit on main's or the reader's).
+        self._submit_lock = threading.Lock()
+        self._init_floor_ts = 0
+        self._init_waits_n = 0
+        # The child's lag: the states teed beyond the newest one it has reported applying.
+        self._teed_recent = deque(maxlen=64)
+        self.child_lag = 0
         self._dropped = 0
         self.initialized = False
         # Two-sided rings: the child usually computes AHEAD of main (it applies
@@ -1023,6 +1049,8 @@ class ScoringShadow:
     def start(self) -> None:
         """Start the shadow process and its feed."""
         import socket as _socket
+        self._init_floor_ts = 0
+        self._init_waits_n = 0
         self._sock, child_sock = _socket.socketpair()
         # daemon=False: the child spawns loky workers for shadow scoring, which
         # daemonic processes cannot. Orphan safety comes from the socket: when
@@ -1087,22 +1115,28 @@ class ScoringShadow:
                 with self._pending_lock:
                     self._pending -= 1
 
-        self._executor.submit(_send)
-        self._last_teed_ts = timestamp
+        with self._submit_lock:
+            self._executor.submit(_send)
+            self._last_teed_ts = timestamp
+            self._teed_recent.append(timestamp)
 
-    def emit_sim_start(self, old_ts: int, new_ts: int) -> None:
+    def emit_sim_start(self, old_ts: int, new_ts: int, book_changes=None) -> None:
         """Simulation restart: the child must run the same history shift.
 
         Args:
             old_ts: The previous simulation's time base.
             new_ts: The new simulation's time base.
         FIFO-ordered with the state tee (old-sim frames before, new-sim after)."""
+        # the new run's clock starts below any floor set, and any state teed, on the old one
+        self._init_floor_ts = 0
+        with self._submit_lock:
+            self._teed_recent.clear()
         if not self.is_alive():
             return
 
         def _send():
             try:
-                _send_frame(self._sock, ("sim_start", (old_ts, new_ts)))
+                _send_frame(self._sock, ("sim_start", (old_ts, new_ts, book_changes)))
             except Exception:
                 pass
 
@@ -1276,24 +1310,20 @@ class ScoringShadow:
         self._executor.submit(_send)
         return expect_ts, fut
 
-    def request_reinit(self) -> None:
+    def request_reinit(self, storm: bool = True) -> None:
         """Self-heal: drop the child's state and re-run INIT on the next round
         (triggered automatically after consecutive parity mismatches). Counted
         by the storm breaker: SHADOW_REINIT_STORM_N of these inside
-        SHADOW_REINIT_STORM_S seconds suspend the service instead."""
+        SHADOW_REINIT_STORM_S seconds suspend the service instead.
+
+        storm=False is main replacing its own state (a resume reloaded from a checkpoint snapshot): counted as a
+        re-INIT when there was a replica to drop, which is how the board tells it from a restart, but not a parity
+        failure for the breaker. The frame is sent either way, so the child also drops the rounds it buffered for a
+        pending INIT. The boundaries already shipped eagerly to the dropped replica are forgotten, since the new one
+        never scores them."""
         import bittensor as bt
         if self.cutover_suspended:
             return
-        self.reinits += 1
-        if self._storm.hit(time.monotonic()):
-            self.suspend(f"{self._storm.count} re-INITs within {self._storm.window:.0f}s")
-            return
-        bt.logging.warning(f"[SHADOW] requesting re-INIT (parity self-heal, #{self.reinits})")
-        self.initialized = False
-        self._ring.clear()
-        self._score_ring.clear()
-        self._pending_child_parity.clear()
-        self._pending_child_scores.clear()
 
         def _send():
             try:
@@ -1301,7 +1331,63 @@ class ScoringShadow:
             except Exception:
                 pass
 
-        self._executor.submit(_send)
+        suspend_reason = None
+        with self._submit_lock:
+            # counted against the replica it drops, read under the lock that drops it
+            if storm or self.initialized:
+                self.reinits += 1
+            if storm and self._storm.hit(time.monotonic()):
+                suspend_reason = f"{self._storm.count} re-INITs within {self._storm.window:.0f}s"
+            else:
+                bt.logging.warning(
+                    f"[SHADOW] requesting re-INIT ({'parity self-heal' if storm else 'main restored its state'}, "
+                    f"#{self.reinits})")
+                # the floor is in place before main can see the shadow uninitialized and attempt the INIT
+                self._init_floor_ts = self._last_teed_ts
+                self._init_waits_n = 0
+                self.initialized = False
+                self._ring.clear()
+                self._score_ring.clear()
+                self._pending_child_parity.clear()
+                self._pending_child_scores.clear()
+                if not storm:
+                    self._eager_inputs.clear()
+                self._executor.submit(_send)
+        if suspend_reason is not None:
+            # outside the lock: suspend resolves the pending score futures, which runs their callbacks here
+            self.suspend(suspend_reason)
+
+    def init_waits(self, applied_ts: int) -> bool:
+        """Whether the INIT must wait for main to apply more states. The states teed before the reinit frame reach
+        the child first and are applied to the replica it drops; one main has not yet applied when the snapshot is
+        taken is in neither the snapshot nor the child's pre-INIT buffer, and the fresh replica would lack it. So
+        the INIT runs once main has applied the last of them (the floor), or after SHADOW_REINIT_WAIT_MAX waits.
+
+        Args:
+            applied_ts: The timestamp of the last state main has applied (the INIT's base_ts).
+
+        Returns:
+            bool: True to skip the INIT this round.
+        """
+        floor = self._init_floor_ts
+        if not floor or applied_ts >= floor or self._init_waits_n >= SHADOW_REINIT_WAIT_MAX:
+            if floor and applied_ts < floor:
+                import bittensor as bt
+                bt.logging.warning(
+                    f"[SHADOW] re-INIT ran after {self._init_waits_n} waits with main at ts={applied_ts}, short of "
+                    f"the last state the dropped replica received (ts={floor}); expect a parity MISMATCH."
+                )
+            self._init_floor_ts = 0
+            self._init_waits_n = 0
+            return False
+        self._init_waits_n += 1
+        if self._init_waits_n == 1:
+            import bittensor as bt
+            bt.logging.info(
+                f"[SHADOW] re-INIT waits for main to apply ts={floor}, the last state the dropped replica received "
+                f"(main at ts={applied_ts})"
+            )
+        return True
 
     def suspend(self, reason: str) -> None:
         """Storm breaker: the parity self-heal is not converging, so stop paying for it. The child
@@ -1347,13 +1433,19 @@ class ScoringShadow:
             "parity_mismatches": int(self.mismatches),
             "reinits": int(self.reinits),
             "tee_dropped": int(self._dropped),
+            "child_lag": int(self.child_lag),
         }
+
+    def _child_applied(self, ts: int) -> None:
+        """The child reports it has applied the state at `ts`: its lag is the states teed beyond it."""
+        with self._submit_lock:
+            self.child_lag = sum(1 for t in self._teed_recent if t > ts)
 
     def send_init(self, validator) -> None:
         """Build + stream the INIT snapshot. MUST be called while the caller
         holds _reward_lock (structures frozen); runs synchronously on the
         shadow executor so it is FIFO-ordered with the tee frames."""
-        if self.cutover_suspended:
+        if self.cutover_suspended or self.init_waits(validator._shadow_applied_ts):
             import concurrent.futures
             done = concurrent.futures.Future()
             done.set_result(None)
@@ -1547,6 +1639,7 @@ class ScoringShadow:
                 kind, payload = _recv_frame(self._sock)
                 if kind == "parity":
                     ts, comps, vec, applied, apply_s = payload
+                    self._child_applied(ts)
                     mine = self._ring.pop(ts, None)
                     if mine is None:
                         # Child computed ahead of main (normal: it applies on tee,
@@ -1557,6 +1650,8 @@ class ScoringShadow:
                         self._compare_parity(ts, mine, (comps, vec, applied))
                 elif kind == "scores":
                     ts, result, score_s = payload
+                    # scored on its state at the boundary, before applying any state after it
+                    self._child_applied(ts)
                     fut = self._score_futures.pop(ts, None)
                     if fut is not None:
                         # cutover mode: resolve the awaiting _reward directly
@@ -1612,6 +1707,11 @@ class ScoringShadow:
             if self._proc.is_alive():
                 self._proc.kill()
             self._proc = None
+        # A save still pending will never be written: answer it, or the save waiting on it holds its executor.
+        for ts in list(self._save_futures):
+            fut = self._save_futures.pop(ts, None)
+            if fut is not None and not fut.done():
+                fut.set_result(None)
 
 
 def _num(v, default, cast):
@@ -1657,7 +1757,6 @@ def _simulation_duck(simulation):
     minimum order size, the dust floor's voting bar (trade._min_order_size). Without that answer the child took the
     0.0 fallback on every book while main read the layout's minimum, and the two sides built different floors from
     the same prints on a two-class layout. The map is built here, once, so the duck stays plain data to ship."""
-    from types import SimpleNamespace
     min_sizes = {}
     lookup = getattr(simulation, "config_for_book", None)
     if callable(lookup):

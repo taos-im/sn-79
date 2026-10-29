@@ -7,6 +7,7 @@
 #include <taosim/replay/helpers.hpp>
 #include <taosim/simulation/SimulationManager.hpp>
 #include <taosim/simulation/multiasset/helpers.hpp>
+#include <taosim/util/FatalSignal.hpp>
 
 #include <CLI/CLI.hpp>
 #include <cstdio>
@@ -22,6 +23,12 @@ int main(int argc, char* argv[])
     // Force line-buffered stdout/stderr so pm2/pipe environments don't batch log lines.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
+
+    // A crash leaves its signal and backtrace in the engine's own stderr, which pm2 keeps. An ASan build keeps
+    // the sanitizer's report, which says more.
+#if !defined(__SANITIZE_ADDRESS__)
+    taosim::util::installFatalSignalHandler();
+#endif
 
     CLI::App app{"ExchangeSimulator v2.0"};
 

@@ -30,6 +30,7 @@ import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch.utils.data import DataLoader
@@ -38,6 +39,9 @@ from GenTRX.src.dataloader import create_dataloaders
 from GenTRX.src.metrics import StepMetrics
 from GenTRX.src.model import ModelConfig, OrderModel, compute_loss
 from GenTRX.src.tokenizer import TokenizerConfig
+
+if TYPE_CHECKING:
+    from GenTRX.src.tokenizer import OrderTokenizer
 
 logger = logging.getLogger(__name__)
 

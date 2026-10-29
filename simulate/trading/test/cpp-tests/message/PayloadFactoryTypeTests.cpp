@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 //
 // The msgpack payload factory decodes the message types it models and refuses every other, as the JSON
-// factory does. A checkpointed message queue also holds the engine's own events and responses, which the
-// factory does not model; those still restore, with an empty payload.
+// factory does. A checkpointed message queue also holds the engine's own events and responses, and each of
+// those restores with its payload.
 
 #include <taosim/message/Message.hpp>
 #include <taosim/message/MultiBookMessagePayloads.hpp>
@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -172,35 +173,116 @@ TEST(PayloadFactoryTypes, EveryInstructionTypeStillDecodesToItsPayload)
 
 //-------------------------------------------------------------------------
 
-class CheckpointedEngineMessage : public TestWithParam<std::string> {};
-
-TEST_P(CheckpointedEngineMessage, RestoresFromTheQueueWithAnEmptyPayload)
+// A checkpointed queue also holds the engine's own replies and events. Each restores with its payload, so a reply or
+// a trade in flight at the checkpoint reaches its agent after the resume instead of being dropped where it is read.
+struct CheckpointedEngineMessageCase
 {
-    const Message msg{
-        Timestamp{10},
-        Timestamp{11},
-        "EXCHANGE",
-        "DISTRIBUTED_PROXY_AGENT",
-        GetParam(),
-        wrapped(MessagePayload::create<CancelOrdersResponsePayload>(
-            std::vector{OrderID{7}},
-            MessagePayload::create<CancelOrdersPayload>(
-                std::vector{taosim::event::Cancellation{OrderID{7}}}, kBookId)))};
+    std::string type;
+    MessagePayload::Ptr payload;
+    std::function<bool(const MessagePayload::Ptr&)> holdsIt;
+};
+
+class CheckpointedEngineMessage : public TestWithParam<CheckpointedEngineMessageCase> {};
+
+TEST_P(CheckpointedEngineMessage, RestoresFromTheQueueWithItsPayload)
+{
+    const auto& c = GetParam();
+    const Message msg{Timestamp{10}, Timestamp{11}, "EXCHANGE", "DISTRIBUTED_PROXY_AGENT", c.type, c.payload};
 
     Message restored;
-    ASSERT_NO_THROW(restored = restore(msg)) << "a checkpoint holding a " << GetParam() << " cannot be restored";
-    EXPECT_EQ(restored.type, GetParam());
+    ASSERT_NO_THROW(restored = restore(msg)) << "a checkpoint holding a " << c.type << " cannot be restored";
+    EXPECT_EQ(restored.type, c.type);
     EXPECT_EQ(restored.arrival, msg.arrival);
-    EXPECT_NE(std::dynamic_pointer_cast<EmptyPayload>(restored.payload), nullptr);
+    EXPECT_EQ(std::dynamic_pointer_cast<EmptyPayload>(restored.payload), nullptr) << c.type << " lost its payload";
+    EXPECT_TRUE(c.holdsIt(restored.payload)) << c.type << " restored with the wrong payload";
 }
+
+namespace
+{
+
+template<typename T>
+std::function<bool(const MessagePayload::Ptr&)> holds(std::function<bool(const T&)> fields = [](const T&) { return true; })
+{
+    return [fields](const MessagePayload::Ptr& p) {
+        const auto pld = std::dynamic_pointer_cast<T>(p);
+        return pld != nullptr && fields(*pld);
+    };
+}
+
+template<typename T>
+std::function<bool(const MessagePayload::Ptr&)> holdsWrapped(
+    std::function<bool(const T&)> fields = [](const T&) { return true; })
+{
+    return [inner = holds<T>(fields)](const MessagePayload::Ptr& p) {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(p);
+        return pld != nullptr && pld->agentId == kAgentId && inner(pld->payload);
+    };
+}
+
+CancelOrdersPayload::Ptr cancelRequest()
+{
+    return MessagePayload::create<CancelOrdersPayload>(std::vector{taosim::event::Cancellation{OrderID{7}}}, kBookId);
+}
+
+std::vector<CheckpointedEngineMessageCase> checkpointedEngineMessages()
+{
+    auto restingTrade = MessagePayload::create<EventTradePayload>();
+    restingTrade->bookId = kBookId;
+    restingTrade->isResting = true;
+    auto orders = MessagePayload::create<RetrieveOrdersResponsePayload>();
+    orders->bookId = kBookId;
+    auto closeError = MessagePayload::create<ClosePositionsErrorResponsePayload>();
+    closeError->orderIds = {OrderID{7}};
+    auto limitEvent = MessagePayload::create<EventOrderLimitPayload>();
+    limitEvent->bookId = kBookId;
+    limitEvent->agentId = kAgentId;
+    auto marketEvent = MessagePayload::create<EventOrderMarketPayload>();
+    marketEvent->bookId = kBookId;
+    auto closeResponse = MessagePayload::create<ClosePositionsResponsePayload>();
+    closeResponse->orderIds = {OrderID{7}};
+    const auto sevenIs = [](const auto& p) { return p.orderIds == std::vector{OrderID{7}}; };
+
+    return {
+        {"RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+            wrapped(MessagePayload::create<CancelOrdersResponsePayload>(std::vector{OrderID{7}}, cancelRequest())),
+            holdsWrapped<CancelOrdersResponsePayload>(sevenIs)},
+        {"ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+            wrapped(MessagePayload::create<CancelOrdersErrorResponsePayload>()),
+            holdsWrapped<CancelOrdersErrorResponsePayload>()},
+        {"RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT",
+            wrapped(MessagePayload::create<PlaceOrderLimitResponsePayload>()),
+            holdsWrapped<PlaceOrderLimitResponsePayload>()},
+        {"ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET",
+            wrapped(MessagePayload::create<PlaceOrderMarketErrorResponsePayload>()),
+            holdsWrapped<PlaceOrderMarketErrorResponsePayload>()},
+        {"RESPONSE_DISTRIBUTED_CLOSE_POSITIONS", wrapped(closeResponse),
+            holdsWrapped<ClosePositionsResponsePayload>(sevenIs)},
+        {"ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS", wrapped(closeError),
+            holdsWrapped<ClosePositionsErrorResponsePayload>(sevenIs)},
+        {"RESPONSE_DISTRIBUTED_RESET_AGENT",
+            wrapped(MessagePayload::create<ResetAgentsResponsePayload>()),
+            holdsWrapped<ResetAgentsResponsePayload>()},
+        {"EVENT_TRADE", wrapped(restingTrade),
+            holdsWrapped<EventTradePayload>([](const auto& t) { return t.bookId == kBookId && t.isResting; })},
+        {"EVENT_TRADE", restingTrade,
+            holds<EventTradePayload>([](const auto& t) { return t.bookId == kBookId && t.isResting; })},
+        {"RESPONSE_RETRIEVE_ORDERS", orders,
+            holds<RetrieveOrdersResponsePayload>([](const auto& p) { return p.bookId == kBookId; })},
+        {"EVENT_ORDER_LIMIT", limitEvent,
+            holds<EventOrderLimitPayload>([](const auto& p) { return p.bookId == kBookId && p.agentId == kAgentId; })},
+        {"EVENT_ORDER_MARKET", marketEvent,
+            holds<EventOrderMarketPayload>([](const auto& p) { return p.bookId == kBookId; })},
+    };
+}
+
+}  // namespace
 
 INSTANTIATE_TEST_SUITE_P(
     PayloadFactory,
     CheckpointedEngineMessage,
-    Values(
-        "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
-        "EVENT_TRADE",
-        "RESPONSE_RETRIEVE_ORDERS",
-        "EVENT_ORDER_LIMIT"));
+    testing::ValuesIn(checkpointedEngineMessages()),
+    [](const testing::TestParamInfo<CheckpointedEngineMessageCase>& info) {
+        return info.param.type + "_" + std::to_string(info.index);
+    });
 
 //-------------------------------------------------------------------------

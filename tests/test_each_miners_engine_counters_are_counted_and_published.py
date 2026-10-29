@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """Each miner's block of rounds also counts the engine's view of its instructions: placements and cancel instructions
-the validator sent, cancels the engine honoured and failed, fills, and instructions the caps dropped, published with
+the validator sent, the orders the cancels named by outcome, fills, and instructions the caps dropped, published with
 the request stats and reset with them.
 
 The placements the engine accepted and refused were already counted from its answers; the rest of what an agent asks
@@ -22,15 +22,16 @@ def _validator():
     return SimpleNamespace(miner_stats={})
 
 
-def _n(y, m=""):
-    return {"y": y, "u": y[0] != "E", "m": m, "b": 5}
+def _n(y, m="", c=None):
+    return {"y": y, "u": y[0] != "E", "m": m, "b": 5, "c": c or []}
 
 
-def test_cancel_answers_are_counted_honoured_and_failed_beside_the_placements():
+def test_cancel_answers_are_counted_per_order_beside_the_placements():
     v = _validator()
-    forward.update_placement_stats(v, {3: [_n("RDCO"), _n("RDCO"), _n("ERDCO", "x : ORDER NOT FOUND"), _n("RDPOL"), _n("ET")]})
+    forward.update_placement_stats(v, {3: [_n("RDCO", c=[{"o": 1}]), _n("RDCO", c=[{"o": 2}]),
+                                           _n("ERDCO", "x : ORDER NOT FOUND", c=[{"o": 3}]), _n("RDPOL"), _n("ET")]})
     st = v.miner_stats[3]
-    assert (st["cancels_ok"], st["cancels_failed"], st["placed"], st["fills"]) == (2, 1, 1, 1)
+    assert (st["orders_cancelled"], st["orders_not_found"], st["placed"], st["fills"]) == (2, 1, 1, 1)
 
 
 def _fill(book, tid):
@@ -59,10 +60,10 @@ def test_the_instructions_sent_are_counted_by_kind_per_agent():
 
 def test_a_row_restored_from_an_older_state_takes_the_new_counters_from_zero():
     v = SimpleNamespace(miner_stats={9: {"requests": 5, "timeouts": 0, "failures": 0, "rejections": 0, "call_time": []}})
-    forward.update_placement_stats(v, {9: [_n("ERDCO")]})
+    forward.update_placement_stats(v, {9: [_n("ERDCO", c=[{"o": 4}])]})
     block_stats.bump(v.miner_stats, 9, "fills")
     names = dict(report.round_block_gauges(v.miner_stats[9]))
-    assert (names["cancels_failed"], names["fills"], names["placements_sent"], names["dropped"], names["requests"]) == (1, 1, 0, 0, 5)
+    assert (names["orders_not_found"], names["fills"], names["placements_sent"], names["dropped"], names["requests"]) == (1, 1, 0, 0, 5)
 
 
 def _reply(uid, orders):
@@ -96,6 +97,7 @@ def test_the_dropped_counts_reach_each_miners_block_from_the_query_result():
 def test_the_block_publishes_the_engine_counters_and_the_reset_row_holds_them_at_zero():
     row = block_stats.empty_block_stats()
     names = [n for n, _ in report.round_block_gauges(row)]
-    for name in ("placements_sent", "cancels_sent", "cancels_ok", "cancels_failed", "fills", "dropped"):
+    for name in ("placements_sent", "cancels_sent", "cancel_orders_sent", "orders_cancelled", "orders_not_found",
+                 "stp_cancels", "fills", "dropped"):
         assert name in names and row[name] == 0
     assert row["call_time"] == []

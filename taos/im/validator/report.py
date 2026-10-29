@@ -949,6 +949,10 @@ CLASS_DETAIL_GAUGES = (
     ('p11_factor', 'p11_factor'), ('making_s3_factor', 's3_factor'), ('bg_share', 'bg_share'),
     ('skill_coverage_factor', 'coverage_factor'), ('skill_net_alpha', 'net_alpha'), ('skill_books', 'skill_books'),
     ('coverage_books', 'coverage_books'), ('present', 'present'), ('notional', 'notional'),
+    # both shrinkage forms of the class's skill pool (0.6.6), the empirical Bayes one shrunk within the class
+    ('skill_shrunk_self', 'skill_shrunk_self'), ('skill_shrunk_eb', 'skill_shrunk_eb'),
+    # the conjunction (0.6.6): two-sided resting presence near the touch within the class, published, never paid
+    ('conjunction', 'conjunction'),
 )
 
 
@@ -1061,8 +1065,8 @@ def round_quantile(values, q):
 def round_block_gauges(ms) -> list:
     """A uid's published block of rounds as (gauge, value): the request counts, the mean response time of the answered
     rounds with the block's 5th percentile (the uid's floor) and median, which the round lines read, and the engine's
-    view of the uid's instructions: placements and cancels sent, placed and refused, cancels honoured and failed, fills,
-    and instructions dropped under the caps."""
+    view of the uid's instructions: placements and cancel instructions sent, placed and refused, the orders the cancels
+    named, cancelled and not found, the self-trade-prevention cancels, fills, and instructions dropped under the caps."""
     times = ms.get('call_time') or []
     return [
         ("requests", ms['requests']),
@@ -1078,8 +1082,10 @@ def round_block_gauges(ms) -> list:
         ("refused_contract", ms.get('refused_contract', 0)),
         ("placements_sent", ms.get('placements_sent', 0)),
         ("cancels_sent", ms.get('cancels_sent', 0)),
-        ("cancels_ok", ms.get('cancels_ok', 0)),
-        ("cancels_failed", ms.get('cancels_failed', 0)),
+        ("cancel_orders_sent", ms.get('cancel_orders_sent', 0)),
+        ("orders_cancelled", ms.get('orders_cancelled', 0)),
+        ("orders_not_found", ms.get('orders_not_found', 0)),
+        ("stp_cancels", ms.get('stp_cancels', 0)),
         ("fills", ms.get('fills', 0)),
         ("dropped", ms.get('dropped', 0)),
     ]
@@ -1151,6 +1157,7 @@ def publish_validator_gauges(self: ReportingService):
             ("scoring_shadow_tee_dropped", "tee_dropped"),
             ("scoring_shadow_suspended", "cutover_suspended"),
             ("scoring_shadow_initialized", "initialized"),
+            ("scoring_shadow_child_lag", "child_lag"),
         ):
             self.prometheus_validator_gauges.labels(
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
@@ -1160,8 +1167,10 @@ def publish_validator_gauges(self: ReportingService):
     if _clock:
         # A run change the validator did not apply leaves the previous run's last window stamped ahead of the
         # clock, inside every window and never pruned; the first gauge is that distance (0 when clean), the
-        # other two count the repairs (the load-time rebase and the first-update recovery).
-        for _gauge in ("history_stamp_ahead_ns", "run_changes_recovered", "histories_rebased_at_load"):
+        # other two count the repairs (the load-time rebase and the first-update recovery). The last two count
+        # the resumes to an engine checkpoint, reloaded from the validator's snapshot there or re-opened without one.
+        for _gauge in ("history_stamp_ahead_ns", "run_changes_recovered", "histories_rebased_at_load",
+                       "resumes_restored", "resumes_unrestored"):
             self.prometheus_validator_gauges.labels(
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
                 sim_id=self.simulation.simulation_id, validator_gauge_name=_gauge,
@@ -1789,9 +1798,12 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'skill_books_kept': kappa_values.get('skill_books_kept') if kappa_values else None,
                 'skill_mark_alt': kappa_values.get('skill_mark_alt') if kappa_values else None,
                 'skill_net_alpha_mark_alt': kappa_values.get('skill_net_alpha_mark_alt') if kappa_values else None,
+                'skill_shrunk_self': kappa_values.get('skill_shrunk_self') if kappa_values else None,
+                'skill_shrunk_eb': kappa_values.get('skill_shrunk_eb') if kappa_values else None,
                 'maker_notional_two_sided': kappa_values.get('maker_notional_two_sided') if kappa_values else None,
                 'at_best_seconds': kappa_values.get('at_best_seconds') if kappa_values else None,
                 'best_size': kappa_values.get('best_size') if kappa_values else None,
+                'conjunction': kappa_values.get('conjunction') if kappa_values else None,
                 'skill_pool_factor': kappa_values.get('skill_pool_factor') if kappa_values else None,
                 'skill_coverage_factor': kappa_values.get('skill_coverage_factor') if kappa_values else None,
                 'coverage_books': kappa_values.get('coverage_books') if kappa_values else None,
@@ -2371,10 +2383,15 @@ async def report(self: ReportingService) -> None:
                            # the alternative mark's skill (0.6.5): judged on live data before a change of mark pays
                            ('skill_mark_alt', 'debeta_skill_mark_alt'),
                            ('skill_net_alpha_mark_alt', 'debeta_skill_net_alpha_mark_alt'),
+                           # both shrinkage forms beside the present skill (0.6.6): the aggregation is chosen on them
+                           ('skill_shrunk_self', 'debeta_skill_shrunk_self'),
+                           ('skill_shrunk_eb', 'debeta_skill_shrunk_eb'),
                            # the liquidity a maker provides (0.6.5): read before a making rule pays for it
                            ('maker_notional_two_sided', 'debeta_maker_notional_two_sided'),
                            ('at_best_seconds', 'debeta_at_best_seconds'),
                            ('best_size', 'debeta_best_size'),
+                           # the conjunction (0.6.6): watched on live data before any rule pays for it
+                           ('conjunction', 'debeta_conjunction'),
                            ('skill_weakest3', 'debeta_skill_weakest3'),
                            ('skill_books_kept', 'debeta_skill_books_kept'),
                            ('skill_pool_factor', 'debeta_skill_pool_factor'),

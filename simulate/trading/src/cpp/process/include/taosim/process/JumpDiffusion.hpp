@@ -48,6 +48,9 @@ public:
     JumpDiffusion(const JumpDiffusionDesc& desc) noexcept;
 
     [[nodiscard]] auto&& state(this auto&& self) noexcept { return self.m_state; }
+    [[nodiscard]] auto&& gaussian(this auto&& self) noexcept { return self.m_gaussian; }
+    [[nodiscard]] auto&& jump(this auto&& self) noexcept { return self.m_jump; }
+    [[nodiscard]] auto&& poisson(this auto&& self) noexcept { return self.m_poisson; }
 
     virtual double value() const override { return m_state.value; }
 

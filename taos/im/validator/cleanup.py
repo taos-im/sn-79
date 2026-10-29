@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import time
 import asyncio
-import time
+import threading
 from concurrent.futures import TimeoutError as FuturesTimeout
 import traceback
 import subprocess
 from typing import TYPE_CHECKING
 
 import bittensor as bt
+
+from taos.im.validator.persistence import save_state_on_stop, saves_on_stop
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -404,6 +406,49 @@ def cleanup_event_loop(self: Validator):
         bt.logging.error(traceback.format_exc())
 
 
+# The engine checkpoints at the last state it published and resumes one step after it. Once the validator stops
+# answering, the listener handles at most one more state, the one the engine checkpoints at, and leaves its loop.
+# That takes about one round: 5 s at the median on mainnet, 12 s at most.
+STOP_LISTEN_WAIT_S = 15.0
+# The stop save: the rewards queued and a report's preparation, which holds the same lock (up to 12 s on mainnet),
+# stopping the scoring service (up to 3 s), then the write (7 to 15 s on mainnet's state). pm2 kills the validator
+# at its kill timeout, 60 s for one the launcher starts, and the teardown needs the rest.
+STOP_SAVE_TIMEOUT_S = 35.0
+
+
+def await_last_state(self: Validator):
+    """Wait for the listener to account the state the engine will checkpoint at. On the exchange the listener runs
+    on the thread the signal interrupted, so it cannot hand anything over and is not waited for."""
+    stopped = getattr(self, '_listener_stopped', None)
+    if stopped is None or getattr(self, '_listener_thread', None) is threading.current_thread():
+        return
+    if not stopped.wait(STOP_LISTEN_WAIT_S):
+        # A state arriving from here on would be accounted after the save and lost with the process.
+        self._listener_closed = True
+        bt.logging.warning(
+            f"The listener handed over no further state within {STOP_LISTEN_WAIT_S:.0f}s; saving without one")
+
+
+def save_on_stop(self: Validator):
+    """Run the stop save on the main loop, where the rewards run, and wait for it within STOP_SAVE_TIMEOUT_S."""
+    loop = getattr(self, 'main_loop', None)
+    if loop is None or loop.is_closed():
+        bt.logging.warning("No main loop to save the state on; the restart loads the last periodic save")
+        return
+    try:
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(save_state_on_stop(self), loop).result(timeout=STOP_SAVE_TIMEOUT_S)
+        else:
+            loop.run_until_complete(asyncio.wait_for(save_state_on_stop(self), STOP_SAVE_TIMEOUT_S))
+    except (FuturesTimeout, asyncio.TimeoutError):
+        bt.logging.error(
+            f"The stop save did not finish within {STOP_SAVE_TIMEOUT_S:.0f}s; the restart may load the last "
+            f"periodic save")
+    except Exception as ex:
+        bt.logging.error(f"Stop save failed: {ex}")
+        bt.logging.error(traceback.format_exc())
+
+
 def cleanup(self: Validator):
     """
     Performs full resource cleanup for the validator during shutdown.
@@ -416,10 +461,13 @@ def cleanup(self: Validator):
     self._cleanup_done = True
 
     try:
-        bt.logging.info("Waiting for active operations to complete...")
         wait_timeout = 30.0
         wait_start = time.time()
+        if saves_on_stop(self):
+            await_last_state(self)
+            save_on_stop(self)
 
+        bt.logging.info("Waiting for active operations to complete...")
         while (self.shared_state_rewarding or
             self.shared_state_saving or
             self.shared_state_reporting or
@@ -444,3 +492,5 @@ def cleanup(self: Validator):
     except Exception as ex:
         bt.logging.error(f"Error during cleanup: {ex}")
         bt.logging.error(traceback.format_exc())
+    finally:
+        self._cleanup_finished = True

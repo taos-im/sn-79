@@ -24,5 +24,5 @@ def test_both_fan_out_paths_dispatch_in_the_round_order():
     import inspect
     from taos.im.validator import query
     src = inspect.getsource(query)
-    assert src.count("for index, uid in round_order(uid_list)") == 2, "the threaded path and the fanout path"
+    assert src.count("for index, uid in round_order(uid_list)") == 3, "the threaded, fanout and prebuilt paths"
     assert "for index, uid in enumerate(uid_list)\n            if uid not in deregistered_uids" not in src

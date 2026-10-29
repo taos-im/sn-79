@@ -20,9 +20,9 @@
                 targetMTR="0.4" shapeMakerFee="2" shapeMakerRebate="2"/>
             <Books instanceCount="16" maxDepth="21" detailedDepth="5">
                 <Processes>
-                    <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.0277"
-                        lambda="0.000206" muJump="0.0" sigmaJump="0.025" updatePeriod="30000000000"
-                        Hurst="0.729" epsilon="0.07" ownRng="1"/>
+                    <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.0125"
+                        lambda="0.000206" muJump="0.0" sigmaJump="0.0113" updatePeriod="30000000000"
+                        Hurst="0.729" epsilon="0.0315" ownRng="1"/>
                     <FuturesSignal name="external" lambda="0.001155" seedInterval="10000000000" updatePeriod="10000000000"/>
                     <MagneticField name="magneticfield" numRows="32" beta="0.874" alpha="10.3" 
                         updatePeriod="60000000000"/>
@@ -96,7 +96,7 @@
             sigmaSqr="0.0036"
             kappa="78"
             spread="0.0015"
-            orderMean="0.479"
+            orderMean="-0.0943"
             orderSTD="1.4"
             noiseRay="0.41"
             shiftPercentage="0.021"
@@ -104,7 +104,7 @@
             spreadSensitivityExp="1.5"
             spreadSensitivityBase="0.00015"
             rateMax="0.0075"
-            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="11" minSpreadTicks="2526" inventoryHorizon="1.1" undercutTicks="1" quoteSizeVolumeFrac="4.7" acdOmega="3.72" spreadRefPrice="300"
+            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="10" minSpreadTicks="2526" inventoryHorizon="1.1" undercutTicks="1" quoteSizeVolumeFrac="4.7" acdOmega="3.64" spreadRefPrice="300"
             >
             <Balances>
                 <Base total="479.2158" maxLeverage="4" maxLoan="10000" />
@@ -174,15 +174,15 @@
             sigmaN="0.7"
             sigmaC="1.5"
             sigmaF="2.9"
-            tau="123427035028"
+            tau="181619736749"
             tauHist="50"
             tauF="20"
             volGuard="0.000001"
             sigmaEps="0.002"
-            r_aversion="29100"
+            r_aversion="40900"
             HARA="2.0"
             regimeChangeFlag="0"
-            acdOmega="4.65"
+            acdOmega="4.75"
             acdAlpha="0.15"
 			acdBeta="0.65"
             minDMD="2000000000"

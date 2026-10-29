@@ -4,11 +4,9 @@
 PR-5 — defensive guards + circuit-breaker observability.
 
 Tests:
-  1. `_prune_dedup_keys` drops `miner_X/round_Y` entries whose round_id is
-     older than `_DEDUP_RETENTION_ROUNDS` rounds behind `_agg_round`.
-  2. The rollback-rate warning fires when ≥8 of the last 10 rounds rolled
+  1. The rollback-rate warning fires when ≥8 of the last 10 rounds rolled
      back.
-  3. `GENTRX_STRICT_VERSION_CHECK` env var controls whether untagged
+  2. `GENTRX_STRICT_VERSION_CHECK` env var controls whether untagged
      gradients are rejected (default off keeps the current behaviour).
 """
 import logging
@@ -29,38 +27,6 @@ def _make_aggregator(tmp_path):
         is_aggregator=False,
         no_startup_cleanup=True,
     )
-
-
-def test_prune_dedup_keys_drops_old_rounds(tmp_path):
-    """Keys for rounds older than the retention window are removed; recent
-    keys survive."""
-    gs = _make_aggregator(tmp_path)
-    gs._agg_round = 100
-    # Build a mix of recent + ancient dedup entries.
-    gs._processed_grad_keys = {
-        "miner_1/round_99",  # recent (keep)
-        "miner_2/round_95",  # boundary (within window=5, keep)
-        "miner_3/round_94",  # outside window (drop)
-        "miner_4/round_0",   # ancient (drop)
-        "malformed_key",     # malformed → can't parse round → keep
-    }
-    gs._failed_grad_keys = {
-        "miner_5/round_99",
-        "miner_6/round_10",
-    }
-
-    gs._prune_dedup_keys()
-
-    # `_DEDUP_RETENTION_ROUNDS = 5`, cutoff = 95, so anything < 95 dropped.
-    assert "miner_1/round_99" in gs._processed_grad_keys
-    assert "miner_2/round_95" in gs._processed_grad_keys
-    assert "miner_3/round_94" not in gs._processed_grad_keys
-    assert "miner_4/round_0" not in gs._processed_grad_keys
-    # Malformed keys are preserved (we don't know their round, can't safely drop).
-    assert "malformed_key" in gs._processed_grad_keys
-    # Failed-key set is pruned with the same cutoff.
-    assert "miner_5/round_99" in gs._failed_grad_keys
-    assert "miner_6/round_10" not in gs._failed_grad_keys
 
 
 def test_rollback_rate_warning_fires_at_threshold(tmp_path, caplog):

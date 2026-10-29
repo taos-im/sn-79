@@ -16,6 +16,8 @@
 #include <boost/algorithm/string.hpp>
 #include <msgpack.hpp>
 
+#include <map>
+
 #include <source_location>
 
 //-------------------------------------------------------------------------
@@ -220,6 +222,9 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
         o.pack("accounts"s);
         o.pack_map(remoteAgentCount);
 
+        // A book's rates, computed once: an untiered policy prices every agent it covers the same on a book (the
+        // dynamic fee follows the book's maker/taker ratio), and computing them is decimal pow and exp.
+        std::map<BookId, taosim::matching::Fees> bookRates;
         for (AgentId agentId : views::keys(representativeSimulation->exchange()->accounts())) {
             if (agentId < 0) continue;
 
@@ -342,7 +347,14 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                         o.pack_nil();
                     }
 
-                    const auto rates = feePolicy->getRates(book->id(), agentId);
+                    const auto rates = [&] {
+                        if (feePolicy->isTiered() || feePolicy->hasOwnPolicy(agentId)) {
+                            return feePolicy->getRates(book->id(), agentId);
+                        }
+                        const auto [it, fresh] = bookRates.try_emplace(bookIdCanon);
+                        if (fresh) it->second = feePolicy->getRates(book->id(), agentId);
+                        return it->second;
+                    }();
 
                     o.pack("m"s);
                     o.pack(rates.maker);

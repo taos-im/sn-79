@@ -177,7 +177,10 @@ def test_the_skill_floor_sees_only_pairs_with_fills_in_the_window():
     for u in range(10, 20):                       # pairs whose only fills are outside the window
         mtm[u] = {0: 1e-12, 1: 0.0}
     invsum = {u: {b: 0.0 for b in books} for u, books in mtm.items()}
-    ts_of = lambda u: 300 if u in (1, 2) else 100
+
+    def ts_of(u):
+        return 300 if u in (1, 2) else 100
+
     mtm_hist = {u: {b: {ts_of(u): v} for b, v in books.items()} for u, books in mtm.items()}
     inv_hist = {u: {b: {ts_of(u): v} for b, v in books.items()} for u, books in invsum.items()}
     prune_hist_2level(mtm_hist, mtm, threshold=250)

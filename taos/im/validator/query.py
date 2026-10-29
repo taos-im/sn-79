@@ -17,11 +17,14 @@ import gc
 import pickle
 import os
 import argparse
+import contextvars
 import traceback
 from typing import Dict, Any
 from collections import defaultdict
 import aiohttp
-from taos.im.protocol import STP
+import msgpack
+from taos.im.protocol.simulator import PackedOrders
+from taos.im.validator.delays import set_delays
 from taos.im.protocol.instructions import PlaceOrderInstruction
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.utils.compress import reply_bounds
@@ -33,6 +36,8 @@ try:
 except ImportError:
     _HAS_PROTOCOL_EXCHANGE = False
     ExchangeStateUpdate = None  # type: ignore[assignment,misc]
+
+_SENT_PLACEMENTS = frozenset({"PLACE_ORDER_LIMIT", "PLACE_ORDER_MARKET"})  # forward._PLACEMENT_TYPES
 
 
 def _query_fanout_enabled():
@@ -55,6 +60,32 @@ def _query_fanout_enabled():
     except Exception:
         pass
     return os.environ.get("QUERY_FANOUT", "1") != "0"
+
+
+def _prebuilt(service):
+    """neuron.query_prebuilt: each round's requests are built and signed before the first is sent (_query_prebuilt)."""
+    return bool(getattr(getattr(getattr(service, "config", None), "neuron", None), "query_prebuilt", False))
+
+
+KEEP_ALIVE_S = 120  # an idle kept connection's life, as the stock miner keeps its side
+
+
+def _reusing(service):
+    """neuron.reuse_connections (0.6.5): one session kept across rounds. With it an idle connection lives
+    KEEP_ALIVE_S, as the stock miner keeps its side, a connection the miner closed between rounds is tried once
+    more on a new one, and each round counts the connections it opened ([QUERY-CONN])."""
+    return bool(getattr(getattr(getattr(service, "config", None), "neuron", None), "reuse_connections", False))
+
+
+def _connection_counter(counts):
+    """aiohttp trace: counts the connections a session opens (with neuron.reuse_connections, read per round)."""
+    trace = aiohttp.TraceConfig()
+
+    async def opened(session, context, params):
+        counts["new"] += 1
+
+    trace.on_connection_create_end.append(opened)
+    return trace
 
 
 def _queryable_axons(metagraph_axons, own_uid, own_hotkey):
@@ -105,6 +136,45 @@ def round_order(uid_list, rng=None):
     (rng or random).shuffle(order)
     return order
 
+_WIRE_CLOCK = contextvars.ContextVar("query_wire_clock", default=None)
+
+
+async def _on_request_chunk_sent(session, ctx, params):
+    clock = _WIRE_CLOCK.get()
+    if clock is not None:
+        clock["sent"] = time.time()
+
+
+async def _on_response_read(session, ctx, params):
+    clock = _WIRE_CLOCK.get()
+    if clock is not None:
+        clock["read"] = time.time()
+
+
+def wire_trace_config() -> aiohttp.TraceConfig:
+    """Stamps a call's request written (its last body chunk) and its answer read, into the clock the calling task
+    set: bittensor's Dendrite.call starts its own clock before signing and serialising the request, so its time
+    holds the validator's preparation as well as the miner's."""
+    trace = aiohttp.TraceConfig()
+    trace.on_request_chunk_sent.append(_on_request_chunk_sent)
+    trace.on_response_chunk_received.append(_on_response_read)
+    return trace
+
+
+async def call_on_wire_clock(call):
+    """Awaits one dendrite call and records the miner's time from the request written to the answer read; a call
+    that never reached both keeps the time (or the error) bittensor gave it."""
+    clock = {}
+    _WIRE_CLOCK.set(clock)
+    synapse = await call
+    sent, read = clock.get("sent"), clock.get("read")
+    if sent is not None and read is not None and read >= sent:
+        dendrite = getattr(synapse, "dendrite", None)
+        if dendrite is not None and dendrite.process_time is not None:
+            dendrite.process_time = read - sent
+    return synapse
+
+
 class DendriteManager:
     """Owns the dendrite pool used to query miners, recycling connections as they age."""
     @staticmethod
@@ -116,12 +186,14 @@ class DendriteManager:
         Reuses an existing session if available.
         """
         if not validator.dendrite._session or validator.dendrite._session.closed:
+            keep = _reusing(validator)
             connector = aiohttp.TCPConnector(
                 ssl=False,
                 limit=0,
                 limit_per_host=0,
                 ttl_dns_cache=300,
                 enable_cleanup_closed=True,
+                **({'keepalive_timeout': KEEP_ALIVE_S} if keep else {}),
             )
             timeout = aiohttp.ClientTimeout(
                 total=validator.config.neuron.timeout,
@@ -129,10 +201,13 @@ class DendriteManager:
                 sock_read=validator.config.neuron.timeout,
                 sock_connect=1.0,
             )
+            if keep and not hasattr(validator, '_connections'):
+                validator._connections = {"new": 0}
             validator.dendrite._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
                 skip_auto_headers={'User-Agent'},
+                trace_configs=[wire_trace_config()] + ([_connection_counter(validator._connections)] if keep else []),
             )
             bt.logging.debug("Created new aiohttp session")
         else:
@@ -145,6 +220,85 @@ class DendriteManager:
         if session and not session.closed:
             await session.close()
         dendrite._session = None
+
+def build_axon_synapses(request_data, uid_list, level, engine, parallel_workers):
+    """Compress the books once, then build and compress each queried miner's synapse: in the query process, or in the
+    main process with neuron.query_prepayload. Returns (compressed_books, axon_synapses)."""
+    from taos.im.utils.compress import compress, batch_compress
+    import multiprocessing
+
+    compress_start = time.time()
+    compressed_books = compress(
+        request_data['books'],
+        level=level,
+        engine=engine,
+        version=request_data['version'],
+    )
+    bt.logging.info(f"Compressed books ({time.time()-compress_start:.4f}s).")
+
+    def create_axon_synapse(uid):
+        if request_data.get('engine_mode') == 'exchange':
+            if not _HAS_PROTOCOL_EXCHANGE:
+                raise RuntimeError(
+                    "Exchange engine mode is not supported in this build "
+                    "(taos.im.protocol.exchange is not available)."
+                )
+            synapse = ExchangeStateUpdate.parse_dict(request_data)
+            accounts = synapse.accounts or {}
+            notices = synapse.notices or {}
+            object.__setattr__(synapse, "accounts", {uid: accounts[uid]} if uid in accounts else {uid: {}})
+            object.__setattr__(synapse, "notices",  {uid: notices[uid]} if uid in notices else {uid: []})
+        else:
+            synapse = MarketSimulationStateUpdate.parse_dict(request_data)
+            # Benchmark miners (UIDs >= metagraph.n) are not simulation agents,
+            # so the simulator never sends account/notice data for them.
+            accounts = synapse.accounts or {}
+            notices = synapse.notices or {}
+            object.__setattr__(synapse, "accounts", {uid: accounts[uid]} if uid in accounts else {})
+            object.__setattr__(synapse, "notices",  {uid: notices[uid]} if uid in notices else {uid: []})
+        object.__setattr__(synapse, "config", request_data['config'])
+        synapse.version = request_data['version']
+        return synapse
+
+    create_start = time.time()
+    axon_synapses = {uid: create_axon_synapse(uid) for uid in uid_list}
+    bt.logging.info(f"Created axon synapses ({time.time()-create_start:.4f}s)")
+
+    synapse_start = time.time()
+    if parallel_workers == 0:
+        def compress_axon_synapse(synapse):
+            return synapse.compress(
+                level=level,
+                engine=engine,
+                compressed_books=compressed_books,  # noqa: F821  (closure over compressed_books bound earlier in enclosing scope)
+            )
+        axon_synapses = {uid: compress_axon_synapse(axon_synapses[uid]) for uid in uid_list}
+    else:
+        num_processes = parallel_workers if parallel_workers > 0 else multiprocessing.cpu_count() // 2
+        num_axons = len(uid_list)
+        batch_size = max(1, int(num_axons / num_processes))
+        batches = [uid_list[i:i+batch_size] for i in range(0, num_axons, batch_size)]
+        axon_synapses = batch_compress(
+            axon_synapses,
+            compressed_books,
+            batches,
+            level=level,
+            engine=engine,
+            version=request_data['version']
+        )
+    bt.logging.info(f"Compressed synapses ({time.time()-synapse_start:.4f}s).")
+    return compressed_books, axon_synapses
+
+
+def prebuild_request(request_data, own_hotkey, level, engine, parallel_workers):
+    """neuron.query_prepayload, simulation mode: build every queried miner's compressed synapse in the main process
+    with the query process's own function, and hand over those instead of the decoded books, accounts and notices.
+    Pickle stores the shared books blob once, so the query process unpickles strings, not the whole state."""
+    uids = [uid for uid, _ in _queryable_axons(request_data['metagraph_axons'], request_data.get('uid'), own_hotkey)]
+    books, synapses = build_axon_synapses(request_data, uids, level, engine, parallel_workers)
+    return {**request_data, 'books': {}, 'accounts': None, 'notices': None,
+            'books_blob': books, 'axon_synapses': synapses}
+
 
 class QueryService:
     """Out-of-process miner querying: fans a synapse out to axons and returns the responses.
@@ -347,6 +501,14 @@ class QueryService:
                         for book_id in effective_book_ids
                     }
 
+            # the pairs at or over the cap at this round's snapshot: the engine refuses their non-cancel placements
+            # when they arrive at the exchange, delayed or not (row 67), the hole the acceptance check cannot close
+            capped = sorted(
+                [int(uid), int(book_id)] for uid, volumes in all_miner_volumes.items()
+                for book_id, volume in volumes.items() if volume_cap > 0 and volume >= volume_cap)
+            if self is not None:
+                self._capped_pairs = capped
+            max_delay_ns = int(request_data.get('max_instruction_delay_ns') or 600 * 1_000_000_000)
             checked = set()
             for uid, synapse in synapses.items():
                 if uid in deregistered_uids:
@@ -385,6 +547,7 @@ class QueryService:
                 instructions_per_book = defaultdict(int)
                 invalid_agent_id = False
                 volume_cap_logged = False
+                delay_logged = False
                 uid_cap = volume_cap
                 
                 for instruction in synapse.response.instructions:
@@ -396,6 +559,15 @@ class QueryService:
                         
                         if not book_id_valid(instruction.bookId):
                             bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Invalid Book Id {instruction.bookId})")
+                            continue
+
+                        if int(getattr(instruction, 'delay', 0) or 0) > max_delay_ns:
+                            if not delay_logged:
+                                bt.logging.info(
+                                    f"Agent {uid} asked a delay beyond the bound: delay={instruction.delay / 1e9:,.1f}s "
+                                    f"> max_instruction_delay={max_delay_ns / 1e9:,.1f}s; instruction DROPPED")
+                                delay_logged = True
+                            dropped[uid] = dropped.get(uid, 0) + 1
                             continue
 
                         if volume_cap > 0 and miner_volumes[instruction.bookId] >= uid_cap and instruction.type != "CANCEL_ORDERS":
@@ -495,14 +667,15 @@ class QueryService:
 
                 async def _call():
                     async with bt.Dendrite(wallet=wallet) as d:
+                        d._session = aiohttp.ClientSession(trace_configs=[wire_trace_config()])
                         try:
                             return await asyncio.wait_for(
-                                d(
+                                call_on_wire_clock(d(
                                     axons=axon,
                                     synapse=synapse,
                                     timeout=neuron_timeout,
                                     deserialize=False,
-                                ),
+                                )),
                                 timeout=per_task_timeout,
                             )
                         except asyncio.TimeoutError:
@@ -599,7 +772,7 @@ class QueryService:
             _prof_offsets.append(_t - query_start)
             try:
                 response = await asyncio.wait_for(
-                    self.dendrite.call(axon, synapse, timeout=neuron_timeout, deserialize=False),
+                    call_on_wire_clock(self.dendrite.call(axon, synapse, timeout=neuron_timeout, deserialize=False)),
                     timeout=per_task_timeout,
                 )
                 return uid, response
@@ -659,6 +832,128 @@ class QueryService:
         _log_query_profile(" fanout", _prof_offsets, _prof_durations)
         return synapse_responses, completed_count
 
+    async def _query_prebuilt(self, axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout):
+        """The fan-out's requests, prepared once per round (neuron.query_prebuilt).
+
+        The same body bytes, headers and reply handling as Dendrite.call, with one nonce and header set per round and
+        each distinct books blob JSON-encoded once; per miner only the axon fields, the signature and its own payload
+        change. Every request is built and signed before the first is sent, so nothing is prepared while replies
+        arrive: a miner's process_time and timeout run from when its own request leaves. Each round's nonce is above
+        the previous round's, so a kept dendrite's nonces still increase after the clock steps back. Falls back to the
+        fan-out when the synapse declares hashed fields, whose body hash differs per miner.
+        Returns (synapse_responses, completed_count).
+        """
+        import json
+        from bittensor.core.synapse import TerminalInfo
+
+        live = [(index, uid) for index, uid in round_order(uid_list)
+                if uid not in deregistered_uids and axon_synapses.get(uid) is not None]
+        if not live:
+            return {}, 0
+        first = axon_synapses[live[0][1]]
+        if type(first).required_hash_fields:
+            return await self._query_fanout(axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout)
+        d = self.dendrite
+        neuron_timeout = self.config.neuron.timeout
+        d.preprocess_synapse_for_request(self.metagraph.axons[live[0][0]], first, neuron_timeout)
+        first.dendrite.nonce = self._last_nonce = max(first.dendrite.nonce, getattr(self, "_last_nonce", 0) + 1)
+        shared = first.dendrite.model_dump()
+        body_hash = first.body_hash
+        base_headers = first.model_copy().to_headers()  # to_headers() stores a size on the synapse it reads
+        base_headers["Content-Type"] = "application/json"
+        marker = json.dumps("\x00books\x00")
+        encoded = {}
+        prepared = []
+        for index, uid in live:
+            axon, synapse = self.metagraph.axons[index], axon_synapses[uid]
+            synapse.timeout = neuron_timeout
+            synapse.dendrite = TerminalInfo(**shared)
+            synapse.axon = TerminalInfo(ip=axon.ip, port=axon.port, hotkey=axon.hotkey)
+            message = f"{shared['nonce']}.{shared['hotkey']}.{axon.hotkey}.{shared['uuid']}.{body_hash}"
+            synapse.dendrite.signature = f"0x{d.keypair.sign(message).hex()}"
+            headers = dict(base_headers)
+            headers.update({
+                "bt_header_axon_ip": str(axon.ip), "bt_header_axon_port": str(axon.port),
+                "bt_header_axon_hotkey": str(axon.hotkey), "bt_header_dendrite_signature": synapse.dendrite.signature,
+                "total_size": str(synapse.get_total_size()),  # per miner, into the body too, as to_headers() does
+            })
+            body = synapse.model_dump()
+            books = synapse.compressed.get("books") if isinstance(synapse.compressed, dict) else None
+            if books is None:
+                body = json.dumps(body)
+            else:
+                if id(books) not in encoded:
+                    encoded[id(books)] = json.dumps(books)
+                body["compressed"] = dict(body["compressed"], books="\x00books\x00")
+                body = json.dumps(body).replace(marker, encoded[id(books)], 1)
+            prepared.append((uid, d._get_endpoint_url(axon, request_name=synapse.__class__.__name__), headers,
+                             body.encode(), synapse))
+
+        session = await d.session
+        offsets, durations = [], []
+        keep, retried = _reusing(self), [0]
+        opened_before = getattr(self, '_connections', {}).get("new", 0)
+
+        async def post(uid, url, headers, body, synapse):
+            first = time.time()
+            offsets.append(first - query_start)
+            for attempt in (0, 1):
+                sent = time.time()
+                clock = {}
+                _WIRE_CLOCK.set(clock)  # the session's trace stamps this attempt's request written and answer read
+                try:
+                    async with session.post(url=url, headers=headers, data=body,
+                                            timeout=aiohttp.ClientTimeout(total=synapse.timeout)) as response:
+                        d.process_server_response(response, await response.json(), synapse)
+                    wire_sent, wire_read = clock.get("sent"), clock.get("read")
+                    if wire_sent is not None and wire_read is not None and wire_read >= wire_sent:
+                        synapse.dendrite.process_time = str(wire_read - wire_sent)
+                    else:
+                        synapse.dendrite.process_time = str(time.time() - sent)
+                except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
+                    if keep and attempt == 0:  # a kept connection the miner closed between rounds: once, on a new one
+                        retried[0] += 1
+                        continue
+                    synapse = d.process_error_message(synapse, synapse.__class__.__name__, e)
+                except Exception as e:
+                    synapse = d.process_error_message(synapse, synapse.__class__.__name__, e)
+                break
+            durations.append(time.time() - first)
+            return uid, synapse
+
+        async def fire(args):
+            try:
+                return await asyncio.wait_for(post(*args), timeout=per_task_timeout)
+            except asyncio.TimeoutError:
+                args[-1].dendrite.status_code = 408
+                return args[0], args[-1]
+
+        tasks = [asyncio.create_task(fire(p)) for p in prepared]
+        # The fan-out's own two lines, at the same moments: the round instruments time the wait between them.
+        bt.logging.info(f"Created {len(tasks)} fanout query tasks, "
+                        f"starting wait with {self.config.neuron.global_query_timeout}s timeout")
+        done, pending = await asyncio.wait(tasks, timeout=self.config.neuron.global_query_timeout,
+                                           return_when=asyncio.ALL_COMPLETED)
+        elapsed = time.time() - query_start
+        self._last_wait_s = elapsed  # the round's query wait, as the fan-out records it for the report
+        bt.logging.info(f"Wait completed (fanout): {len(done)} done, {len(pending)} pending in {elapsed:.4f}s")
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        synapse_responses = {}
+        for task in done:
+            try:
+                uid, response = task.result()
+                synapse_responses[uid] = response
+            except Exception as e:
+                bt.logging.debug(f"Prebuilt task failed: {e}")
+        _log_query_profile(" prebuilt", offsets, durations)
+        if keep:
+            opened = getattr(self, '_connections', {}).get("new", 0) - opened_before
+            bt.logging.info(f"[QUERY-CONN] sent={len(prepared)} new_connections={opened} retried={retried[0]}")
+        return synapse_responses, len(synapse_responses)
+
     async def query_miners(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Issues parallel dendrite requests to all miners and collects results.
@@ -686,11 +981,11 @@ class QueryService:
                 }
         """
         gc_was_enabled = gc.isenabled()
-        old_dendrite = None
+        _old_dendrite = None
         try:
             gc.disable()
             
-            old_dendrite = self.dendrite
+            _old_dendrite = self.dendrite  # the reference held until the round's dendrite is in place
             await self._round_dendrite()
             
             class MinimalMetagraph:
@@ -752,69 +1047,13 @@ class QueryService:
 
             DendriteManager.configure_session(self)
 
-            from taos.im.utils.compress import compress, batch_compress
-            import multiprocessing
-
-            compress_start = time.time()
-            compressed_books = compress(
-                request_data['books'],
-                level=self.config.compression.level,
-                engine=self.config.compression.engine,
-                version=request_data['version'],
-            )
-            bt.logging.info(f"Compressed books ({time.time()-compress_start:.4f}s).")
-
-            def create_axon_synapse(uid):
-                if request_data.get('engine_mode') == 'exchange':
-                    if not _HAS_PROTOCOL_EXCHANGE:
-                        raise RuntimeError(
-                            "Exchange engine mode is not supported in this build "
-                            "(taos.im.protocol.exchange is not available)."
-                        )
-                    synapse = ExchangeStateUpdate.parse_dict(request_data)
-                    accounts = synapse.accounts or {}
-                    notices = synapse.notices or {}
-                    object.__setattr__(synapse, "accounts", {uid: accounts[uid]} if uid in accounts else {uid: {}})
-                    object.__setattr__(synapse, "notices",  {uid: notices[uid]} if uid in notices else {uid: []})
-                else:
-                    synapse = MarketSimulationStateUpdate.parse_dict(request_data)
-                    # Benchmark miners (UIDs >= metagraph.n) are not simulation agents,
-                    # so the simulator never sends account/notice data for them.
-                    accounts = synapse.accounts or {}
-                    notices = synapse.notices or {}
-                    object.__setattr__(synapse, "accounts", {uid: accounts[uid]} if uid in accounts else {})
-                    object.__setattr__(synapse, "notices",  {uid: notices[uid]} if uid in notices else {uid: []})
-                object.__setattr__(synapse, "config", request_data['config'])
-                synapse.version = request_data['version']
-                return synapse
-
-            create_start = time.time()
-            axon_synapses = {uid: create_axon_synapse(uid) for uid in uid_list}
-            bt.logging.info(f"Created axon synapses ({time.time()-create_start:.4f}s)")
-
-            synapse_start = time.time()
-            if self.config.compression.parallel_workers == 0:
-                def compress_axon_synapse(synapse):
-                    return synapse.compress(
-                        level=self.config.compression.level,
-                        engine=self.config.compression.engine,
-                        compressed_books=compressed_books,  # noqa: F821  (closure over compressed_books bound earlier in enclosing scope)
-                    )
-                axon_synapses = {uid: compress_axon_synapse(axon_synapses[uid]) for uid in uid_list}
+            prebuilt = request_data.get('axon_synapses')
+            if prebuilt is not None and set(uid_list) <= set(prebuilt):  # neuron.query_prepayload: built in main
+                compressed_books, axon_synapses = request_data['books_blob'], prebuilt
             else:
-                num_processes = self.config.compression.parallel_workers if self.config.compression.parallel_workers > 0 else multiprocessing.cpu_count() // 2
-                num_axons = len(uid_list)
-                batch_size = max(1, int(num_axons / num_processes))
-                batches = [uid_list[i:i+batch_size] for i in range(0, num_axons, batch_size)]
-                axon_synapses = batch_compress(
-                    axon_synapses,
-                    compressed_books,
-                    batches,
-                    level=self.config.compression.level,
-                    engine=self.config.compression.engine,
-                    version=request_data['version']
-                )
-            bt.logging.info(f"Compressed synapses ({time.time()-synapse_start:.4f}s).")
+                compressed_books, axon_synapses = build_axon_synapses(
+                    request_data, uid_list, self.config.compression.level, self.config.compression.engine,
+                    self.config.compression.parallel_workers)
 
             query_start = time.time()
             synapse_responses = {}
@@ -834,7 +1073,11 @@ class QueryService:
             # QUERY_FANOUT=0 to fall back to the legacy thread-per-call path.
             # Both build the same synapse_responses dict + completed_count; the
             # missing-UID stub and validation below are shared.
-            if _query_fanout_enabled():
+            if _prebuilt(self):
+                synapse_responses, completed_count = await self._query_prebuilt(
+                    axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout
+                )
+            elif _query_fanout_enabled():
                 synapse_responses, completed_count = await self._query_fanout(
                     axon_synapses, uid_list, deregistered_uids, query_start, per_task_timeout
                 )
@@ -870,6 +1113,7 @@ class QueryService:
                 deregistered_uids
             )
             bt.logging.info(f"Validated Responses ({time.time()-validate_start:.4f}s).")
+            packed = self._pack_orders(synapse_responses, request_data['delays']) if 'delays' in request_data else {}
 
             # Heavy cleanup (dealloc of ~255 request synapses + compressed books,
             # aiohttp session teardown) is DEFERRED to after the response is
@@ -882,6 +1126,8 @@ class QueryService:
             return {
                 'success': True,
                 'responses': synapse_responses,
+                'capped': getattr(self, '_capped_pairs', None),
+                **packed,
                 'validation_stats': {
                     "total_responses": total_responses,
                     "total_instructions": total_instructions,
@@ -917,6 +1163,31 @@ class QueryService:
         await DendriteManager.close_session(d)
         self.dendrite = bt.Dendrite(wallet=self.wallet)
         return self.dendrite
+
+    def _pack_orders(self, synapse_responses, delays):
+        """neuron.orders_packed: delay the checked orders here, as the main process would (set_delays with its settings,
+        `delays`), and return them encoded for the simulator; the replies go back without their orders. An order the
+        wire cannot encode is left out and counted, as SimulationEngine.respond does. Each miner's placements and
+        cancels sent are counted here as forward.update_sent_stats counts them, since main never sees these orders."""
+        pack = msgpack.Packer(use_bin_type=True).pack
+        parts, dropped, sent = [], [], {}
+        for response in set_delays(delays, synapse_responses):
+            row = sent.setdefault(response.agent_id, {'placements_sent': 0, 'cancels_sent': 0})
+            for instruction in response.instructions:
+                if instruction.type in _SENT_PLACEMENTS:
+                    row['placements_sent'] += 1
+                elif instruction.type == 'CANCEL_ORDERS':
+                    row['cancels_sent'] += 1
+                item = instruction.serialize()
+                try:
+                    parts.append(pack(item))
+                except (OverflowError, ValueError, TypeError):
+                    dropped.append(item["agentId"])
+            response.instructions = []
+        if dropped:
+            bt.logging.error(f"[ORDERS-PACKED] dropped {len(dropped)} instruction(s) the wire cannot encode from "
+                             f"agent(s) {sorted(set(dropped))}")
+        return {'orders': PackedOrders(len(parts), b"".join(parts)), 'pack_drops': len(dropped), 'sent': sent}
 
     async def _post_query_cleanup(self):
         """Deferred query cleanup, run AFTER the response is written and the main
@@ -1332,6 +1603,8 @@ def service_parser():
                         help='Prefix for POSIX IPC resource names — "validator" for simulation, "exchange" for exchange mode')
     # The dendrite lives here, so 0.6.5's kept connections are read here: the validator passes the switch on.
     parser.add_argument('--neuron.reuse_connections', action='store_true', default=False)
+    # The requests are built here, so the prebuilt switch is read here too: the validator passes it on.
+    parser.add_argument('--neuron.query_prebuilt', action='store_true', default=False)
     return parser
 
 

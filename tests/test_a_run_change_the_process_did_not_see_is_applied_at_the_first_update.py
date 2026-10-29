@@ -53,7 +53,8 @@ def test_history_clock_health_reports_how_far_the_stamps_sit_ahead_of_the_clock(
     v = SimpleNamespace(simulation_timestamp=600 * S, debeta_invn_hist={0: {OLD_END: 1.0, 500 * S: 1.0}, 1: {}},
                         _run_changes_recovered=1, _histories_rebased_at_load=7)
     h = trade.history_clock_health(v)
-    assert h == {"history_stamp_ahead_ns": OLD_END - 600 * S, "run_changes_recovered": 1, "histories_rebased_at_load": 7}
+    assert h == {"history_stamp_ahead_ns": OLD_END - 600 * S, "run_changes_recovered": 1,
+                 "histories_rebased_at_load": 7, "resumes_restored": 0, "resumes_unrestored": 0}
     v.debeta_invn_hist = {0: {500 * S: 1.0}}
     assert trade.history_clock_health(v)["history_stamp_ahead_ns"] == 0
     assert trade.history_clock_health(SimpleNamespace())["history_stamp_ahead_ns"] == 0

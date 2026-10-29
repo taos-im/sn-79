@@ -96,6 +96,7 @@ public:
 
         while (m_time.current < m_time.start + m_time.duration) {
             step();
+            clearFilledOrders();  // before the barrier, so before the completion publishes
             barrier.arrive_and_wait();
             // AFTER THE BARRIER, NEVER BEFORE. Every block reads the value the completion function
             // just wrote, so they all leave on the same iteration. A block that broke out early

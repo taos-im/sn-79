@@ -17,10 +17,8 @@ not have on 23 September 2026:
 """
 import os
 import sys
-import types
 from types import SimpleNamespace
 
-import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -111,7 +109,8 @@ def test_run_end_applies_a_tree_that_moved_under_the_process(monkeypatch):
     seen = _spy(monkeypatch)
     monkeypatch.setattr(vmod, "check_repo", lambda self: (False, False, False, False), raising=False)
     monkeypatch.setattr(vmod, "classify_changes", upd.classify_changes, raising=False)
-    d.repo_path = __import__("pathlib").Path("/r"); d.simulator_config_file = "/r/simulate/trading/run/config/simulation_0.xml"
+    d.repo_path = __import__("pathlib").Path("/r")
+    d.simulator_config_file = "/r/simulate/trading/run/config/simulation_0.xml"
     vmod.Validator.update_repo(d, end=True)
     assert seen["rebuild_simulator"] == 1
     assert seen["restart_simulator"] == [True]

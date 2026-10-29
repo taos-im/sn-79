@@ -45,6 +45,10 @@ CLEARED = {
     # the liquidity a maker provides (0.6.5)
     "debeta_maker_buy_notional", "debeta_maker_sell_notional", "debeta_at_best", "debeta_best_size",
     "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
+    # the conjunction (0.6.6)
+    "debeta_conj", "debeta_conj_hist",
+    # the captured pair's taker legs, which the making pool takes back out (0.6.6)
+    "capture_taker_buy_sums", "capture_taker_sell_sums", "debeta_captkbuy_hist", "debeta_captksell_hist",
     "debeta_helddrift", "debeta_notional", "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist",
     "debeta_invsum_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
     "debeta_notional_hist", "debeta_cp", "debeta_cp_hist",
@@ -57,9 +61,21 @@ CLEARED_BOOK_FIRST = {"debeta_inv", "debeta_inv_alt"}
 # class-first per-uid state ({asset class: {maker uid: {taker uid: ...}}}): the counterparty rows kept per class
 CLEARED_CLASS_FIRST = {"debeta_cpc", "debeta_cpc_hist"}
 EXEMPT = {
+    # the conjunction's book-keyed state (0.6.6): the farm reference and the per-book references are per book, not
+    # per uid, and the interval is the state's, set at the start of every update
+    "debeta_conj_farm": "per book, not per uid", "debeta_conj_farm_hist": "per book, not per uid",
+    "debeta_conj_ref": "the books' spread and fill-size references", "_conj_dt": "the state's interval, set every update",
+    "debeta_conj_clock": "the previous state's time, validator-wide",
+    # the run-boundary handover (0.6.6): class-keyed vectors whose uids reset_agent_histories pops (its own test)
+    "_debeta_class_vectors": "class-keyed; a reset uid is popped from each leg", "_debeta_handover": "class-keyed; likewise",
+    # the report's publish flags, rebuilt at a run open (0.6.6, D4); a reset uid's flag is set False by the engine's reset
+    "initial_balances_published": "report flag; the engine's reset path sets a reset uid's to False",
     # configuration, handles and scalars
     "config": "configuration", "engine": "engine handle", "device": "torch device", "simulation": "config",
     "simulation_config": "the scoring child's copy of the simulation config (skill_bar reads its book count)",
+    "_latency_profile": "configuration: the latency_profile dial's per-uid process times, read once from its file",
+    "_capped_pairs": "the round's (uid, book) pairs at the volume cap, rebuilt from volume_sums at every query; a reset "
+                     "clears volume_sums and the next round's set follows (row 67)",
     # round timing the report publishes: the validator's own clocks, not per-uid state
     "round_gaps": "wall seconds between states, validator-wide", "query_waits": "the query service's wait per round",
     "reward_gate_waits": "waits for the reward lock, validator-wide", "_round_clock": "the last state's wall time",
@@ -89,7 +105,7 @@ EXEMPT = {
     "_gentrx": "object; its _scores are cleared by handle_deregistration",
     # runtime handles and flags of the query service, the reporter and load bookkeeping
     "_histories_rebased_at_load": "load counter", "_last_prune_timestamp": "clock", "_run_changes_recovered": "counter",
-    "_last_accounted_ts": "clock",
+    "_last_accounted_ts": "clock", "_resumes_restored": "counter", "_resumes_unrestored": "counter",
     "_pending_reward_tasks": "task queue", "_start_query_service": "method", "dendrite": "network handle",
     "get_extended_metagraph": "method", "hotkeys": "chain view", "miner_net_lock": "lock",
     "pagerduty_alert": "method", "query_ipc_executor": "executor", "query_notify_read": "IPC handle",

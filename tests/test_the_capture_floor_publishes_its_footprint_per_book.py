@@ -6,7 +6,6 @@ below their floor (what the floor excludes), beside the floor's own level. The v
 from the live window the scorer already keeps, ships them with the reporting payload, and the report publishes
 them as book_gauges capture_dust_share and capture_floor; the board monitor flags a book over its share threshold
 and the injected acceptance rows assert the same share under the same prints."""
-import inspect
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace

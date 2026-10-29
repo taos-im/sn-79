@@ -22,6 +22,7 @@ Base miner neuron: registers the axon, handles forward/blacklist/priority
 callbacks, and drives the async serving loop for subnet miners.
 """
 
+import gc
 import os
 import time
 import typing
@@ -41,6 +42,12 @@ from taos.common.protocol import SimulationStateUpdate, EventNotification
 
 
 AXON_KEEP_ALIVE_S = 120
+
+
+def freeze_heap() -> None:
+    """Move every object alive now into the collector's permanent generation, so later full collections skip it."""
+    gc.collect()
+    gc.freeze()
 
 
 class BaseMinerNeuron(BaseNeuron):
@@ -357,6 +364,11 @@ class BaseMinerNeuron(BaseNeuron):
                 )
         else:
             raise Exception("Cannot serve axon - invalid subtensor.  Check bittensor version and configuration and try again.")        
+
+        # The agent has loaded by now. A full collection over that heap inside a request costs 60 to 80 ms of the
+        # recorded response time, so the heap is left out of every later scan.
+        if not getattr(getattr(self.config, "neuron", None), "no_gc_freeze", False):
+            freeze_heap()
 
         # Start  starts the miner's axon, making it active on the network.
         self.axon.start()

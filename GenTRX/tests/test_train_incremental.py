@@ -8,7 +8,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import torch
 from torch.utils.data import DataLoader
 
 from GenTRX.src.dataloader import OrderDataset, ChunkSampler

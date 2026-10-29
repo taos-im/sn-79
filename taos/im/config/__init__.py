@@ -115,8 +115,10 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--compression.parallel_workers",
         type=int,
-        help="Number of parallel workers to use in synapse compression. (0 => no parallelization, -1 => auto [half available cores])",
-        default=-1,
+        help="Number of parallel workers to use in synapse compression. (0 => no parallelization, the default: the "
+             "workers are threads and contend for the GIL, so at 256 miners one thread builds the payloads faster; "
+             "-1 => auto [half available cores])",
+        default=0,
     )
     
     parser.add_argument(
@@ -614,8 +616,9 @@ def add_im_validator_args(cls, parser):
              "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
              "'median' = window median (robust: moving it needs a sustained majority of prints); "
              "'mid' = the book's mid-quote from each state (no bounce, one state of lag, no window, so a "
-             "sparse book marks as well as a dense one). Default 'last': last-trade marking, byte-identical to 0.6.0.",
-        default="last",
+             "sparse book marks as well as a dense one). Default 'mid' since 0.6.6 (the last-trade mark paid the "
+             "bid-ask bounce to makers as skill); 'last' is the pre-0.6.6 mark, byte-identical to 0.6.0.",
+        default="mid",
     )
 
     parser.add_argument(
@@ -632,8 +635,26 @@ def add_im_validator_args(cls, parser):
         choices=["none", "last", "vwap", "median", "mid"],
         help="A second mark accumulated beside the paid one, its skill published per uid "
              "(debeta_skill_mark_alt, debeta_skill_net_alpha_mark_alt) so a change of mark is judged on live data "
-             "before it pays; 'none', or the paid mark's own name, skips the leg. Pay reads mark_mode alone.",
-        default="mid",
+             "before it pays; 'none', or the paid mark's own name, skips the leg. Pay reads mark_mode alone. "
+             "Default 'last' since 0.6.6, the mark paid before it, so the board keeps both legs for one release.",
+        default="last",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.conjunction_bounds",
+        type=str,
+        help="The conjunction's band per asset class as name:bound pairs: a miner's resting volume counts within "
+             "this many times the book's spread reference (a running mean of its quoted spread) of the mid, on each "
+             "side. A class the list does not name takes 5. Published per miner and class, never paid.",
+        default="simulation_0:5,simulation_1:2,simulation_2:5",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.conjunction_min_size_frac",
+        type=float,
+        help="The conjunction's size gate: both sides of a miner's resting volume within the band must reach this "
+             "share of the book's size reference (a running mean of its fill sizes).",
+        default=0.25,
     )
 
     parser.add_argument(
@@ -823,6 +844,41 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.delay_policy",
+        type=str,
+        choices=["curve", "flat", "jitter"],
+        help="How a response's process time maps to its base delay. curve: the exponential mapping from min_delay to "
+             "max_delay over the timeout. flat: min_delay for every response within the timeout, the responses "
+             "submitted in a random order (the engine keeps insertion order among equal timestamps). jitter: min_delay "
+             "plus a uniform draw up to delay_jitter for a response within delay_prompt_cutoff seconds, the curve "
+             "beyond it. A response at or over the timeout follows the curve under every policy.",
+        default="curve",
+    )
+
+    parser.add_argument(
+        "--scoring.delay_jitter",
+        type=int,
+        help="Width of the uniform base delay draw under the jitter policy, in simulation time units.",
+        default=40_000_000,
+    )
+
+    parser.add_argument(
+        "--scoring.delay_prompt_cutoff",
+        type=float,
+        help="Process time in seconds at or under which the jitter policy draws its base delay; above it the curve applies.",
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--scoring.latency_profile",
+        type=str,
+        help="Path of a JSON file mapping uid to a process time in seconds that replaces the measured one when the base "
+             "delay is computed; uids absent from the file keep their measured time. Read once at first use. Empty "
+             "disables it.",
+        default="",
+    )
+
+    parser.add_argument(
         "--rewarding.seed",
         type=int,
         help="Seed to use in generating distribution for rewards.",
@@ -953,6 +1009,98 @@ def add_im_validator_args(cls, parser):
             "but skip all miner queries and weight submission. "
             "Useful for connecting to mainnet/testnet to preview the UI without any chain interaction."
         ),
+    )
+
+    parser.add_argument(
+        "--neuron.skip_repeated_state",
+        action="store_true",
+        help="Leave unanswered the first copy of a state the engine sends again after a late answer. Off: every "
+             "state is answered, as before; the engine drains both queues before each send, so a duplicate answer is "
+             "harmless.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--neuron.query_prebuilt",
+        action="store_true",
+        help="Build and sign each round's requests before the first is sent. Off by default; "
+             "--neuron.query_prebuilt turns it on.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--neuron.no_query_prebuilt",
+        action="store_false",
+        dest="neuron.query_prebuilt",
+        help="Build and sign each request as it is sent.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--neuron.query_prepayload",
+        action="store_true",
+        help="Simulation mode: build every queried miner's compressed request in the main process, so the query "
+             "process receives the requests rather than the decoded state. On by default; "
+             "--neuron.no_query_prepayload turns it off.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.no_query_prepayload",
+        action="store_false",
+        dest="neuron.query_prepayload",
+        help="Build the miners' requests in the query process.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.orders_packed",
+        action="store_true",
+        help="Simulation mode: the query process delays the checked orders and encodes them for the simulator. On by "
+             "default; --neuron.no_orders_packed turns it off.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.no_orders_packed",
+        action="store_false",
+        dest="neuron.orders_packed",
+        help="Delay and encode the miners' orders in the main process.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.max_instruction_delay_s",
+        type=float,
+        help="The longest delay (simulated seconds) a miner's instruction may ask for; a longer one is refused at "
+             "acceptance, beside the protocol's ceiling. The engine holds the same bound (maxInstructionDelay) and "
+             "refuses on arrival. Default 600, long at first.",
+        default=600.0,
+    )
+
+    parser.add_argument(
+        "--neuron.gc_freeze",
+        action="store_true",
+        help="After startup, leave every object that exists out of the garbage collector's scans, so full collections "
+             "over the validator's long-lived state no longer run on the step. On by default; --neuron.no_gc_freeze "
+             "turns it off.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.no_gc_freeze",
+        action="store_false",
+        dest="neuron.gc_freeze",
+        help="Keep the garbage collector scanning the whole heap.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--neuron.gc_threshold",
+        type=str,
+        help="Garbage collector thresholds 'young,middle,old'. The default '50000,20,100' gives fewer, larger young "
+             "collections; an empty value keeps Python's.",
+        default="50000,20,100",
     )
 
     # ── Engine-specific arguments (loaded conditionally) ──────────────────────

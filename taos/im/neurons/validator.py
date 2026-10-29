@@ -71,11 +71,11 @@ if __name__ != "__mp_main__":
     from taos.im.utils.affinity import get_core_allocation
 
     from taos.im.config import add_im_validator_args, debeta_dial
-    from taos.im.protocol.simulator import SimulatorResponseBatch
+    from taos.im.protocol.simulator import PackedOrders, response_batch, with_capped
     from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification
     from taos.im.protocol.events import SimulationStartEvent
     from taos.im.validator.trade import history_clock_health as _history_clock_health
-    from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine
+    from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine, RepeatedState
 
     # Optional exchange-mode component; not part of this tree. Import is guarded, so a validator without
     # it starts normally and simply does not surface those notices.
@@ -169,6 +169,68 @@ if __name__ != "__mp_main__":
             book["e"] = list(book.get("e") or []) + list(events)
             books[nid] = book
         return books
+
+    def _settled_fill_roles(fill: dict, trade_events_by_id: dict) -> tuple:
+        """(taker, maker, stated) for one settled exchange fill: a matching trade event's roles when one exists, else
+        the executed fill's own (reconcile.resolve_trade_roles, as the miner's notice reads them). stated is False for
+        a fill record from before the roles were carried, and each reader keeps its old reading for it."""
+        tid = fill.get('trade_id')
+        te = trade_events_by_id.get(str(tid)) if tid is not None else None
+        if te is not None:
+            return getattr(te, 'taker_uid', None), getattr(te, 'maker_uid', None), True
+        if 'taker_uid' in fill or 'maker_uid' in fill:
+            return fill.get('taker_uid'), fill.get('maker_uid'), True
+        return None, None, False
+
+    def _settled_fill_side(fill: dict, taker, maker, stated: bool) -> int:
+        """The taker's direction, as every reader of a trade's side takes it. The fill's direction is the settling
+        agent's own, so a maker's is the opposite."""
+        direction = int(fill.get('direction', 0) or 0)
+        agent = fill.get('agent_id')
+        return 1 - direction if stated and maker == agent and taker != agent else direction
+
+    def _settled_fill_event(fill: dict, trade_events_by_id: dict, ts_ns: int) -> dict:
+        """The book's 't' event for one settled exchange fill (GenTRX inputs, the ingest books, the recent-trades
+        panel). A fill record without roles keeps the settling agent as the maker, on its own side."""
+        taker, maker, stated = _settled_fill_roles(fill, trade_events_by_id)
+        if not stated:
+            taker, maker = None, fill.get('agent_id')
+        return {
+            'y': 't',
+            'nid': int(fill.get('netuid')),
+            'i': fill.get('trade_id'),
+            'p': float(fill.get('price', 0.0) or 0.0),
+            'q': float(fill.get('alpha_volume', 0.0) or 0.0),
+            's': _settled_fill_side(fill, taker, maker, stated),
+            'Ta': taker,
+            'Ma': maker,
+            't': ts_ns,
+        }
+
+    def _settled_fill_notice(fill: dict, trade_events_by_id: dict) -> tuple:
+        """The settled fill's ET notice, which scoring reads from state.notices, and the uids it goes to. It names the
+        roles the fill states, so a resting order the pool filled is booked as the maker's fill; a fill record
+        without roles keeps the settling agent as the taker, as it was read before."""
+        taker, maker, stated = _settled_fill_roles(fill, trade_events_by_id)
+        if not stated:
+            taker, maker = fill.get('agent_id'), None
+        # Built by the canonical serializer, which is the only producer of an ET notice.
+        # Consumers reach these keys by subscript, so a key absent from a notice is a
+        # KeyError that costs a uid its whole volume, PnL and roundtrip for the block.
+        notice = NormalizedTradeEvent(
+            book_id=int(fill.get('netuid')),
+            quantity=float(fill.get('alpha_volume', 0.0) or 0.0),
+            price=float(fill.get('price', 0.0) or 0.0),
+            side=_settled_fill_side(fill, taker, maker, stated),
+            maker_uid=maker,
+            taker_uid=taker,
+            maker_fee=float(fill.get('maker_fee', 0.0) or 0.0),
+            taker_fee=float(fill.get('taker_fee', 0.0) or 0.0),
+            trade_id=fill.get('trade_id'),
+            taker_order_id=int(fill.get('taker_order_id', 0) or 0),
+            maker_order_id=int(fill.get('maker_order_id', 0) or 0),
+        ).to_notice_dict()
+        return notice, {u for u in (taker, maker) if u is not None}
 
     async def _push_fill_notifications(trade_events: list, url: str) -> None:
         """Fire-and-forget: push fill notifications directly to the data service
@@ -385,6 +447,11 @@ if __name__ != "__mp_main__":
             """
             def signal_handler(signum, frame):
                 signal_name = signal.Signals(signum).name
+                if getattr(self, '_cleanup_done', False) and not getattr(self, '_cleanup_finished', False) \
+                        and saves_on_stop(self):
+                    # Exiting here would end the stop save half written; the kill timeout still bounds the stop.
+                    bt.logging.warning(f"Received {signal_name} while shutting down; letting the state save finish")
+                    return
                 bt.logging.info(f"Received {signal_name}, initiating graceful shutdown...")
                 self.cleanup()
                 sys.exit(0)
@@ -513,6 +580,8 @@ if __name__ != "__mp_main__":
             # it: unpassed, the child reads it unset and opens fresh connections every round.
             if getattr(self.config.neuron, 'reuse_connections', False):
                 cmd.append('--neuron.reuse_connections')
+            if getattr(self.config.neuron, 'query_prebuilt', False):
+                cmd.append('--neuron.query_prebuilt')
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
 
@@ -2331,6 +2400,12 @@ if __name__ != "__mp_main__":
                         'debeta_making_fee_weight': float(debeta_dial(_dcfg, 'making_fee_weight')),
                         'debeta_capture_market_votes': int(debeta_dial(_dcfg, 'capture_market_votes')),
                         'debeta_skill_share_ema': int(debeta_dial(_dcfg, 'skill_share_ema')),
+                        # 0.6.6: the skill leg's mark and the alternative published beside it
+                        'debeta_mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
+                        'debeta_mark_mode_alt': str(debeta_dial(_dcfg, 'mark_mode_alt')),
+                        # 0.6.6: the conjunction's band per class and its size gate
+                        'debeta_conjunction_bounds': str(debeta_dial(_dcfg, 'conjunction_bounds')),
+                        'debeta_conjunction_min_size_frac': float(debeta_dial(_dcfg, 'conjunction_min_size_frac')),
                     }
                 }
             }
@@ -2557,6 +2632,10 @@ if __name__ != "__mp_main__":
                     start = time.time()
 
                     try:
+                        # The engine checkpointed the state before this one, which every structure is still at:
+                        # keep the scoring state there for a resume to that checkpoint.
+                        from taos.im.validator.checkpoint_snapshot import take_due_snapshot
+                        await take_due_snapshot(self, state)
                         # Sync mutation on _reward's coroutine — atomic against
                         # other coroutines (no awaits inside update_trade_volumes)
                         # and against the MVTRX push builder via the two-step
@@ -2701,6 +2780,10 @@ if __name__ != "__mp_main__":
                                 'debeta_pool_ema': _p_ema,
                                 'trading_ema_n': _t_ema_n,
                                 'trading_ema_ts': _t_ema_ts,
+                                # the presence gate's inputs as shipped with the boundary: the query windows
+                                # keep moving while the verify waits for and runs its compute
+                                'absent': _absent,
+                                'presence': _presence,
                             } if _verify else None
                             trading_rewards, gentrx_rewards, updated_data, all_uids = await loop.run_in_executor(
                                 self.reward_executor,
@@ -3293,10 +3376,7 @@ if __name__ != "__mp_main__":
                 # execute()'s trade_events are empty in the async-settlement flow, so the
                 # event is built from the reconciliation (self._pending_ingest_reconciliation,
                 # set post-settlement, consumed at the ingest push below).
-                # Maker/taker attribution comes from a matching trade_event when one is
-                # present (by trade_id); otherwise the reconciliation carries only the
-                # settling agent, surfaced as the maker side (matches the LOB convention
-                # where the miner's resting order is the maker, counterparty = pool).
+                # The book event's roles and side: see _settled_fill_event.
                 try:
                     _fill_ts_ns = int(time.time() * 1e9)
                     _te_by_tid = {}
@@ -3310,25 +3390,7 @@ if __name__ != "__mp_main__":
                         if _nid is None:
                             continue
                         _tid = _ef.get('trade_id')
-                        _agent = _ef.get('agent_id')
-                        _te_m = _te_by_tid.get(str(_tid)) if _tid is not None else None
-                        if _te_m is not None:
-                            _ta = getattr(_te_m, 'taker_uid', None)
-                            _ma = getattr(_te_m, 'maker_uid', None)
-                        else:
-                            _ta = None
-                            _ma = _agent
-                        _ev = {
-                            'y':  't',
-                            'nid': int(_nid),
-                            'i':  _tid,
-                            'p':  float(_ef.get('price', 0.0) or 0.0),
-                            'q':  float(_ef.get('alpha_volume', 0.0) or 0.0),
-                            's':  int(_ef.get('direction', 0) or 0),
-                            'Ta': _ta,
-                            'Ma': _ma,
-                            't':  _fill_ts_ns,
-                        }
+                        _ev = _settled_fill_event(_ef, _te_by_tid, _fill_ts_ns)
                         _settled_fill_events.setdefault(int(_nid), []).append(_ev)
                         _bk = state.books.get(_nid)
                         if _bk is None:
@@ -3345,31 +3407,9 @@ if __name__ != "__mp_main__":
                         # reached scoring (snapshot score/volume = 0 despite rows landing
                         # in `trades`). Surface the SAME reconciled fill as a settled
                         # trade notice ('ET') keyed by the settling UID so snapshots
-                        # reflect on-chain-settled activity. Pool fills: the settling
-                        # miner is the aggressor (taker); a matched LOB trade_event
-                        # reuses its maker/taker sides.
-                        if _te_m is not None:
-                            _n_ta = getattr(_te_m, 'taker_uid', None)
-                            _n_ma = getattr(_te_m, 'maker_uid', None)
-                        else:
-                            _n_ta = _agent
-                            _n_ma = None
-                        # Built by the canonical serializer, which is the only producer of an ET notice.
-                        # Consumers reach these keys by subscript, so a key absent from a notice is a
-                        # KeyError that costs a uid its whole volume, PnL and roundtrip for the block.
-                        _notice = NormalizedTradeEvent(
-                            book_id=int(_nid),
-                            quantity=float(_ef.get('alpha_volume', 0.0) or 0.0),
-                            price=float(_ef.get('price', 0.0) or 0.0),
-                            side=int(_ef.get('direction', 0) or 0),
-                            maker_uid=_n_ma,
-                            taker_uid=_n_ta,
-                            maker_fee=float(_ef.get('maker_fee', 0.0) or 0.0),
-                            taker_fee=float(_ef.get('taker_fee', 0.0) or 0.0),
-                            trade_id=_tid,
-                            taker_order_id=int(_ef.get('taker_order_id', 0) or 0),
-                            maker_order_id=int(_ef.get('maker_order_id', 0) or 0),
-                        ).to_notice_dict()
+                        # reflect on-chain-settled activity, with the roles the fill states
+                        # (_settled_fill_notice).
+                        _notice, _notice_uids = _settled_fill_notice(_ef, _te_by_tid)
                         # One ET notice per fill per uid. Two sources describe the same
                         # fill: this reconciliation-derived one, and the trade-event one
                         # surfaced to miners before forward(). state.notices feeds BOTH
@@ -3377,9 +3417,7 @@ if __name__ != "__mp_main__":
                         # it), so a second copy would double-count that fill's volume.
                         # They now share the engine's trade id, so it identifies the
                         # duplicate.
-                        for _nuid in {_n_ta, _n_ma}:
-                            if _nuid is None:
-                                continue
+                        for _nuid in _notice_uids:
                             _existing = state.notices.setdefault(_nuid, [])
                             if _tid is not None and any(
                                 isinstance(_e, dict)
@@ -3555,8 +3593,7 @@ if __name__ != "__mp_main__":
                 response = {"responses": []}
             else:
                 start = time.time()
-                response = SimulatorResponseBatch(miner_responses)
-                response = response.serialize()
+                response = with_capped(response_batch(miner_responses), getattr(self, '_capped_pairs', None))
                 bt.logging.debug(f"Serialized Response Batch ({time.time()-start}s)")
                 # Inject UI-submitted external orders
                 _ext = getattr(self.engine, '_external_instructions', [])
@@ -3782,7 +3819,20 @@ if __name__ != "__mp_main__":
                                 desc = f"<chain error: {_e}>"
                             bt.logging.debug(f"[hb] task {t.get_name()}: {desc or '<no frames>'}")
             _hb_task = asyncio.ensure_future(_listen_heartbeat())  # noqa: F841 — keep ref
+            import gc
+            if getattr(self.config.neuron, "gc_freeze", False):
+                gc.collect()
+                gc.freeze()
+                bt.logging.info(f"[GC] froze {gc.get_freeze_count()} objects")
+            if getattr(self.config.neuron, "gc_threshold", ""):
+                gc.set_threshold(*(int(x) for x in self.config.neuron.gc_threshold.split(",")))
+                bt.logging.info(f"[GC] thresholds {gc.get_threshold()}")
+            repeats = RepeatedState()
+            skip_repeats = bool(getattr(self.config.neuron, "skip_repeated_state", False))
 
+            # A stop waits on these for the state the engine checkpoints at (cleanup.await_last_state).
+            self._listener_thread = threading.current_thread()
+            self._listener_stopped = threading.Event()
             try:
                 while True:
                     # Shutdown guard: cleanup() sets _cleanup_done and tears down
@@ -3796,8 +3846,19 @@ if __name__ != "__mp_main__":
                         break
                     response = {"responses": []}
                     raw_message = None
+                    answer = True
                     try:
                         raw_message, normalized_state, receive_start = await self.engine.receive()
+                        if normalized_state is not None and getattr(self, '_listener_closed', False):
+                            bt.logging.warning(
+                                f"State at {normalized_state.timestamp} arrived after the stop save began; "
+                                "it is not accounted")
+                            break
+                        if normalized_state is not None and skip_repeats and repeats.skip(normalized_state.timestamp):
+                            bt.logging.warning(f"[REPEAT-STATE] state {normalized_state.timestamp} received again "
+                                               f"after a late answer: skipped, not answered")
+                            answer = False
+                            continue
                         if normalized_state is not None:
                             if isinstance(raw_message, (bytes, bytearray)):
                                 # opt-in record of the stream for the scoring acceptance's replay harness (STATE_CAPTURE_DIR);
@@ -3845,10 +3906,10 @@ if __name__ != "__mp_main__":
                     finally:
                         # Don't attempt to respond during teardown — respond()
                         # also hits run_in_executor/IPC on torn-down resources.
-                        if not getattr(self, '_cleanup_done', False):
+                        if answer and not getattr(self, '_cleanup_done', False):
                             self.engine.respond(raw_message, response)
             finally:
-                pass
+                self._listener_stopped.set()
 
         def listen(self):
             """
@@ -3948,8 +4009,11 @@ if __name__ != "__mp_main__":
                     self.on_simulation_failed(message)
                 elif message['type'] == 'RESPONSES_ERROR_REPORT':
                     dump_file = self.config.neuron.full_path + f"/{self.last_state.config.simulation_id}.{message['timestamp']}.responses.json"
+                    dumped = dict(self.last_response, responses=[  # packed orders written out, so the indices match
+                        item for r in self.last_response.get("responses", ())
+                        for item in (r.unpack() if isinstance(r, PackedOrders) else [r])])
                     with open(dump_file, "w") as f:
-                        json.dump(self.last_response, f, indent=4)
+                        json.dump(dumped, f, indent=4)
                     error_file = self.config.neuron.full_path + f"/{self.last_state.config.simulation_id}.{message['timestamp']}.error.json"
                     with open(error_file, "w") as f:
                         json.dump(message, f, indent=4)
@@ -4040,7 +4104,7 @@ from taos.im.validator.persistence import (
         snapshot_2_level_dict, snapshot_volume_sums, snapshot_trade_volumes,
         snapshot_roundtrip_volumes, snapshot_open_positions,
         construct_save_data_sync, defragment_histories, schedule_save,
-        save_state_sync, migrate_sampling_interval,
+        save_state_sync, migrate_sampling_interval, saves_on_stop,
     )
 from taos.im.validator import fdwatch
 

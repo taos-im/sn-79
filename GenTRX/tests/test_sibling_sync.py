@@ -327,6 +327,22 @@ def test_startup_without_local_checkpoint_ignores_stale_record(tmp_path, uid0):
     assert _same_weights(_weights(restarted.checkpoint_path), uid0.state())
 
 
+def test_quarantined_seed_sibling_scores_without_warmup_after_sync(tmp_path, uid0):
+    uid0.publish_full(6)
+    agg = _make(tmp_path)
+    agg.checkpoint_path.write_bytes(_ckpt_bytes(n_types=3))
+    agg.warmup_rounds = 5
+    agg.rollback = True
+
+    _start(agg)
+
+    assert (tmp_path / "best.pt.incompatible-n_types3").exists()
+    assert _same_weights(_weights(agg.checkpoint_path), uid0.state())
+    assert agg._effective_min_score == agg.min_score
+    assert agg._effective_rollback is True
+    assert agg._is_gradient_acceptable(agg.min_score - 1.0, {}) is False
+
+
 def test_sibling_skips_own_bucket_resume_and_upload(tmp_path, uid0):
     own = _OwnBucket(head_version=40)
     uid0.publish_full(6)

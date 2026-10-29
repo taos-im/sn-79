@@ -14,6 +14,11 @@ import os
 API_HOST_DEFAULT = "127.0.0.1"
 METRICS_HOST_DEFAULT = "0.0.0.0"
 SERVER_LOG_LEVEL = "warning"
+# In simulation mode the API server takes the stop signal first and hands it to the validator, which then saves its
+# state, only once its graceful shutdown ends; past this it cancels the requests still running. The API's handlers
+# answer from memory, and the longest await among them, the forwarding of the engine's notices to miners, allows one
+# second per notice.
+API_GRACEFUL_SHUTDOWN_S = 5
 _PER_CLIENT_DEFAULT = 8
 
 
@@ -84,6 +89,7 @@ def api_server_options(config) -> dict:
         "port": int(config.port),
         "access_log": False,
         "log_level": SERVER_LOG_LEVEL,
+        "timeout_graceful_shutdown": API_GRACEFUL_SHUTDOWN_S,
     }
 
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import os
 import shutil
@@ -56,6 +57,7 @@ from taos.im.validator.engines import (
 )
 
 from taos.im.protocol import MarketSimulationStateUpdate
+from taos.im.protocol.simulator import PackedOrders, pack_batch
 from taos.im.validator.fundamental import stamp as stamp_fundamental
 from taos.im.validator.multiasset_state import flatten_multiasset_state
 
@@ -140,8 +142,51 @@ def _run_outputs(run_dir: Path):
 
 
 
+def _read_segment(fd: int, size: int) -> bytes:
+    """The first size bytes of a shared-memory segment, read with pread rather than a mapping. The engine can shrink
+    /state between the reader's size check and its read; a shared mapping read past the end of its object is SIGBUS,
+    which kills the reading process, while pread past the end comes back short, and the unpack retry
+    then reads the segment again."""
+    out = bytearray()
+    while len(out) < size:
+        chunk = os.pread(fd, size - len(out), len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
+
+
 class RunWentBackwardError(RuntimeError):
     """The engine published a state from a run older than the one this validator has locked."""
+
+
+@contextlib.contextmanager
+def _reward_lock_held(v):
+    """Hold the validator's reward lock from the thread handling the engine's events, so a history transition
+    (the shift of a run change, a snapshot's reload) never interleaves with a reward or a checkpoint snapshot in
+    progress. Every reward queued before it is applied first. The main loop stays free while it is held."""
+    lock, loop = getattr(v, '_reward_lock', None), getattr(v, 'main_loop', None)
+    if lock is None or loop is None:
+        yield
+        return
+    acquired, release = threading.Event(), concurrent.futures.Future()
+
+    async def _hold():
+        async with lock:
+            acquired.set()
+            await asyncio.wrap_future(release)
+
+    holder = asyncio.run_coroutine_threadsafe(_hold(), loop)
+    while not acquired.wait(0.5):
+        if holder.done():
+            holder.result()
+            raise RuntimeError("the reward lock holder ended before acquiring the lock")
+    try:
+        yield
+    finally:
+        release.set_result(None)
+        holder.result()
+
 
 class SimulationEngine(MarketEngine):
 
@@ -191,6 +236,9 @@ class SimulationEngine(MarketEngine):
 
         # ── 1. Load simulation XML config ─────────────────────────────────────
         self._load_config()
+        # The run this process resumes keeps its own layout, which a release can change: a class added or removed
+        # takes effect at the next run, which the engine starts from the start config.
+        self._follow_resumed_run_layout()
 
         # ── 2. Benchmark agents + effective UID count ─────────────────────────
         v.benchmark_agents = []
@@ -532,10 +580,17 @@ class SimulationEngine(MarketEngine):
         """
         try:
             self.validator.last_response = response
-            try:
-                packed = msgpack.packb(response, use_bin_type=True)
-            except (OverflowError, ValueError, TypeError) as exc:
-                packed = self._pack_dropping_unencodable(response, exc)
+            if any(isinstance(item, PackedOrders) for item in response.get("responses", ())):  # neuron.orders_packed
+                packed, dropped = pack_batch(response)
+                if dropped:
+                    self.response_pack_drops = getattr(self, "response_pack_drops", 0) + len(dropped)
+                    logger.error(f"SimulationEngine.respond: dropped {len(dropped)} instruction(s) the wire cannot "
+                                 f"encode from agent(s) {sorted({str(a) for a in dropped})}")
+            else:
+                try:
+                    packed = msgpack.packb(response, use_bin_type=True)
+                except (OverflowError, ValueError, TypeError) as exc:
+                    packed = self._pack_dropping_unencodable(response, exc)
             self._send_bytes(packed)
         except Exception as exc:
             logger.error(f"SimulationEngine.respond error: {exc}")
@@ -615,8 +670,27 @@ class SimulationEngine(MarketEngine):
         _prev_sim_id = (
             getattr(v.simulation, "simulation_id", None) if getattr(v, "simulation", None) else None
         )
+        _prev_label = self._layout_label()
+        _prev_sim = getattr(v, "simulation", None)
         self._load_config()
+        self._adopt_run_layout(log_dir, "the run opened", previous_label=_prev_label)
         volume_decimals = v.simulation.volumeDecimals
+        # the books whose market changed between the two runs start fresh, the vanished ones are dropped (row 64)
+        from taos.im.validator.trade import layout_book_changes
+        _book_changes = layout_book_changes(_prev_sim, v.simulation)
+        # passed on only when a book changed, so a run change on the same layout keeps its shape
+        if not any(d != "keep" for d in _book_changes.get("books", {}).values()):
+            _book_changes = None
+        else:
+            # the scoring child shifts onto the NEW layout's books, classes and names, which it would otherwise learn only
+            # at its next re-INIT
+            from taos.im.validator.reward import class_map, class_names_by_index
+            _book_changes["layout"] = {
+                "book_ids": [int(b) for b in v.simulation.book_ids],
+                "book_count": int(len(v.simulation.book_ids)),
+                "class_of_book": {str(k): int(c) for k, c in class_map(v).items()},
+                "class_names": class_names_by_index(v),
+            }
 
         logger.info(f"Shifting timestamps for simulation restart ({reason})...")
 
@@ -625,23 +699,28 @@ class SimulationEngine(MarketEngine):
         # all new-sim frames follow it.
         _shadow = getattr(v, '_scoring_shadow', None)
         if _shadow is not None:
-            _shadow.emit_sim_start(old_simulation_timestamp, new_simulation_timestamp)
+            if _book_changes:
+                _shadow.emit_sim_start(old_simulation_timestamp, new_simulation_timestamp, _book_changes)
+            else:
+                _shadow.emit_sim_start(old_simulation_timestamp, new_simulation_timestamp)
 
         # The full history shift lives in trade.shift_simulation_histories —
         # shared verbatim with the shadow scoring service so both sides make the
         # identical transition.
         from taos.im.validator.trade import shift_simulation_histories
-        shift_simulation_histories(
-            v, old_simulation_timestamp, new_simulation_timestamp,
-            book_count=v.simulation.book_count,
-            volume_decimals=volume_decimals,
-            lookback=v.config.scoring.kappa.lookback,
-            volume_assessment_period=v.config.scoring.activity.trade_volume_assessment_period,
-            miner_wealth=v.simulation.miner_wealth,
-            effective_max_uids=v.effective_max_uids,
-            log=logger.info,
-            book_ids=getattr(self, "_book_ids", None) or None,
-        )
+        with _reward_lock_held(v):
+            shift_simulation_histories(
+                v, old_simulation_timestamp, new_simulation_timestamp,
+                book_count=v.simulation.book_count,
+                volume_decimals=volume_decimals,
+                lookback=v.config.scoring.kappa.lookback,
+                volume_assessment_period=v.config.scoring.activity.trade_volume_assessment_period,
+                miner_wealth=v.simulation.miner_wealth,
+                effective_max_uids=v.effective_max_uids,
+                log=logger.info,
+                book_ids=getattr(self, "_book_ids", None) or None,
+                **({"book_changes": _book_changes} if _book_changes else {}),
+            )
 
         v.start_time = time.time()
         v.simulation_timestamp = new_simulation_timestamp
@@ -713,6 +792,93 @@ class SimulationEngine(MarketEngine):
         asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
         logger.info("Simulation restart complete")
         self._restart_if_deferred(why="the new run is open and its state is saved on the new clock")
+
+    def _resumed_checkpoint(self, state) -> int:
+        """The checkpoint a resumed engine restarted from: its first state is one step after it."""
+        return int(state.timestamp) - int(getattr(self.validator.simulation, "publish_interval", 0) or 0)
+
+    def _checkpoint_snapshot_for(self, state, run_id):
+        """The scoring snapshot kept at the checkpoint this state resumes from, checked from its meta record alone
+        ({'path', 'meta'}), or None."""
+        from taos.im.validator import checkpoint_snapshot
+        v = self.validator
+        log_dir = state.logDir or getattr(v.simulation, "logDir", None)
+        try:
+            return checkpoint_snapshot.check_snapshot(v, run_id, self._resumed_checkpoint(state), log_dir)
+        except Exception:
+            logger.exception("Could not look up the scoring snapshot for the resumed run")
+            return None
+
+    def _recover_from_saved_state(self) -> None:
+        """A reload that failed partway leaves some structures at the checkpoint and the rest after it. Every one is
+        dropped, the structures are initialised and the saved state files read back through the validator's normal
+        loader, as a restart reads them. The caller holds the reward lock."""
+        from taos.im.validator.persistence import load_state
+        from taos.im.validator.scoring_shadow import _STRUCT_NAMES, _rebuild_structs
+        v = self.validator
+        fresh = _rebuild_structs({})
+        for name in _STRUCT_NAMES:
+            setattr(v, name, fresh.get(name, {}))
+        v._last_accounted_ts = None
+        v._last_prune_timestamp = None
+        self.initialize_structures()
+        load_state(v)
+
+    def _resume_from_snapshot(self, old_simulation_timestamp, state, checked) -> bool:
+        """Reload the scoring state the validator kept at the engine's checkpoint, in place of re-opening the run.
+
+        Under the reward lock, so every reward queued before the resume is applied first and the next one starts
+        from the snapshot. The reload streams the snapshot one structure at a time. If it fails partway the mixed
+        state is replaced by the saved state files and the run is re-opened on the resumed clock, as without a
+        snapshot. Either way the scoring service's replica holds the abandoned stretch, so it is re-initialised from
+        main's state; that re-INIT is not a parity failure and does not count toward its storm breaker. Returns
+        whether the snapshot was reloaded."""
+        from taos.im.validator.checkpoint_snapshot import restore_snapshot_from
+        v = self.validator
+        ckpt_ts = checked["meta"]["ts"]
+        logger.warning(
+            f"RESUME FROM THE ENGINE'S CHECKPOINT: the clock went from {old_simulation_timestamp} to "
+            f"{state.timestamp} on run {checked['meta']['run_id']!r}; reloading the scoring state kept at the "
+            f"checkpoint ({ckpt_ts}), so the replayed stretch counts once and the positions held there are kept"
+        )
+        failed = None
+        with _reward_lock_held(v):
+            try:
+                restore_snapshot_from(v, checked["path"])
+            except Exception as exc:
+                failed = exc
+                logger.exception(
+                    f"The scoring snapshot at {ckpt_ts} could not be read whole; reloading the saved state in its "
+                    f"place, so no structure is left at the checkpoint while the others are not")
+                self._recover_from_saved_state()
+            _shadow = getattr(v, '_scoring_shadow', None)
+            if _shadow is not None:
+                _shadow.request_reinit(storm=False)
+            if failed is None and getattr(v, '_shadow_applied_ts', None) is not None:
+                v._shadow_applied_ts = ckpt_ts
+        if failed is not None:
+            loaded = int(v.simulation_timestamp or 0)
+            logger.warning(
+                f"RESUME NOT RESTORED: the snapshot reload failed {failed}; every structure is replaced by the saved "
+                f"state at {loaded} and the run re-opened on the resumed clock {state.timestamp}, so the replayed "
+                "stretch counts twice in every window and the positions held at the checkpoint are reset"
+            )
+            if loaded > state.timestamp:
+                self._open_run(loaded, state.timestamp, state.logDir,
+                               reason="clock regression on the resumed run, after a failed snapshot reload")
+            v._run_changes_recovered = getattr(v, '_run_changes_recovered', 0) + 1
+            v._resumes_unrestored = getattr(v, '_resumes_unrestored', 0) + 1
+            return False
+        v.simulation_timestamp = ckpt_ts
+        v.start_time = time.time()
+        v.start_timestamp = ckpt_ts
+        v.last_state_time = None
+        v.step_rates = []
+        v._resumes_restored = getattr(v, '_resumes_restored', 0) + 1
+        if getattr(v, 'main_loop', None) is not None:
+            asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
+        self._restart_if_deferred(why="the resumed run is restored and saved at its checkpoint")
+        return True
 
     def _restart_if_deferred(self, *, why: str) -> None:
         """The validator restart a run-end update owes (update.update_validator with restart=False) happens
@@ -792,8 +958,18 @@ class SimulationEngine(MarketEngine):
         #    update belongs to a run that has only just opened; no start event came between. Apply the run
         #    change here, as the event would have, before anything sums the histories on the new clock.
         from taos.im.validator.trade import missed_run_change
+        from taos.im.validator import checkpoint_snapshot
         _prev_ts = v.simulation_timestamp
-        if missed_run_change(_prev_ts, state.timestamp, fresh_threshold=self._fresh_threshold()):
+        # A STEP BACK ON THE SAME RUN TO A CHECKPOINT THE VALIDATOR KEPT is a resume, wherever its clock lands: the
+        # scoring state saved there is reloaded, so the replay counts once and the positions held there are kept.
+        _run = _locked or _incoming
+        _snap = None
+        if state.timestamp < _prev_ts and _incoming and _incoming == _run:
+            _snap = self._checkpoint_snapshot_for(state, _run)
+        if _snap is not None:
+            self._last_start_ts = state.timestamp
+            self._resume_from_snapshot(_prev_ts, state, _snap)
+        elif missed_run_change(_prev_ts, state.timestamp, fresh_threshold=self._fresh_threshold()):
             logger.warning(
                 f"RUN CHANGE NOT SEEN: the clock went from {_prev_ts} to {state.timestamp} without a start event; "
                 "applying the run change now, as the event would have"
@@ -808,11 +984,14 @@ class SimulationEngine(MarketEngine):
             # notice would have; a late copy of that notice is then absorbed by on_start.
             logger.warning(
                 f"RESUME NOT SEEN: the clock went from {_prev_ts} to {state.timestamp} on run {_incoming!r} without "
-                "a start event; re-opening the run on the resumed clock, as the event would have"
+                "a start event; re-opening the run on the resumed clock, as the event would have. There is no "
+                f"scoring snapshot at the engine's checkpoint {self._resumed_checkpoint(state)}, so the replayed "
+                "stretch counts twice in every window and the positions held at the checkpoint are reset"
             )
             self._last_start_ts = state.timestamp
             self._open_run(_prev_ts, state.timestamp, state.logDir, reason="clock regression on the resumed run")
             v._run_changes_recovered = getattr(v, '_run_changes_recovered', 0) + 1
+            v._resumes_unrestored = getattr(v, '_resumes_unrestored', 0) + 1
         elif getattr(v, '_restart_when_run_opens', None) and \
                 time.time() - v._restart_when_run_opens > _DEFERRED_RESTART_CEILING_S:
             # The run is ticking, so it opened, yet neither the start event nor the recovery consumed the
@@ -820,6 +999,8 @@ class SimulationEngine(MarketEngine):
             asyncio.run_coroutine_threadsafe(v._save_state_sync(), v.main_loop).result()
             self._restart_if_deferred(
                 why=f"the run has been ticking for over {_DEFERRED_RESTART_CEILING_S:.0f}s with a restart owed")
+        # The engine checkpointed the previous state: this state's reward keeps the validator's state there.
+        checkpoint_snapshot.mark_if_checkpointed(v, state, _prev_ts, _run)
         # 1. Periodic validator-update check (uses OLD simulation_timestamp)
         if v.simulation_timestamp % 3_600_000_000_000 == 0 and v.simulation_timestamp != 0:
             v.update_repo()
@@ -830,6 +1011,7 @@ class SimulationEngine(MarketEngine):
             )
             v.simulation.logDir = state.logDir
             self._notify_seed_log_dir_change(state.logDir)
+            self._adopt_run_layout(state.logDir, "the first state of the run", previous_label=self._layout_label())
         # 3. Update simulation_timestamp
         v.simulation_timestamp = state.timestamp
         # 4. Derive simulation_id from logDir — set once and lock; mid-sim logDir
@@ -935,7 +1117,7 @@ class SimulationEngine(MarketEngine):
             # ids, so glob per realization dir and let the headers do the mapping.
             prices = {}
             import glob
-            for flat_idx, name, instance, _config in v.simulation.realizations():
+            for _flat_idx, name, instance, _config in v.simulation.realizations():
                 inst_dir = os.path.join(v.simulation.logDir, f"{name}-{instance}")
                 files = sorted(glob.glob(os.path.join(inst_dir, 'fundamental.*.csv')))
                 if not files:
@@ -1119,6 +1301,94 @@ class SimulationEngine(MarketEngine):
         self._book_ids = list(
             getattr(self._sim_config, 'book_ids', None)
             or range(self._sim_config.book_count))
+
+    def _layout_label(self):
+        """The loaded layout's label, or None where the simulation config carries none (single-market stubs)."""
+        label = getattr(getattr(self.validator, 'simulation', None), 'label', None)
+        return label() if callable(label) else None
+
+    def _run_layout(self, run_dir):
+        """The multi-asset layout the engine wrote into a run's config.xml, as (xml root, config): read from the run
+        root, or from the parent of a realization's directory. None when there is no such file to read."""
+        if not run_dir:
+            return None
+        import xml.etree.ElementTree as ET
+        from taos.im.protocol.models import MultiAssetSimulationConfig
+        d = Path(run_dir)
+        for cfg in (d / "config.xml", d.parent / "config.xml"):
+            if not cfg.is_file():
+                continue
+            try:
+                root = ET.parse(cfg).getroot()
+                if root.tag != "MultiAssetSimulation":
+                    return None
+                return root, MultiAssetSimulationConfig.from_multiasset_xml(root, cfg.parent)
+            except Exception:
+                logger.exception(f"could not read the run's layout from {cfg}")
+                return None
+        return None
+
+    def _adopt_run_layout(self, run_dir, why: str, previous_label: str | None = None) -> bool:
+        """Score the run in run_dir on its own layout when the loaded one differs; True when it was replaced.
+
+        The simulation state file is named after the layout, so it follows; the engine's next run still starts from
+        the start config (simulator_config_file). A layout on other books than the loaded ones is refused: every
+        book-keyed structure is built on the book ids. With previous_label, the layout scored before a run opened,
+        a change across the open re-initialises the scoring service once, so it scores the same classes as main.
+        """
+        v = self.validator
+        changed = False
+        current = self._layout_label()
+        if current is None:
+            return False
+        found = self._run_layout(run_dir)
+        if found is not None:
+            xml, sim = found
+            if sim.label() != current:
+                if list(sim.book_ids) != list(self._book_ids):
+                    # a book count that grew or shrank between runs: the layout is adopted and the book-keyed
+                    # structures follow at the open (new books start empty, vanished ones are dropped: row 64)
+                    logger.warning(
+                        f"LAYOUT ON OTHER BOOKS ({why}): the run in {run_dir} has {sim.book_count} books on "
+                        f"{sim.label()}, the loaded structures {len(self._book_ids)} on {v.simulation.label()}; "
+                        "the layout is adopted, the vanished books' histories are dropped at the open")
+                    self._book_ids = [int(b) for b in sim.book_ids]
+                if True:
+                    old = v.simulation.label()
+                    sim.logDir = v.simulation.logDir
+                    sim.simulation_id = v.simulation.simulation_id
+                    v.xml_config = xml
+                    v.simulation = sim
+                    self._sim_config = sim
+                    v.simulation_state_file = v.config.neuron.full_path + f"/{sim.label()}.mp"
+                    logger.warning(
+                        f"LAYOUT FROM THE RUN ({why}): {old} -> {sim.label()}; the next run starts from "
+                        f"{v.simulator_config_file}")
+                    changed = True
+        if previous_label is not None and self._layout_label() != previous_label:
+            shadow = getattr(v, '_scoring_shadow', None)
+            if shadow is not None:
+                shadow.request_reinit()
+        return changed
+
+    def _follow_resumed_run_layout(self) -> bool:
+        """At start, score the run the engine resumes on its own layout. That run is the newest run directory with a
+        checkpoint (the engine's `-c latest` rule); it is followed when this process's newest saved state is that
+        run's, and otherwise the run change at the first state of the other run sets the layout."""
+        v = self.validator
+        if not getattr(v, 'repo_path', None):
+            return False
+        logs = Path(v.repo_path) / 'simulate' / 'trading' / 'run' / 'logs'
+        try:
+            runs = sorted(d for d in logs.iterdir()
+                          if d.is_dir() and any((c / 'common.ckpt').is_file() for c in (d / 'ckpt').glob('*')))
+        except OSError:
+            return False
+        parts = Path(getattr(v, 'validator_state_file', '') or '').name.split('.')
+        sim_id = parts[3] if len(parts) >= 5 else None
+        if not runs or not sim_id or not runs[-1].name.startswith(sim_id):
+            return False
+        return self._adopt_run_layout(runs[-1], f"start on the resumed run {runs[-1].name}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Benchmark agent handling (moved from validator)
@@ -1355,7 +1625,6 @@ class SimulationEngine(MarketEngine):
         if not hasattr(v, 'fundamental_price'):
             v.fundamental_price = {bookId: None for bookId in book_ids}
 
-        from collections import defaultdict, deque
         if not hasattr(v, 'volume_sums'):
             v.volume_sums = defaultdict(lambda: defaultdict(float))
         if not hasattr(v, 'maker_volume_sums'):
@@ -1628,7 +1897,6 @@ class SimulationEngine(MarketEngine):
         msgpack payload from the /state shared-memory segment.
         """
         import posix_ipc as _posix_ipc
-        import mmap as _mmap
 
         loop = asyncio.get_event_loop()
         # [RECV-PROFILE] discriminates the scoring-round recv spike:
@@ -1763,8 +2031,9 @@ class SimulationEngine(MarketEngine):
                 _ready = _actual
             byte_size = _ready
             _t_poll = time.time()
-            with _mmap.mmap(shm_req.fd, byte_size, _mmap.MAP_SHARED, _mmap.PROT_READ) as mm:
-                packed_data = mm.read(byte_size)
+            packed_data = _read_segment(shm_req.fd, byte_size)
+            if len(packed_data) < byte_size:
+                logger.warning(f"SHM /state shrank during the read: {len(packed_data)} of {byte_size} B; retried at unpack")
             import bittensor as bt
             bt.logging.info(
                 f"[RECV-PROFILE] mq={_mq_done[0] - _t0:.3f}s "
@@ -1780,7 +2049,6 @@ class SimulationEngine(MarketEngine):
         """Re-read the current SHM /state payload without consuming a new MQ message.
         Used to retry after a partial-write race on the first read."""
         import posix_ipc as _posix_ipc
-        import mmap as _mmap
         import os as _os
         byte_size = len(prev_bytes)
         loop = asyncio.get_event_loop()
@@ -1805,8 +2073,7 @@ class SimulationEngine(MarketEngine):
                         "SHM /state retry: announced %d B, actual %d B — reading actual",
                         byte_size, read_size,
                     )
-                with _mmap.mmap(shm.fd, read_size, _mmap.MAP_SHARED, _mmap.PROT_READ) as mm:
-                    return mm.read(read_size)
+                return _read_segment(shm.fd, read_size)
             finally:
                 shm.close_fd()
         return await loop.run_in_executor(None, _read)

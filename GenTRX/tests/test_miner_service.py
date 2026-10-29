@@ -9,7 +9,6 @@ Run: pytest GenTRX/tests/test_miner_service.py -v
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from GenTRX.src.miner_training_service import MinerTrainingService, MinerTrainingConfig
 
@@ -106,3 +105,61 @@ def test_prune_gradients_disabled_when_keep_zero(tmp_path):
     svc._prune_gradients()
 
     store.prune_keep_latest.assert_not_called()
+
+
+def _stub_training(svc, monkeypatch):
+    """Real _train_one_uid, with page download and the training step stubbed."""
+    import torch
+
+    from GenTRX.src.gradient import GradientDelta, GradientMetadata
+
+    svc._download_assignment_data = lambda a: ["page.parquet"]
+    svc._build_page_loaders = lambda files: [object()]
+    delta = GradientDelta(delta={"w": torch.ones(4)}, metadata=GradientMetadata(loss_before=1.0, loss_after=0.9))
+    monkeypatch.setattr("GenTRX.src.distributed.train_incremental", lambda model, loaders, cfg, device: delta)
+
+
+def test_trained_gradients_are_uploaded_to_shared_store(tmp_path, monkeypatch):
+    svc = _svc(tmp_path, uid=7, uids=[12])
+    _stub_training(svc, monkeypatch)
+    store = MagicMock()
+    svc._write_store = store  # one shared bucket, {uid} in the path
+
+    svc._train_all_uids_background({7: [{"round": 3}], 12: [{"round": 3}]}, target_v=1)
+
+    uploads = {c.kwargs["miner_uid"]: c.kwargs for c in store.put_gradient.call_args_list}
+    assert set(uploads) == {7, 12}
+    assert all(kw["round_id"] == 3 and kw["data"] for kw in uploads.values())
+    assert svc.state.last_uploaded_round == 3
+
+
+def test_upload_uses_per_uid_store_when_set(tmp_path, monkeypatch):
+    svc = _svc(tmp_path, uid=7, uids=[12])
+    _stub_training(svc, monkeypatch)
+    shared, dedicated = MagicMock(), MagicMock()
+    svc._write_store = shared
+    svc._write_stores = {12: dedicated}
+
+    svc._train_one_uid(7, [{"round": 3}], target_v=1, budget_s=10.0)
+    svc._train_one_uid(12, [{"round": 3}], target_v=1, budget_s=10.0)
+
+    assert shared.put_gradient.call_args.kwargs["miner_uid"] == 7
+    assert dedicated.put_gradient.call_args.kwargs["miner_uid"] == 12
+
+
+def test_failing_uid_does_not_skip_the_rest(tmp_path):
+    svc = _svc(tmp_path, uid=7, uids=[12, 40])
+    calls = []
+
+    def _train(uid, assignments, target_v, budget):
+        calls.append(uid)
+        if uid == 12:
+            raise RuntimeError("upload store unavailable")
+        return 10.0
+
+    svc._train_one_uid = _train
+
+    svc._train_all_uids_background({7: [{"round": 1}], 12: [{"round": 1}], 40: [{"round": 1}]}, target_v=0)
+
+    assert calls == [7, 12, 40]
+    assert svc.state.training_in_progress is False

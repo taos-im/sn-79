@@ -61,11 +61,13 @@ def test_apply_version_deltas_matches_manual_apply():
     theta0, store_bytes, comps = _make_deltas()
     expected = {n: p.shape for n, p in _tiny().named_parameters()}
 
-    ref = _tiny(); ref.load_state_dict(theta0)
+    ref = _tiny()
+    ref.load_state_dict(theta0)
     apply_gradient(ref, decompress(comps[1]))
     apply_gradient(ref, decompress(comps[2]))
 
-    test = _tiny(); test.load_state_dict(theta0)
+    test = _tiny()
+    test.load_state_dict(theta0)
     reached = apply_version_deltas(test, _FakeStore(store_bytes), 0, 0, 2, expected)
 
     assert reached == 2
@@ -79,7 +81,8 @@ def test_missing_delta_stops_at_gap():
     expected = {n: p.shape for n, p in _tiny().named_parameters()}
     partial = _FakeStore({1: store_bytes[1]})  # v2 absent (pruned)
 
-    test = _tiny(); test.load_state_dict(theta0)
+    test = _tiny()
+    test.load_state_dict(theta0)
     reached = apply_version_deltas(test, partial, 0, 0, 2, expected)
     assert reached == 1  # advanced to 1, then hit the gap
 

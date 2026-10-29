@@ -173,14 +173,6 @@ def test_create_assignments_returns_empty_when_no_pages(mock_server, http_server
     status = asyncio.run(s._fetch_data_status())
     assignments = s._create_assignments(status)
     assert assignments == {}
-def test_create_assignments_returns_empty_when_insufficient_data(mock_server, http_server):
-    """When max_ts < window_ns, no assignments are created."""
-    import asyncio
-    mock_server.max_ts = 100_000_000  # 0.1s — way below 5min window
-    s = _service(http_server, miner_uids=[0], poll_interval=0)
-    status = asyncio.run(s._fetch_data_status())
-    assignments = s._create_assignments(status)
-    assert assignments == {}
 
 
 def test_create_assignments_iid_shared_window(mock_server, http_server):
@@ -350,6 +342,26 @@ def test_poll_and_deliver_no_data(mock_server, http_server):
     assert len(mock_server.received_rounds) == 0
 
 
+def test_insufficient_data_is_gated_in_poll_not_create_assignments(mock_server, http_server):
+    """Before the sim has pushed one full window, poll_and_deliver assigns no
+    round even though pages are listed. _create_assignments picks from the
+    listed pages and does not read max_ts, so the window gate is here."""
+    delivered = []
+
+    async def deliver(assignments):
+        delivered.append(assignments)
+
+    s = _service(http_server, poll_interval=0, deliver_fn=deliver, miner_uids=[0])
+    s._max_sim_ts_pushed = s._window_ns - 1
+    asyncio.run(s.poll_and_deliver())
+    assert delivered == []
+    assert len(mock_server.received_rounds) == 0
+
+    s._max_sim_ts_pushed = s._window_ns
+    asyncio.run(s.poll_and_deliver())
+    assert len(mock_server.received_rounds) == 1
+
+
 def test_receive_scores_updates_store(http_server):
     """Scores received via receive_scores are stored and retrievable."""
     s = _service(http_server, miner_uids=[0, 1])
@@ -467,7 +479,6 @@ def test_spool_persists_unsent_across_instance(http_server, mock_server, tmp_pat
 
 def test_spool_unbounded_queue_replays_all(http_server, mock_server, tmp_path):
     """C3: when spool is enabled, queue is unbounded so replay > 256 still drains."""
-    import time as _t
     spool = str(tmp_path / "spool.bin")
     packager = MagicMock()
     packager.extract_state.return_value = {"step": 1, "books": {}}

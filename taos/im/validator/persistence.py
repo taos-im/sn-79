@@ -24,7 +24,7 @@ import bittensor as bt
 from taos.im.utils.save import save_state_worker
 from taos.im.protocol.models import TradeInfo
 from taos.im.validator.debeta import sum_hist_2level, sum_hist_1level
-from taos.im.protocol.events import TradeEvent, trade_event_from_wire
+from taos.im.protocol.events import trade_event_from_wire
 
 if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
@@ -130,8 +130,18 @@ def _snap_hist2(h):
 _DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist", "debeta_cp_hist",
                  "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
                  "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
-                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist")
-_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist")
+                 "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
+                 "debeta_conj_hist", "debeta_captkbuy_hist", "debeta_captksell_hist")
+_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist")
+
+
+def _load_class_vectors(raw) -> dict:
+    """``{class name: {'making': {uid: share}, 'skill': {uid: share}}}`` from a saved state, uids as ints."""
+    out = {}
+    for name, v in (raw or {}).items():
+        out[str(name)] = {leg: {int(u): float(x) for u, x in ((v or {}).get(leg) or {}).items()}
+                          for leg in ("making", "skill")}
+    return out
 
 
 def build_debeta_state(self) -> dict:
@@ -151,6 +161,14 @@ def build_debeta_state(self) -> dict:
     # the alternative mark's leg (0.6.5): its own inventory and last mark, so its path continues after a restart
     out["debeta_inv_alt"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv_alt', {}) or {}).items()}
     out["debeta_plast_alt"] = dict(getattr(self, 'debeta_plast_alt', {}) or {})
+    # the conjunction's per-book references and the previous state's time (0.6.6), so a resume or a restart goes on
+    # from them instead of warming again
+    out["debeta_conj_ref"] = {int(b): [r[0], r[1]] for b, r in (getattr(self, 'debeta_conj_ref', {}) or {}).items()}
+    out["debeta_conj_clock"] = dict(getattr(self, 'debeta_conj_clock', None) or {})
+    # the run-boundary handover (0.6.6): the classes' last paid vectors and a handover in progress, so a restart
+    # inside the lookback resumes it
+    out["debeta_class_vectors"] = dict(getattr(self, '_debeta_class_vectors', None) or {})
+    out["debeta_handover"] = dict(getattr(self, '_debeta_handover', None) or {})
     return out
 
 
@@ -601,6 +619,31 @@ _SAVE_STREAM_DEPTH = 2
 _SAVE_EVERY_INTERVALS = max(1, int(os.environ.get("SAVE_EVERY_INTERVALS", "2")))
 
 
+def saves_on_stop(self: Validator) -> bool:
+    """The save on stop is simulation mode's. The exchange validator stops as it did: no wait for a last state and no
+    save of its own."""
+    return getattr(getattr(self, 'engine', None), 'mode', 'simulation') != 'exchange'
+
+
+def _accounted_key(self: Validator):
+    """What the fills in a save depend on: the last state accounted, the clock and the step. None where the engine
+    does not stamp its accounting (the exchange dedupes by trade id), so a stop there always saves."""
+    accounted = getattr(self, '_last_accounted_ts', None)
+    if accounted is None:
+        return None
+    return (accounted, self.simulation_timestamp, self.step)
+
+
+class _Superseded(Exception):
+    """The stop save began while this save was writing: the stop save's files are the newer ones."""
+
+
+async def _replace_unless_superseded(self: Validator, tmp: str, path: str) -> None:
+    if getattr(self, '_stop_save_begun', False):
+        raise _Superseded(path)
+    await aiofiles.os.replace(tmp, path)
+
+
 def _snapshot(obj):
     """A container-only copy of `obj`: every dict, list or tuple is copied in one C-level step (no GIL switch
     inside), so a worker thread packs a consistent document while the event loop keeps writing the live one.
@@ -712,6 +755,7 @@ async def save_state_async(self: Validator) -> bool:
             _offload_req = _shadow.request_save(self.validator_state_file, build_save_light_fields(self))
 
         validator_state_data = None
+        _saved_key = None
         if _offload_req is not None:
             bt.logging.info(f"[SAVE-OFFLOAD] validator state delegated to scoring service (ts={_offload_req[0]})")
             prep_start = time.time()
@@ -736,6 +780,7 @@ async def save_state_async(self: Validator) -> bool:
                 )
 
                 simulation_state_data, validator_state_data, prep_time = await construct_save_data_async(self)
+                _saved_key = _accounted_key(self)
 
         async def wait_for_query_and_receive(process):
             """
@@ -788,7 +833,7 @@ async def save_state_async(self: Validator) -> bool:
                     sim_total = await loop.run_in_executor(
                         self.save_state_executor,
                         _pack_stream_fsync, sim_temp, simulation_state_data)
-                    await aiofiles.os.replace(sim_temp, self.simulation_state_file)
+                    await _replace_unless_superseded(self, sim_temp, self.simulation_state_file)
                 except Exception as ex:
                     if os.path.exists(sim_temp):
                         try:
@@ -817,6 +862,8 @@ async def save_state_async(self: Validator) -> bool:
                             f"[SAVE-OFFLOAD] validator state written by scoring service "
                             f"({val_total/1024/1024:.2f}MB, child io={_child_io:.2f}s, waited {val_time:.2f}s)"
                         )
+                    elif getattr(self, '_stop_save_begun', False):
+                        raise _Superseded(self.validator_state_file)
                     else:
                         bt.logging.warning(
                             "[SAVE-OFFLOAD] scoring service save failed — in-process fallback"
@@ -832,7 +879,7 @@ async def save_state_async(self: Validator) -> bool:
                         val_total = await loop.run_in_executor(
                             self.save_state_executor,
                             _pack_stream_fsync, val_temp, _val_data)
-                        await aiofiles.os.replace(val_temp, self.validator_state_file)
+                        await _replace_unless_superseded(self, val_temp, self.validator_state_file)
                     except Exception as ex:
                         if os.path.exists(val_temp):
                             try:
@@ -860,14 +907,20 @@ async def save_state_async(self: Validator) -> bool:
             except Exception as ex:
                 return {
                     'success': False,
+                    'superseded': isinstance(ex, _Superseded),
                     'error': str(ex),
                     'traceback': traceback.format_exc()
                 }
 
         result = await async_save_worker()
         total_time = time.time() - total_start
+        if not result.get('superseded'):
+            # Only a save main wrote from its own snapshot, taken under the reward lock, lets a stop skip its save.
+            self._last_saved_key = _saved_key if result['success'] and _offload_req is None else None
 
-        if result['success']:
+        if result.get('superseded'):
+            bt.logging.info(f"Save for step {save_step} superseded by the stop save; its files were not put in place")
+        elif result['success']:
             bt.logging.success(
                 f"State saved: simulation ({result['simulation_save_time']:.4f}s, {result['sim_size_mb']:.2f}MB), "
                 f"validator ({result['validator_save_time']:.4f}s, {result['val_size_mb']:.2f}MB), "
@@ -954,6 +1007,8 @@ def schedule_save(self: Validator) -> None:
     """
     if not self.last_state or self.last_state.timestamp % (_SAVE_EVERY_INTERVALS * self.config.scoring.interval) != 4_000_000_000:
         return
+    if getattr(self, '_cleanup_done', False) and saves_on_stop(self):
+        return
     if self.shared_state_saving:
         bt.logging.warning(f"Skipping save at step {self.step} — previous save still running.")
         return
@@ -983,8 +1038,12 @@ async def save_state_sync(self: Validator):
         - Sends PagerDuty alerts on failure
         - Logs save operation status and timing
     """
+    self._last_saved_key = None
     try:
         bt.logging.info("Saving state (sync)...")
+        _lock = getattr(self, '_reward_lock', None)
+        # A reward holding the lock has accounted its state and not yet applied its scores.
+        _key = None if _lock is not None and _lock.locked() else _accounted_key(self)
         simulation_state_data, validator_state_data, prep_time = construct_save_data_sync(self)
         result = save_state_worker(
             simulation_state_data,
@@ -993,11 +1052,57 @@ async def save_state_sync(self: Validator):
             self.validator_state_file
         )
         if result['success']:
+            self._last_saved_key = _key
             bt.logging.success("State saved directly!")
         else:
             self.pagerduty_alert(f"Direct save failed: {result['error']}")
     except Exception as ex:
         self.pagerduty_alert(f"Error in direct save: {ex}", details={"trace": traceback.format_exc()})
+
+
+async def save_state_on_stop(self: Validator) -> bool:
+    """Save the state a stopping validator holds, so its restart loads every fill it accounted.
+
+    Runs on the main loop once the listener has handed over its last state. Under the reward lock, so every reward
+    queued before the stop is applied first and none can start during the save. A periodic save still writing gives
+    way: from here on it puts no file in place. The scoring service writes the validator file too, so it is stopped
+    before this write and nothing of its own can land after it. Both files are then built and written in one step
+    with no await, through the same atomic writer as the run-start save (temp file, fsync, rename), so a kill
+    mid-write leaves the last complete files in place. Skipped when nothing has been accounted since a save main
+    wrote itself. Returns whether the files hold the state at the end."""
+    loop = asyncio.get_running_loop()
+    lock = getattr(self, '_reward_lock', None)
+    if lock is None:
+        lock = self._reward_lock = asyncio.Lock()
+    async with lock:
+        key = _accounted_key(self)
+        if key is not None and key == getattr(self, '_last_saved_key', None) \
+                and not getattr(self, 'shared_state_saving', False):
+            bt.logging.info(f"Stop save skipped: nothing accounted since the last save (state at {key[0]})")
+            return True
+        self._stop_save_begun = True
+        shadow = getattr(self, '_scoring_shadow', None)
+        if shadow is not None:
+            await loop.run_in_executor(None, shadow.stop)
+            self._scoring_shadow = None
+        accounted = getattr(self, '_last_accounted_ts', None)
+        if accounted is not None and accounted != self.simulation_timestamp:
+            bt.logging.warning(
+                f"Stop save: the clock is at {self.simulation_timestamp} but the last state accounted is at "
+                f"{accounted}; the save holds the fills up to {accounted}")
+        start = time.time()
+        simulation_state_data, validator_state_data, prep_time = construct_save_data_sync(self)
+        result = save_state_worker(
+            simulation_state_data, validator_state_data, self.simulation_state_file, self.validator_state_file)
+        if not result['success']:
+            self.pagerduty_alert(f"Stop save failed: {result['error']}", details={"trace": result.get('traceback')})
+            return False
+        self._last_saved_key = key
+        bt.logging.success(
+            f"Stop save at step {self.step}, state at {accounted}: prep {prep_time:.2f}s, "
+            f"simulation {result['simulation_save_time']:.2f}s, validator {result['validator_save_time']:.2f}s, "
+            f"total {time.time() - start:.2f}s")
+        return True
 
 
 def migrate_sampling_interval(self: Validator, old_interval: int, new_interval: int):
@@ -1301,6 +1406,10 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     # realized spread (2 Oct 2026); absent from a snapshot written before it, so it warms from empty
     self.debeta_realbuy_hist = _load_hist3("debeta_realbuy_hist")
     self.debeta_realsell_hist = _load_hist3("debeta_realsell_hist")
+    # the captured pair's taker legs (0.6.6); absent from a snapshot written before it, so the old taker legs stay in
+    # the captured pair and age out of the lookback while the new ones are taken back out
+    self.debeta_captkbuy_hist = _load_hist3("debeta_captkbuy_hist")
+    self.debeta_captksell_hist = _load_hist3("debeta_captksell_hist")
     self.debeta_mtm_hist = _load_hist3("debeta_mtm_hist")
     self.debeta_invsum_hist = _load_hist3("debeta_invsum_hist")
     # the alternative mark's leg (0.6.5); absent from an older snapshot, so it warms from empty
@@ -1311,6 +1420,8 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_maker_sell_notional_hist = _load_hist3("debeta_maker_sell_notional_hist")
     self.debeta_at_best_hist = _load_hist3("debeta_at_best_hist")
     self.debeta_best_size_hist = _load_hist3("debeta_best_size_hist")
+    # the conjunction (0.6.6); absent from an older snapshot, so it warms from empty
+    self.debeta_conj_hist = _load_hist3("debeta_conj_hist")
     self.debeta_cp_hist = _load_hist3("debeta_cp_hist")
     self.debeta_cpc_hist, self.debeta_cpc = load_class_counterparty_rows(validator_state)
     # 0.6.2 skill-leg histories; absent from a snapshot written before them, so they warm from empty.
@@ -1322,11 +1433,14 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_drift_hist = _load_hist2("debeta_drift_hist")
     self.debeta_invn_alt_hist = _load_hist2("debeta_invn_alt_hist")
     self.debeta_drift_alt_hist = _load_hist2("debeta_drift_alt_hist")
+    self.debeta_conj_farm_hist = _load_hist2("debeta_conj_farm_hist")
     # rebuild running sums from the histories
     self.capture_buy_sums = _dd2(sum_hist_2level(self.debeta_capbuy_hist))
     self.capture_sell_sums = _dd2(sum_hist_2level(self.debeta_capsell_hist))
     self.realized_buy_sums = _dd2(sum_hist_2level(self.debeta_realbuy_hist))
     self.realized_sell_sums = _dd2(sum_hist_2level(self.debeta_realsell_hist))
+    self.capture_taker_buy_sums = _dd2(sum_hist_2level(self.debeta_captkbuy_hist))
+    self.capture_taker_sell_sums = _dd2(sum_hist_2level(self.debeta_captksell_hist))
     self.debeta_mtm = _dd2(sum_hist_2level(self.debeta_mtm_hist))
     self.debeta_invsum = _dd2(sum_hist_2level(self.debeta_invsum_hist))
     self.debeta_heldn = _dd2(sum_hist_2level(self.debeta_heldn_hist))
@@ -1344,6 +1458,11 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
         for b, us in (validator_state.get("debeta_inv") or {}).items()
     })
     self.debeta_plast_alt = {int(b): float(v) for b, v in (validator_state.get("debeta_plast_alt") or {}).items()}
+    self._debeta_class_vectors = _load_class_vectors(validator_state.get("debeta_class_vectors"))
+    _hand = validator_state.get("debeta_handover") or {}
+    self._debeta_handover = ({"start": int(_hand.get("start") or 0), "span": int(_hand.get("span") or 0),
+                              "carried": _load_class_vectors(_hand.get("carried")),
+                              "new": [str(n) for n in (_hand.get("new") or [])]} if _hand else {})
     self.debeta_inv_alt = defaultdict(lambda: defaultdict(float), {
         int(b): defaultdict(float, {int(u): float(v) for u, v in (us or {}).items()})
         for b, us in (validator_state.get("debeta_inv_alt") or {}).items()
@@ -1357,6 +1476,11 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_best_size = _dd2(sum_hist_2level(self.debeta_best_size_hist))
     self.debeta_invn_alt = sum_hist_1level(self.debeta_invn_alt_hist)
     self.debeta_drift_alt = sum_hist_1level(self.debeta_drift_alt_hist)
+    self.debeta_conj = _dd2(sum_hist_2level(self.debeta_conj_hist))
+    self.debeta_conj_farm = defaultdict(float, sum_hist_1level(self.debeta_conj_farm_hist))
+    self.debeta_conj_ref = {int(b): (r[0], r[1]) for b, r in (validator_state.get("debeta_conj_ref") or {}).items()}
+    _clock = validator_state.get("debeta_conj_clock") or {}
+    self.debeta_conj_clock = {"prev": int(_clock["prev"])} if isinstance(_clock.get("prev"), (int, float)) else {}
     self.debeta_pfirst_alt = {}
     self.debeta_mark_state_alt = {}
 

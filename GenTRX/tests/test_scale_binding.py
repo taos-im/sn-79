@@ -8,7 +8,6 @@ silently-wrong scale.
 Run: pytest GenTRX/tests/test_scale_binding.py -v
 """
 
-from GenTRX.src.util.schema import DEFAULT_PRICE_DECIMALS, DEFAULT_VOLUME_DECIMALS
 
 
 def _make_aggregator(tmp_path):

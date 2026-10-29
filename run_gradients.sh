@@ -475,8 +475,12 @@ if [ "$USE_TMUX" = "1" ]; then
     tmux kill-session -t gentrx 2>/dev/null || true
     tmux new-session -d -s gentrx -n 'gentrx' 'htop'
     tmux set-option -t gentrx mouse on
-    tmux split-window -h -t gentrx:gentrx 'nvitop 2>/dev/null || watch -n2 nvidia-smi'
+    # Each pane is a shell with its command typed in: a pane started with its command runs it in a non-interactive
+    # shell, which may not find pm2 or nvitop, and the pane then closes at once.
+    _P=$(tmux split-window -h -t gentrx:gentrx -P -F '#{pane_id}')
+    tmux send-keys -t "$_P" 'nvitop 2>/dev/null || watch -n2 nvidia-smi' Enter
     tmux select-pane -t 0
-    tmux split-window -v -t gentrx:gentrx "pm2 logs $GRADIENT_SERVER_NAME"
+    _P=$(tmux split-window -v -t gentrx:gentrx -P -F '#{pane_id}')
+    tmux send-keys -t "$_P" "pm2 logs $GRADIENT_SERVER_NAME" Enter
     tmux attach-session -t gentrx
 fi

@@ -273,6 +273,9 @@ VALIDATOR_CMD="python $(pwd)/validator.py \
   $BENCHMARK_ARG \
   $GENTRX_VAL_ARGS \
   ${EXTRA_VALIDATOR_ARGS:-}"
+# --kill-timeout: pm2 SIGKILLs 1600ms after the signal by default. On a stop the validator first waits
+# up to 30s for a state save, reward, report or archive compression in flight, then stops its services
+# and its event loop, so at 1600ms a stop loses the save it was writing. 60s, as the engine has.
 GENTRX_API_KEY="${GENTRX_API_KEY:-}" \
 GENTRX_VALIDATOR_S3_ENDPOINT_URL="${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-}" \
 GENTRX_VALIDATOR_S3_BUCKET="${GENTRX_VALIDATOR_S3_BUCKET:-}" \
@@ -280,7 +283,7 @@ GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY="${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-}"
 GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY="${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-}" \
 GENTRX_VALIDATOR_S3_READ_ACCESS_KEY="${GENTRX_VALIDATOR_S3_READ_ACCESS_KEY:-${GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY:-}}" \
 GENTRX_VALIDATOR_S3_READ_SECRET_KEY="${GENTRX_VALIDATOR_S3_READ_SECRET_KEY:-${GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY:-}}" \
-pm2 start --name=$VALIDATOR_NAME bash -- -c "$VALIDATOR_CMD"
+pm2 start --name=$VALIDATOR_NAME --kill-timeout 60000 bash -- -c "$VALIDATOR_CMD"
 
 # ── C++ Simulator ─────────────────────────────────────────────────────────────
 if [ "$PRESERVE_SIMULATOR" = "0" ]; then
@@ -304,13 +307,17 @@ if [ "$USE_TMUX" = "1" ]; then
     _HTOP='P=$(pgrep -d, -f "validator.py|taosim" 2>/dev/null); [ -n "$P" ] && exec htop -p "$P" || exec htop'
     P0=$(tmux new-session -d -s "$TMUX_SESSION" -n 'monitor' -P -F '#{pane_id}' "$_HTOP")
     tmux set-option -t "$TMUX_SESSION" mouse on
-    P1=$(tmux split-window -v -p 75 -t "$P0" -P -F '#{pane_id}' "pm2 logs $VALIDATOR_NAME")
-    tmux split-window -h -p 50 -t "$P1" 'pm2 logs simulator'
+    # Each log pane is a shell with its command typed in: a pane started with its command runs it in a non-interactive
+    # shell, which may not find pm2 (installed under nvm), and the pane then closes at once.
+    P1=$(tmux split-window -v -l 75% -t "$P0" -P -F '#{pane_id}')
+    tmux send-keys -t "$P1" "pm2 logs $VALIDATOR_NAME" Enter
+    _P=$(tmux split-window -h -l 50% -t "$P1" -P -F '#{pane_id}')
+    tmux send-keys -t "$_P" 'pm2 logs simulator' Enter
     if [ -n "$GENTRX_MODE" ]; then
         tmux new-window -t "$TMUX_SESSION:" -n 'gentrx'
         _GTX_HTOP='P=$(pgrep -d, -f "gradient_server" 2>/dev/null); [ -n "$P" ] && exec htop -p "$P" || exec htop'
         tmux send-keys -t "$TMUX_SESSION:gentrx" "$_GTX_HTOP" Enter
-        PG=$(tmux split-window -v -p 67 -t "$TMUX_SESSION:gentrx" -P -F '#{pane_id}')
+        PG=$(tmux split-window -v -l 67% -t "$TMUX_SESSION:gentrx" -P -F '#{pane_id}')
         tmux send-keys -t "$PG" 'pm2 logs gradient-server' Enter
     fi
     tmux select-window -t "$TMUX_SESSION:monitor"
@@ -326,7 +333,8 @@ net.core.wmem_default=8388608
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 87380 67108864
 net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_fin_timeout=30"
+net.ipv4.tcp_fin_timeout=30
+net.ipv4.tcp_slow_start_after_idle=0"
 echo "$SETTINGS" | while IFS= read -r line; do
     sudo sysctl -w "${line}" >/dev/null 2>&1 || true
 done
