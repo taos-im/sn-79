@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The dust floor's live line. A scoring rule ships with an acceptance check and a monitor line that read the same
-quantity with the same threshold. The quantity is the share of prints in a book's live capture window that fall
-below their floor (what the floor excludes), beside the floor's own level. The validator computes both per book
-from the live window the scorer already keeps, ships them with the reporting payload, and the report publishes
-them as book_gauges capture_dust_share and capture_floor; the board monitor flags a book over its share threshold
-and the injected acceptance rows assert the same share under the same prints."""
+"""The dust floor publishes its footprint per book. The quantity is the share of prints in a book's live capture
+window that fall below their floor (what the floor excludes), beside the floor's own level. The validator computes
+both per book from the live window the scorer already keeps, ships them with the reporting payload, and the report
+publishes them as book_gauges capture_dust_share and capture_floor, so a dashboard can flag a book over its share
+threshold."""
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace

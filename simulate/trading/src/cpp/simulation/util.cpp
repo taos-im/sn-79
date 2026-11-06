@@ -11,6 +11,8 @@
 
 #include <fmt/core.h>
 
+#include <charconv>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::simulation
@@ -246,6 +248,37 @@ void queueValidatorResponse(
         return;
     }
     blocks.at(*blockIdx)->queueMessage(msg);
+}
+
+//-------------------------------------------------------------------------
+
+std::optional<DeliveredSeed> readStepSeed(const msgpack::object& batch)
+{
+    if (batch.type != msgpack::type::MAP) return std::nullopt;
+    const msgpack::object* seed{};
+    for (const auto& [k, v] : batch.via.map) {
+        if (k.type == msgpack::type::STR && k.as<std::string_view>() == "seed") seed = &v;
+    }
+    if (seed == nullptr || seed->type != msgpack::type::ARRAY || seed->via.array.size < 2) return std::nullopt;
+    const auto& round = seed->via.array.ptr[0];
+    const auto& randomness = seed->via.array.ptr[1];
+    if (round.type != msgpack::type::POSITIVE_INTEGER) return std::nullopt;
+    uint64_t word{};
+    if (randomness.type == msgpack::type::BIN && randomness.via.bin.size >= 8) {
+        for (size_t i = 0; i < 8; ++i) {
+            word = (word << 8) | static_cast<uint8_t>(randomness.via.bin.ptr[i]);
+        }
+    }
+    else if (randomness.type == msgpack::type::STR && randomness.via.str.size >= 16) {
+        // Exactly 16 hex digits: no sign, white space or 0x prefix, and no seed from a prefix of them.
+        const char* first = randomness.via.str.ptr;
+        const auto [end, ec] = std::from_chars(first, first + 16, word, 16);
+        if (ec != std::errc{} || end != first + 16) return std::nullopt;
+    }
+    else {
+        return std::nullopt;
+    }
+    return DeliveredSeed{.round = round.as<uint64_t>(), .word = word};
 }
 
 //-------------------------------------------------------------------------

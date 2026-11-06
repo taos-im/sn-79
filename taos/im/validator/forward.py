@@ -36,16 +36,38 @@ from typing import List
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import FinanceAgentResponse, FinanceEventNotification, MarketSimulationStateUpdate
 from taos.im.protocol.instructions import *
-from taos.im.validator.delays import latency_profile, set_delays
-from taos.im.validator.block_stats import block_row, bump
+from taos.im.validator.delays import latency_profile, max_instruction_delay_ns, set_delays
+from taos.im.validator.block_stats import block_row, bump, sent_counts
 from taos.im.utils import duration_from_timestamp
+
+
+async def read_notify_byte(fd, timeout):
+    """One byte from the query process's notify pipe, within timeout. The reader comes off the loop however the wait
+    ends, so a wait that was cancelled or timed out raises nothing later and leaves a late byte for the next wait."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def readable():
+        loop.remove_reader(fd)
+        if future.done():
+            return
+        try:
+            future.set_result(os.read(fd, 1))
+        except Exception as e:
+            future.set_exception(e)
+
+    loop.add_reader(fd, readable)
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    finally:
+        loop.remove_reader(fd)
+
 
 _PLACEMENT_ANSWERS = frozenset({"RDPOL", "RDPOM", "ERDPOL", "ERDPOM"})
 _CANCEL_ANSWERS = frozenset({"RDCO", "ERDCO"})
 _FILL_EVENTS = frozenset({"ET", "EVENT_TRADE"})
 _FILL_SEEN_CAP = 200000   # (uid, book, trade id) keys kept to count a redelivered exchange fill once; the oldest half goes when full
 _CANCEL_PENDING_CAP = 200000   # (uid, book, order id) of cancels sent and not yet answered; the oldest half goes when full
-_PLACEMENT_TYPES = frozenset({"PLACE_ORDER_LIMIT", "PLACE_ORDER_MARKET"})
 
 
 def _field(obj, name):
@@ -124,22 +146,22 @@ def update_sent_stats(self: Validator, responses) -> None:
     """Counts, per miner, the placements, the cancel instructions and the orders they name that the validator sends to
     the engine this round, after validation and the delays, and keeps each named order until its answer, so the
     engine's answers can be read against what was asked."""
+    take_sent(self, *sent_counts(responses))
+
+
+def take_packed_sent(self: Validator, result: dict) -> None:
+    """neuron.orders_packed: the same counts and named orders, taken from the query process that packed the orders."""
+    take_sent(self, result.get('sent') or {}, result.get('cancel_named') or ())
+
+
+def take_sent(self: Validator, rows: dict, named) -> None:
     pending = self.__dict__.setdefault('_cancel_pending', {})
-    for response in responses or ():
-        uid = getattr(response, 'agent_id', None)
-        if uid is None:
-            continue
-        for instruction in getattr(response, 'instructions', None) or ():
-            t = getattr(instruction, 'type', None)
-            if t in _PLACEMENT_TYPES:
-                bump(self.miner_stats, uid, 'placements_sent')
-            elif t == 'CANCEL_ORDERS':
-                bump(self.miner_stats, uid, 'cancels_sent')
-                book = getattr(instruction, 'bookId', None)
-                ids = [getattr(c, 'orderId', None) for c in getattr(instruction, 'cancellations', None) or ()]
-                bump(self.miner_stats, uid, 'cancel_orders_sent', len(ids))
-                for oid in ids:
-                    _remember(pending, (uid, book, oid), _CANCEL_PENDING_CAP)
+    for uid, row in rows.items():
+        for name, n in row.items():
+            if n:
+                bump(self.miner_stats, uid, name, n)
+    for uid, book, oid in named:
+        _remember(pending, (uid, book, oid), _CANCEL_PENDING_CAP)
 
 
 def update_dropped_stats(self: Validator, result: dict | None) -> None:
@@ -168,7 +190,9 @@ def delay_settings(self: Validator) -> SimpleNamespace:
     """What set_delays reads from the validator, for the query process to apply it (neuron.orders_packed)."""
     scoring = self.config.scoring
     return SimpleNamespace(
-        config=SimpleNamespace(neuron=SimpleNamespace(timeout=self.config.neuron.timeout), scoring=SimpleNamespace(
+        config=SimpleNamespace(neuron=SimpleNamespace(
+            timeout=self.config.neuron.timeout,
+            max_instruction_delay_s=getattr(self.config.neuron, 'max_instruction_delay_s', None)), scoring=SimpleNamespace(
             min_delay=scoring.min_delay, max_delay=scoring.max_delay,
             min_instruction_delay=scoring.min_instruction_delay, max_instruction_delay=scoring.max_instruction_delay,
             delay_policy=getattr(scoring, 'delay_policy', None), delay_jitter=getattr(scoring, 'delay_jitter', None),
@@ -212,13 +236,6 @@ def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpd
             window = int(getattr(dcfg, 'presence_window', None) or 50)
             outcomes = presence[uid] = deque(maxlen=max(window, 1))
         outcomes.append(ok)
-
-def max_instruction_delay_ns(config) -> int:
-    """The longest delay a miner's instruction may ask for, --neuron.max_instruction_delay_s in nanoseconds; the
-    query service refuses a longer one at acceptance and the engine holds the same bound."""
-    seconds = float(getattr(getattr(config, 'neuron', None), 'max_instruction_delay_s', 600.0) or 0.0)
-    return int(seconds * 1_000_000_000)
-
 
 async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAgentResponse]:
     """
@@ -395,32 +412,24 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             receive_start = time.time()
             self.request_queue.send(b'query')
             bt.logging.info("Sent query request, waiting for notification...")
+            # work that reads nothing of the answers starts here and runs in the miners' wait (the data-service push)
+            _on_sent = getattr(self, 'on_query_sent', None)
+            if _on_sent is not None:
+                try:
+                    _on_sent(synapse)
+                except Exception:
+                    bt.logging.exception("on_query_sent failed; the forward goes on to wait for the answers")
 
             max_wait = self.config.neuron.global_query_timeout + 10
 
             try:
-                loop = asyncio.get_event_loop()
                 notify_result = None
                 deadline = time.time() + max_wait
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise asyncio.TimeoutError()
-                    future = asyncio.Future()
-
-                    def pipe_readable():
-                        loop.remove_reader(self.query_notify_read)
-                        try:
-                            data = os.read(self.query_notify_read, 1)
-                            future.set_result(data)
-                        except Exception as e:
-                            future.set_exception(e)
-                    loop.add_reader(self.query_notify_read, pipe_readable)
-                    try:
-                        notify_result = await asyncio.wait_for(future, timeout=remaining)
-                    except asyncio.TimeoutError:
-                        loop.remove_reader(self.query_notify_read)
-                        raise
+                    notify_result = await read_notify_byte(self.query_notify_read, remaining)
                     if notify_result == b'R':
                         bt.logging.debug("Ignoring stray ready signal, re-waiting")
                         continue
@@ -488,7 +497,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
 
         synapse_responses = result['responses']
         # the (uid, book) pairs at or over the volume cap at this round's snapshot, for the engine to refuse their
-        # placements on arrival (row 67); None when the query service did not say, so the engine keeps its last set
+        # placements on arrival; None when the query service did not say, so the engine keeps its last set
         self._capped_pairs = result.get('capped')
         
         bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
@@ -503,10 +512,7 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         if 'orders' in result:  # neuron.orders_packed: already delayed and encoded by the query process
             responses.append(result['orders'])
             self.engine.response_pack_drops = getattr(self.engine, 'response_pack_drops', 0) + result['pack_drops']
-            for uid, row in result['sent'].items():  # update_sent_stats' counts, taken where the orders were packed
-                for name, n in row.items():
-                    if n:
-                        bump(self.miner_stats, uid, name, n)
+            take_packed_sent(self, result)
         else:
             delayed = set_delays(self, synapse_responses)
             responses.extend(delayed)
@@ -600,22 +606,9 @@ async def deliver_gentrx(self: Validator, deliveries: list) -> None:
         gtx_log.info("Sent deliver_gentrx command, waiting for notification...")
 
         max_wait = 60.0
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
-
-        def pipe_readable():
-            loop.remove_reader(self.query_notify_read)
-            try:
-                data = os.read(self.query_notify_read, 1)
-                future.set_result(data)
-            except Exception as e:
-                future.set_exception(e)
-
-        loop.add_reader(self.query_notify_read, pipe_readable)
         try:
-            notify_result = await asyncio.wait_for(future, timeout=max_wait)
+            notify_result = await read_notify_byte(self.query_notify_read, max_wait)
         except asyncio.TimeoutError:
-            loop.remove_reader(self.query_notify_read)
             gtx_log.error(f"deliver_gentrx notification timeout after {max_wait}s")
             return
         except Exception as e:

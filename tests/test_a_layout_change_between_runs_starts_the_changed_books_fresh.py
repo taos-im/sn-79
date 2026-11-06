@@ -4,11 +4,12 @@ A book's previous-run histories are kept only where its market is unchanged: a b
 carry the old market's records into its new class's skill pool, and a layout on other book ids than the loaded ones
 is adopted rather than refused, so a book count that grows or shrinks between runs is scored on the new layout.
 
-Now the two runs' layouts are compared book by book at the open: a book whose class signature is unchanged keeps
-its histories (shifted as before); a book whose class or instrument changed starts fresh; a book the new layout no
-longer has is dropped from every structure, its sums with it; a new book starts empty; a class whose book set holds
-anything but kept books restarts its class pool. The disposition travels to the shadow scoring service in the same
-run-change frame, so both sides make the identical transition, and a layout on other books is adopted, not refused.
+The two runs' layouts are compared class by class at the open: a class whose market is unchanged keeps its books'
+histories in order, its k-th book taking the old k-th's wherever the ids moved, and its added books start empty; a
+class whose market changed starts fresh and restarts its class pool; a class new to the layout starts empty and ramps
+in; an old book whose records no new book takes is dropped from every structure, its sums with it. The map travels to
+the shadow scoring service in the same run-change frame, so both sides make the identical transition, and a layout on
+other books is adopted, not refused.
 """
 import os
 import sys
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_scoring_shadow as tss  # noqa: E402
 import test_shadow_snapshot_completeness as tsc  # noqa: E402
 from test_the_validator_scores_the_layout_of_the_run_it_is_on import (  # noqa: E402
-    OLD_RUN, _composition, _run_dir, tree as _tree_fixture,
+    NEW_RUN, OLD_RUN, _composition, _run_dir, tree as _tree_fixture,
 )
 
 tree = _tree_fixture  # that module's fixture, collected here under its own name
@@ -41,39 +42,43 @@ def _layout(tree, name, comp):
 
 # ── the change map between two layouts ───────────────────────────────────────────────────────────────────────────
 
-def test_a_class_change_on_the_same_book_count_is_a_clear_per_moved_book(tree):
+def test_a_class_whose_ids_shift_takes_its_records_and_a_new_class_starts_empty(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)])
-    new = _layout(tree, "20261024_031003", [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
+    new = _layout(tree, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
     ch = trade.layout_book_changes(old, new)
     books = ch["books"]
     assert all(books[b] == "keep" for b in range(64))
-    assert all(books[b] == "clear" for b in range(64, 128)), "books 64-95 changed class, 96-127 changed instrument"
+    assert all(books[b] == "move" for b in range(64, 96)), "simulation_1 sits on 64-95 and its records follow it"
+    assert all(ch["dest"][96 + k] == 64 + k for k in range(32))
+    assert all(ch["dest"][b] is None for b in range(64, 96)), "simulation_0's dropped realizations go nowhere"
+    assert all(books[b] == "new" for b in range(96, 128)), "simulation_2 is new to the layout"
     assert set(books) == set(range(128))
-    assert ch["classes"] == [1, 2], "the class pools whose book set holds anything but kept books restart"
+    assert ch["classes"] == [], "no class's market changed: simulation_2 is new and ramps in, the others keep their pools"
 
 
 def test_a_count_decrease_drops_the_vanished_books(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)])
-    new = _layout(tree, "20261027_000000", [("simulation_0", 4), ("simulation_1", 2)])
+    new = _layout(tree, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2)])
     ch = trade.layout_book_changes(old, new)
     assert all(ch["books"][b] == "keep" for b in range(64))
-    assert all(ch["books"][b] == "clear" for b in range(64, 96))
+    assert all(ch["books"][b] == "move" for b in range(64, 96)), "simulation_1 moves down onto 64-95"
     assert all(ch["books"][b] == "drop" for b in range(96, 128))
-    assert ch["classes"] == [1]
+    assert all(ch["dest"][b] is None for b in range(64, 96)), "simulation_0's vanished realizations are dropped"
+    assert ch["classes"] == []
 
 
 def test_a_count_increase_adds_fresh_books(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 4), ("simulation_1", 2)])
-    new = _layout(tree, "20261027_000000", [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
+    new = _layout(tree, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
     ch = trade.layout_book_changes(old, new)
     assert all(ch["books"][b] == "keep" for b in range(96))
     assert all(ch["books"][b] == "new" for b in range(96, 128))
-    assert ch["classes"] == [2]
+    assert ch["classes"] == [], "a class new to the layout has no pool to restart"
 
 
 def test_the_same_layout_changes_nothing(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)])
-    new = _layout(tree, "20261027_000000", [("simulation_0", 6), ("simulation_1", 2)])
+    new = _layout(tree, NEW_RUN, [("simulation_0", 6), ("simulation_1", 2)])
     ch = trade.layout_book_changes(old, new)
     assert set(ch["books"].values()) == {"keep"} and ch["classes"] == []
     assert trade.layout_book_changes(None, new) == {"books": {}, "classes": []}, "no old layout: nothing to compare"
@@ -144,7 +149,7 @@ def test_a_changed_class_restarts_its_pool_and_an_unchanged_one_keeps_it():
     assert not main.debeta_cpc_hist.get(1) and not main.debeta_cpc.get(1)
 
 
-def test_no_change_map_shifts_every_book_as_before():
+def test_no_change_map_shifts_every_book_as_a_keep_map_does():
     a, b = tsc._debeta_main(), tsc._debeta_main()
     _shift(a, None, [0, 1])
     _shift(b, {"books": {0: "keep", 1: "keep"}, "classes": []}, [0, 1])
@@ -175,7 +180,7 @@ def test_a_layout_on_other_books_is_adopted_not_refused(tree):
     _run_dir(tree.root, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
     assert tree.engine._follow_resumed_run_layout() is True
     assert tree.engine._book_ids == list(range(128))
-    new = _run_dir(tree.root, "20261027_000000", [("simulation_0", 4), ("simulation_1", 2)], tree.config_dir)
+    new = _run_dir(tree.root, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2)], tree.config_dir)
     before = tree.v.simulation.label()
     tree.v._scoring_shadow = SimpleNamespace(request_reinit=lambda: None)
     tree.engine._load_config()
@@ -187,7 +192,7 @@ def test_a_layout_on_other_books_is_adopted_not_refused(tree):
 def test_the_open_computes_the_changes_and_passes_them_on(tree, monkeypatch):
     _run_dir(tree.root, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
     assert tree.engine._follow_resumed_run_layout() is True
-    new = _run_dir(tree.root, "20261024_031003", [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)],
+    new = _run_dir(tree.root, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)],
                    tree.config_dir)
     v = tree.v
     v.config.scoring = SimpleNamespace(kappa=SimpleNamespace(lookback=10800 * _S),
@@ -209,6 +214,7 @@ def test_the_open_computes_the_changes_and_passes_them_on(tree, monkeypatch):
         tree.engine._open_run(7 * _S, 0, str(new / "simulation_0-0"), reason="the test")
     assert len(shifts) == 1 and len(frames) == 1
     changes = shifts[0]["book_changes"]
-    assert changes["books"][0] == "keep" and changes["books"][64] == "clear" and changes["books"][127] == "clear"
+    assert changes["books"][0] == "keep" and changes["books"][64] == "move" and changes["books"][127] == "new"
+    assert changes["dest"][96] == 64 and changes["dest"][64] is None, "simulation_1's records follow it"
     assert frames[0][2] == changes, "the shadow gets the same map in its run-change frame"
     assert shifts[0]["book_ids"] == list(range(128))

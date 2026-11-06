@@ -64,6 +64,9 @@ class _Session:
         self.sent.append((url, dict(headers)))
         return _Resp()
 
+    async def close(self):
+        self.closed = True
+
 
 class _Dendrite:
     preprocess_synapse_for_request = bt.Dendrite.preprocess_synapse_for_request

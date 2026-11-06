@@ -54,7 +54,7 @@
 - Use `std::swap` and `std::exchange` where applicable to simplify code
 - Prefer CRTP over virtual functions where possible, liberally mark classes and structures `final` in the case of virtual functions
 - Be judicious about resource management and ownership, `std::shared_ptr` should be used sparingly, higher level objects should own, e.g., `std::unique_ptr`s and these should be passed downstream as raw pointers.
-- Avoid sizable parameter lists to functions. Instead prefer simple interfaces or, when necessary, passing context structs instead. For an example refer to `exchange_service/include/taosim/exchange_service/Exchange.hpp`.
+- Avoid sizable parameter lists to functions. Instead prefer simple interfaces or, when necessary, passing context structs instead.
 - Prefer descriptor struct passing to constructors. Keep these in such a shape that aggregate initialization of members is possible. For an example refer to `checkpoint/include/taosim/checkpoint/CheckpointManager.hpp`
 - Aspire for structs to support aggregate initialization in general
 - Maximum length of a line is 100 with a 5% error margin, so the absolute maximum is 105 characters
@@ -121,4 +121,4 @@
 - Avoid `std::function`. When passing, e.g., callbacks, pass them using `<concepts>` facilities. For example, `std::function<bool(int32_t)> criterion` can be replaced with `std::predicate<int32_t> auto criterion`.
 - Use `<cstdint>` types instead of plain integer types to make the byte footprint obvious. `char` is the allowed exception to this rule, which is typically more descriptive than `int8_t`.
 - `size_t` should be used for unsigned size types, `ptrdiff_t` for signed ones. Prefer signed sizes as per the entry regarding `std::ssize`. `std::byte` is off-limits due to poor codegen potential; use `uint8_t` (or plain `char` as, e.g., msgpack uses) instead.
-
+- Avoid functions like `std::stoi` and `std::stod` and instead prefer `std::from_chars`

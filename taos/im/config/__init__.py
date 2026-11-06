@@ -71,7 +71,9 @@ def add_im_validator_args(cls, parser):
 
     parser.add_argument(
         '--benchmark.enabled',
-        type=bool,
+        type=_flag,
+        nargs="?",
+        const=True,
         default=False,
         help='Enable benchmark agents'
     )
@@ -158,12 +160,10 @@ def add_im_validator_args(cls, parser):
         default=0.375,
     )
 
-    # The three trading weights below are the CURRENT LADDER RUNG, set as defaults so a deployment
-    # is a file copy. The 0.6.1 de-beta ladder stands at its final rung, (0, 0, 1), the
-    # characterised full replacement. At kappa weight 0 the kappa-3 batch is not computed (its
-    # carrier is a stub) and an empty de-beta cycle carries the previous map rather than scoring the
-    # board 0. Rehearsal rung was (0.79, 0.21, 0.0), rung 1 (0.5925, 0.1575, 0.25), rung 2
-    # (0.395, 0.105, 0.50). They must sum to 1, checked at validator init.
+    # The three trading weights below are the paid blend, set as defaults so a deployment is a file
+    # copy: (0, 0, 1), de-beta alone. At kappa weight 0 the kappa-3 batch is not computed (its
+    # carrier is a stub) and an empty de-beta cycle carries the previous map rather than scoring
+    # every miner 0. They must sum to 1, checked at validator init.
     parser.add_argument(
         "--scoring.kappa.weight",
         type=float,
@@ -261,12 +261,11 @@ def add_im_validator_args(cls, parser):
         nargs="?",
         const=True,
         help="Publish the PER-BOOK de-beta gauges (debeta_capture_buy/sell, debeta_book_making, "
-             "debeta_alpha) for dashboard drill-down. Default ON for the 0.6.1 ladder: the per-UID "
-             "gauges say WHAT a miner scored, these say on WHICH book and WHY (one-sided capture, "
-             "alpha under the floor), which is what the ladder gates are read against. The cost is "
-             "cardinality uid x book: on a 259-uid 128-book board each gauge is ~33k series, so the "
-             "four add ~133k series and roughly 24MB to every /metrics scrape that already runs "
-             "154MB. Pass `false` to turn them off where the scrape body is the binding constraint.",
+             "debeta_alpha) for dashboard drill-down. Default ON: the per-UID gauges say WHAT a miner "
+             "scored, these say on WHICH book and WHY (one-sided capture, alpha under the floor). The "
+             "cost is cardinality uid x book: each gauge carries one series per uid and book, which "
+             "grows every /metrics scrape. Pass `false` to turn them off where the scrape body is the "
+             "binding constraint.",
         default=True,
     )
 
@@ -275,7 +274,7 @@ def add_im_validator_args(cls, parser):
         type=str,
         choices=["rank", "proportional", "proportional_blended", "proportional_both"],
         default="proportional_both",
-        help="How the trading pool pays the two de-beta legs. 'proportional_both' (default since 0.6.2): both halves "
+        help="How the trading pool pays the two de-beta legs. 'proportional_both' (the default): both halves "
              "are paid in proportion. The making half in proportion to each uid's making credit after its counterparty "
              "factor and tether; the skill half in proportion to each uid's net alpha over the books it filled, times "
              "its skill counterparty factor (skill_p11_strength), among uids with positive skill on at least the skill "
@@ -309,8 +308,8 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="E5 magnitude floor for kappa-of-alpha: a per-book |alpha| must clear "
              "floor_scale*median(|alpha|) to count (kappa is magnitude-blind; kills tiny-consistent "
-             "spam). 0 (default since 0.6.2) disables the pool-relative floor in favour of the "
-             "size-neutral hurdle (skill_hurdle_bps); 0.5 is the basis shipped through 0.6.1.",
+             "spam). 0 (the default) disables the pool-relative floor in favour of the "
+             "size-neutral hurdle (skill_hurdle_bps).",
         default=0.0,
     )
 
@@ -350,7 +349,7 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="Tether on miner-sourced making credit: on the counterparty volumes the P11 factor reads, a maker's "
              "making credit is scaled by (background + min(miner-sourced, k x background)) / total, after the P11 "
-             "factor. 4, the default since 1 October 2026 (0.6.3), leaves every maker with at least a fifth of its "
+             "factor. 4, the default, leaves every maker with at least a fifth of its "
              "maker volume against the background market untouched; a maker served mostly by other miners keeps at "
              "most k times its background share. 0 disables. Market analogue: liquidity programmes pay for liquidity "
              "provided to public order flow, not for flow arranged among participants.",
@@ -362,7 +361,7 @@ def add_im_validator_args(cls, parser):
         type=str,
         choices=["captured", "realized"],
         help="Which basis the making pool pays on. captured: the two-sided spread of a uid's maker fills against the "
-             "centred mid at the moment of each fill. realized (default since 0.6.3): the same captured credit "
+             "centred mid at the moment of each fill. realized (the default): the same captured credit "
              "multiplied by the uid's markout quality, the share of that spread its maker fills still hold "
              "making_horizon_s of simulation time later, summed over all its fills and held between 0 and 1. Only the "
              "maker's side of a fill is judged, so taking never earns making credit, and nobody is paid more than on "
@@ -387,10 +386,9 @@ def add_im_validator_args(cls, parser):
         help="Magnitude floor for the MAKING rank, the making-side twin of floor_scale: a uid's "
              "two-sided capture must clear making_floor_scale*median(positive making) to enter the "
              "making rank, otherwise it ranks as 0 (rank is magnitude-blind; a negligible two-sided "
-             "quoter ranked beside the field's real makers on testnet). 0, the default, disables it: "
-             "on an earlier testnet board it moved the combined Gini from 0.64 to 0.74 for the "
-             "removal of four small makers, so it stays off until observed. Skill is always clamped "
-             "at 0 before ranking, so only positive directional skill earns skill rank.",
+             "quoter ranks beside the field's real makers). 0, the default, disables it: removing "
+             "small makers from the rank concentrates the combined pay, so it stays off until observed. "
+             "Skill is always clamped at 0 before ranking, so only positive directional skill earns skill rank.",
         default=0.0,
     )
 
@@ -438,8 +436,8 @@ def add_im_validator_args(cls, parser):
         default=50,
     )
 
-    # 0.6.2 skill-leg forms. Every default reproduces the 0.6.1 leg exactly; the new quantities are
-    # published as gauges at every setting so they can be read on a live board before they score.
+    # Skill-leg forms. Every default is the plain leg; the quantities are published as gauges at
+    # every setting so they can be read live before they score.
     parser.add_argument(
         "--scoring.debeta.skill_variant",
         type=str,
@@ -447,16 +445,16 @@ def add_im_validator_args(cls, parser):
         help="Which drift strip the skill leg's alpha uses. drift (default): the window's whole drift, "
              "so a position closed inside the window keeps being re-marked by later prints. held: the "
              "drift over the prints on which the agent held inventory, so a closed round trip is scored "
-             "once and a single constant position scores exactly zero. The other variant is published "
-             "alongside as debeta_skill_held or debeta_skill_drift.",
+             "once and a single constant position scores exactly zero. Only the chosen variant is "
+             "computed.",
         default="drift",
     )
     parser.add_argument(
         "--scoring.debeta.skill_subwindows",
         type=int,
         help="Temporal consistency: split the skill window into this many equal sub-windows and assess "
-             "skill with skill_subwindow_form. 1 (default) is the plain windowed leg. The three-way "
-             "weakest kappa is published as debeta_skill_weakest3 whatever the setting.",
+             "skill with skill_subwindow_form. 1 (default) is the plain windowed leg, and no sub-window is "
+             "computed.",
         default=1,
     )
     parser.add_argument(
@@ -479,9 +477,9 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.skill_hurdle_bps",
         type=float,
         help="Absolute skill hurdle in basis points of the agent's filled notional on a book: a book's "
-             "alpha counts toward skill only above it. 2.3 (default since 0.6.2) reproduces the "
-             "membership the 0.5 floor gave on both a young and a mature field and cannot be moved by "
-             "anyone else's size; 0 keeps the pool-relative floor alone.",
+             "alpha counts toward skill only above it. 2.3 (the default) gives the membership a "
+             "pool-relative floor of 0.5 gives, on both a young and a mature field, and cannot be moved "
+             "by anyone else's size; 0 keeps the pool-relative floor alone.",
         default=2.3,
     )
     parser.add_argument(
@@ -519,22 +517,20 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.debeta.capture_market_votes",
         type=int,
-        help="Capture mid votes (0.6.4, default off): with 1 only prints with the background market on one side vote in a "
+        help="Capture mid votes (default off): with 1 only prints with the background market on one side vote in a "
              "fill's capture mid, over the same span (the 15 nearest prints a side that clear the fill's dust floor), "
              "reaching on until 5 such prints a side vote. Two miners trading with each other then cannot move a "
-             "competitor's capture mid at any size. Off by default: on the 10 October mainnet run the minimum-size "
-             "shaping it closes was not in use (miner-to-miner votes pulled makers' mids by 0.0 bp on average) and "
-             "turning it on moves 2.8 to 10.2% of captured credit per window; the capture-window monitor flags the "
-             "attack, and switching this on is a validator restart.",
+             "competitor's capture mid at any size. Off by default: turning it on moves captured credit between "
+             "makers in every window, and switching it on is a validator restart.",
         default=0,
     )
     parser.add_argument(
         "--scoring.debeta.making_fee_weight",
         type=float,
-        help="Fee-aware making credit (0.6.4): the share of each maker fee netted from the maker's captured and realized "
+        help="Fee-aware making credit: the share of each maker fee netted from the maker's captured and realized "
              "spread on that fill (a rebate, a negative fee, adds), so the making pool pays the spread a maker earns after "
              "the venue's charge. Stepped: 0.005 first, raised at later boundaries as maker fees fall; 0 books the gross "
-             "spread as before 0.6.4.",
+             "spread.",
         default=0.005,
     )
     parser.add_argument(
@@ -616,8 +612,8 @@ def add_im_validator_args(cls, parser):
              "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
              "'median' = window median (robust: moving it needs a sustained majority of prints); "
              "'mid' = the book's mid-quote from each state (no bounce, one state of lag, no window, so a "
-             "sparse book marks as well as a dense one). Default 'mid' since 0.6.6 (the last-trade mark paid the "
-             "bid-ask bounce to makers as skill); 'last' is the pre-0.6.6 mark, byte-identical to 0.6.0.",
+             "sparse book marks as well as a dense one). Default 'mid' (the last-trade mark pays the "
+             "bid-ask bounce to makers as skill); 'last' marks on the last trade.",
         default="mid",
     )
 
@@ -636,7 +632,7 @@ def add_im_validator_args(cls, parser):
         help="A second mark accumulated beside the paid one, its skill published per uid "
              "(debeta_skill_mark_alt, debeta_skill_net_alpha_mark_alt) so a change of mark is judged on live data "
              "before it pays; 'none', or the paid mark's own name, skips the leg. Pay reads mark_mode alone. "
-             "Default 'last' since 0.6.6, the mark paid before it, so the board keeps both legs for one release.",
+             "Default 'last', the last-trade mark, so both legs are published beside each other.",
         default="last",
     )
 
@@ -644,8 +640,9 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.conjunction_bounds",
         type=str,
         help="The conjunction's band per asset class as name:bound pairs: a miner's resting volume counts within "
-             "this many times the book's spread reference (a running mean of its quoted spread) of the mid, on each "
-             "side. A class the list does not name takes 5. Published per miner and class, never paid.",
+             "this many times the book's spread reference (its median quoted spread over the trailing simulated "
+             "hour) of the mid, on each side. A class the list does not name takes 5. Published per miner and class, "
+             "never paid.",
         default="simulation_0:5,simulation_1:2,simulation_2:5",
     )
 
@@ -653,7 +650,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.debeta.conjunction_min_size_frac",
         type=float,
         help="The conjunction's size gate: both sides of a miner's resting volume within the band must reach this "
-             "share of the book's size reference (a running mean of its fill sizes).",
+             "share of the book's size reference (its median fill size over the trailing simulated hour).",
         default=0.25,
     )
 
@@ -907,7 +904,9 @@ def add_im_validator_args(cls, parser):
 
     parser.add_argument(
         "--rewarding.floor.enabled",
-        type=bool,
+        type=_flag,
+        nargs="?",
+        const=True,
         help="Enable the soft score floor: taper below-percentile trading scores toward "
              "zero before Pareto allocation, so merely-adequate UID fleets stop earning "
              "and rewards concentrate on genuine performers. Enabled by default; the "
@@ -1015,7 +1014,7 @@ def add_im_validator_args(cls, parser):
         "--neuron.skip_repeated_state",
         action="store_true",
         help="Leave unanswered the first copy of a state the engine sends again after a late answer. Off: every "
-             "state is answered, as before; the engine drains both queues before each send, so a duplicate answer is "
+             "state is answered; the engine drains both queues before each send, so a duplicate answer is "
              "harmless.",
         default=False,
     )

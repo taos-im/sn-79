@@ -280,8 +280,8 @@ void Book::dumpCSVLOB(auto begin, auto end, uint32_t depth) const
             //   * whole levels MISSING from the dump, because `totalVolume > 0_dec` below tested a garbage
             //     sum and skipped a level that genuinely had volume.
             // Display-only: dumpCSVLOB feeds printCSV, which is test and debug output. Stored order volumes,
-            // reservations, fills and accounting never pass through here, which is why the acceptance run's
-            // invariants and notional identities all held while this test failed.
+            // reservations, fills and accounting never pass through here, so the book's
+            // invariants and notional identities hold whatever this prints.
             taosim::decimal_t totalVolume = 0_dec;
             for (auto it = begin->begin(); it != begin->end(); ++it) {
                 const auto& order = *it;

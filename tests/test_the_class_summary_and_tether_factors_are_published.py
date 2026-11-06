@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """The validator publishes what the two-class layout needs observed: a class_gauges family (weight, bar, books,
 makers, skilled uids, credit and effective pool weight per asset class) and two more per-uid miner gauges, the
-S3' tether factor and the maker's background share of fill volume, so the board monitor can read the class split,
+S3' tether factor and the maker's background share of fill volume, so a dashboard can read the class split,
 the tether's bite and a griefed honest maker (high background share, low P11 factor) directly."""
 import inspect
 
@@ -50,6 +50,9 @@ def test_the_report_publishes_the_class_gauges_and_the_two_miner_gauges():
 
 def test_the_validator_hands_the_summary_to_the_report():
     from taos.im.neurons import validator
+    from taos.im.validator import reward
 
     src = inspect.getsource(validator)
-    assert "'debeta_class_summary': getattr(self, '_debeta_class_summary', None) or {}" in src
+    # as the scoring of the report's boundary kept it, or as main's own recomputation left it
+    assert "'debeta_class_summary': _class_summary" in src
+    assert "getattr(self, '_debeta_class_summary', None) or {}" in inspect.getsource(reward.debeta_for_report)

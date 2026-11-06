@@ -78,6 +78,16 @@ using CappedPair = std::pair<AgentId, BookId>;
 [[nodiscard]] std::vector<std::vector<CappedPair>> splitCappedPairs(
     std::span<const CappedPair> pairs, uint32_t blockDim, uint32_t blockCount);
 
+// The reply batch's "seed" member, [round, randomness]: the public randomness round the validator took for the
+// fundamental's next seed step and its randomness (bytes, or their hex), of which the first 8, big-endian, are the
+// step's seed value. No value when the batch carries none or the member is malformed.
+struct DeliveredSeed
+{
+    uint64_t round{};
+    uint64_t word{};
+};
+[[nodiscard]] std::optional<DeliveredSeed> readStepSeed(const msgpack::object& batch);
+
 }  // namespace taosim::simulation
 
 //-------------------------------------------------------------------------

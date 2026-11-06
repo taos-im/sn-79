@@ -3,21 +3,13 @@
 """A simulation that is warming up must not be killed for being silent.
 
 The engine publishes no state during its grace period: the publish is gated on warmingUp(), and so
-is the checkpoint writer. That period is configured in SIM seconds -- 600 in the acceptance config,
-which is ten real minutes at 1x and far longer on a loaded box.
+is the checkpoint writer. That period is configured in SIM seconds (600 in the published layout),
+which is ten real minutes at 1x and far longer on a loaded box, and no checkpoint exists until it ends.
 
-The health check allowed a flat 300 wall-clock seconds and then declared the engine unhealthy. So a
-cold-started simulation was killed several minutes before it could ever speak. restart_simulator
-read that verdict as a failed resume, rewrote the pm2 entry to a bare `taosim -c latest`, and
-started another -- which died the same way. And because no checkpoint exists until grace ends, none
-of them was ever resumable, so every restart cold-started again.
-
-Left alone it repeats: each restart cold-starts, dies at the same point and never advances, while
-every log line reports the engine restarted successfully. It also means a deliberate cold start can
-never survive, so nothing that needs a fresh simulation can have one.
-
-Silence during grace is expected; stillness is not. So the question became whether the engine is
-still writing its episode log.
+So the health check does not condemn the engine on a wall-clock allowance alone while no state has
+arrived: silence during grace is expected, stillness is not, and the check asks whether the engine is
+still writing its episode log. A kill during grace leaves nothing resumable, so every restart would
+cold-start and die at the same point, and a deliberate cold start could never survive.
 """
 
 import os
@@ -100,7 +92,7 @@ def test_an_unreadable_directory_never_condemns(tmp_path):
 
 
 def test_the_health_check_consults_progress_rather_than_the_clock_alone():
-    """The 300s allowance must no longer be the final word when no state has arrived."""
+    """The 300s allowance is not the final word when no state has arrived."""
     src = open(os.path.join(os.path.dirname(__file__), "..", "taos", "im", "validator", "update.py")).read()
     body = src[src.index("def check_simulator"):]
     assert "_engine_log_is_growing(self)" in body, (
@@ -111,7 +103,7 @@ def test_the_health_check_consults_progress_rather_than_the_clock_alone():
 def test_the_restart_keeps_the_wrapper_and_the_kill_timeout():
     """pm2 re-runs whatever is registered here verbatim for the rest of the box's life.
 
-    A bare `taosim -c latest` replaces the entry run_mvtrx.sh installed and takes two things with
+    A bare `taosim -c latest` replaces the entry the launcher installed and takes two things with
     it: start_simulator.sh reads the one-shot cold-start marker, so nothing can ask for a new
     simulation once this has run, and without --kill-timeout pm2 SIGKILLs 1600ms after the signal,
     well before the engine can write its shutdown checkpoint -- turning every intended stop into a

@@ -616,6 +616,46 @@ TEST_F(BookAggregateInvariantTest, ClearFilledOrdersKeepsLiveOrdersAndAggregates
 
 //-------------------------------------------------------------------------
 
+// clearFilledOrders reads only the levels an order may have emptied on since the last clear: a level it has read
+// is read again once one of its orders fills or is cancelled down, and a level only added to is not.
+TEST_F(BookAggregateInvariantTest, ALevelClearedOnceIsReadAgainWhenAnOrderOnItShrinks)
+{
+    const auto first = placeLimit(agent4, OrderDirection::BUY, DEC(1.0), 299_dec);
+    const auto second = placeLimit(agent3, OrderDirection::BUY, DEC(1.0), 299_dec);
+    placeLimit(agent4, OrderDirection::BUY, DEC(1.0), 298_dec);
+    book->clearFilledOrders();
+    check();
+    EXPECT_FALSE(levelAt(bids(), 299_dec)->mayHoldGhosts());
+    EXPECT_FALSE(levelAt(bids(), 298_dec)->mayHoldGhosts());
+
+    const auto third = placeLimit(agent3, OrderDirection::BUY, DEC(1.0), 299_dec);
+    EXPECT_FALSE(levelAt(bids(), 299_dec)->mayHoldGhosts()) << "an order joining a level leaves it unmarked";
+
+    placeMarket(agent1, OrderDirection::SELL, DEC(1.5));
+    check();
+    EXPECT_EQ(first->volume(), 0_dec);
+    EXPECT_EQ(second->volume(), DEC(0.5));
+    EXPECT_TRUE(levelAt(bids(), 299_dec)->mayHoldGhosts());
+    EXPECT_FALSE(levelAt(bids(), 298_dec)->mayHoldGhosts());
+    EXPECT_EQ(ghostCount(*book), 1uz);
+
+    book->clearFilledOrders();
+    check();
+    EXPECT_THAT(*levelAt(bids(), 299_dec), ElementsAre(second, third));
+    EXPECT_FALSE(levelAt(bids(), 299_dec)->mayHoldGhosts());
+    EXPECT_EQ(ghostCount(*book), 0uz);
+
+    ASSERT_TRUE(book->cancelOrder(second->id(), DEC(0.25)));
+    check();
+    EXPECT_TRUE(levelAt(bids(), 299_dec)->mayHoldGhosts()) << "a partial cancel marks the level";
+    book->clearFilledOrders();
+    check();
+    EXPECT_THAT(*levelAt(bids(), 299_dec), ElementsAre(second, third));
+    EXPECT_EQ(levelAt(bids(), 299_dec)->volume(), DEC(1.25));
+}
+
+//-------------------------------------------------------------------------
+
 TEST_F(BookAggregateInvariantTest, LeveragedOrdersAggregateTotalVolume)
 {
     const auto plain = placeLimit(agent1, OrderDirection::BUY, DEC(1.0), 299_dec);
@@ -881,6 +921,8 @@ TEST_F(BookAggregateInvariantTest, RandomizedOperationsKeepAggregates)
             book->clearFilledOrders();
             ++cleared;
             check();
+            // Every ghost goes, though the clear reads only the levels marked since the last one.
+            ASSERT_EQ(ghostCount(*book), 0uz);
         }
     }
 

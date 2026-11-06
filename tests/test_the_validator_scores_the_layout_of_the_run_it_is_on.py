@@ -1,16 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
+# SPDX-License-Identifier: MIT
 """The validator scores the class layout of the run it is on, not the layout of the config it was started with.
 
-The 0.6.5 validator resumed mainnet's 0.6.4 run (six simulation_0 and two simulation_1, books 0-95 and
-96-127) under 0.6.5's three-class default. It took its layout from the start config (engines/simulation.py
-`_load_config`) and never from the run, so it scored and published 0-63 / 64-95 / 96-127, advertised the third class's
-grid and minimum order for books 96-127, and started its simulation state fresh, because that file is named after the
-layout. It was relaunched by hand on a copy of the run's layout and crossed over at the run end through a one-shot
-watcher.
-
-Now: at start the validator reads the layout of the run it resumes from that run's own config.xml; when a run opens it
+At start the validator reads the layout of the run it resumes from that run's own config.xml; when a run opens it
 reads the new run's; and the engine's next run still starts from the start config, the release default. A layout
-whose books differ from the loaded ones is adopted as well: the book ids follow it, and at the run
-open the books whose market changed start their histories fresh and the vanished ones are dropped.
+whose books differ from the loaded ones is adopted as well: the book ids follow it, and at the run open the books whose
+market changed start their histories fresh and the vanished ones are dropped. A layout read from the start config
+alone would score and publish a resumed run on books that are not the run's, advertise one class's grid and minimum
+order for another class's books, and start the simulation state fresh, because that file is named after the layout.
 """
 
 import shutil
@@ -23,10 +20,14 @@ from taos.im.validator.engines.simulation import SimulationEngine
 from taos.im.validator.reward import class_map
 
 CONFIGS = Path(__file__).resolve().parents[1] / "simulate" / "trading" / "run" / "config"
-NEEDED = ["multiasset_simulation_0.xml", "simulation_0.xml", "simulation_1.xml", "simulation_2.xml"]
+# the 64/32/32 layout (128 books), kept under its own name beside the 128/64/64 default (256 books); the changeover
+# from it is tests/test_a_class_keeps_its_records_when_the_book_count_grows.py
+START = "multiasset_simulation_0_64_32_32.xml"
+NEEDED = [START, "simulation_0.xml", "simulation_1.xml", "simulation_2.xml"]
 pytestmark = pytest.mark.skipif(not all((CONFIGS / n).exists() for n in NEEDED), reason="the class files are not here")
 
-OLD_RUN = "20261019_102513"
+OLD_RUN = "20000101_000000"
+NEW_RUN = "20000102_000000"  # a later run: run names sort by their start stamp
 
 
 def _wrapper(backgrounds, config_dir):
@@ -61,7 +62,7 @@ def tree(tmp_path):
     (state / f"validator.simulation.localnet.{OLD_RUN[:13]}.mp").write_bytes(b"")
     v = SimpleNamespace(
         config=SimpleNamespace(
-            simulation=SimpleNamespace(xml_config=str(config_dir / "multiasset_simulation_0.xml")),
+            simulation=SimpleNamespace(xml_config=str(config_dir / START)),
             neuron=SimpleNamespace(full_path=str(state)),
             subtensor=SimpleNamespace(network="local"),
         ),
@@ -76,7 +77,7 @@ def _composition(sim):
     return [(bg.name, bg.instance_count) for bg in sim.backgrounds]
 
 
-def test_the_start_config_is_the_three_class_default(tree):
+def test_the_start_config_is_the_three_class_128_book_layout(tree):
     assert _composition(tree.v.simulation) == [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)]
 
 
@@ -98,7 +99,7 @@ def test_a_validator_started_on_a_resumed_run_scores_that_runs_layout(tree):
 def test_a_run_that_opens_on_the_default_layout_crosses_over(tree):
     _run_dir(tree.root, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
     tree.engine._follow_resumed_run_layout()
-    new = _run_dir(tree.root, "20261024_031500", [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)],
+    new = _run_dir(tree.root, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)],
                    tree.config_dir)
     reinits = []
     tree.v._scoring_shadow = SimpleNamespace(request_reinit=lambda: reinits.append(1))
@@ -127,7 +128,7 @@ def test_a_layout_on_other_books_is_adopted_and_the_book_ids_follow(tree):
 def test_a_newer_run_than_the_saved_state_leaves_the_layout_to_the_run_change(tree):
     default = _composition(tree.v.simulation)
     _run_dir(tree.root, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
-    _run_dir(tree.root, "20261024_031500", [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
+    _run_dir(tree.root, NEW_RUN, [("simulation_0", 6), ("simulation_1", 2)], tree.config_dir)
     assert tree.engine._follow_resumed_run_layout() is False, (
         "the engine resumes the newest run, which this validator has not scored: its run change sets the layout")
     assert _composition(tree.v.simulation) == default

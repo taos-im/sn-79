@@ -76,6 +76,7 @@ if __name__ != "__mp_main__":
     from taos.im.protocol.events import SimulationStartEvent
     from taos.im.validator.trade import history_clock_health as _history_clock_health
     from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine, RepeatedState
+    from taos.im.validator import fundamental_seed
 
     # Optional exchange-mode component; not part of this tree. Import is guarded, so a validator without
     # it starts normally and simply does not surface those notices.
@@ -87,10 +88,10 @@ if __name__ != "__mp_main__":
     def warn_exchange_notices_missing(holder) -> bool:
         """One loud line, once per process, when EXCHANGE mode runs without the notice-delivery companion.
 
-        A checkout without the companion degrades to a no-op by design (the carve keeps mechanism
-        private), but it used to degrade silently: an exchange validator on such a tree delivers
-        placement acks while surfacing no fills or refusals, which reads as a miner-side bug and cost
-        hours to trace. The message names the consequence, never the mechanism."""
+        A checkout without the companion degrades to a no-op by design (the public release keeps
+        mechanism private), but not silently: an exchange validator on such a tree delivers placement
+        acks while surfacing no fills or refusals, which reads as a miner-side bug. The message names
+        the consequence, never the mechanism."""
         if getattr(holder, '_warned_exchange_notices_missing', False):
             return False
         holder._warned_exchange_notices_missing = True
@@ -158,6 +159,20 @@ if __name__ != "__mp_main__":
             f"and is not restarted; relaunch it from the kept checkpoint once the cause is fixed."
         )
         return text, details
+
+    def _json_bytes_as_hex(value):
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value).hex()
+        raise TypeError(f"{type(value).__name__} is not JSON serializable")
+
+    def _dump_responses(path: str, last_response: dict | None) -> None:
+        """Write the last batch sent for the engine's error report: packed orders written out, so the indices match
+        the engine's, and bytes (the step seed's randomness) as hex."""
+        dumped = dict(last_response or {}, responses=[
+            item for r in (last_response or {}).get("responses", ())
+            for item in (r.unpack() if isinstance(r, PackedOrders) else [r])])
+        with open(path, "w") as f:
+            json.dump(dumped, f, indent=4, default=_json_bytes_as_hex)
 
     def _settled_ingest_books(settled_books: dict, fill_events: dict) -> dict:
         """The books an exchange ingest push publishes: the books receive() reconciled with the chain, with this
@@ -351,18 +366,17 @@ if __name__ != "__mp_main__":
     #
     # asyncio.create_task returns the only strong reference to the task; the running loop keeps a weak
     # one. Discard the return value and an UNFINISHED task becomes eligible for garbage collection, at
-    # which point the push never happens -- no exception, no log line, nothing to find afterwards. This
-    # repo's own standard says so: "Background tasks: always keep a strong ref. Pattern in
-    # service/main.py:_spawn_bg (set + add_done_callback(set.discard))".
+    # which point the push never happens -- no exception, no log line, nothing to find afterwards. So
+    # each task is held in a set until it is done (add_done_callback(set.discard)).
     #
-    # The state pushes are the worst case for it. _build_sim_push_payload spends 7-11s in an executor
+    # The state pushes are the worst case for it. _build_sim_push_payload spends seconds in an executor
     # before anything is sent, so on every tick the task sits alive, unreferenced and collectable for
     # seconds rather than microseconds.
     #
-    # The consequence is visible on the tape: agent_fills holds the fill (written per notice, down a
+    # A lost push shows in the data service: agent_fills holds the fill (written per notice, down a
     # different path) while trades never receives the block, so the fill reads as floating free of the
-    # tape. The signature is a loss rate that is roughly uniform across books irrespective of their
-    # activity, which is what whole pushes disappearing looks like; a per-book cause would not be
+    # trade record. The signature is a loss rate that is roughly uniform across books irrespective of
+    # their activity, which is what whole pushes disappearing looks like; a per-book cause would not be
     # uniform, and the ingest POSTs that DO arrive all return 200.
     _PUSH_TASKS: set = set()
     # NAMED, SO SHUTDOWN CAN TELL A BLOCK IN FLIGHT FROM A LOOP THAT SHOULD BE CANCELLED.
@@ -2102,6 +2116,8 @@ if __name__ != "__mp_main__":
             from taos.im.validator.debeta import capture_floor_stats, capture_settle_by_class, capture_settle_counts
             from taos.im.validator.reward import class_map
             from taos.im.validator.fundamental import reported as reported_fundamental
+            from taos.im.validator.recent_trades import newest_per_uid
+            from taos.im.validator import levers
             start = time.time()
             # The fundamental the metrics publish is the one the reported state carried to miners.
             fundamental_price = reported_fundamental(
@@ -2115,12 +2131,12 @@ if __name__ != "__mp_main__":
 
             # Read from the incrementally-maintained running totals instead of
             # re-summing realized_pnl_history[uid][ts][book_id] every call. The
-            # sum is O(N*T*B) (~66M ops on mainnet at N=259, T~2000, B=128) and
+            # sum is O(N*T*B) (uids x timestamps x books) and
             # this function runs under _reward_lock, blocking every subsequent
             # _reward for its duration. The running totals are kept in sync by
             # trade.py:_apply_pnl_delta on write/delete/prune and rebuilt on
             # startup + sim-restart by persistence.bootstrap_pnl_totals — so
-            # this is byte-identical to the old loop but constant-time per UID.
+            # this is byte-identical to the full sum but constant-time per UID.
             _pnl_by_book = self.agent_pnl_by_book
             _pnl_total = self.agent_pnl_total
             for uid in self.realized_pnl_history.keys():
@@ -2170,10 +2186,9 @@ if __name__ != "__mp_main__":
             fee_sums_flat = _nested_snapshot(getattr(self, 'fee_sums', {}))
             roundtrip_volume_sums_flat = _nested_snapshot(self.roundtrip_volume_sums)
 
-            # De-beta (P8) trading score for the reporting snapshot, finalized via the shared helper
-            # (this process owns the fill-stream accumulators); passed as a compact {uid: score} map
-            # rather than shipping the raw per-book sums over IPC. {} when disabled/warming.
-            debeta_scores_flat = compute_debeta_scores(self)
+            # De-beta (P8) trading score for the reporting snapshot as a compact {uid: score} map: the one the scoring
+            # of this boundary paid, recomputed here only when main did not adopt it. {} when disabled/warming.
+            debeta_scores_flat, _class_summary, _class_details = debeta_for_report(self, self.last_state.timestamp)
 
             bt.logging.debug(f"Serialized volume sums ({time.time()-serialize_start:.4f}s)")
 
@@ -2204,16 +2219,8 @@ if __name__ != "__mp_main__":
                 for bookId, trades in self.recent_trades.items()
             }
 
-            recent_miner_trades = {
-                uid: {
-                    bookId: [
-                        {'trade': miner_trade.model_dump(), 'role': role}
-                        for miner_trade, role in trades[-5:]
-                    ]
-                    for bookId, trades in book_trades.items()
-                }
-                for uid, book_trades in self.recent_miner_trades.items()
-            }
+            # each miner's newest trades across its books for the dashboard's table, and every book's newest fee rates
+            recent_miner_trades, recent_fee_rates = newest_per_uid(self.recent_miner_trades)
             bt.logging.debug(f"Built minimal recent trades ({time.time()-trades_start:.4f}s)")
 
             def _cap_notices_per_book(notices, per_book=20):
@@ -2281,8 +2288,7 @@ if __name__ != "__mp_main__":
                 'debeta_capture_sell_sums': getattr(self, 'capture_sell_sums', {}) or {},
                 'debeta_alphas_by_book': getattr(self, 'debeta_alphas_by_book', {}) or {},
                 # Scoring-service health (parity matches/mismatches, re-INITs, tee drops, suspension) for
-                # the validator gauges: a re-INIT storm truncates the de-beta window and used to leave no
-                # mark on any dashboard.
+                # the validator gauges: a re-INIT storm truncates the de-beta window, and these show it.
                 'scoring_shadow': (
                     self._scoring_shadow.health()
                     if getattr(self, '_scoring_shadow', None) is not None else None
@@ -2302,6 +2308,7 @@ if __name__ != "__mp_main__":
                 'round_gaps': list(self.round_gaps[-100:]),
                 'query_waits': list(self.query_waits[-100:]),
                 'reward_gate_waits': list(self.reward_gate_waits[-100:]),
+                'fundamental_seed_sources': dict(getattr(self, 'fundamental_seed_sources', None) or {}),
                 'pending_reward_tasks': self._pending_reward_tasks,
                 'volume_sums': volume_sums_flat,
                 'maker_volume_sums': maker_volume_sums_flat,
@@ -2317,8 +2324,8 @@ if __name__ != "__mp_main__":
                 'realized_pnl_by_book': realized_pnl_by_book,
                 'book_count': book_count,
                 'activity_factors': self.activity_factors,
-                'debeta_class_summary': getattr(self, '_debeta_class_summary', None) or {},
-                'debeta_class_details': getattr(self, '_debeta_class_details', None) or {},
+                'debeta_class_summary': _class_summary,
+                'debeta_class_details': _class_details,
                 'capture_floor_stats': capture_floor_stats(getattr(self, 'debeta_capture_mid', None)),
                 'capture_settle_by_class': capture_settle_by_class(
                     capture_settle_counts(getattr(self, 'debeta_capture_mid', None)), class_map(self)),
@@ -2341,11 +2348,13 @@ if __name__ != "__mp_main__":
                 'initial_balances_published': self.initial_balances_published,
                 'recent_trades': recent_trades,
                 'recent_miner_trades': recent_miner_trades,
+                'recent_fee_rates': recent_fee_rates,
                 'open_positions': open_positions,
                 'fundamental_price': fundamental_price,
                 'shared_state_rewarding': self.shared_state_rewarding,
                 'current_block': self.current_block,
                 'uid': self.uid,
+                'levers': levers.states(),
                 'reconciliation': dict(getattr(getattr(self, 'engine', None), '_pending_reconciliation', None) or {}),
                 # Exchange engine: include chain-level events and delegates for the data service.
                 # block_events feeds the L3 stream (StakeAdded/StakeRemoved etc.).
@@ -2476,15 +2485,16 @@ if __name__ != "__mp_main__":
                 serialize_start = time.time()
 
                 def _pack_report_chunked():
-                    # Byte-identical to msgpack.packb(data, use_bin_type=True)
-                    # (see persistence._stream_pack) but sliced into per-subtree
-                    # pack() calls so serializing the ~35MB report can't hold the
-                    # GIL solid against the event loop in the post-reward window.
-                    import io as _io
-                    from taos.im.validator.persistence import _SAVE_STREAM_DEPTH, _stream_pack
-                    _buf = _io.BytesIO()
-                    _stream_pack(msgpack.Packer(use_bin_type=True), _buf.write, data, _SAVE_STREAM_DEPTH)
-                    return _buf.getvalue()
+                    # Byte-identical to msgpack.packb(data, use_bin_type=True), sliced into per-subtree pack() calls
+                    # (persistence._stream_pack) so packing the report can't hold the GIL solid against the event
+                    # loop; the parts built for this report, and in simulation mode the state, go without a copy.
+                    from taos.im.validator import levers
+                    from taos.im.validator.persistence import REPORT_UNSHARED, pack_report
+                    _exchange = getattr(self.engine, 'mode', None) == 'exchange'
+                    _state = frozenset() if _exchange else frozenset({'last_state'})
+                    # turned off at runtime (levers.py), every part is copied
+                    unshared = (REPORT_UNSHARED | _state) if levers.enabled('pack_shared') else frozenset()
+                    return pack_report(data, unshared)
 
                 data_bytes = await asyncio.get_event_loop().run_in_executor(
                     self.reporting_ipc_executor,
@@ -2752,10 +2762,10 @@ if __name__ != "__mp_main__":
                         if adopted is not None:
                             _sched = self._scoring_proc_verify_sched
                             if _sched is None:
-                                from taos.im.validator.scoring_shadow import VerifyScheduler
-                                _sched = self._scoring_proc_verify_sched = VerifyScheduler(
-                                    int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "10"))
+                                from taos.im.validator.scoring_shadow import (
+                                    VerifyScheduler, SCORING_PROC_VERIFY_EVERY,
                                 )
+                                _sched = self._scoring_proc_verify_sched = VerifyScheduler(SCORING_PROC_VERIFY_EVERY)
                             _verify = _sched.boundary(self._scoring_proc_n, self._pending_reward_tasks)
                             if _sched.last == "deferred":
                                 bt.logging.info(
@@ -2840,6 +2850,18 @@ if __name__ != "__mp_main__":
                                 self._trading_score_ema_ts = adopted.get('trading_ema_ts')
                                 self._debeta_pool_ema = {str(k): {int(u): float(x) for u, x in (v or {}).items()}
                                                          for k, v in (adopted.get('debeta_pool_ema') or {}).items()}
+                        # a VERIFY boundary pays main's own result, so its report reads main's computation
+                        if adopted is not None and not _verify and adopted.get('debeta_scores') is not None:
+                            self._scored_debeta = {
+                                'ts': timestamp,
+                                'scores': {int(u): float(s) for u, s in adopted['debeta_scores'].items()},
+                                'class_summary': adopted.get('debeta_class_summary') or {},
+                                'class_details': adopted.get('debeta_class_details') or {},
+                            }
+                            # main runs no de-beta compute on this boundary: the per-book alpha gauges read the
+                            # service's alphas
+                            if adopted.get('debeta_alphas_by_book') is not None:
+                                self.debeta_alphas_by_book = adopted['debeta_alphas_by_book']
 
                         bt.logging.info(
                             f"Reward calculation completed ({time.time()-calc_start:.4f}s"
@@ -3144,6 +3166,23 @@ if __name__ != "__mp_main__":
                                            if getattr(self, 'simulation', None) else None),
                 "sltp_triggers": _sim_live_triggers,
             }
+
+        def _sim_push_url(self) -> str:
+            return (getattr(getattr(self.config, 'simulation', None), 'data_service_url', '')
+                    or getattr(getattr(self.config, 'exchange', None), 'data_service_url', ''))
+
+        def on_query_sent(self, state) -> None:
+            """Start this state's data-service push once its query is with the query process, so the payload build
+            and the encode run while the miners answer instead of in the next round. The push reads the state and the
+            validator's maps, nothing of the answers."""
+            from taos.im.validator import levers
+            # turned off at runtime (levers.py), the push starts after the forward
+            if getattr(self.engine, 'mode', None) == 'exchange' or not levers.enabled('push_in_wait'):
+                return
+            url = self._sim_push_url()
+            if url:
+                self._sim_push_ts = state.timestamp
+                _spawn_push(self._push_sim_state_bg(state, url))
 
         async def _push_sim_state_bg(self, state, url: str) -> None:
             """Async wrapper: build the MVTRX push payload in a dedicated
@@ -3595,22 +3634,22 @@ if __name__ != "__mp_main__":
                 start = time.time()
                 response = with_capped(response_batch(miner_responses), getattr(self, '_capped_pairs', None))
                 bt.logging.debug(f"Serialized Response Batch ({time.time()-start}s)")
+                # timed apart: at a seed boundary the attach waits for its drand round
+                start = time.time()
+                response = await fundamental_seed.attach(self, response, state.timestamp, closed_at=_rp_fwd1)
+                bt.logging.debug(f"Step seed attach ({time.time()-start}s)")
                 # Inject UI-submitted external orders
                 _ext = getattr(self.engine, '_external_instructions', [])
                 if _ext:
                     response['responses'].extend(_ext)
                     self.engine._external_instructions = []
                     bt.logging.info(f"Injected {len(_ext)} external order(s) into simulation response")
-                # Push simulation state to MVTRX data service each tick. Payload
-                # construction is O(N * T * B) over realized_pnl_history and cost
-                # ~7-11s per state on the main event loop; offloaded to
-                # reporting_ipc_executor via _push_sim_state_bg. Skip when the URL
-                # isn't configured so we don't spawn no-op tasks every tick.
-                _push_url = (
-                    getattr(getattr(self.config, 'simulation', None), 'data_service_url', '')
-                    or getattr(getattr(self.config, 'exchange', None), 'data_service_url', '')
-                )
-                if _push_url:
+                # Push simulation state to MVTRX data service each tick, built in an executor by _push_sim_state_bg.
+                # A state whose query went out was pushed from on_query_sent, in the miners' wait; this push is for a
+                # state that sent none (an observing validator, a failed hand-off). Skip when the URL isn't
+                # configured so we don't spawn no-op tasks every tick.
+                _push_url = self._sim_push_url()
+                if _push_url and getattr(self, '_sim_push_ts', None) != state.timestamp:
                     _spawn_push(self._push_sim_state_bg(state, _push_url))
 
             # GenTRX: poll for round advance and deliver assignments after the
@@ -3759,13 +3798,11 @@ if __name__ != "__mp_main__":
                             "reconciliation":      {},
                             "agent_open_orders":   _soo,
                             "agent_orders_detail": _sod,
-                            # The scoring maps too. This push carried accounts and no scoring, and
-                            # the service built an agent_snapshots row from it for every uid, so each
-                            # run of this block wrote a whole board of score, volume and PnL zeros
-                            # between real rows (seen on the localnet exchange DB:
-                            # 256 or 257 such rows at 16:06, 16:25, 16:58, 17:31 and 18:04 local, each
-                            # matching a "MVTRX startup push" line). load_state() has already run in
-                            # engine.start(), so these are the restored values, not warm-up zeros.
+                            # The scoring maps too: the service builds an agent_snapshots row from
+                            # this push for every uid, so a push with accounts and no scoring would
+                            # write a whole board of score, volume and PnL zeros between real rows.
+                            # load_state() has already run in engine.start(), so these are the
+                            # restored values, not warm-up zeros.
                             **self._build_agent_scoring_maps(),
                             "metagraph":           _sm,
                             "validator_uid":       self.uid,
@@ -3861,7 +3898,7 @@ if __name__ != "__mp_main__":
                             continue
                         if normalized_state is not None:
                             if isinstance(raw_message, (bytes, bytearray)):
-                                # opt-in record of the stream for the scoring acceptance's replay harness (STATE_CAPTURE_DIR);
+                                # opt-in record of the stream, for replaying it offline (STATE_CAPTURE_DIR);
                                 # queued for a writer thread, so the loop never waits on the compress and write
                                 submit_capture(raw_message, normalized_state.timestamp)
                             if self._scoring_shadow is not None and isinstance(raw_message, (bytes, bytearray)):
@@ -4009,11 +4046,7 @@ if __name__ != "__mp_main__":
                     self.on_simulation_failed(message)
                 elif message['type'] == 'RESPONSES_ERROR_REPORT':
                     dump_file = self.config.neuron.full_path + f"/{self.last_state.config.simulation_id}.{message['timestamp']}.responses.json"
-                    dumped = dict(self.last_response, responses=[  # packed orders written out, so the indices match
-                        item for r in self.last_response.get("responses", ())
-                        for item in (r.unpack() if isinstance(r, PackedOrders) else [r])])
-                    with open(dump_file, "w") as f:
-                        json.dump(dumped, f, indent=4)
+                    _dump_responses(dump_file, self.last_response)
                     error_file = self.config.neuron.full_path + f"/{self.last_state.config.simulation_id}.{message['timestamp']}.error.json"
                     with open(error_file, "w") as f:
                         json.dump(message, f, indent=4)
@@ -4024,9 +4057,8 @@ if __name__ != "__mp_main__":
                     else:
                         self.pagerduty_alert(f"{self.msgpack_error_counter} msgpack deserialization errors encountered in simulator - terminating simulation.", details=message)
                         return { "continue": False }
-                # ONE PLACE DECIDES WHAT REACHES MINERS. The start event used to `continue` here
-                # and the end event used to fall through, so the two halves of the same question were
-                # answered in different ways in the same loop and only one of them was visible.
+                # ONE PLACE DECIDES WHAT REACHES MINERS, so the start and the end event answer the
+                # same question the same way.
                 if not _notice_is_forwarded_to_miners(message['type']):
                     continue
                 notice = FinanceEventNotification.from_json(message)
@@ -4140,7 +4172,7 @@ if __name__ == "__main__":
 
     from taos.im.validator.update import check_repo, classify_changes, update_validator, check_simulator, rebuild_simulator, restart_simulator
     from taos.im.validator.forward import forward, notify, deliver_gentrx, update_placement_stats
-    from taos.im.validator.reward import get_rewards, compute_debeta_scores
+    from taos.im.validator.reward import get_rewards, debeta_for_report
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:
         raise Exception("taos validator requires Ubuntu >= 22.04!")

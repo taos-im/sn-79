@@ -142,9 +142,8 @@ TEST(LifecycleNotice, WrapperNetworkAttributesAreReadFromTheRoot)
 }
 
 // THE SL/TP TRACER IS A WRAPPER SETTING. SimulationManager reads `sltpDebug` from its own root, but
-// a multi-asset run never builds through that path, so the attribute was dead under the wrapper and
-// in every background file that set it: the 7 October acceptance run could not show the trigger
-// table its SL/TP check needed. The wrapper root carries it now, like the other wrapper settings.
+// a multi-asset run never builds through that path, so under the wrapper the attribute is read from
+// the wrapper root, like the other wrapper settings, and a background file's has no effect.
 TEST(LifecycleNotice, WrapperReadsTheSltpTracerFlag)
 {
     EXPECT_TRUE(wrapperConfig("sltpDebug=\"1\"").sltpDebug);
@@ -153,8 +152,8 @@ TEST(LifecycleNotice, WrapperReadsTheSltpTracerFlag)
 
 // THE STEP DIAGNOSTICS ARE WRAPPER SETTINGS TOO. traceTime prints the sim clock each step and
 // measureStepWallClockTime the PROCESSED wall-clock breakdown; SimulationManager reads both from its root,
-// a multi-asset run never builds through it, and the background files that set them were ignored, so a
-// 0.6.3 validator's engine log carried neither line.
+// a multi-asset run never builds through it, and a background file's have no effect, so the wrapper root
+// carries them.
 TEST(LifecycleNotice, WrapperReadsTheStepDiagnostics)
 {
     const auto on = wrapperConfig("traceTime=\"1\" measureStepWallClockTime=\"1\"");

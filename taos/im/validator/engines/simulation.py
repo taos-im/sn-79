@@ -142,18 +142,23 @@ def _run_outputs(run_dir: Path):
 
 
 
-def _read_segment(fd: int, size: int) -> bytes:
+def _read_segment(fd: int, size: int) -> bytes | bytearray:
     """The first size bytes of a shared-memory segment, read with pread rather than a mapping. The engine can shrink
     /state between the reader's size check and its read; a shared mapping read past the end of its object is SIGBUS,
     which kills the reading process, while pread past the end comes back short, and the unpack retry
-    then reads the segment again."""
-    out = bytearray()
-    while len(out) < size:
-        chunk = os.pread(fd, size - len(out), len(out))
-        if not chunk:
-            break
-        out += chunk
-    return bytes(out)
+    then reads the segment again. Read into one buffer of the announced size and returned as it is, so a large state
+    is copied once, not three times."""
+    buf = bytearray(size)
+    got = 0
+    with memoryview(buf) as view:
+        while got < size:
+            n = os.preadv(fd, [view[got:]], got)
+            if n <= 0:
+                break
+            got += n
+    if got < size:
+        return bytes(buf[:got])
+    return buf
 
 
 class RunWentBackwardError(RuntimeError):
@@ -265,6 +270,7 @@ class SimulationEngine(MarketEngine):
 
         # ── 5. Load persisted state ────────────────────────────────────────────
         v.load_state()
+        self._settle_scored_layout()
 
         # ── 6. Start seed service ──────────────────────────────────────────────
         v.seed_process = None
@@ -672,12 +678,17 @@ class SimulationEngine(MarketEngine):
         )
         _prev_label = self._layout_label()
         _prev_sim = getattr(v, "simulation", None)
+        # the layout the records were scored on: a validator down across the boundary loaded the old run's records
+        # onto the new run's layout, and only the saved layout says where they belong
+        from taos.im.validator.book_layout import layout_of
+        _prev_layout = getattr(v, "_scored_layout", None) or layout_of(_prev_sim)
         self._load_config()
         self._adopt_run_layout(log_dir, "the run opened", previous_label=_prev_label)
         volume_decimals = v.simulation.volumeDecimals
-        # the books whose market changed between the two runs start fresh, the vanished ones are dropped (row 64)
+        # each class's records follow it to its books in the new layout, the books whose market changed start fresh,
+        # the vanished ones are dropped
         from taos.im.validator.trade import layout_book_changes
-        _book_changes = layout_book_changes(_prev_sim, v.simulation)
+        _book_changes = layout_book_changes(_prev_layout, v.simulation)
         # passed on only when a book changed, so a run change on the same layout keeps its shape
         if not any(d != "keep" for d in _book_changes.get("books", {}).values()):
             _book_changes = None
@@ -721,6 +732,7 @@ class SimulationEngine(MarketEngine):
                 book_ids=getattr(self, "_book_ids", None) or None,
                 **({"book_changes": _book_changes} if _book_changes else {}),
             )
+            v._scored_layout = layout_of(v.simulation)
 
         v.start_time = time.time()
         v.simulation_timestamp = new_simulation_timestamp
@@ -980,7 +992,7 @@ class SimulationEngine(MarketEngine):
             # THE SAME RUN, ITS CLOCK STEPPED BACK: a resume whose start notice this process never received (the
             # engine can publish it while the validator is still coming up). The
             # near-zero rule above cannot see a resumed clock, and without the re-open the histories keep the old
-            # clock, which the board monitor reads as stamped ahead of it. Re-open on the update's clock, as the
+            # clock, so their stamps sit ahead of the run's. Re-open on the update's clock, as the
             # notice would have; a late copy of that notice is then absorbed by on_start.
             logger.warning(
                 f"RESUME NOT SEEN: the clock went from {_prev_ts} to {state.timestamp} on run {_incoming!r} without "
@@ -1117,9 +1129,22 @@ class SimulationEngine(MarketEngine):
             # ids, so glob per realization dir and let the headers do the mapping.
             prices = {}
             import glob
+            # Each realization writes its fundamental files once, at the run's start, into a directory that fills
+            # with every book's logs: list it once a run, and again only while it is empty, when a listed file is
+            # gone, or when the run's directory changes.
+            listed = self.__dict__.setdefault('_fundamental_files', {})
+            if listed.get('_logdir') != v.simulation.logDir:
+                listed.clear()
+                listed['_logdir'] = v.simulation.logDir
             for _flat_idx, name, instance, _config in v.simulation.realizations():
                 inst_dir = os.path.join(v.simulation.logDir, f"{name}-{instance}")
-                files = sorted(glob.glob(os.path.join(inst_dir, 'fundamental.*.csv')))
+                files = listed.get(inst_dir)
+                if not files or not all(os.path.exists(f) for f in files):
+                    files = sorted(glob.glob(os.path.join(inst_dir, 'fundamental.*.csv')))
+                    if files:
+                        listed[inst_dir] = files
+                    else:
+                        listed.pop(inst_dir, None)
                 if not files:
                     self._warn_fundamental_once(
                         inst_dir, f"load_fundamental: no fundamental files under {inst_dir}")
@@ -1342,12 +1367,16 @@ class SimulationEngine(MarketEngine):
         if current is None:
             return False
         found = self._run_layout(run_dir)
+        markets = []
         if found is not None:
             xml, sim = found
-            if sim.label() != current:
+            # a run resumed on other class files than the start config's keeps its own markets until it ends
+            markets = self._changed_markets(v.simulation, sim) if sim.label() == current else []
+            if sim.label() != current or markets:
                 if list(sim.book_ids) != list(self._book_ids):
                     # a book count that grew or shrank between runs: the layout is adopted and the book-keyed
-                    # structures follow at the open (new books start empty, vanished ones are dropped: row 64)
+                    # structures follow at the open (each class's records follow it to its books, added books start
+                    # empty, vanished ones are dropped)
                     logger.warning(
                         f"LAYOUT ON OTHER BOOKS ({why}): the run in {run_dir} has {sim.book_count} books on "
                         f"{sim.label()}, the loaded structures {len(self._book_ids)} on {v.simulation.label()}; "
@@ -1362,14 +1391,27 @@ class SimulationEngine(MarketEngine):
                     self._sim_config = sim
                     v.simulation_state_file = v.config.neuron.full_path + f"/{sim.label()}.mp"
                     logger.warning(
-                        f"LAYOUT FROM THE RUN ({why}): {old} -> {sim.label()}; the next run starts from "
-                        f"{v.simulator_config_file}")
+                        f"LAYOUT FROM THE RUN ({why}): {old} -> {sim.label()}"
+                        + (f", the market of {', '.join(markets)} from the run's class files" if markets else "")
+                        + f"; the next run starts from {v.simulator_config_file}")
                     changed = True
-        if previous_label is not None and self._layout_label() != previous_label:
+        if previous_label is not None and (self._layout_label() != previous_label or markets):
             shadow = getattr(v, '_scoring_shadow', None)
             if shadow is not None:
                 shadow.request_reinit()
         return changed
+
+    @staticmethod
+    def _changed_markets(loaded, run) -> list[str]:
+        """The classes of the run's layout whose market is not the loaded layout's on the same books."""
+        from taos.im.validator.trade import layout_book_changes
+        books = layout_book_changes(loaded, run).get("books", {})
+        try:
+            classes = run.asset_classes()
+        except Exception:
+            logger.debug("the run's layout has no asset classes to compare", exc_info=True)
+            return []
+        return [c.name for c in classes if any(books.get(int(b), "keep") != "keep" for b in c.books)]
 
     def _follow_resumed_run_layout(self) -> bool:
         """At start, score the run the engine resumes on its own layout. That run is the newest run directory with a
@@ -1389,6 +1431,30 @@ class SimulationEngine(MarketEngine):
         if not runs or not sim_id or not runs[-1].name.startswith(sim_id):
             return False
         return self._adopt_run_layout(runs[-1], f"start on the resumed run {runs[-1].name}")
+
+    def _settle_scored_layout(self) -> None:
+        """After the load, the layout the loaded records were scored on, which the next run's open compares with its
+        own: the one the state saved; for a state saved without one (an older version's), the layout in the
+        config.xml of the run the state was saved in; else the loaded layout. A validator down across a boundary that
+        changed the layout loads the old run's records onto the new layout, and the open moves them by this."""
+        v = self.validator
+        from taos.im.validator.book_layout import layout_of
+        if getattr(v, '_scored_layout', None):
+            return
+        parts = Path(getattr(v, 'validator_state_file', '') or '').name.split('.')
+        sim_id = parts[3] if len(parts) >= 5 else None
+        found = None
+        if sim_id and getattr(v, 'repo_path', None) and Path(getattr(v, 'validator_state_file', '')).is_file():
+            logs = Path(v.repo_path) / 'simulate' / 'trading' / 'run' / 'logs'
+            try:
+                runs = sorted(d for d in logs.iterdir() if d.is_dir() and d.name.startswith(sim_id))
+            except OSError:
+                runs = []
+            found = self._run_layout(runs[-1]) if runs else None
+        v._scored_layout = layout_of(found[1] if found else getattr(v, 'simulation', None))
+        if found and v._scored_layout != layout_of(v.simulation):
+            logger.warning(f"The loaded records were scored on the layout of run {runs[-1].name}, not the loaded one; "
+                           "the next run's open moves them to their classes' books")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Benchmark agent handling (moved from validator)

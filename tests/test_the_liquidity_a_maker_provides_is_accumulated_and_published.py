@@ -53,7 +53,7 @@ def test_resting_at_the_best_is_read_from_the_accounts_orders_and_the_top_of_boo
     assert v.debeta_at_best[5][0] == 2 and 1 not in v.debeta_at_best[5], "two states at the best on book 0, none on book 1"
     assert v.debeta_best_size[5][0] == 6.0, "2 at the bid plus 1 at the ask, twice"
     assert v.debeta_at_best_hist[5][0] == {1: 1, 2: 1}
-    assert "accumulate_at_best(self, uid_item, books, accounts_uid, ts=sampled_timestamp)" in inspect.getsource(trade._process_uid_trade_volumes)
+    assert "accumulate_at_best(self, uid_item, books, accounts_uid, ts=sampled_timestamp, best=best)" in inspect.getsource(trade._process_uid_trade_volumes)
     assert "accumulate_maker_notional(self, bookId, de_trades, ts=sampled_timestamp)" in inspect.getsource(trade.update_trade_volumes)
 
 

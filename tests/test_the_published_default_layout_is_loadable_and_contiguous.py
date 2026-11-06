@@ -3,15 +3,10 @@
 """The layout the published launcher runs by default must load, and look the way the release says.
 
 run_validator.sh defaults SIMULATION_CONFIG to multiasset_simulation_0, so this is the configuration a
-miner actually trades unless they pass -g. Until 0.6.3 the carve shipped neither it nor the per-class
-config it references, and the published suite covered multi-asset nowhere: the tests that read a layout
-all read an INTERNAL bench (multiasset_mp.xml, multiasset_96_32.xml, multiasset_acceptance.xml) and were
-excluded from the carve for raising FileNotFoundError on files that do not ship. The release's headline
-capability therefore had no published test at all.
-
-This one reads the layout that ships, so it fails in a miner's tree if the carve ever stops shipping a
-piece of it, and it states the properties an agent is entitled to rely on: contiguous ids from zero, three
-named classes, and a grid per book rather than one top-level priceDecimals.
+miner actually trades unless they pass -g. This test reads the layout that ships, so it fails in a miner's
+tree if the tree stops shipping a piece of it (the wrapper or a per-class config it references), and it
+states the properties an agent is entitled to rely on: contiguous ids from zero, three named classes, and
+a grid per book rather than one top-level priceDecimals.
 """
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -44,11 +39,11 @@ def test_the_default_layout_loads_as_three_named_classes():
     classes = _layout().asset_classes()
     assert [c.name for c in classes] == ["simulation_0", "simulation_1", "simulation_2"], (
         "the published layout's classes are the names the migration note and the announcement use")
-    assert [len(c.books) for c in classes] == [64, 32, 32]
+    assert [len(c.books) for c in classes] == [128, 64, 64], "the published 128/64/64"
 
 
 def test_book_ids_run_contiguously_from_zero_across_the_whole_layout():
-    """An agent written on the 0.6.2 base class iterates range(book_count); that must still work."""
+    """An agent that iterates range(book_count) reaches every book of the layout."""
     cfg = _layout()
     assert cfg.book_ids == list(range(len(cfg.book_ids)))
     covered = [b for c in cfg.asset_classes() for b in c.books]

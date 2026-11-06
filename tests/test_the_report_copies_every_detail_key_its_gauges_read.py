@@ -3,10 +3,7 @@
 """The report builds one dict per miner from uid_kappa (where reward.py stored the de-beta detail) with an explicit
 key list, then its gauge loop and the miners table read that dict by detail key. A key reward.py stores and the
 gauge loop names, but the dict does not copy, is silently dark: the gauge is never published and the table label
-reads 0.0 for every miner, with no error anywhere. The two making bases (debeta_making_realized,
-debeta_making_captured) and debeta_making_basis went dark that way on the 0.6.3 testnet (6 October 2026): the
-making-basis line of the board monitor, the agents dashboard's making-credit panel and the acceptance's live-parity
-check all read nothing. This test holds the dict and the loop together."""
+reads 0.0 for every miner, with no error anywhere. This test holds the dict and the loop together."""
 import ast
 from pathlib import Path
 

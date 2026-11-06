@@ -4,8 +4,7 @@ The child re-scores from a hand-built namespace rather than the real config obje
 `compute_debeta_scores` but not to `_config_duck` therefore takes its `getattr` default inside the
 child while main uses the operator's value, and the two sides score differently with nothing failing
 loudly: it surfaces later as a parity mismatch, which reads as a shadow fault rather than a missing
-field. Two dials were added on 22 September and both had to be wired by hand, which is what this
-guards.
+field. A dial added without its wiring is what this guards.
 
 Scope is deliberately what the SCORER reads off `config.scoring.debeta`, not every declared
 argument: `publish_book_gauges` is read only by the reporter. `weight` is included: the fallback that

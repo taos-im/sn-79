@@ -7,8 +7,9 @@ At each state, on each book with a bid and an ask that do not cross, a uid's res
 the mid and its resting sell volume within the band above it are summed; when both reach the size gate the smaller of
 the two, times the interval since the previous state, is its presence for that interval. The band is the class's
 bound (`--scoring.debeta.conjunction_bounds`, one value per class in the layout's order) times the book's spread
-reference, a running mean of the quoted spread in basis points of the mid; the gate is
-`--scoring.debeta.conjunction_min_size_frac` of the book's size reference, a running mean of its fill sizes. The farm
+reference, the trailing hour's median quoted spread in basis points of the mid; the gate is
+`--scoring.debeta.conjunction_min_size_frac` of the book's size reference, the trailing hour's median fill size (0.6.7;
+tests/test_the_conjunction_references_are_the_trailing_hours_medians.py). The farm
 reference per book is what a quote at the gate's size on both sides would score: the gate times every counted
 interval. All of it is windowed on the kappa lookback, pruned, shifted, persisted and reset with the other de-beta
 accumulators, and pay reads none of it.
@@ -53,7 +54,7 @@ def test_the_book_references_follow_the_quoted_spread_and_the_fill_sizes():
     assert abs(spread - 20.0) < 1e-9 and size == 2.0, "the first sample sets each reference"
     trade.conjunction_book_refs(v, 0, _book(99.8, 100.2), [{"y": "t", "q": 4.0}])
     spread2, size2 = v.debeta_conj_ref[0]
-    assert 20.0 < spread2 < 40.0 and 2.0 < size2 < 4.0, "then a running mean moves toward each new sample"
+    assert abs(spread2 - 30.0) < 1e-9 and size2 == 3.0, "then the median of the samples kept"
     trade.conjunction_book_refs(v, 1, _book(100.2, 100.1), [])
     assert 1 not in v.debeta_conj_ref, "a crossed book sets no spread reference"
 
@@ -101,10 +102,10 @@ def test_the_interval_is_the_time_since_the_previous_state_and_is_capped():
 
 def test_the_accumulators_are_wired_into_the_state_update():
     src = inspect.getsource(trade.update_trade_volumes)
-    assert "conjunction_book_refs(self, bookId, book, trades)" in src
+    assert "conjunction_book_refs(self, bookId, book, trades, ts=timestamp)" in src
     assert "accumulate_conjunction_farm(self, books, dt=_conj_dt, ts=sampled_timestamp)" in src
     assert "_conj_dt = conjunction_interval(self, timestamp)" in src
-    assert "accumulate_conjunction(self, uid_item, books, accounts_uid, dt=self._conj_dt, ts=sampled_timestamp)" \
+    assert "accumulate_conjunction(self, uid_item, books, accounts_uid, dt=self._conj_dt, ts=sampled_timestamp, bands=bands)" \
         in inspect.getsource(trade._process_uid_trade_volumes)
 
 

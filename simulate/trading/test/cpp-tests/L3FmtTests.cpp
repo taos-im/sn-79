@@ -203,11 +203,11 @@ TEST(L3FmtTests, HighPrecisionValuesRoundTrip)
 
 #include <map>
 
-// A PUBLISHED CANCEL SAYS WHICH SIDE IT CANCELLED. It carried no side, so the miner library's book
-// replay guessed one from the price against the best ask (taos/im/protocol/book.py) and the data
-// service stored the missing value as 0: an ask placed with side=1 on book 4 (event 23996, 7 October)
-// was recorded cancelled with side=0, and a replay by side moves a cancel to the wrong side. The side is
-// the cancelled order's own, under "s" as an order event publishes it: 0 buy, 1 sell.
+// A PUBLISHED CANCEL SAYS WHICH SIDE IT CANCELLED. Without it the miner library's book replay has to
+// guess the side from the price against the best ask (taos/im/protocol/book.py), and a reader that
+// stores a missing side as 0 records a cancelled ask as a cancelled bid, so a replay by side moves the
+// cancel to the wrong side. The side is the cancelled order's own, under "s" as an order event
+// publishes it: 0 buy, 1 sell.
 TEST(CancellationEvent, PublishesTheSideOfTheOrderItCancels)
 {
     for (const auto dir : {OrderDirection::BUY, OrderDirection::SELL}) {

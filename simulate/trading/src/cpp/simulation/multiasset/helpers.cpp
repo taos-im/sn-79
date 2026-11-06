@@ -10,9 +10,13 @@
 #include <taosim/simulation/SimulationManager.hpp>
 #include <taosim/xml/helpers.hpp>
 
+#include <fmt/format.h>
+
 #include <algorithm>
+#include <charconv>
 #include <optional>
 #include <string>
+#include <string_view>
 
 //-------------------------------------------------------------------------
 
@@ -48,6 +52,21 @@ std::unique_ptr<simulation::SimulationOrchestrator> makeOrchestratorFromCheckpoi
         return MultiAssetSimulationOrchestrator::fromCheckpoint(ckptToken);
     }
     return simulation::SimulationManager::fromCheckpoint(ckptToken);
+}
+
+//-------------------------------------------------------------------------
+
+std::optional<uint32_t> threadsFromEnvironment(const char* value)
+{
+    if (value == nullptr || *value == '\0') return std::nullopt;
+    const std::string_view text{value};
+    uint32_t threads{};
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), threads);
+    if (ec != std::errc{} || end != text.data() + text.size() || threads == 0) {
+        fmt::println("TAOSIM_THREADS=\"{}\" is not a positive integer; the config's threads apply", text);
+        return std::nullopt;
+    }
+    return threads;
 }
 
 //-------------------------------------------------------------------------
@@ -108,12 +127,9 @@ pugi::xml_document adjustedBackgroundDoc(
     if (seed) {
         xml::setAttribute(simuNode, "rngSeed", *seed);
     }
-    // Quote balances stay per book, as in a single-market run. Until 30 September 2026 this stamped
-    // sharedQuoteBalances onto every realization, which gave a miner ONE quote wallet per realization
-    // holding one book's template quote (25k for sixteen books, where mainnet gives 25k per book): the
-    // probe miner in the first multi-asset test emptied two realizations' wallets in the first sim hour
-    // and never traded there again, and the validator's balance totals summed the wallet once per book.
-    // A portfolio wallet may come back later as a sized, declared option, not as a stamp.
+    // Quote balances stay per book, as in a single-market run: a wallet shared across a realization's books would hold
+    // one book's template quote for all of them, and the validator's balance totals would sum it once per book. A
+    // portfolio wallet may come back later as a sized, declared option, not as a stamp.
 
     return doc;
 }

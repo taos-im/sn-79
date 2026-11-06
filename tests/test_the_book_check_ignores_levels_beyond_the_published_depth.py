@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The published book carries a fixed number of levels per side; the miner's reconstruction carries every level the
 events built. When the published side is full, a reconstructed level deeper than its worst published level is not a
-discrepancy: the publisher simply did not print it (on the 7 October capture 1740 of the 'other' mismatches were
-levels entering or leaving the published window). When the published side is short of the depth, every level is
+discrepancy: the publisher simply did not print it, and levels entering or leaving the published window would otherwise read
+as mismatches. When the published side is short of the depth, every level is
 printed and a deeper reconstructed level is a real disagreement."""
 from types import SimpleNamespace
 

@@ -31,6 +31,7 @@ independent of the launching shell's CWD.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json as _json
 import logging
 import math
@@ -110,6 +111,29 @@ def _json_safe(obj):
     if isinstance(obj, (list, tuple)):
         return [_json_safe(v) for v in obj]
     return obj
+
+
+def gradient_content_hash(comp) -> str:
+    """A gradient's content as a sha256 hex digest: in parameter-name order, each parameter's name, shape and the
+    nonzero entries of the dense float32 update the scoring applies (decompress), as int64 indices in ascending order
+    and float32 values. An encoding that applies the same update (other index or value dtypes, permuted pairs,
+    explicit zeros) hashes the same, and a parameter whose update is all zero is left out, as is the metadata, which
+    names the uploader."""
+    import torch
+
+    h = hashlib.sha256()
+    for name in sorted(comp.sparse):
+        indices, vals, shape = comp.sparse[name]
+        shape = torch.Size(shape)
+        flat = torch.zeros(shape.numel(), dtype=torch.float32)
+        flat[indices.detach().cpu().reshape(-1).long()] = vals.detach().cpu().reshape(-1).to(torch.float32)
+        nz = torch.nonzero(flat).reshape(-1)
+        if nz.numel() == 0:
+            continue
+        h.update(f"{name}\0{tuple(shape)}\0{nz.numel()}\0".encode())
+        h.update(nz.to(torch.int64).contiguous().numpy().tobytes())
+        h.update(flat[nz].contiguous().numpy().tobytes())
+    return h.hexdigest()
 
 
 def _serialize_assignments(d: dict) -> dict:
@@ -299,7 +323,7 @@ class GradientAggregator:
         log_path: str | None = None,
         books_per_miner: int = 3,
         val_fraction: float = 0.10,
-        min_score: float = -0.1,
+        min_score: float = 0.0,
         warmup_rounds: int = 5,
         rollback: bool = True,
         label_smooth_sigma: float = 1.0,
@@ -477,6 +501,8 @@ class GradientAggregator:
         self._sim_epoch: int = 0
         self._last_seen_sim_ts: int = 0
         self._dedup_drops_total: int = 0
+        self._copy_drops_total: int = 0
+        self._grad_uploaded_at: dict[tuple[int, int], float] = {}
         self._pre_bind_drops: int = 0
         # Reorder buffer for out-of-order state ticks. Ticks are held when
         # they arrive with a sim-timestamp jump larger than _reorder_jump_ns
@@ -537,6 +563,7 @@ class GradientAggregator:
             "n_delivered": 0,
             "n_collected": 0,
             "n_version_mismatched": 0,
+            "n_copies": 0,
             "n_scored": 0,
             "n_accepted": 0,
             "loss_before": 0.0,
@@ -694,19 +721,19 @@ class GradientAggregator:
         self._book_flush_locks: dict[int, threading.Lock] = {}
         # Per-book engine state persists across _process_tick calls
         self._engines: dict[int, Any] = {}
-        self._order_sides: dict[int, dict[int, bool]] = {}
         self._last_ts: dict[int, int] = {}
+        # Books whose clock a tick has set since start or the last sim reset; a restored book is not one of them.
+        self._ticked_books: set[int] = set()
         self._session_open_mid: dict[int, int | None] = {}
         # Local staging file for in-progress parquet buffer: persisted
         # periodically so a restart can continue filling the current window
         # rather than starting a fresh 5-min accumulation.
         # SCOPED BY MODE, not just by directory. checkpoint_path is .resolve()d above, so two
-        # aggregators whose --checkpoint paths differ only by a symlink collapse to the SAME parent.
-        # That happened: the exchange server restored the simulation's buffer ("Restored pending
-        # buffer: 128 books, 165419 rows"), exchange rows were written into simulation books, and the
-        # exchange mechanism never accumulated a page of its own. A directory split alone could not
-        # prevent it; the filename must carry the mode. Empty mode keeps the legacy name so an older
-        # invocation does not orphan an existing buffer.
+        # aggregators whose --checkpoint paths differ only by a symlink collapse to the SAME parent,
+        # and without the mode in the filename one would restore the other's buffer and write its
+        # rows into the other's books. A directory split alone cannot prevent that, so the filename
+        # carries the mode. Empty mode keeps the legacy name so an older invocation does not orphan
+        # an existing buffer.
         self._pending_staging_path: Path = self.checkpoint_path.parent / (
             f"pending_rows.{self._mode}.msgpack" if self._mode else "pending_rows.msgpack"
         )
@@ -1629,6 +1656,7 @@ class GradientAggregator:
                         "n_delivered",
                         "n_collected",
                         "n_version_mismatched",
+                        "n_copies",
                         "n_scored",
                         "n_accepted",
                         "loss_before",
@@ -2277,7 +2305,6 @@ class GradientAggregator:
                 # and overwrite our restored pending_rows with [].
                 if bid not in self._engines:
                     self._engines[bid] = MatchingEngine()
-                    self._order_sides[bid] = {}
                     self._session_open_mid[bid] = None
 
             if max_ts > self._max_timestamp_ns:
@@ -2442,6 +2469,51 @@ class GradientAggregator:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _tail_flush_stalled_books(self) -> None:
+        """Tail flush for stalled / sparse books. Active books flush at the row cap in _process_tick; this lands a
+        partial page once a book stops receiving rows (the book clock advanced past its last event by a full
+        interval) so it does not linger. With the cap disabled the sim-time interval is the primary trigger, so it
+        falls back to the interval-start comparison.
+
+        A ROBUST CLOCK, NOT THE MAXIMUM. "Has the sim advanced past this book" is measured against the median of the
+        books' last-event times (_book_clock), not self._max_timestamp_ns: a maximum over every book lets one book
+        with a bad timestamp define the clock for all of them, so every other book sits a full interval behind it and
+        tail-flushes on every loop, into pages too short to train on. The median cannot be moved by a single outlier.
+        The outlier is reported rather than silently tolerated: it is a real symptom, and hiding it would trade one
+        silent failure for another."""
+        if self._max_timestamp_ns <= 0:
+            return
+        _cap = self._max_pending_rows_per_book
+        # Right after a restart only the books that have ticked form the median (_clock_lasts).
+        _lasts = self._clock_lasts()
+        if _lasts:
+            _clock = self._book_clock(_lasts)
+            _hi = _lasts[-1]
+            if (_hi - _clock) >= self._parquet_interval_ns and not getattr(
+                self, "_clock_outlier_warned", False
+            ):
+                self._clock_outlier_warned = True
+                _who = [b for b, v in self._last_ts.items() if v == _hi]
+                logger.warning(
+                    "book clock outlier: book(s) %s at ts=%d are %.0fs ahead of the "
+                    "median book (%d). Using the median as the sim clock so one book "
+                    "cannot stall the rest; investigate the source of that timestamp.",
+                    _who, _hi, (_hi - _clock) / 1e9, _clock,
+                )
+        else:
+            _clock = self._max_timestamp_ns
+        for _bid in list(self._pending_rows):
+            if not self._pending_rows[_bid]:
+                continue
+            if _cap:
+                _last = self._last_ts.get(_bid, 0)
+                if _last > 0 and (_clock - _last) >= self._parquet_interval_ns:
+                    self._flush_book_parquet(_bid)
+            else:
+                _start = self._pending_interval_start.get(_bid, 0)
+                if _start > 0 and (_clock - _start) >= self._parquet_interval_ns:
+                    self._flush_book_parquet(_bid)
+
     def _aggregation_loop(self) -> None:
         """Event-driven aggregation loop.
 
@@ -2475,61 +2547,7 @@ class GradientAggregator:
                     self._prune_s3_cache()
                     self._last_s3_cache_prune = _now
 
-                # Tail flush for stalled / sparse books. Active books flush at
-                # the row cap in _process_tick; this lands a partial page once a
-                # book stops receiving rows (global sim clock advanced past its
-                # last event by a full interval) so it does not linger. With the
-                # cap disabled the sim-time interval is the primary trigger, so
-                # fall back to the interval-start comparison.
-                if self._max_timestamp_ns > 0:
-                    _cap = self._max_pending_rows_per_book
-                    # A ROBUST CLOCK, NOT THE MAXIMUM.
-                    #
-                    # "Has the sim advanced past this book" used self._max_timestamp_ns, which is a
-                    # MAX over every book -- so one book with a bad timestamp defines the clock for
-                    # all of them. Book 70 held 1530540000000000 (425 sim-hours,
-                    # exchange-scale) while the other 128 sat at ~2.45e12 (0.68h). Every one of them
-                    # was then 1,528,085s "behind" a 300s interval, so every book tail-flushed on
-                    # every loop -- pages of 1-3 sim-seconds and ~217 rows against train_seq_len=512,
-                    # which reads downstream as "no trainable pages" and no gradient, on a stack where
-                    # nothing was actually wrong with training.
-                    #
-                    # The median cannot be moved by a single outlier, so one poisoned book can no
-                    # longer stall the other 128. The outlier is reported rather than silently
-                    # tolerated: it is a real symptom (here, exchange-scale time in a simulation
-                    # aggregator) and hiding it would trade one silent failure for another.
-                    _lasts = sorted(v for v in self._last_ts.values() if v > 0)
-                    if _lasts:
-                        _clock = _lasts[len(_lasts) // 2]
-                        _hi = _lasts[-1]
-                        if (_hi - _clock) >= self._parquet_interval_ns and not getattr(
-                            self, "_clock_outlier_warned", False
-                        ):
-                            self._clock_outlier_warned = True
-                            _who = [b for b, v in self._last_ts.items() if v == _hi]
-                            logger.warning(
-                                "book clock outlier: book(s) %s at ts=%d are %.0fs ahead of the "
-                                "median book (%d). Using the median as the sim clock so one book "
-                                "cannot stall the rest; investigate the source of that timestamp.",
-                                _who, _hi, (_hi - _clock) / 1e9, _clock,
-                            )
-                    else:
-                        _clock = self._max_timestamp_ns
-                    for _bid in list(self._pending_rows):
-                        if not self._pending_rows[_bid]:
-                            continue
-                        if _cap:
-                            _last = self._last_ts.get(_bid, 0)
-                            if _last > 0 and (
-                                _clock - _last
-                            ) >= self._parquet_interval_ns:
-                                self._flush_book_parquet(_bid)
-                        else:
-                            _start = self._pending_interval_start.get(_bid, 0)
-                            if _start > 0 and (
-                                _clock - _start
-                            ) >= self._parquet_interval_ns:
-                                self._flush_book_parquet(_bid)
+                self._tail_flush_stalled_books()
 
                 # Drain any rounds queued by POST /gentrx/round. The HTTP
                 # handler installs new assignments and advances _agg_round
@@ -2880,6 +2898,7 @@ class GradientAggregator:
                 grad_data = self._try_read_miner_gradient(uid, a["round"])
                 if grad_data is not None:
                     a["_gradient_data"] = grad_data
+                    a["_uploaded_at"] = self._grad_uploaded_at.pop((uid, a["round"]), None)
                     a["_state"] = "GRADIENT_IN"
                     logger.info(
                         "[GTX] round=%d gradient received: uid=%d (%.1f KB)",
@@ -2931,6 +2950,9 @@ class GradientAggregator:
                     t_start = time.time()
                     resp = client.get_object(Bucket=bucket_info.bucket_name, Key=key)
                     data = resp["Body"].read()
+                    modified = resp.get("LastModified")
+                    if modified is not None and hasattr(modified, "timestamp"):
+                        self._grad_uploaded_at[(uid, round_id)] = float(modified.timestamp())
                     t_get = time.time() - t_start
                     self._processed_grad_keys.add(dedup_key)
                     logger.info(
@@ -3422,6 +3444,13 @@ class GradientAggregator:
                 )
                 return None
 
+            # Own try: a gradient whose content cannot be hashed is still scored, and the copy check passes over it.
+            try:
+                assignment["_content_hash"] = gradient_content_hash(comp)
+            except Exception:
+                assignment["_content_hash"] = None
+                logger.debug("  miner %d: gradient content hash failed", miner_uid, exc_info=True)
+
             t_loader_start = time.time()
             miner_loader = self._build_miner_loader(assignment, tokenizer, device)
             if miner_loader is None:
@@ -3638,7 +3667,14 @@ class GradientAggregator:
           fresh-regime random init, can push the apply over fp32 stability).
           During warmup anything is accepted (model bootstrapping from scratch).
         - No held-out loader (outside warmup): the score is own-data loss
-          (memorization), not a generalization signal."""
+          (memorization), not a generalization signal.
+        - In warmup and after: a gradient whose norm is 0 (no update), and one whose content another uid uploaded
+          this round, unless it is the single earliest upload of that content (_mark_copies): rejected."""
+        if assignment.get("_duplicate_of") is not None:
+            return False
+        norm = assignment.get("_grad_norm")
+        if norm is not None and norm <= 0.0:
+            return False
         if score <= self._effective_min_score:
             return False
         if not self._in_warmup and assignment.get("_version_mismatched"):
@@ -3646,6 +3682,37 @@ class GradientAggregator:
         if not self._in_warmup and assignment.get("_no_held"):
             return False
         return True
+
+    def _mark_copies(self, scored: list) -> None:
+        """Mark the scored gradients whose content (_content_hash) another uid uploaded this round: the single earliest
+        upload by the storage's time keeps the content, and the rest carry _duplicate_of, the uid that keeps it. When
+        the earliest time is shared by more than one uid, or an upload of that content has no time, no uid keeps it
+        and every one carries _duplicate_of, the lowest other uid with that content."""
+        by_content: dict[str, list] = {}
+        for m, _w, _s, _c, a in scored:
+            h = a.get("_content_hash")
+            if h is not None:
+                by_content.setdefault(h, []).append((m, a))
+        for group in by_content.values():
+            if len(group) < 2:
+                continue
+            times = [a.get("_uploaded_at") for _m, a in group]
+            keeper = None
+            if None not in times and times.count(min(times)) == 1:
+                keeper = group[times.index(min(times))][0]
+            for m, a in group:
+                if m == keeper:
+                    continue
+                if keeper is not None:
+                    a["_duplicate_of"] = keeper
+                    logger.warning("  miner %d: gradient content matches miner %d's upload, rejected", m, keeper)
+                else:
+                    a["_duplicate_of"] = min((u for u, _a in group if u != m), default=m)
+                    logger.warning(
+                        "  miner %d: gradient content matches miner(s) %s with no single earliest upload, rejected",
+                        m, sorted(u for u, _a in group if u != m),
+                    )
+                self._copy_drops_total = getattr(self, "_copy_drops_total", 0) + 1
 
     def _aggregate_accepted(
         self,
@@ -3682,6 +3749,8 @@ class GradientAggregator:
         def _is_acceptable(s: float, a: dict) -> bool:
             return self._is_gradient_acceptable(s, a)
 
+        self._mark_copies(scored)
+
         accepted = [(m, w, s, c, a) for m, w, s, c, a in scored if _is_acceptable(s, a)]
         rejected = [(m, w, s, a) for m, w, s, _, a in scored if not _is_acceptable(s, a)]
 
@@ -3692,6 +3761,7 @@ class GradientAggregator:
         n_version_mismatched = sum(
             1 for _, a in round_assignments if a.get("_version_mismatched")
         )
+        n_copies = sum(1 for _m, _w, _s, _c, a in scored if a.get("_duplicate_of") is not None)
         t_loader_build_miners = sum(
             a.get("_t_loader_build", 0.0) for _, a in round_assignments
         )
@@ -3755,7 +3825,8 @@ class GradientAggregator:
                     "score_own": a.get("_score_own"),
                     "score_held": a.get("_score_held"),
                     "overfitting": a.get("_overfitting", False),
-                    "accepted": s > threshold,
+                    "accepted": _is_acceptable(s, a),
+                    "duplicate_of": a.get("_duplicate_of"),
                     "books": a.get("books", []),
                     "version": self._version,
                 }
@@ -3773,6 +3844,7 @@ class GradientAggregator:
                     "n_delivered": n_delivered,
                     "n_collected": n_collected,
                     "n_version_mismatched": n_version_mismatched,
+                    "n_copies": n_copies,
                     "n_scored": len(scored),
                     "n_accepted": 0,
                     "t_loader_build_s": t_loader_build_miners,
@@ -4077,6 +4149,7 @@ class GradientAggregator:
                         "n_delivered": n_delivered,
                         "n_collected": n_collected,
                         "n_version_mismatched": n_version_mismatched,
+                        "n_copies": n_copies,
                         "n_scored": len(scored),
                         "n_accepted": len(accepted),
                         "loss_before": baseline_loss,
@@ -4103,6 +4176,7 @@ class GradientAggregator:
                         "n_delivered": n_delivered,
                         "n_collected": n_collected,
                         "n_version_mismatched": n_version_mismatched,
+                        "n_copies": n_copies,
                         "n_scored": len(scored),
                         "n_accepted": len(accepted),
                         "version": self._version,
@@ -4193,6 +4267,7 @@ class GradientAggregator:
                 "n_delivered": n_delivered,
                 "n_collected": n_collected,
                 "n_version_mismatched": n_version_mismatched,
+                "n_copies": n_copies,
                 "n_scored": len(scored),
                 "n_accepted": len(accepted),
                 "loss_before": baseline_loss,
@@ -4271,6 +4346,7 @@ class GradientAggregator:
             "counters": {
                 "rounds_aggregated_total": self._rounds_aggregated_total,
                 "rollbacks_total": self._rollbacks_total,
+                "copy_drops_total": self._copy_drops_total,
             },
             "config": {
                 "min_score": self.min_score,
@@ -4524,6 +4600,21 @@ class GradientAggregator:
             else:
                 break
 
+    def _clock_lasts(self) -> list[int]:
+        """Sorted last-event times of the books that have ticked since the server started or the last sim reset
+        (_ticked_books). A book restored from an earlier run's buffer and silent since is left out; until any book has
+        ticked, every book with a time counts."""
+        lasts = sorted(v for b, v in self._last_ts.items() if v > 0 and b in self._ticked_books)
+        return lasts or sorted(v for v in self._last_ts.values() if v > 0)
+
+    def _book_clock(self, lasts: list[int] | None = None) -> int:
+        """The clock the tail flush measures each book's interval against: the median of _clock_lasts (or of `lasts`,
+        a list it already returned), so one book far ahead cannot define it, and the newest timestamp seen before any
+        book has a time."""
+        if lasts is None:
+            lasts = self._clock_lasts()
+        return lasts[len(lasts) // 2] if lasts else self._max_timestamp_ns
+
     def _reset_sim_buffers(self) -> None:
         """Drop every in-memory tick buffer so the next sim starts clean.
 
@@ -4537,6 +4628,7 @@ class GradientAggregator:
         self._written_parquets = {}
         self._book_flush_locks = {}
         self._last_seen_sim_ts = 0
+        self._ticked_books = set()
         self._reorder_buf = []
         self._reorder_seq = 0
         self._ts_increment_ema = 0.0
@@ -4857,11 +4949,10 @@ class GradientAggregator:
 
         tick_ts = int(tick.get("ts", 0) or 0)
 
-        # INGEST COUNTER. There was no way to tell a tick that carried nothing from a tick that was
-        # never sent: /data-status only reports books that already have PARQUETS, so an aggregator
-        # receiving a steady stream of event-free ticks looked identical to one receiving nothing at
-        # all, for as long as you cared to watch. That ambiguity hid the exchange mechanism producing
-        # zero training rows across several hour-long runs. Cheap counters, logged once a minute.
+        # INGEST COUNTER. /data-status only reports books that already have PARQUETS, so without
+        # these an aggregator receiving a steady stream of event-free ticks looks identical to one
+        # receiving nothing at all. Cheap counters, logged once a minute, tell a tick that carried
+        # nothing from a tick that was never sent.
         self._ingest_ticks += 1
         _bk = tick.get("books") or {}
         self._ingest_books += len(_bk)
@@ -4943,9 +5034,8 @@ class GradientAggregator:
                 #
                 # --no-startup-cleanup says "do not wipe stored data/", which is about the BUCKET. The
                 # in-memory tick buffers belong to the PREVIOUS sim's clock and are meaningless against
-                # the new one: interval_start sat at 907s from the old epoch while
-                # the live sim was at 687s, so `clock - interval_start` was NEGATIVE and no book could
-                # flush until the sim ran another ~520 seconds -- past the end of the acceptance window.
+                # the new one: an interval_start from the old epoch can sit ahead of the live sim, so
+                # `clock - interval_start` is NEGATIVE and no book flushes until the new sim catches up.
                 # Reset them regardless; stored data is untouched either way.
                 self._reset_sim_buffers()
                 logger.warning(
@@ -4986,7 +5076,6 @@ class GradientAggregator:
 
             if book_id not in self._engines:
                 self._engines[book_id] = MatchingEngine()
-                self._order_sides[book_id] = {}
                 self._last_ts[book_id] = 0
                 self._session_open_mid[book_id] = None
                 self._pending_rows[book_id] = []
@@ -5039,7 +5128,6 @@ class GradientAggregator:
                 else:
                     eid = ev.get("i", 0)
                     order_type = BID if is_buy else ASK
-                    self._order_sides[book_id][eid] = is_buy
                     remaining = float(ev.get("q", 0))
                     full_qty = remaining + taker_fill_qty.get(eid, 0.0)
                     qty = remaining
@@ -5088,6 +5176,7 @@ class GradientAggregator:
                 if drive_engine:
                     engine.process_order(order_type, price_ticks, vol_ticks, is_buy)
                 self._last_ts[book_id] = evt
+                self._ticked_books.add(book_id)
 
                 if evt > self._max_timestamp_ns:
                     self._max_timestamp_ns = evt
@@ -5258,7 +5347,8 @@ def add_api_key_middleware(app, api_key: str) -> None:
 
     class APIKeyMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
-            if request.headers.get("X-API-Key") != api_key:
+            provided = request.headers.get("X-API-Key") or ""
+            if not hmac.compare_digest(provided.encode(), api_key.encode()):
                 return JSONResponse(
                     {"error": "Invalid or missing X-API-Key"},
                     status_code=401,
@@ -5276,8 +5366,8 @@ def create_gradient_router(
 ) -> tuple[APIRouter, GradientAggregator]:
     """Create a FastAPI router + aggregator for gradient exchange.
 
-    Data collection is handled by the validator/proxy — it saves
-    mvtrx state updates directly to S3. The gradient server
+    Data collection is handled by the validator/proxy, which saves
+    the state updates directly to S3. The gradient server
     reads from S3 for scoring.
 
     Returns (router, aggregator) — caller must call aggregator.start().
@@ -5770,7 +5860,7 @@ if __name__ == "__main__":
         default=30,
         help="Aggregation interval in seconds (default: 30)",
     )
-    parser.add_argument("--min-score", type=float, default=-0.1)
+    parser.add_argument("--min-score", type=float, default=0.0)
     parser.add_argument(
         "--max-grad-norm",
         type=float,

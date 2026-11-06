@@ -23,6 +23,7 @@ import os
 os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
 
 import argparse
+import copy
 import bittensor as bt
 from loguru import logger
 
@@ -320,6 +321,23 @@ def prune_config(cfg, cls):
     re-injecting the default shadows — so this must run again after any
     merge (see BaseNeuron.__init__), not only at construction."""
     _prune_default_shadow_configs(cfg, _build_parser(cls))
+
+
+# Settings whose values are secrets: a log of the config shows them as "set", never their value.
+SECRET_SETTINGS = ("alerting.pagerduty.integration_key", "gentrx.api_key")
+
+
+def loggable_config(cfg: "bt.Config") -> str:
+    """The config as it is logged: each secret that is set reads "set". The config itself is left as it is."""
+    shown = copy.deepcopy(cfg)
+    for path in SECRET_SETTINGS:
+        *groups, name = path.split(".")
+        node = shown
+        for group in groups:
+            node = node.get(group) if isinstance(node, dict) else None
+        if isinstance(node, dict) and node.get(name):
+            node[name] = "set"
+    return str(shown)
 
 
 def config(cls):

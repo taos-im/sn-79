@@ -30,6 +30,9 @@ from taos.common.utils.prometheus import prometheus
 from taos.im.utils import duration_from_timestamp
 from taos.im.config import debeta_dial
 from taos.im.validator.ingest_payload import kappa_maps, debeta_maps, scoring_params
+from taos.im.validator import order_stats
+# a report cycle allocates millions of tuples and dicts; the cyclic collector is paused around it (gc_pause)
+from taos.im.validator.gc_pause import cyclic_gc_paused
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import GaugeMetricFamily
 from taos.im.validator.exposition import Exposition, SNAPSHOT_ENABLED
@@ -98,10 +101,9 @@ class ReportingService:
 
     def _response_for(self, data: dict) -> dict:
         """What the main process gets back for one publish: the step, and the two pieces of state the service owns
-        between cycles. A publish that deferred (the simulation id not yet known on a cold run) returned before it
-        copied the request's state onto the service, so the loop read attributes that were never set and failed every
-        cycle until the id appeared (localnet deploy, 7 October 2026). The request's own values answer in that case,
-        so the main process gets back exactly what it sent."""
+        between cycles. A publish that defers (the simulation id not yet known on a cold run) returns before it copies
+        the request's state onto the service, so those attributes may never have been set. The request's own values
+        answer in that case, so the main process gets back exactly what it sent."""
         return {
             'step': data.get('step'),
             'initial_balances_published': getattr(self, 'initial_balances_published', None)
@@ -213,7 +215,7 @@ class ReportingService:
 
         def _body(name=None):
             # The frozen cycle, rendered once and sliced per registry; before the first cycle, or with
-            # the snapshot switched off, the live render the child served until 30 September 2026.
+            # the snapshot switched off, the live render of the registries.
             if SNAPSHOT_ENABLED:
                 served = self.exposition.serve(name)
                 if served is not None:
@@ -326,8 +328,7 @@ class ReportingService:
         # the Prometheus child once and skips the lock+tuple-normalize that
         # gauge.labels() pays on every call, and skips the .set() entirely when
         # the value is unchanged from the prior cycle. This is the hot path at
-        # full cardinality (~1.6M agent_gauges updates/cycle on mainnet's
-        # 128 books x ~256 miners). Cleared families (trades/books/miner_trades)
+        # full cardinality (every miner on every book, each cycle). Cleared families (trades/books/miner_trades)
         # are NOT cached — their children are destroyed each cycle. Entries are
         # evicted via _remove_and_evict on every .remove(), and the whole cache
         # is reset on simulation changeover (clear_all_metrics).
@@ -339,8 +340,8 @@ class ReportingService:
         self._debeta_book_gauges = bool(debeta_dial(getattr(_sc, 'debeta', None), 'publish_book_gauges'))
 
         self.prometheus_counters = Counter('counters', 'Counter summaries for the running validator.', ['wallet', 'netuid', 'sim_id', 'timestamp', 'counter_name'], registry=self.registry_validator)
-        # simulation_gauges, miner_gauges and book_gauges are snapshot-backed since 30 September 2026 (carry
-        # forward, as the eager Gauges did) so that a scrape is one frozen cycle; see exposition.py.
+        # simulation_gauges, miner_gauges and book_gauges are snapshot-backed (they carry forward, as eager Gauges
+        # would) so that a scrape is one frozen cycle; see exposition.py.
         self.prometheus_simulation_gauges = _SnapshotCollector('simulation_gauges', 'Gauge summaries for global simulation metrics.', ['wallet', 'netuid', 'sim_id', 'simulation_gauge_name'])
         self.registry_simulation.register(self.prometheus_simulation_gauges)
         # Per asset class under a multi-asset layout (0.6.3): weight, bar, books, makers, skilled uids, credit and the
@@ -389,9 +390,8 @@ class ReportingService:
             'book_gauge_name'
         ], carry_forward=False)
         self.registry_books.register(self.prometheus_books)
-        # miners and miner_identity are rebuilt in full every cycle: replace-mode snapshot collectors since
-        # 30 September 2026, so no scrape can see them half rebuilt (three of 206 mainnet board reads in the
-        # week before lost some or all coldkeys that way).
+        # miners and miner_identity are rebuilt in full every cycle: replace-mode snapshot collectors, so no
+        # scrape can see them half rebuilt (a half-rebuilt read loses some or all coldkeys).
         self.prometheus_miners = _SnapshotCollector('miners', 'Gauge summaries for miner metrics.', [
             'wallet', 'netuid', 'sim_id', 'timestamp', 'timestamp_str', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port', 'axon',
             'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
@@ -408,6 +408,8 @@ class ReportingService:
             'debeta_making_share', 'debeta_ladder_input',
             'debeta_present', 'debeta_coverage_books', 'debeta_skill_coverage_factor',
             'num_scored_books', 'scorable',
+            # resting orders and open loans, summed over the books (order_stats)
+            'open_bids', 'open_asks', 'resting_notional', 'open_loans',
             'miner_gauge_name'
         ], carry_forward=False)
         self.registry_miner.register(self.prometheus_miners)
@@ -488,10 +490,9 @@ class ReportingService:
             self.prometheus_trades: {},
             self.prometheus_miner_trades: {},
             self.prometheus_books: {},
-            # since 30 September 2026 every bulk family is snapshot-backed, so a scrape is one frozen
-            # cycle: these three carry forward as their eager Gauges did, miners and miner_identity are
-            # rebuilt in full every cycle (replace) as their clear-and-rebuild did, without the window
-            # in which a scrape saw the family half rebuilt
+            # every bulk family is snapshot-backed, so a scrape is one frozen cycle: these three carry
+            # forward, miners and miner_identity are rebuilt in full every cycle (replace), and no scrape
+            # sees a family half rebuilt
             self.prometheus_simulation_gauges: {},
             self.prometheus_miner_gauges: {},
             self.prometheus_book_gauges: {},
@@ -552,14 +553,17 @@ class ReportingService:
                     size_bytes = self.request_mem.read(8)
                     data_size = struct.unpack('Q', size_bytes)[0]
                     request_bytes = self.request_mem.read(data_size)
-                    
-                    deserialize_start = time.time()
-                    data = msgpack.unpackb(request_bytes, raw=False, strict_map_key=False)
-                    deserialize_time = time.time() - deserialize_start
-                    
-                    bt.logging.info(f"Read reporting data ({time.time()-read_start:.4f}s, deserialize={deserialize_time:.4f}s)")
 
-                    await self.publish_metrics(data)
+                    with cyclic_gc_paused():
+                        deserialize_start = time.time()
+                        data = msgpack.unpackb(request_bytes, raw=False, strict_map_key=False)
+                        deserialize_time = time.time() - deserialize_start
+
+                        bt.logging.info(
+                            f"Read reporting data ({time.time()-read_start:.4f}s, deserialize={deserialize_time:.4f}s)"
+                        )
+
+                        await self.publish_metrics(data)
 
                     result = self._response_for(data)
                     write_start = time.time()
@@ -684,6 +688,11 @@ class ReportingService:
             }
             for uid, book_trades in data['recent_miner_trades'].items()
         }
+        self.levers = dict(data.get('levers') or {})
+        self.recent_fee_rates = {
+            int(uid): {int(bookId): rates for bookId, rates in book_rates.items()}
+            for uid, book_rates in (data.get('recent_fee_rates') or {}).items()
+        }
 
         self.volume_sums = deserialize_to_nested_dict(data['volume_sums'])
         self.maker_volume_sums = deserialize_to_nested_dict(data['maker_volume_sums'])
@@ -714,6 +723,7 @@ class ReportingService:
         self.round_gaps = list(data.get('round_gaps') or [])
         self.query_waits = list(data.get('query_waits') or [])
         self.reward_gate_waits = list(data.get('reward_gate_waits') or [])
+        self.fundamental_seed_sources = dict(data.get('fundamental_seed_sources') or {})
         self.pending_reward_tasks = int(data.get('pending_reward_tasks') or 0)
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
@@ -856,8 +866,7 @@ class ReportingService:
             "reconciliation": data.get('reconciliation', {}),
             # per-agent scoring — used by data service to build agent:stats. The kappa and de-beta
             # keys come from the same functions as the validator's own push, so agent_kappa is the
-            # kappa TOTAL here as everywhere (this push used to send the kappa SCORE under that key,
-            # and the two landed in the same agent_snapshots column).
+            # kappa TOTAL here as everywhere (both pushes land in the same agent_snapshots column).
             "agent_scores":          self.scores,
             **kappa_maps(self.kappa_values),
             **debeta_maps(self.kappa_values),
@@ -1008,10 +1017,9 @@ def publish_capture_settle_gauges(self, updates, wallet_addr, netuid, simid):
 def neuron_info_labels(self) -> dict:
     """The labels of the neuron_info series: the validator's identity, every scoring dial it runs
     (config_scoring_*) and the fee policy (simulation_fee_policy_*), which the dashboards' Scoring Config and
-    Fee Policy tables read. The market parameters are NOT here: since 0.6.3 simulation_config_info publishes them
-    per asset class, and carrying a copy of all of them put this series at 150 labels, which the metrics store
-    behind the dashboards refused on 6 October 2026 (VictoriaMetrics ignores a series over its per-series label
-    cap); the two tables went dark while the 100-label per-class series was ingested. Held under 100 by
+    Fee Policy tables read. The market parameters are NOT here: simulation_config_info publishes them per asset
+    class, and a copy of all of them would carry this series past the metrics store's per-series label cap
+    (VictoriaMetrics ignores such a series, and the two tables go dark). Held under 100 by
     tests/test_the_neuron_info_series_stays_under_the_store_label_cap.py."""
     hotkey = self.wallet.hotkey.ss58_address
     labels = {
@@ -1091,6 +1099,13 @@ def round_block_gauges(ms) -> list:
     ]
 
 
+def fundamental_seed_gauges(self) -> list:
+    """How many step seeds each source gave since the validator started, as (gauge, value): drand's HTTP endpoints,
+    the chain's Drand pallet and the random fallback, and how often two endpoints served different randomness."""
+    src = dict(getattr(self, 'fundamental_seed_sources', None) or {})
+    return [(f"fundamental_seed_{k}", float(src.get(k, 0))) for k in ("drand", "chain", "random", "drand_disagree")]
+
+
 def round_timing_gauges(self) -> list:
     """The validator's round timing over its last published rounds, as (gauge, value): the round period's 5th
     percentile, median and 95th percentile (wall seconds between consecutive states), the query wait's median and 95th
@@ -1127,6 +1142,11 @@ def publish_validator_gauges(self: ReportingService):
     bt.logging.debug("Publishing validator metrics...")
     start = time.time()
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="uid").set( self.uid )
+    # each round-time lever's state, 1 on and 0 turned off at runtime (levers.py)
+    for _name, _on in (getattr(self, 'levers', None) or {}).items():
+        self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+                                                sim_id=self.simulation.simulation_id,
+                                                validator_gauge_name=f"lever_{_name}").set(1.0 if _on else 0.0)
     # instructions the engine could not encode for the simulator and dropped from a step's message (see SimulationEngine.respond)
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="response_pack_drops").set( float(getattr(getattr(self, 'engine', None), 'response_pack_drops', 0) or 0) )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="stake").set( self.metagraph.stake[self.uid] )
@@ -1136,6 +1156,8 @@ def publish_validator_gauges(self: ReportingService):
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="last_update").set( self.current_block - self.metagraph.last_update[self.uid] )
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name="active").set( self.metagraph.active[self.uid] )
     for _name, _value in round_timing_gauges(self):
+        self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
+    for _name, _value in fundamental_seed_gauges(self):
         self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
     cpu_usage = psutil.cpu_percent()
     memory_info = psutil.virtual_memory()
@@ -1793,8 +1815,6 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'debeta_w_make': kappa_values.get('debeta_w_make') if kappa_values else None,
                 'debeta_weight': kappa_values.get('debeta_weight') if kappa_values else None,
                 'debeta_floor': kappa_values.get('debeta_floor') if kappa_values else None,
-                'skill_other': kappa_values.get('skill_other') if kappa_values else None,
-                'skill_weakest3': kappa_values.get('skill_weakest3') if kappa_values else None,
                 'skill_books_kept': kappa_values.get('skill_books_kept') if kappa_values else None,
                 'skill_mark_alt': kappa_values.get('skill_mark_alt') if kappa_values else None,
                 'skill_net_alpha_mark_alt': kappa_values.get('skill_net_alpha_mark_alt') if kappa_values else None,
@@ -1938,9 +1958,8 @@ async def report(self: ReportingService) -> None:
                     get_price('ask',1), get_vol('ask',1), get_price('ask',0), get_vol('ask',0),
                     "books"
                 ))
-            # The fundamental price does not depend on this step's trades: it used to sit inside the
-            # trades branch below, so a quiet book had no fundamental_price series after a reporting
-            # restart until its next trade.
+            # The fundamental price does not depend on this step's trades, so it is published outside the
+            # trades branch below: a quiet book keeps its fundamental_price series after a reporting restart.
             fp = self.fundamental_price.get(bookId) if self.fundamental_price else None
             if fp is not None:
                 if isinstance(fp, pd.Series):
@@ -2201,8 +2220,8 @@ async def report(self: ReportingService) -> None:
                 else:
                     _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, agentId, "kappa")
                 # DE-BETA per-book inputs: which books earned making credit, and each book's alpha.
-                # GATED, default off. Cardinality is uid x book, so on a 259x128 board these four are
-                # ~133k series and ~24MB on a scrape already running 154MB. two_sided and alpha_counted
+                # GATED by publish_book_gauges. Cardinality is uid x book, so these four grow every scrape
+                # by four series per uid and book. two_sided and alpha_counted
                 # were dropped rather than gated: both are derivable in the query from the four below
                 # plus the per-uid debeta_skill_floor, so publishing them bought nothing.
                 #   two_sided     = debeta_capture_buy != 0 and debeta_capture_sell != 0
@@ -2239,8 +2258,6 @@ async def report(self: ReportingService) -> None:
             for uid, book_miner_trades in self.recent_miner_trades.items():
                 for bookId, miner_trades in book_miner_trades.items():
                     if len(miner_trades) > 0:
-                        last_maker_trade = None
-                        last_taker_trade = None
                         # Bounded-slot shape (slot=0 most recent); numeric fields move
                         # from labels into the gauge value keyed by miner_trade_gauge_name.
                         # role is encoded 0=maker / 1=taker; timestamp emitted in seconds.
@@ -2278,15 +2295,28 @@ async def report(self: ReportingService) -> None:
                             ):
                                 updates.append((self.prometheus_miner_trades, val,
                                     wallet_addr, netuid, simid, miner_trade.bookId, uid, slot, name))
-                            if role == 'maker':
-                                last_maker_trade = miner_trade
-                            if role == 'taker':
-                                last_taker_trade = miner_trade
-                        if last_maker_trade:
-                            updates.append((agent_gauges, last_maker_trade.makerFeeRate, wallet_addr, netuid, simid, bookId, uid, "fees_last_maker_rate"))
-                        if last_taker_trade:
-                            updates.append((agent_gauges, last_taker_trade.takerFeeRate, wallet_addr, netuid, simid, bookId, uid, "fees_last_taker_rate"))
+            # every book's newest maker and taker fee rate, sent apart from the trades (recent_trades)
+            for uid, book_rates in (self.recent_fee_rates or {}).items():
+                for bookId, (maker_rate, taker_rate) in book_rates.items():
+                    if maker_rate is not None:
+                        updates.append((agent_gauges, maker_rate, wallet_addr, netuid, simid, bookId, uid, "fees_last_maker_rate"))
+                    if taker_rate is not None:
+                        updates.append((agent_gauges, taker_rate, wallet_addr, netuid, simid, bookId, uid, "fees_last_taker_rate"))
         bt.logging.debug(f"Miner trade metrics collected ({time.time()-start:.4f}s).")
+
+        # Resting orders and open loans per uid and book, only for the books a miner rests orders or holds loans on.
+        # The agent gauges carry forward, so a series published last cycle and not this one is cleared explicitly.
+        _order_books = order_stats.book_stats(self.last_state.accounts)
+        _order_totals = order_stats.uid_totals(_order_books)
+        _order_keys = set()
+        for uid, books in _order_books.items():
+            for bookId, row in books.items():
+                for _name, _value in order_stats.book_gauges(row):
+                    updates.append((agent_gauges, _value, wallet_addr, netuid, simid, bookId, uid, _name))
+                    _order_keys.add((bookId, uid, _name))
+        for bookId, uid, _name in getattr(self, '_order_book_keys', set()) - _order_keys:
+            _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, uid, _name)
+        self._order_book_keys = _order_keys
 
         bt.logging.debug("Collecting miner metrics...")
         self.prometheus_miners.clear()
@@ -2294,6 +2324,9 @@ async def report(self: ReportingService) -> None:
         start = time.time()
         for agentId in miner_metrics:
             m = miner_metrics[agentId]
+            _orders = _order_totals.get(agentId) or order_stats.NO_ORDERS
+            for _name, _value in _orders.items():
+                updates.append((miner_gauges, _value, wallet_addr, netuid, simid, agentId, _name))
 
             updates.append((miner_gauges, m['total_base_balance'], wallet_addr, netuid, simid, agentId, "total_base_balance"))
             updates.append((miner_gauges, m['total_base_loan'], wallet_addr, netuid, simid, agentId, "total_base_loan"))
@@ -2338,12 +2371,9 @@ async def report(self: ReportingService) -> None:
             else:
                 _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "kappa")
             # The blend scores, the de-beta decomposition and the eligibility flag are NOT kappa gauges
-            # and are published for every miner whose carrier holds them. They used to sit inside the
-            # kappa test above: at kappa weight 0 (the final rung) no uid has a kappa, and on the first
-            # cycle of (0, 0, 1), every debeta_*, trading_score,
-            # combined_score and scorable series disappeared for all 257 miners while the score itself
-            # kept moving. The same gate had hidden the decomposition for the scored uids without a
-            # kappa at every earlier rung.
+            # and are published for every miner whose carrier holds them, outside the kappa test above:
+            # at kappa weight 0 no uid has a kappa, and inside that test every debeta_*, trading_score,
+            # combined_score and scorable series would disappear while the score itself kept moving.
             if m['pnl_score'] is not None:
                 updates.append((miner_gauges, m['pnl_score'], wallet_addr, netuid, simid, agentId, "pnl_score"))
             if m.get('trading_score') is not None:
@@ -2376,10 +2406,8 @@ async def report(self: ReportingService) -> None:
                            ('debeta_weight', 'debeta_weight'),
                            ('debeta_w_make', 'debeta_w_make'),
                            ('debeta_floor', 'debeta_skill_floor'),
-                           # 0.6.2 skill-leg quantities: the other drift variant's skill, the three-way
-                           # weakest sub-window kappa, books left after the hurdle, the pool factor, the
+                           # 0.6.2 skill-leg quantities: books left after the hurdle, the pool factor, the
                            # filled notional and the graded presence share
-                           ('skill_other', 'debeta_skill_other_variant'),
                            # the alternative mark's skill (0.6.5): judged on live data before a change of mark pays
                            ('skill_mark_alt', 'debeta_skill_mark_alt'),
                            ('skill_net_alpha_mark_alt', 'debeta_skill_net_alpha_mark_alt'),
@@ -2392,7 +2420,6 @@ async def report(self: ReportingService) -> None:
                            ('best_size', 'debeta_best_size'),
                            # the conjunction (0.6.6): watched on live data before any rule pays for it
                            ('conjunction', 'debeta_conjunction'),
-                           ('skill_weakest3', 'debeta_skill_weakest3'),
                            ('skill_books_kept', 'debeta_skill_books_kept'),
                            ('skill_pool_factor', 'debeta_skill_pool_factor'),
                            ('skill_coverage_factor', 'debeta_skill_coverage_factor'),
@@ -2451,6 +2478,10 @@ async def report(self: ReportingService) -> None:
                 quote_balance=m['total_quote_balance'],
                 quote_loan=m['total_quote_loan'],
                 quote_collateral=m['total_quote_collateral'],
+                open_bids=_orders['open_bids'],
+                open_asks=_orders['open_asks'],
+                resting_notional=_orders['resting_bid_notional'] + _orders['resting_ask_notional'],
+                open_loans=_orders['open_loans'],
                 inventory_value=m['total_inventory_value'],
                 inventory_value_change=m['inventory_value_change'],
                 pnl=m['pnl'],
@@ -2495,8 +2526,8 @@ async def report(self: ReportingService) -> None:
                 # its own series.
                 debeta_making_share=(m['making_share'] if m.get('making_share') is not None else 0.0),
                 debeta_ladder_input=(m['ladder_input'] if m.get('ladder_input') is not None else 0.0),
-                # Presence and the two coverage counts belong on the summary row: the per-miner
-                # de-beta table that used to carry them duplicated six of its ten columns from here.
+                # Presence and the two coverage counts belong on the summary row, so the per-miner
+                # de-beta table does not duplicate its columns from here.
                 debeta_present=(m['present'] if m.get('present') is not None else 1.0),
                 debeta_coverage_books=(m['coverage_books'] if m.get('coverage_books') is not None else 0),
                 debeta_skill_coverage_factor=(m['skill_coverage_factor']

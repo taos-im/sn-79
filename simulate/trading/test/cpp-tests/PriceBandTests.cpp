@@ -191,7 +191,7 @@ TEST(PriceBandTest, SelfTradesDoNotMoveTheReference)
 // cheap fills a sweep prediction would count on, so the order must reserve its full volume at its
 // limit price. Used as a price bound that 0 compares against every level price, so the walk broke on
 // the FIRST level, collected nothing, and every buy IOC was refused CONTRACT_VIOLATION whatever its
-// price or size -- on a simulation-acceptance run, `BUY 1.0@312.35` against a book
+// price or size, for example `BUY 1.0@312.35` against a book
 // holding 20.8 alpha at 285.5. The sell side was unaffected because sweepCap's sell branch happens to
 // return a real price bound; matchCap gives the buy side the same shape.
 namespace

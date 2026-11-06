@@ -368,7 +368,7 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
     # Every UID whose PnL hasn't changed since last cycle can be resolved
     # directly from `cache` in ~1μs — no pickle, no IPC, no worker roundtrip.
     # In steady state most UIDs don't trade in every 5s scoring window, so
-    # this typically resolves 200+/259 UIDs on mainnet without touching loky.
+    # this resolves most UIDs without touching loky.
     # Without this fast path every UID's realized_pnl_history is pickled
     # into a batch dict and shipped to a loky worker, which then pays the
     # cache-check cost per worker: orders of magnitude more overhead than

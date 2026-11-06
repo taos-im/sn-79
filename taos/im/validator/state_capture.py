@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""Opt-in capture of the state stream a validator receives, for the scoring acceptance's replay harness.
+"""Opt-in capture of the state stream a validator receives, so its scoring can be replayed offline.
 
-The validator scores what it receives, not what a tape shows, so the harness that certifies its pay replays the
-same bytes: the raw msgpack state the engine hands the listener loop, one file per update, named by the update's
-timestamp. Off unless STATE_CAPTURE_DIR is set; bounded by STATE_CAPTURE_MAX_BYTES (oldest files go first); never
-raises into the validator. A mainnet update is about 12 MB raw, so files are lz4 frames when the lz4 package is
-present, which the engine already requires.
+The validator scores what it receives, not what a trade record shows, so a replay of its pay reads the same bytes:
+the raw msgpack state the engine hands the listener loop, one file per update, named by the update's timestamp. Off
+unless STATE_CAPTURE_DIR is set; bounded by STATE_CAPTURE_MAX_BYTES (oldest files go first); never raises into the
+validator. An update at many books is large, so files are lz4 frames when the lz4 package is present, which the
+engine already requires.
 """
 import logging
 import os
@@ -192,6 +192,6 @@ def read_captured(path) -> bytes:
 
 
 def iter_captured(directory):
-    """(timestamp, raw bytes) for every captured update, oldest first: the harness's recorded-stream input."""
+    """(timestamp, raw bytes) for every captured update, oldest first: a replay's recorded-stream input."""
     for ts, path in captured_files(directory):
         yield ts, read_captured(path)

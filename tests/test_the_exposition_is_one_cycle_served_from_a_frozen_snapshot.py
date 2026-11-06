@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 """A scrape of the validator's metrics is one cycle, whole, and costs one render per cycle however many
-readers ask. Until 30 September 2026 every scrape rendered the live registries while the next cycle was
-being applied, so a read could carry a family half rebuilt (three of 206 mainnet board reads lost some or
-all coldkeys in one week) and two cycles mixed, and each scrape paid the whole render. Now the reporting
+readers ask. Rendering the live registries while the next cycle is applied would let a read
+carry a family half rebuilt and two cycles mixed, and make each scrape pay the whole render. The reporting
 child publishes a frozen snapshot at the end of each cycle; the first scrape renders it once, single-flight,
 and every per-registry endpoint is a slice of the same bytes. The text is byte-identical to the client's
 own renderer, and the two bulk registries can be left off /metrics without losing their own endpoints."""
@@ -130,10 +129,9 @@ def test_the_bulk_families_of_the_reporter_are_all_snapshot_backed():
 
 
 def test_the_renderer_needs_no_escaping_api_from_the_client(monkeypatch):
-    """The 6 October testnet deploy served HTTP 500 on every metrics family: the renderer reached for
-    prometheus_client's metric-name escaping API (escape_metric_name, UNDERSCORES, added in 0.22), which the
-    host's older package did not have, and nothing pinned the version the launcher installs. The renderer
-    carries its own escaping, so the same bytes come out whatever the installed client offers."""
+    """The renderer carries its own metric-name escaping rather than prometheus_client's (escape_metric_name,
+    UNDERSCORES, added in 0.22), which an older installed package lacks, so the same bytes come out whatever the
+    installed client offers."""
     import prometheus_client.openmetrics.exposition as om
     regs, _, _ = _registries()
     expected = b''.join(generate_latest(regs[n]) for n in ORDER)   # the client's own render, taken while it still works

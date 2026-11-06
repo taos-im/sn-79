@@ -606,11 +606,16 @@ void SimulationManager::publishStateMessagePack()
             simulation->exchange()->setCappedPairs(split[blockIdx]);
         }
     }
-    // Looked up rather than positional, and no size check. The batch used to be required to
-    // hold exactly one member, so ANY future addition alongside the responses would have been
-    // rejected wholesale -- silently dropping that tick's order flow to complain about
-    // something it did not need to read. Kept from the reverted seed delivery because the
-    // hazard is real regardless of what the extra member turns out to be.
+    // The fundamental's next step seed, for every block: each book mixes in its own id.
+    if (const auto seed = taosim::simulation::readStepSeed(obj)) {
+        for (const auto& simulation : m_simulations) {
+            simulation->setStepSeed(seed->round, seed->word);
+        }
+    }
+    // Looked up by key rather than by position, and without a size check: the batch carries
+    // members beside the responses (the capped pairs and the step seed above), and a member
+    // this does not read must not cost the tick its order flow. A batch of one member is the
+    // responses, whatever its key.
     const msgpack::object* responsesVal{};
     for (const auto& [k, v] : obj.via.map) {
         const auto key = k.as<std::string_view>();
@@ -776,9 +781,8 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(
         return requestedThreadCount;
     }());
 
-    // See the note beside requestStop() in the header: the signal_set that stood here was a
-    // temporary on an io_context that is never run, so it could not fire. std::signal is what the
-    // exchange service already uses for the same job (exchange_service/server.cpp), and it works.
+    // See the note beside requestStop() in the header: a signal_set on an io_context that is never
+    // run could not fire, so the handler is installed with std::signal.
     std::signal(SIGINT, onStopSignal);
     std::signal(SIGTERM, onStopSignal);
 
@@ -999,9 +1003,8 @@ std::unique_ptr<SimulationManager> SimulationManager::fromReplay(const replay::R
         };
     }();
     mngr->m_threadPool = std::make_unique<boost::asio::thread_pool>(mngr->m_blockInfo.count);
-    // See the note beside requestStop() in the header: the signal_set that stood here was a
-    // temporary on an io_context that is never run, so it could not fire. std::signal is what the
-    // exchange service already uses for the same job (exchange_service/server.cpp), and it works.
+    // See the note beside requestStop() in the header: a signal_set on an io_context that is never
+    // run could not fire, so the handler is installed with std::signal.
     std::signal(SIGINT, onStopSignal);
     std::signal(SIGTERM, onStopSignal);
 

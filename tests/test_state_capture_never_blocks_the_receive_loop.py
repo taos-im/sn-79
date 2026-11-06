@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""A captured state (about 12 MB on mainnet) is compressed, written and trimmed off the listener loop: the loop only
+"""A captured state, several megabytes, is compressed, written and trimmed off the listener loop: the loop only
 hands it to a bounded queue and returns at once, a writer thread does the rest, the directory is trimmed on a timer,
 and when the writer falls behind the oldest pending state is dropped and counted rather than the loop waiting."""
 import time

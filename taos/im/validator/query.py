@@ -24,6 +24,7 @@ from collections import defaultdict
 import aiohttp
 import msgpack
 from taos.im.protocol.simulator import PackedOrders
+from taos.im.validator.block_stats import sent_counts
 from taos.im.validator.delays import set_delays
 from taos.im.protocol.instructions import PlaceOrderInstruction
 from taos.im.protocol import MarketSimulationStateUpdate
@@ -36,8 +37,6 @@ try:
 except ImportError:
     _HAS_PROTOCOL_EXCHANGE = False
     ExchangeStateUpdate = None  # type: ignore[assignment,misc]
-
-_SENT_PLACEMENTS = frozenset({"PLACE_ORDER_LIMIT", "PLACE_ORDER_MARKET"})  # forward._PLACEMENT_TYPES
 
 
 def _query_fanout_enabled():
@@ -68,6 +67,7 @@ def _prebuilt(service):
 
 
 KEEP_ALIVE_S = 120  # an idle kept connection's life, as the stock miner keeps its side
+RETRY_MIN_S = 0.1  # the least of a request's deadline worth a new connection for a retry
 
 
 def _reusing(service):
@@ -142,22 +142,35 @@ _WIRE_CLOCK = contextvars.ContextVar("query_wire_clock", default=None)
 async def _on_request_chunk_sent(session, ctx, params):
     clock = _WIRE_CLOCK.get()
     if clock is not None:
-        clock["sent"] = time.time()
+        clock["sent"] = time.monotonic()
 
 
 async def _on_response_read(session, ctx, params):
     clock = _WIRE_CLOCK.get()
     if clock is not None:
-        clock["read"] = time.time()
+        clock["read"] = time.monotonic()
+
+
+class RedirectRefused(aiohttp.ClientError):
+    """A miner answered with a redirect, which the validator does not follow."""
+
+
+async def _on_request_redirect(session, ctx, params):
+    params.response.close()
+    raise RedirectRefused(f"redirect ({params.response.status}) refused")
 
 
 def wire_trace_config() -> aiohttp.TraceConfig:
-    """Stamps a call's request written (its last body chunk) and its answer read, into the clock the calling task
-    set: bittensor's Dendrite.call starts its own clock before signing and serialising the request, so its time
-    holds the validator's preparation as well as the miner's."""
+    """Stamps a call's request written (its last body chunk) and its answer read, on the monotonic clock so a step of
+    the host's wall clock is not in a miner's time, into the clock the calling task set: bittensor's Dendrite.call
+    starts its own clock before signing and serialising the request, so its time holds the validator's preparation as
+    well as the miner's. A redirect is refused here, on every session that queries miners, since bittensor's
+    Dendrite.call posts with aiohttp's default of following one: the answer is the one to the request the validator
+    sent."""
     trace = aiohttp.TraceConfig()
     trace.on_request_chunk_sent.append(_on_request_chunk_sent)
     trace.on_response_chunk_received.append(_on_response_read)
+    trace.on_request_redirect.append(_on_request_redirect)
     return trace
 
 
@@ -502,7 +515,7 @@ class QueryService:
                     }
 
             # the pairs at or over the cap at this round's snapshot: the engine refuses their non-cancel placements
-            # when they arrive at the exchange, delayed or not (row 67), the hole the acceptance check cannot close
+            # when they arrive at the exchange, delayed or not, which a check at acceptance here cannot do
             capped = sorted(
                 [int(uid), int(book_id)] for uid, volumes in all_miner_volumes.items()
                 for book_id, volume in volumes.items() if volume_cap > 0 and volume >= volume_cap)
@@ -575,9 +588,7 @@ class QueryService:
                                 # SAY WHAT THE CAP AND THE VOLUME ACTUALLY ARE. "hit volume cap on one
                                 # or more books" names neither the book, the accumulated volume, nor
                                 # the limit -- so an agent silently restricted for the rest of the run
-                                # looks identical to one that simply is not trading. This is the line
-                                # that was firing, unread, while every simulation instruction from the
-                                # acceptance miner was being dropped here.
+                                # looks identical to one that simply is not trading.
                                 bt.logging.info(
                                     f"Agent {uid} hit volume cap: book={instruction.bookId} "
                                     f"volume={miner_volumes[instruction.bookId]:,.2f} >= cap={uid_cap:,.2f} "
@@ -897,28 +908,34 @@ class QueryService:
         async def post(uid, url, headers, body, synapse):
             first = time.time()
             offsets.append(first - query_start)
+            first_m = time.monotonic()
             for attempt in (0, 1):
-                sent = time.time()
+                sent = time.monotonic()
                 clock = {}
                 _WIRE_CLOCK.set(clock)  # the session's trace stamps this attempt's request written and answer read
+                # a retry runs inside the first attempt's deadline, never on a fresh one
+                total = synapse.timeout - (sent - first_m) if attempt else synapse.timeout
                 try:
                     async with session.post(url=url, headers=headers, data=body,
-                                            timeout=aiohttp.ClientTimeout(total=synapse.timeout)) as response:
+                                            timeout=aiohttp.ClientTimeout(total=total)) as response:
                         d.process_server_response(response, await response.json(), synapse)
                     wire_sent, wire_read = clock.get("sent"), clock.get("read")
                     if wire_sent is not None and wire_read is not None and wire_read >= wire_sent:
                         synapse.dendrite.process_time = str(wire_read - wire_sent)
                     else:
-                        synapse.dendrite.process_time = str(time.time() - sent)
+                        synapse.dendrite.process_time = str(time.monotonic() - sent)
                 except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
-                    if keep and attempt == 0:  # a kept connection the miner closed between rounds: once, on a new one
+                    # a kept connection the miner closed between rounds: once, on a new one, with time left for it; a
+                    # connect that failed is not retried, since no connection reaches that miner
+                    if (keep and attempt == 0 and not isinstance(e, aiohttp.ClientConnectorError)
+                            and synapse.timeout - (time.monotonic() - first_m) > RETRY_MIN_S):
                         retried[0] += 1
                         continue
                     synapse = d.process_error_message(synapse, synapse.__class__.__name__, e)
                 except Exception as e:
                     synapse = d.process_error_message(synapse, synapse.__class__.__name__, e)
                 break
-            durations.append(time.time() - first)
+            durations.append(time.monotonic() - first_m)
             return uid, synapse
 
         async def fire(args):
@@ -1167,17 +1184,14 @@ class QueryService:
     def _pack_orders(self, synapse_responses, delays):
         """neuron.orders_packed: delay the checked orders here, as the main process would (set_delays with its settings,
         `delays`), and return them encoded for the simulator; the replies go back without their orders. An order the
-        wire cannot encode is left out and counted, as SimulationEngine.respond does. Each miner's placements and
-        cancels sent are counted here as forward.update_sent_stats counts them, since main never sees these orders."""
+        wire cannot encode is left out and counted, as SimulationEngine.respond does. What is sent is counted here, with
+        the orders the cancels name, as forward.update_sent_stats counts it, since main never sees these orders."""
         pack = msgpack.Packer(use_bin_type=True).pack
-        parts, dropped, sent = [], [], {}
-        for response in set_delays(delays, synapse_responses):
-            row = sent.setdefault(response.agent_id, {'placements_sent': 0, 'cancels_sent': 0})
+        parts, dropped = [], []
+        delayed = set_delays(delays, synapse_responses)
+        sent, named = sent_counts(delayed)
+        for response in delayed:
             for instruction in response.instructions:
-                if instruction.type in _SENT_PLACEMENTS:
-                    row['placements_sent'] += 1
-                elif instruction.type == 'CANCEL_ORDERS':
-                    row['cancels_sent'] += 1
                 item = instruction.serialize()
                 try:
                     parts.append(pack(item))
@@ -1187,7 +1201,8 @@ class QueryService:
         if dropped:
             bt.logging.error(f"[ORDERS-PACKED] dropped {len(dropped)} instruction(s) the wire cannot encode from "
                              f"agent(s) {sorted(set(dropped))}")
-        return {'orders': PackedOrders(len(parts), b"".join(parts)), 'pack_drops': len(dropped), 'sent': sent}
+        return {'orders': PackedOrders(len(parts), b"".join(parts)), 'pack_drops': len(dropped), 'sent': sent,
+                'cancel_named': named}
 
     async def _post_query_cleanup(self):
         """Deferred query cleanup, run AFTER the response is written and the main
@@ -1403,8 +1418,11 @@ class QueryService:
         finally:
             if gc_was_enabled:
                 gc.enable()
-            if old_dendrite:
-                del old_dendrite
+            # the delivery's own session closes on this loop, and the query's dendrite, with the connections it keeps,
+            # is put back: dropped, its open session was closed by garbage collection with no loop to await it
+            if self.dendrite is not old_dendrite:
+                await DendriteManager.close_session(self.dendrite)
+                self.dendrite = old_dendrite
 
     async def run(self):
         """

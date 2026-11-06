@@ -16,6 +16,7 @@ add_subdirectory(util)
 add_executable(taosim-tests
     ${TEST_SOURCES}
     UtilTests.cpp
+    EngineThreadsTests.cpp
     ChainAmountPrecisionTests.cpp
     RequestFingerprintTests.cpp
     SelfTradePreventionTests.cpp
@@ -56,6 +57,7 @@ add_executable(taosim-tests
     RealizationFailureTests.cpp
     PublishedStateTests.cpp
     FundamentalSeedTests.cpp
+    RunClassFilesTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the
 # target always configures.

@@ -24,12 +24,18 @@ namespace taosim::process
 namespace
 {
 
-// One `count,price` row of a seed file, the price in cents.
+// One row of a seed file: `round,randomness` (the randomness as 64 hex characters, of which the first 8 bytes are
+// read), with an optional third column ignored, or the older `count,price` (the price in cents).
 std::optional<std::pair<int, int64_t>> parseSeedRow(const std::string& line)
 {
     const auto fields = taosim::util::split(line, ',');
-    if (fields.size() != 2) return std::nullopt;
+    if (fields.size() != 2 && fields.size() != 3) return std::nullopt;
     try {
+        const auto& value = fields[1];
+        if (value.size() == 64 && value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos) {
+            return std::pair{std::stoi(fields[0]), static_cast<int64_t>(std::stoull(value.substr(0, 16), nullptr, 16))};
+        }
+        if (fields.size() != 2) return std::nullopt;
         return std::pair{
             std::stoi(fields[0]), static_cast<int64_t>(std::llround(std::stod(fields[1]) * 100.0))};
     } catch (const std::exception&) {
@@ -87,9 +93,7 @@ FundamentalPrice::FundamentalPrice(const FundamentalPriceDesc& desc) noexcept
     m_state.X(1) = m_L->row(1).head(2).cast<double>().dot(m_state.V.head(2));
 
     m_recordedSeeds = !desc.seedFile.empty();
-    m_seedfile = m_recordedSeeds
-        ? desc.seedFile
-        : (sim->runDir() / "fundamental_seed.csv").generic_string();
+    m_seedfile = desc.seedFile;
 }
 
 //-------------------------------------------------------------------------
@@ -98,13 +102,14 @@ void FundamentalPrice::update(Timestamp timestamp)
 {
     if (m_values.empty()) {
         if (timestamp - m_state.lastSeedTime >= m_seedInterval) {
-            const auto row = m_recordedSeeds ? std::optional{recordedSeed(timestamp)} : liveSeed(timestamp);
+            const auto row = m_recordedSeeds ? std::optional{recordedSeed(timestamp)} : deliveredSeed(timestamp);
             uint64_t seed{};
             if (row) {
-                seed = seedFor(row->cents, m_bookId);
+                seed = seedFor(row->value, m_bookId);
                 m_state.lastCount = row->count;
             } else {
                 seed = std::random_device{}();
+                ++m_randomSeedSteps;
             }
             reseed(seed);
             std::mt19937& rng = m_ownRng ? m_processRng : *m_rng;
@@ -146,40 +151,25 @@ void FundamentalPrice::update(Timestamp timestamp)
 
 //-------------------------------------------------------------------------
 
-std::optional<FundamentalPrice::SeedRow> FundamentalPrice::liveSeed(Timestamp timestamp) const
+// The seed the validator delivered with its batch since this book's last seed step: a public randomness round
+// published after the miners' reply deadline, so nobody holds it before replying. With none new the step draws a
+// random seed, logged on the first such step after the grace period and every thousandth after.
+std::optional<FundamentalPrice::SeedRow> FundamentalPrice::deliveredSeed(Timestamp timestamp)
 {
-    const bool warn = timestamp >= m_gracePeriod;
-    if (!fs::exists(m_seedfile)) {
-        if (warn) {
-            fmt::println("FundamentalPrice::update : NO SEED FILE PRESENT AT {}.  Using random seed.", m_seedfile);
-        }
-        return std::nullopt;
-    }
-    std::optional<SeedRow> row;
-    try {
-        const auto lines = taosim::util::getLastLines(m_seedfile, 2);
-        if (lines.size() >= 2) {
-            if (const auto parsed = parseSeedRow(lines[lines.size() - 2])) {
-                row = SeedRow{parsed->first, parsed->second};
-            } else {
-                fmt::println("FundamentalPrice::update : FAILED TO GET SEED FROM LINE - {}", lines[lines.size() - 2]);
+    const auto* seed = m_sim && m_sim->stepSeed() ? &*m_sim->stepSeed() : nullptr;
+    if (seed == nullptr || seed->generation == m_seedGeneration) {
+        if (timestamp >= m_gracePeriod) {
+            if (m_randomSeedStepsAfterGrace % 1000 == 0) {
+                fmt::println(
+                    "WARNING : no new fundamental seed delivered for book {} at {} - using a random seed ({} so far)",
+                    m_bookId, timestamp, m_randomSeedStepsAfterGrace + 1);
             }
-        } else {
-            fmt::println(
-                "FundamentalPrice::update : FAILED TO GET SEED FROM FILE - NO DATA ({} LINES READ)", lines.size());
-        }
-    } catch (const std::exception& exc) {
-        fmt::println("FundamentalPrice::update : ERROR GETTING SEED FROM FILE - {}", exc.what());
-    }
-    if (!row || row->count == m_state.lastCount) {
-        if (warn) {
-            fmt::println(
-                "WARNING : Fundamental price seed not updated - using random seed.  Last Count {} | Count {}",
-                m_state.lastCount, row ? row->count : m_state.lastCount);
+            ++m_randomSeedStepsAfterGrace;
         }
         return std::nullopt;
     }
-    return row;
+    m_seedGeneration = seed->generation;
+    return SeedRow{static_cast<int>(seed->round), static_cast<int64_t>(seed->word)};
 }
 
 //-------------------------------------------------------------------------
@@ -197,7 +187,8 @@ FundamentalPrice::SeedRow FundamentalPrice::recordedSeed(Timestamp timestamp)
             const auto parsed = parseSeedRow(line);
             if (!parsed) {
                 throw std::runtime_error{fmt::format(
-                    "FundamentalPrice: row {} of the recorded seed file {} is not count,price: {}",
+                    "FundamentalPrice: row {} of the recorded seed file {} is neither round,randomness nor "
+                    "count,price: {}",
                     m_recorded.size() + 1, m_seedfile, line)};
             }
             m_recorded.push_back({parsed->first, parsed->second});
@@ -214,9 +205,9 @@ FundamentalPrice::SeedRow FundamentalPrice::recordedSeed(Timestamp timestamp)
 
 //-------------------------------------------------------------------------
 
-uint32_t FundamentalPrice::seedFor(int64_t priceCents, uint64_t bookId) noexcept
+uint32_t FundamentalPrice::seedFor(int64_t value, uint64_t bookId) noexcept
 {
-    // The price and the book each pass through a full avalanche, so distinct books and distinct prices
+    // The value and the book each pass through a full avalanche, so distinct books and distinct values
     // seed distinct streams.
     auto mix = [](uint64_t z) {
         z += 0x9E3779B97F4A7C15ULL;
@@ -224,7 +215,7 @@ uint32_t FundamentalPrice::seedFor(int64_t priceCents, uint64_t bookId) noexcept
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         return z ^ (z >> 31);
     };
-    const uint64_t z = mix(mix(static_cast<uint64_t>(priceCents)) ^ bookId);
+    const uint64_t z = mix(mix(static_cast<uint64_t>(value)) ^ bookId);
     return static_cast<uint32_t>(z ^ (z >> 32));
 }
 

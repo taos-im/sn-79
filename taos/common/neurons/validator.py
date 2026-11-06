@@ -32,6 +32,10 @@ import bittensor as bt
 from typing import List, Optional, Tuple
 
 
+# A uid sizes and shares the training pool while its GenTRX EMA holds at least this much.
+GENTRX_EMA_FLOOR = 0.01
+
+
 def compute_two_pool_allocation(
     trading_scores: torch.Tensor,
     gentrx_scores: torch.Tensor,
@@ -47,6 +51,8 @@ def compute_two_pool_allocation(
     (gentrx). `gentrx_simulation_share` caps the training share at full
     participation; the actual training allocation scales by
     `n_active / n_target`, and any unused training share returns to trading.
+    A uid whose GenTRX EMA is under GENTRX_EMA_FLOOR neither counts toward
+    `n_active` nor takes a share of the training pool.
 
     Returns:
         (raw_weights, summary) — the L1-normalized weight vector and a
@@ -54,6 +60,7 @@ def compute_two_pool_allocation(
     """
     trading_scores = torch.nan_to_num(trading_scores, 0.0)
     gentrx_scores = torch.nan_to_num(gentrx_scores, 0.0)
+    gentrx_scores = torch.where(gentrx_scores >= GENTRX_EMA_FLOOR, gentrx_scores, torch.zeros_like(gentrx_scores))
 
     trading_for_norm = trading_scores
     if trading_for_norm.numel() > 0 and float(torch.min(trading_for_norm)) < 0:

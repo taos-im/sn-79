@@ -25,7 +25,7 @@ from taos.im.validator.fundamental import carried, reported, stamp
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREVIOUS_RELEASE = "0.6.3"
 S = 1_000_000_000
-RUN = "20261014_120000"
+RUN = "20000101_000000"
 
 
 def _book(book_id, bid=300.0, ask=300.5):

@@ -939,7 +939,7 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         uid_kappa['making_basis'] = _d.get('making_basis') if _d else None
         uid_kappa['present'] = ((1.0 if _d.get('present', True) else 0.0) if _d else None)
         # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
-        for _k in ('skill_other', 'skill_mark_alt', 'skill_net_alpha_mark_alt', 'maker_notional_two_sided', 'at_best_seconds', 'best_size', 'skill_weakest3', 'skill_books_kept', 'skill_pool_factor', 'notional',
+        for _k in ('skill_mark_alt', 'skill_net_alpha_mark_alt', 'maker_notional_two_sided', 'at_best_seconds', 'best_size', 'skill_books_kept', 'skill_pool_factor', 'notional',
                    'presence_share', 'skill_coverage_factor', 'coverage_books',
                    'skill_p11_factor', 'skill_net_alpha', 'skill_shrunk_self', 'skill_shrunk_eb', 'conjunction'):
             uid_kappa[_k] = _d.get(_k) if _d else None
@@ -1144,8 +1144,7 @@ def making_pool_inputs(detail, all_uids, trading_scores, w, w_make):
     what a designated market maker programme pays for: a unit of obligation met, not an account
     holding a rank position. The ladder pays rank positions with a steep top, so an operator whose
     accounts occupy the top positions collects many top-of-curve weights whatever its aggregate
-    service; on a mainnet board, one coldkey with 35 per cent of the board's
-    captured spread collected 64 per cent of emission. Splitting one uid's capture across k uids
+    service. Splitting one uid's capture across k uids
     leaves the operator's pool total unchanged, so cloning gains nothing and no identity rule is
     needed. Skill keeps the ladder: superlinear reward for the best predictors is that leg's
     purpose, and clones of one signal compete for the same fills and split the same alpha.
@@ -1180,15 +1179,13 @@ def pool_ladder_input(mode, ladder_scores, trading_scores, all_uids):
     `proportional` ranks the making-stripped input from `making_pool_inputs`, which at de-beta weight
     1.0 is exactly (1 - w_make) * skill_rank. That is what cures concentration and also what costs:
     the ladder's share of emission becomes a pot decided on skill alone, and an account with no maker
-    volume can win it outright. On twelve mainnet boards of 22 September, zero-maker accounts took
-    42.1 per cent of emission under it against 10.4 with the pool off.
+    volume can win it outright.
 
     `proportional_blended` pays the same pool on the same shares and leaves the ladder on the full
     blended score, so a zero-maker account is capped by its making rank again. The cost is that making
-    is then paid on both surfaces. It is a middle setting, not a free one: measured over the same
-    boards, the largest operator takes 59.5 per cent against 26.9 under plain proportional and 77.8
-    with the pool off, and cloning the same captured spread across 16 uids gains 1.18x against 1.04x
-    and 4.00x respectively.
+    is then paid on both surfaces. It is a middle setting, not a free one: the largest operator's
+    share sits between plain proportional's and the pool off's, and so does what cloning the same
+    captured spread across uids gains.
 
     Args:
         mode: ``scoring.debeta.making_pool``.
@@ -1285,7 +1282,7 @@ SKILL_MIN_BOOKS_SHARE = 20 / 128
 def resolve_skill_min_books(explicit, share, n_books) -> int:
     """The skill bar as a count, from a share of the books being scored.
 
-    Twenty books is 16 per cent of mainnet's 128 and 71 per cent of a 28-book multi-asset layout, and a
+    Twenty books is 16 per cent of a 128-book layout and 71 per cent of a 28-book one, and a
     four-book asset class could never clear it alone, so the bar is a share of the layout. An explicit
     count still overrides it; a layout the caller cannot size, or an unset share, keeps the launch value
     rather than dropping to the mechanism's floor.
@@ -1301,7 +1298,7 @@ def resolve_skill_min_books(explicit, share, n_books) -> int:
     count = int(explicit or 0)
     if count > 0:
         return max(SKILL_MIN_BOOKS_FLOOR, count)
-    n = int(n_books or 0)
+    n = float(n_books or 0)
     s = float(share or 0.0)
     if n <= 0 or s <= 0.0:
         return SKILL_MIN_BOOKS_LAUNCH
@@ -1421,19 +1418,24 @@ def class_names_by_index(self) -> list:
     return []
 
 
-def class_handover_now(self):
+def class_handover_now(self, now=None, end=True):
     """The run-boundary handover as it stands at the scorer's clock: ``{'w', 'carried', 'new'}`` with the carried
     shares and the new classes keyed by this layout's class indices, w the carried shares' weight falling linearly
-    from 1 at the boundary to 0 one lookback later; None once it has run out or when there is none."""
+    from 1 at the boundary to 0 one lookback later; None once it has run out or when there is none.
+
+    now is the timestamp the cycle scores at (the one it pins for the scoring child), the scorer's clock when not
+    given. end=False reads the handover without ending it, so a scoring outside the cycle (the reporting snapshot)
+    cannot end it at a clock the cycle has not reached."""
     h = getattr(self, '_debeta_handover', None)
     if not h:
         return None
     span = int(h.get('span') or 0)
-    now = int(getattr(self, 'simulation_timestamp', 0) or 0)
+    now = int(now if now is not None else (getattr(self, 'simulation_timestamp', 0) or 0))
     w = 1.0 - (now - int(h.get('start') or 0)) / span if span > 0 else 0.0
     if w <= 0.0:
-        self._debeta_handover = {}
-        bt.logging.info("[DEBETA-HANDOVER] done: the carried shares and the new classes' ramp ran out")
+        if end:
+            self._debeta_handover = {}
+            bt.logging.info("[DEBETA-HANDOVER] done: the carried shares and the new classes' ramp ran out")
         return None
     idx = {name: i for i, name in enumerate(class_names_by_index(self))}
     return {'w': min(1.0, w),
@@ -1466,13 +1468,26 @@ def _blend_shares(carried, fresh, w, all_uids) -> dict:
             for u in all_uids}
 
 
+def books_with_history(young, books, now) -> float:
+    """How many of ``books`` have history to be scored on: a book a run boundary added counts by the part of one
+    lookback it has existed for (``young``: ``{'span', 'since': {book: start}}``, trade.note_young_books), every other
+    book counts 1. The skill bar is a share of this count, so it rises with the added books' history, not at once."""
+    since = (young or {}).get('since') or {}
+    span = int((young or {}).get('span') or 0)
+    n = 0.0
+    for b in books:
+        t = since.get(b)
+        n += 1.0 if t is None or span <= 0 else min(1.0, max(0.0, (int(now or 0) - int(t)) / span))
+    return n
+
+
 def split_by_class(capture_buy_sums, capture_sell_sums, pool_by_book, class_of_book) -> dict:
     """The scorer's per-uid per-book inputs restricted to each class's books, keyed by class:
-    ``{class: {'capture_buy', 'capture_sell', 'pool', 'n_books'}}``."""
+    ``{class: {'capture_buy', 'capture_sell', 'pool', 'n_books', 'books'}}``."""
     out = {}
     for c in sorted(set(class_of_book.values())):
         books = {b for b, k in class_of_book.items() if k == c}
-        part = {'n_books': len(books), 'capture_buy': {}, 'capture_sell': {}, 'pool': {}}
+        part = {'n_books': len(books), 'books': sorted(books), 'capture_buy': {}, 'capture_sell': {}, 'pool': {}}
         for key, src in (('capture_buy', capture_buy_sums), ('capture_sell', capture_sell_sums), ('pool', pool_by_book)):
             for uid, by_book in (src or {}).items():
                 kept = {b: v for b, v in by_book.items() if b in books}
@@ -1517,8 +1532,12 @@ def class_pool_shares(details_by_class, weights, all_uids, bars, handover=None, 
         _w = float(handover.get('w') or 0.0)
         for c, carried in (handover.get('carried') or {}).items():
             if c in making_by:
-                making_by[c] = _blend_shares(carried.get('making') or {}, making_by[c], _w, all_uids)
-                skill_by[c] = _blend_shares(carried.get('skill') or {}, skill_by[c], _w, all_uids)
+                # the carried shares pass the presence gate the fresh ones pass: an absent uid keeps none of them
+                present = {u for u in all_uids if ((details_by_class.get(c) or {}).get(u) or {}).get('present', True)}
+                cm = {u: v for u, v in (carried.get('making') or {}).items() if u in present}
+                cs = {u: v for u, v in (carried.get('skill') or {}).items() if u in present}
+                making_by[c] = _blend_shares(cm, making_by[c], _w, all_uids)
+                skill_by[c] = _blend_shares(cs, skill_by[c], _w, all_uids)
         for c in handover.get('new') or ():
             if 0 <= int(c) < len(weights):
                 weights[int(c)] = weights[int(c)] * (1.0 - _w)
@@ -1551,7 +1570,7 @@ def skill_bar(self) -> int:
 def smoothed_skill_share(dcfg, detail, all_uids, class_shares, pool_ema, deregs, ts, halflife, n_snap, last_snap,
                          scorable, skill_min_books=SKILL_MIN_BOOKS_FLOOR):
     """The skill half's share after the track-record EMA, under scoring.debeta.skill_share_ema; None when the dial
-    is off or there is no EMA, which leaves pool_pay_vector computing the round's share as before.
+    is off or there is no EMA, which leaves pool_pay_vector computing the round's share.
 
     The making term and share already pass apply_track_record_ema before allocation, so a later bad window costs
     standing gradually rather than all at once; this gives the skill half the same schedule (a copy of the
@@ -1621,7 +1640,7 @@ def maker_capture_sums(self):
 
 
 def making_basis_sums(self):
-    """The capture pair the making pool reads (2 October 2026): realized_buy_sums / realized_sell_sums when
+    """The capture pair the making pool reads: realized_buy_sums / realized_sell_sums when
     scoring.debeta.making_basis is 'realized' (each fill marked against the centered mid making_horizon_s of
     simulation time after it), else capture_buy_sums / capture_sell_sums. Anything but 'realized' reads as
     captured, so a misspelt value cannot select a third behaviour. Both pairs are accumulated and published
@@ -1666,7 +1685,8 @@ def _shrunk_skills(pool_by_book):
     return {u: shrunk_skill_self(a) for u, a in lists.items()}, shrunk_skill_eb(lists)
 
 
-def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict[int, float]:
+def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=None,
+                          end_handover=True) -> Dict[int, float]:
     """Finalize the de-beta (P8) per-uid trading score from the fill-stream accumulators
     (self.capture_buy_sums/capture_sell_sums + self.debeta_mtm/invsum/invn/pfirst/plast, populated
     in trade.update_trade_volumes). making = balanced two-sided spread capture; skill =
@@ -1676,7 +1696,9 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
     where the accumulators live) and used by both get_rewards (weights) and the reporting snapshot.
 
     `absent` and `presence`, when given, are the presence gate's absent set and shares to score on in place
-    of the live query windows (the cutover VERIFY passes the ones the child was given)."""
+    of the live query windows (the cutover VERIFY passes the ones the child was given). `now` is the timestamp the
+    run-boundary handover is weighed at (the cycle's pinned one); `end_handover` False leaves its ending to the
+    scoring cycle (the reporting snapshot scores on the live clock)."""
     dcfg = getattr(getattr(self, 'config', None), 'scoring', None)
     dcfg = getattr(dcfg, 'debeta', None)
     # ALWAYS computed and published (weight replaced the enabled boolean): weight 0 means legacy
@@ -1697,34 +1719,32 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
         # alpha is exactly zero by the invariant; on a long-running validator those pairs are half
         # of all pairs and a floor over every pair collapses to a rounding residue. The capture maps
         # are pruned on the same clock and hold exactly the fill pairs (traded_book_alphas).
+        _caps_b = getattr(self, 'capture_buy_sums', {}) or {}
+        _caps_s = getattr(self, 'capture_sell_sums', {}) or {}
+        _traded = {u: set(_caps_b.get(u) or {}) | set(_caps_s.get(u) or {}) for u in set(_caps_b) | set(_caps_s)}
         self.debeta_alphas_by_book = traded_book_alphas(
             book_alphas_by_book(
                 getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
-                getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}),
+                getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}), only=_traded,
             ),
-            getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {},
+            _caps_b, _caps_s,
         )
-        # 0.6.2 skill-leg forms, every one behind a dial whose default reproduces the 0.6.1 leg. The
-        # alternative quantities are computed at every setting and published, so a live board shows
-        # what a form would pay before it pays it.
-        _caps_b = getattr(self, 'capture_buy_sums', {}) or {}
-        _caps_s = getattr(self, 'capture_sell_sums', {}) or {}
-        held_by_book = traded_book_alphas(
-            book_alphas_held_by_book(getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_heldinv', {}),
-                                     getattr(self, 'debeta_heldn', {}), getattr(self, 'debeta_helddrift', {})),
-            _caps_b, _caps_s)
+        # skill-leg forms, every one behind a dial whose default is the plain leg. A form is computed when its dial
+        # pays it; an unpaid form is not computed; set its dial to compute it.
         _variant = str(debeta_dial(dcfg, 'skill_variant'))
-        pool_by_book = held_by_book if _variant == 'held' else self.debeta_alphas_by_book
-        other_by_book = self.debeta_alphas_by_book if _variant == 'held' else held_by_book
+        pool_by_book = (traded_book_alphas(
+            book_alphas_held_by_book(getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_heldinv', {}),
+                                     getattr(self, 'debeta_heldn', {}), getattr(self, 'debeta_helddrift', {}),
+                                     only=_traded),
+            _caps_b, _caps_s) if _variant == 'held' else self.debeta_alphas_by_book)
         alphas = {uid: list(by_book.values()) for uid, by_book in pool_by_book.items()}
         floor = median_abs_floor(alphas, scale=float(dcfg.floor_scale))
-        other_floor = median_abs_floor({u: list(b.values()) for u, b in other_by_book.items()}, scale=float(dcfg.floor_scale))
-        other_skill = {u: kappa_floored(list(b.values()), other_floor) for u, b in other_by_book.items()}
         # the alternative mark's skill (scoring.debeta.mark_mode_alt): the paid leg's floor rule and bar on its own
         # accumulators, published per uid so a change of mark is judged on live data; never paid
         _alt_mtm = getattr(self, 'debeta_mtm_alt', None) or {}
         _alt_by_book = (book_alphas_by_book(_alt_mtm, getattr(self, 'debeta_invsum_alt', {}) or {},
-                                            getattr(self, 'debeta_invn_alt', {}) or {}, getattr(self, 'debeta_drift_alt', {}) or {})
+                                            getattr(self, 'debeta_invn_alt', {}) or {}, getattr(self, 'debeta_drift_alt', {}) or {},
+                                            only=_traded)
                         if _alt_mtm else {})
         _alt_floor = median_abs_floor({u: list(b.values()) for u, b in _alt_by_book.items()}, scale=float(dcfg.floor_scale))
         alt_skill = {u: kappa_floored(list(b.values()), _alt_floor, _bar) for u, b in _alt_by_book.items()}
@@ -1735,22 +1755,20 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
         kept_by_book = hurdle_filter(pool_by_book, getattr(self, 'debeta_notional', {}) or {}, _hurdle_bps)
         pool_factor = skill_pool_factor(kept_by_book, pool_by_book, _hurdle_books)
         skill_pool = kept_by_book if _hurdle_bps > 0 else pool_by_book
-        # Temporal consistency over the window's sub-windows; the three-way weakest kappa is always read.
+        # Temporal consistency over the window's sub-windows, when skill_subwindows pays it.
         _hists = (getattr(self, 'debeta_mtm_hist', {}) or {}, getattr(self, 'debeta_invsum_hist', {}) or {},
                   getattr(self, 'debeta_invn_hist', {}) or {}, getattr(self, 'debeta_drift_hist', {}) or {})
         _t_end = max((ts for tsd in _hists[3].values() for ts in tsd), default=None)
         _kcfg = getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'kappa', None)
         _lookback = int(getattr(_kcfg, 'lookback', 0) or 0) if _t_end is not None else 0
         _t_start = (_t_end - _lookback) if _t_end is not None else None
-        sub3 = book_alphas_by_subwindow(*_hists, _t_start, _t_end, 3) if _t_end is not None and _lookback > 0 else None
-        weakest3, _ = subwindow_skill(skill_pool, sub3, 'weakest', 2, floor) if sub3 else ({}, {})
         _k = int(debeta_dial(dcfg, 'skill_subwindows'))
         _form = str(debeta_dial(dcfg, 'skill_subwindow_form'))
         _agree = int(debeta_dial(dcfg, 'skill_subwindow_min_agree'))
         skill_values, sub_info = None, {}
         _hurdle_books_by_uid = None
         if _k > 1 and _t_end is not None and _lookback > 0:
-            sub_k = sub3 if _k == 3 else book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k)
+            sub_k = book_alphas_by_subwindow(*_hists, _t_start, _t_end, _k, only=skill_pool)
             skill_values, sub_info = subwindow_skill(skill_pool, sub_k, _form, _agree, floor, min_books=_bar)
         elif _hurdle_bps > 0:
             skill_values, _hurdle_books_by_uid = hurdle_skill(skill_pool, floor, _bar)
@@ -1759,11 +1777,10 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
         skill_p11_strength = float(debeta_dial(dcfg, 'skill_p11_strength'))
         p11_topk = int(debeta_dial(dcfg, 'p11_topk'))
         s3_k = float(debeta_dial(dcfg, 's3_k'))
-        # The counterparty map feeds BOTH discounts. Building it only for the making one meant that
-        # with p11_strength 0 the skill-leg factor could never receive a map and silently stayed at
-        # 1.0, contradicting the dial's own help text (found by the deployment-conditions suite,
-        # 22 September). debeta_cp is the making-window sum of the counterparty history, so the
-        # factor the skill leg sees is the one the board publishes, not a short-window replica's.
+        # The counterparty map feeds BOTH discounts: built for the making one only, the skill-leg factor
+        # would receive no map with p11_strength 0 and stay at 1.0, against the dial's own help text.
+        # debeta_cp is the making-window sum of the counterparty history, so the factor the skill leg
+        # sees is the one the validator publishes, not a short-window replica's.
         cp = ({int(m): dict(t) for m, t in getattr(self, 'debeta_cp', {}).items()}
               if (p11_strength > 0 or skill_p11_strength > 0) else None)
         # The legs, for the dashboards. Stashed on the validator rather than returned so the
@@ -1792,7 +1809,7 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
             s3_k=s3_k,
         )
         # Both making bases per uid, two-sided per book as the pool reads them, and which one pays (1.0 = realized),
-        # so a board shows what the other basis would pay before any dial moves (the 0.6.2 pattern for new forms).
+        # so a board shows what the other basis would pay before any dial moves.
         _rb, _rs = getattr(self, 'realized_buy_sums', {}) or {}, getattr(self, 'realized_sell_sums', {}) or {}
         _cb, _cs = maker_capture_sums(self)
         _cap_credit = balanced_reward_per_book(_cb, _cs, sorted(set(_cb) | set(_cs)))
@@ -1811,7 +1828,6 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
             # under the hurdle a qualifying book is one it kept; the pool's bar reads this count
             if _hurdle_books_by_uid is not None:
                 _dd['skill_books'] = int(_hurdle_books_by_uid.get(_u, 0))
-            _dd['skill_other'] = float(other_skill.get(_u, 0.0))
             _dd['skill_mark_alt'] = float(alt_skill.get(_u, 0.0))
             _dd['skill_net_alpha_mark_alt'] = float(alt_net.get(_u, 0.0))
             # the liquidity the uid provides (0.6.5): two-sided maker notional, states at the best, size at the best
@@ -1823,7 +1839,6 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
             _dd['best_size'] = float(sum(((getattr(self, 'debeta_best_size', None) or {}).get(_u) or {}).values()))
             # the conjunction (0.6.6): two-sided resting presence near the touch over all books, published, never paid
             _dd['conjunction'] = float(sum(((getattr(self, 'debeta_conj', None) or {}).get(_u) or {}).values()))
-            _dd['skill_weakest3'] = float(weakest3.get(_u, 0.0)) if weakest3 else None
             _dd['skill_books_kept'] = int(sub_info[_u]['books']) if _u in sub_info else len(skill_pool.get(_u, {}))
             _dd['skill_pool_factor'] = float(pool_factor)
             _dd['notional'] = float(sum((_notional.get(_u) or {}).values()))
@@ -1874,10 +1889,18 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
                 {u: dict(b) for u, b in _mk_s.items()},
                 skill_pool, _cmap)
             _details, _bars = {}, {}
+            # each uid's filled notional per class, summed in the books' order as the per-class sums were
+            _notional_by_class = {}
+            for _u, _nb in (getattr(self, 'debeta_notional', {}) or {}).items():
+                _acc = _notional_by_class[_u] = {}
+                for _b, _v in (_nb or {}).items():
+                    _bc = _cmap.get(_b)
+                    _acc[_bc] = _acc.get(_bc, 0) + _v
             for _c, _part in _by_class.items():
                 _bars[_c] = resolve_skill_min_books(
                     debeta_dial(dcfg, 'skill_min_books'), debeta_dial(dcfg, 'skill_min_books_share'),
-                    _part['n_books'])
+                    books_with_history(getattr(self, '_debeta_young_books', None), _part['books'],
+                                       now if now is not None else getattr(self, 'simulation_timestamp', 0)))
                 _cvals, _ckept = ((hurdle_skill(_part['pool'], floor, _bars[_c]))
                                   if _hurdle_bps > 0 else (None, None))
                 _cd = {}
@@ -1895,21 +1918,20 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
                     skill_min_books=_bars[_c], skill_p11_strength=skill_p11_strength, p11_topk=p11_topk,
                     s3_k=s3_k,
                 )
-                _notional_all = getattr(self, 'debeta_notional', {}) or {}
                 # the empirical Bayes pool is the class's own, as the class's skill is ranked within it
                 _cself, _ceb = _shrunk_skills(_part['pool'])
                 for _u, _dd in _cd.items():
                     if _ckept is not None:
                         _dd['skill_books'] = int(_ckept.get(_u, 0))
                     _dd['present'] = _u not in _absent
-                    _dd['notional'] = float(sum(v for b, v in (_notional_all.get(_u) or {}).items() if _cmap.get(b) == _c))
+                    _dd['notional'] = float((_notional_by_class.get(_u) or {}).get(_c, 0))
                     _dd['skill_shrunk_self'] = float(_cself.get(_u, 0.0))
                     _dd['skill_shrunk_eb'] = float(_ceb.get(_u, 0.0))
                 _details[_c] = _cd
             # the run-boundary handover (0.6.6): carried class shares blended in, a new class ramped in; the vectors
             # each class pays this cycle are kept by name for the next boundary
             _vectors = {}
-            _handover = class_handover_now(self)
+            _handover = class_handover_now(self, now, end_handover)
             self._debeta_class_shares = class_pool_shares(_details, _cw, sorted(_detail), _bars,
                                                           handover=_handover, vectors_out=_vectors)
             _names = class_names_by_index(self)
@@ -1947,6 +1969,20 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None) -> Dict
         return _debeta_fallback_map(self, dcfg, "exception")
 
 
+def debeta_for_report(self: 'Validator', report_ts: int):
+    """``(scores, class summary, class details)`` for the report of the state at ``report_ts``: the map the scoring of
+    its boundary paid, as main kept it on adopting the scoring service's result, else (a fallback cycle, a missed
+    reply) computed here, without ending a handover."""
+    interval = int(self.config.scoring.interval)
+    boundary = (int(report_ts) // interval) * interval
+    scored = getattr(self, '_scored_debeta', None)
+    if scored is not None and scored.get('ts') == boundary:
+        return scored['scores'], scored['class_summary'], scored['class_details']
+    scores = compute_debeta_scores(self, end_handover=False)
+    return (scores, getattr(self, '_debeta_class_summary', None) or {},
+            getattr(self, '_debeta_class_details', None) or {})
+
+
 # How long a de-beta map may be carried at the (0, 0, 1) rung when the current cycle produced none.
 _DEBETA_CARRY_MAX_S = 600.0
 
@@ -1957,8 +1993,8 @@ def _debeta_fallback_map(self: 'Validator', dcfg, why: str) -> Dict[int, float]:
     Below weight 1.0 the answer is the empty map: score_uid renormalises the de-beta share onto the
     legacy components, which is the characterised warming behaviour of every blend rung. At weight
     1.0 there is nothing to renormalise onto (kappa and pnl carry weight 0 and are not computed), so
-    an empty map scored every miner 0 for the cycle: a warming guard or any exception in the
-    computation zeroed the board (reported by a miner on the 0.6.1 testnet ratchet). At
+    an empty map would score every miner 0 for the cycle, whether a warming guard or an exception in
+    the computation left it empty. At
     that rung the previous cycle's map is carried instead, for at most _DEBETA_CARRY_MAX_S, with its
     decomposition, and the carry is logged every time; with nothing to carry the zero cycle is
     logged as the error it is rather than passing silently.
@@ -2082,8 +2118,8 @@ def build_simulation_config_dict(self: 'Validator') -> Dict:
         'volumeDecimals': self.simulation.volumeDecimals,
         'grace_period': self.simulation.grace_period,
         'book_count': self.simulation.book_count,
-        # Actual traded book-id set (netuids), NOT range(book_count). On the
-        # mainnet-fork localnet this is [1..128] (root/netuid-0 excluded), so
+        # Actual traded book-id set (netuids), NOT range(book_count). Root
+        # (netuid 0) is never a book, so
         # every scoring/reporting loop must iterate this set rather than assume
         # 0-based contiguous ids. Flows to the shadow scorer for parity.
         'book_ids': (
@@ -2231,7 +2267,7 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         'config': build_scoring_config(self),
         'simulation_config': build_simulation_config_dict(self),
         'debeta_scores': _pin.get('debeta_scores') if 'debeta_scores' in _pin else compute_debeta_scores(
-            self, absent=_pin.get('absent'), presence=_pin.get('presence')),
+            self, absent=_pin.get('absent'), presence=_pin.get('presence'), now=_pin.get('simulation_timestamp')),
         # Read AFTER the line above, which is what populates them. Stashed on self by
         # compute_debeta_scores; empty on any fallback path.
         'debeta_detail': getattr(self, 'debeta_detail', {}) or {},
@@ -2257,8 +2293,8 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
     # loop, so any in-process (non-loky) time here directly starves overlapping
     # rounds. score_uids fans kappa out to loky worker processes (off-GIL) but
     # holds the GIL for the arg marshalling + result collection; distribute
-    # (Pareto) is in-process torch. This line tells us, at mainnet cardinality,
-    # which phase dominates the ~24s so Lever 3 (3a-3c) targets the right one.
+    # (Pareto) is in-process torch. This line shows
+    # which phase dominates the reward calculation.
     _prof_t0 = time.perf_counter()
     trading_uid_scores, gentrx_uid_scores = score_uids(validator_data)
     _prof_score = time.perf_counter()
@@ -2381,9 +2417,8 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
         class_shares=_class_shares, skill_share=_skill_sm,
     ).to(self.device)
     _prof_pareto = time.perf_counter()
-    # INFO (not debug): this is one line per scoring round and must land in the
-    # same INFO log time_check.py reads on the live mainnet validator so the
-    # ~24s reward tail's phase split is actually harvestable there.
+    # INFO (not debug): one line per scoring round, so the reward calculation's
+    # phase split can be read from a running validator's log.
     bt.logging.info(
         f"[REWARD-PROFILE] score_uids={_prof_score - _prof_t0:.3f}s "
         f"pareto={_prof_pareto - _prof_score:.3f}s uids={len(all_uids)}"

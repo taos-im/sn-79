@@ -31,6 +31,7 @@
 #include <date/date.h>
 #include <date/tz.h>
 #include <chrono>
+#include <cstdlib>
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -61,9 +62,9 @@
 
 //-------------------------------------------------------------------------
 // The stop signal only records the request (an atomic store; nothing else is async-signal-safe
-// here). Until 30 September 2026 this orchestrator registered no handler at all, so SIGTERM ended
-// the process on the default disposition with no checkpoint, and every restart of a multi-asset
-// run was a crash-resume from the last periodic checkpoint. SimulationManager's handler sits in an
+// here). Without a handler SIGTERM would end the process on the default disposition with no
+// checkpoint, and every restart of a multi-asset run would be a crash-resume from the last periodic
+// checkpoint. SimulationManager's handler sits in an
 // anonymous namespace of its own translation unit; this one feeds the same flag through
 // requestStop(), and run()'s barrier completion is the one place that acts on it.
 extern "C" void onMultiAssetStopSignal(int) noexcept
@@ -98,7 +99,7 @@ std::vector<pugi::xml_document> loadBackgroundDocs(const std::vector<BackgroundD
             throw MultiAssetError{fmt::format(
                 "background '{}' is not a <Simulation> config: {}", label, bg.path.string())};
         }
-        // A BACKGROUND'S RUN-LEVEL SETTINGS DO NOT APPLY, and used to vanish without a word: these are
+        // A BACKGROUND'S RUN-LEVEL SETTINGS DO NOT APPLY, and are reported rather than dropped silently: these are
         // read from a single-market root, never from a background under the wrapper.
         const auto root = doc.child("Simulation");
         for (const auto* attr : {"traceTime", "measureStepWallClockTime", "sltpDebug", "bookStateEndpoint"}) {
@@ -336,6 +337,12 @@ void publishState(Impl& impl, std::span<const taosim::serialization::HumanReadab
             sim->exchange()->setCappedPairs(split[simIdx]);
         }
     }
+    // The fundamental's next step seed, for every realization: each book mixes in its own id.
+    if (const auto seed = taosim::simulation::readStepSeed(obj)) {
+        for (const auto& sim : sims) {
+            sim->setStepSeed(seed->round, seed->word);
+        }
+    }
     // The member named "responses", or the only member, as SimulationManager reads it.
     const msgpack::object* responsesObj{};
     for (const auto& [k, v] : obj.via.map) {
@@ -528,12 +535,27 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
     impl.config.baseDir = runRoot;
 
     // Persist the wrapper config into the run root with the run id and ABSOLUTE background
-    // paths, so the run is reproducible and restorable from its own directory alone.
+    // paths, so the run is reproducible and restorable from its own directory alone. A fresh
+    // run first copies each class file into class_files/ under the run root, so every resume
+    // reads the files the run started on; a restore keeps the paths its config names. Each copy
+    // is named by its background's name, so the backgrounds' names must be unique.
     {
+        const auto classDir = runRoot / "class_files";
         uint32_t persistBgIdx = 0;
         for (pugi::xml_node bgNode : root.children("Background")) {
-            bgNode.attribute("path").set_value(
-                impl.config.backgrounds[persistBgIdx].path.string().c_str());
+            auto& bg = impl.config.backgrounds[persistBgIdx];
+            if (!resumeTimestamp) {
+                std::filesystem::create_directories(classDir);
+                const auto copy = std::filesystem::absolute(
+                    classDir / fmt::format("{}.xml", bg.name.empty() ? fmt::format("bg{}", persistBgIdx) : bg.name));
+                // A fresh run from a run's own saved config, which carries its id, opens that run's root, whose
+                // copies the config already names; a file cannot be copied onto itself.
+                if (!(std::filesystem::exists(copy) && std::filesystem::equivalent(bg.path, copy))) {
+                    std::filesystem::copy_file(bg.path, copy, std::filesystem::copy_options::overwrite_existing);
+                }
+                bg.path = copy;
+            }
+            bgNode.attribute("path").set_value(bg.path.string().c_str());
             ++persistBgIdx;
         }
     }
@@ -552,9 +574,14 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
     const auto simulationCount = ranges::accumulate(
         impl.config.backgrounds | ranges::views::transform(&BackgroundDesc::instanceCount), 0u);
 
+    const auto hostThreads = threadsFromEnvironment(std::getenv("TAOSIM_THREADS"));
+    if (hostThreads) {
+        fmt::println("TAOSIM_THREADS={} sets the worker count (the config's threads is {})",
+            *hostThreads, impl.config.requestedWorkers);
+    }
     impl.allocation = computeResourceAllocation(ResourceAllocationDesc{
         .simulationCount = simulationCount,
-        .requestedWorkers = impl.config.requestedWorkers,
+        .requestedWorkers = hostThreads.value_or(impl.config.requestedWorkers),
         .hardwareConcurrency = std::thread::hardware_concurrency(),
         .checkpointWorkers = 0u  // TODO: surface from config alongside the other ckpt knobs.
     });
@@ -589,9 +616,8 @@ std::unique_ptr<MultiAssetSimulationOrchestrator> MultiAssetSimulationOrchestrat
     for (const auto& [bgIdx, bg] : ranges::views::enumerate(impl.config.backgrounds)) {
         const auto simuNode = impl.backgroundDocs[bgIdx].child("Simulation");
         for (uint32_t instance = 0; instance < bg.instanceCount; ++instance) {
-            // An unnamed background is `bg<index>`, the name the validator model and the
-            // acceptance layer already derive (models.py from_multiasset_xml, ma_layer.py);
-            // plain "bg" made two unnamed backgrounds write into one directory.
+            // An unnamed background is `bg<index>`, the name the validator's model of the
+            // layout derives, so two unnamed backgrounds never write into one directory.
             const auto id = fmt::format(
                 "{}-{}", bg.name.empty() ? fmt::format("bg{}", bgIdx) : bg.name, instance);
             // Derived only under a wrapper seed; otherwise the background's own rngSeed
@@ -886,7 +912,7 @@ void MultiAssetSimulationOrchestrator::run()
                 }
             }
             // Ghosts BEFORE publishing. Filled orders stay in the book as zero-volume
-            // ghosts for the exchange service's on-chain reconciliation; nothing in a
+            // ghosts for an exchange's settlement to reconcile against; nothing in a
             // simulation run reads them, and publishing them left a consumed best level
             // at the head of the book, so the validator's midquote (and every miner's view
             // of the top levels) differed from the single-config run on the same events.

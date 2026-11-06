@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The engine publishes a cancellation without a side, so the book rebuild guesses the side from the best ask; a
-wrong guess moves a whole level to the other side (RECON 27.2469@297.49 against TARGET 0 on the 6 October testnet
-log). A cancellation may now carry a side, the same values as an order's (0 buy, 1 sell); when it does the rebuild
-uses it, and when it does not the old guess runs unchanged, so an engine that does not publish the side behaves as
-before."""
+"""The engine can publish a cancellation without a side, and the book rebuild then guesses the side from the best
+ask; a wrong guess moves a whole level to the other side. A cancellation can carry a side, the same values as an
+order's (0 buy, 1 sell): when it does the rebuild uses it, and when it does not the rebuild guesses from the best ask,
+so an engine that does not publish the side is rebuilt by that guess."""
 import copy
 
 from taos.im.protocol.orders import Cancellation
@@ -30,7 +29,7 @@ def test_a_sell_cancellation_below_the_best_ask_reduces_the_ask_level_when_it_sa
     assert after['bids'][99.0]['q'] == 5.0
 
 
-def test_without_a_side_the_guess_runs_exactly_as_before():
+def test_without_a_side_the_rebuild_guesses_from_the_best_ask():
     hist, _ = H.history(copy.deepcopy(SNAP), [{'y': 'c', 'i': 7, 't': 1, 'p': 99.0, 'q': 2.0}], 4)
     after = hist[1]
     # 99.0 is below the best ask (99.0 >= 99.0 is the guess's test: price at or above the best ask is an ask)

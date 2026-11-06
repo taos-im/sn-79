@@ -128,9 +128,12 @@ def test_submitter_keeps_stamped_score(aggregator):
 
 
 def test_non_submitter_is_zero_and_unaccepted(aggregator):
-    """Score=0.0 > min_score (-0.1) would falsely flip accepted=True for a
-    non-submitter without the explicit submitter-only gate. Pin it."""
+    """Under a negative min_score a non-submitter's 0.0 exceeds the threshold
+    and would flip accepted=True without the explicit submitter-only gate.
+    The default min_score is 0.0, so the test sets one below it. Pin it."""
     _install_fake_scorer(aggregator)
+    aggregator.min_score = -0.1
+    assert aggregator._effective_min_score < 0.0
     aggregator._agg_round = 1
     _plant_assignment(aggregator, 1, 1, submitted=True, score=0.5)
     _plant_assignment(aggregator, 2, 1, submitted=False)

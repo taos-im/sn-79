@@ -1,14 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """The realized making basis marks a fill against the centered mark making_horizon_s of simulation time after it.
-On the live path the accumulator carried the print window across state updates and stamped every print and every
-pending fill with the timestamp it was given for the volume histories, which is the SAMPLED timestamp (floored to
-scoring.activity.trade_volume_sampling_interval, 600 s in production). With every print in a bucket stamped alike, a
-fill could only mature when the next bucket began, so the "20 s" mark was taken anywhere from 0 to 600 s after the
-fill, and nothing matured inside the first bucket of a run (the 0.6.3 testnet warmed for 46 minutes on 6 October;
-the replay harness reproduced it on a 45 s stream). The offline path, which the battery used, read each trade's own
-time, so the battery measured the rule and the validator ran another. These tests hold the live path to the rule:
-the print clock is the trade's own time, the history key stays the sampled timestamp."""
+On the live path the accumulator carries the print window across state updates and stamps every print and every
+pending fill with the trade's own time, not the timestamp it is given for the volume histories, which is the sampled
+timestamp (floored to scoring.activity.trade_volume_sampling_interval). With every print in a bucket stamped alike, a
+fill could only mature when the next bucket began, anywhere from 0 to a whole interval after the fill, and nothing
+would mature inside the first bucket of a run. These tests hold the live path to the rule, as the offline path reads
+it: the print clock is the trade's own time, the history key stays the sampled timestamp."""
 from collections import defaultdict
 
 from taos.im.validator.debeta import accumulate_book_capture, flush_capture_state
@@ -56,11 +54,11 @@ def _run(seconds, fill_at=1, quiet_after=None):
 
 def test_a_fill_matures_at_the_horizon_inside_one_sampling_bucket():
     cb, rb, hrb, booked_at = _run(60)
-    assert cb[1][0] > 0.0, "the captured spread books at the fill as before"
+    assert cb[1][0] > 0.0, "the captured spread books at the fill"
     assert booked_at is not None, "the realized spread never matured inside the bucket: the print clock is the sampled timestamp"
     assert 1 + 20 <= booked_at <= 1 + 20 + W + 1, f"booked {booked_at - 1} s after the fill; the rule is the horizon plus W forward prints"
-    # marked against the background prints at the horizon; since 7 October 2026 a fill's realized spread is clamped to
-    # its captured spread (debeta._capped_mark), and this fill captured less than the 0.52 move
+    # marked against the background prints at the horizon; a fill's realized spread is clamped to its captured spread
+    # (debeta._capped_mark), and this fill captured less than the 0.52 move
     assert abs(rb[1][0] - min(100.5 - 99.98, cb[1][0])) < 1e-9, (rb[1][0], cb[1][0])
 
 

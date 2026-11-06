@@ -363,7 +363,8 @@ fi
 if ! python3 -c "import bittensor" >/dev/null 2>&1; then
     echo "Repairing scalecodec/cyscale conflict (bittensor import failed)"
     pip uninstall -y scalecodec cyscale 2>/dev/null || true
-    pip install --force-reinstall --no-cache-dir cyscale
+    _CONSTRAINTS=(); [ -f "$REPO_ROOT/constraints.txt" ] && _CONSTRAINTS=(-c "$REPO_ROOT/constraints.txt")
+    pip install --force-reinstall --no-cache-dir cyscale "${_CONSTRAINTS[@]}"
 fi
 
 # CUDA check — warn with install command if torch has no CUDA

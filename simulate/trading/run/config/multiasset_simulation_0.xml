@@ -1,9 +1,12 @@
 <!--
-  THE PUBLISHED DEFAULT LAYOUT, three classes from 0.6.5: four realizations of simulation_0 (books 0-63), two of
-  simulation_1 (64-95) and two of simulation_2 (96-127), sixteen books each, 128 in all; the layout run_validator.sh
-  runs by default. simulation_2.xml is the third class, its own market
-  parameters over simulation_1.xml's step, blocks, checkpoints and logging, on a finer price grid, so it comes last.
-  Book ids run consecutively across the realizations and the coarsest grid comes first, as every layout must.
+  THE PUBLISHED DEFAULT LAYOUT from 0.6.7, three classes: eight realizations of simulation_0 (books 0-127), four of
+  simulation_1 (128-191) and four of simulation_2 (192-255), sixteen books each, 256 in all; the layout
+  run_validator.sh runs by default. simulation_2.xml is the third class, its own market parameters over
+  simulation_1.xml's step, blocks, checkpoints and logging, on a finer price grid, so it comes last. Book ids run
+  consecutively across the realizations and the coarsest grid comes first, as every layout must. When a validator
+  moves from the 128-book layout (multiasset_simulation_0_64_32_32.xml) to this one, each class's per-book records
+  move to its first books: simulation_0's stay at 0-63, simulation_1's move from 64-95 to 128-159, simulation_2's
+  from 96-127 to 192-223, and the added books start empty.
 -->
 <MultiAssetSimulation
     traceTime="1"
@@ -22,8 +25,8 @@
     ckptNumWorkers="4"
     ckptMeasureWallClockTime="1">
 
-    <Background name="simulation_0" path="simulation_0.xml" instanceCount="4"/>
-    <Background name="simulation_1" path="simulation_1.xml" instanceCount="2"/>
-    <Background name="simulation_2" path="simulation_2.xml" instanceCount="2"/>
+    <Background name="simulation_0" path="simulation_0.xml" instanceCount="8"/>
+    <Background name="simulation_1" path="simulation_1.xml" instanceCount="4"/>
+    <Background name="simulation_2" path="simulation_2.xml" instanceCount="4"/>
 
 </MultiAssetSimulation>

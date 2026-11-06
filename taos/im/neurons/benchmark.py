@@ -44,6 +44,7 @@ if __name__ != "__mp_main__":
     import importlib.util
     import bittensor as bt
 
+    from taos.common.config import loggable_config
     from taos.common.neurons import BaseNeuron
     from taos.im.neurons.miner import Miner, _HAS_PROTOCOL_EXCHANGE
 
@@ -99,7 +100,7 @@ if __name__ != "__mp_main__":
             bt.logging.info(f"Benchmark miner assigned UID: {self.uid}")
 
             self.device = self.config.neuron.device
-            bt.logging.info(f"Config:\n{self.config}")
+            bt.logging.info(f"Config:\n{loggable_config(self.config)}")
 
             bt.logging.info("Setting up bittensor objects:")
 

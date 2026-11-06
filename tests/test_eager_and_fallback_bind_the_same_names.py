@@ -2,10 +2,8 @@
 
 The dispatch has two arms: an eager one that unpacks inputs the shadow pinned at tee time, and a
 fallback that recomputes them from the validator. They feed one `request_scores` call through a
-lambda, so a name bound in only one arm is not an error until that arm runs — and the eager arm runs
-at a boundary, on the live validator, where the NameError kills the score for that round. That is
-what happened to `presence` on 22 September: it was added to the fallback and to the call, and the
-eager arm left it unbound.
+lambda, so a name bound in only one arm is not an error until that arm runs, and the eager arm runs
+at a boundary, on the live validator, where the NameError kills the score for that round.
 
 Read from source rather than executed, because the block sits inside the validator's run loop.
 """
@@ -37,7 +35,7 @@ def dispatch():
         if (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "_eager"
                 and any(isinstance(o, ast.IsNot) for o in t.ops)):
             return node
-    raise AssertionError("the eager dispatch branch is gone — this guard needs rewriting")
+    raise AssertionError("the eager dispatch branch is not found: this guard needs rewriting")
 
 
 def _bound(body):

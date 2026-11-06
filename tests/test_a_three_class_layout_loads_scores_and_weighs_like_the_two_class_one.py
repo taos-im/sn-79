@@ -4,7 +4,8 @@
 first, and is weighed by the scorer as the two-class layout is: "books" gives each class its share of the books, an
 explicit dial pays only with one entry per class.
 
-The shipped default, multiasset_simulation_0.xml, is that layout (64/32/32, simulation_2 on a finer price grid).
+The shipped default, multiasset_simulation_0.xml, is that layout (128/64/64 from 0.6.7, simulation_2 on a finer price
+grid); multiasset_simulation_0_64_32_32.xml keeps the 64/32/32 of 0.6.5 and 0.6.6.
 """
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,7 +19,9 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent / "simulate" / "trading" / "
 SHIPPED = "multiasset_simulation_0.xml"
 # name: (class names, first and last book id per class, priceDecimals per class)
 LAYOUTS = {
-    SHIPPED: (["simulation_0", "simulation_1", "simulation_2"], [(0, 63), (64, 95), (96, 127)], [2, 2, 4]),
+    SHIPPED: (["simulation_0", "simulation_1", "simulation_2"], [(0, 127), (128, 191), (192, 255)], [2, 2, 4]),
+    "multiasset_simulation_0_64_32_32.xml": (
+        ["simulation_0", "simulation_1", "simulation_2"], [(0, 63), (64, 95), (96, 127)], [2, 2, 4]),
 }
 CASES = sorted(LAYOUTS)
 

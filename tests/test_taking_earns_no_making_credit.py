@@ -80,8 +80,10 @@ def test_a_state_without_the_taker_pair_pays_as_before():
 
 def test_the_skill_leg_still_reads_every_fill():
     src = inspect.getsource(reward.compute_debeta_scores)
-    assert "getattr(self, 'capture_buy_sums', {}) or {}, getattr(self, 'capture_sell_sums', {}) or {}," in src, \
-        "traded_book_alphas keeps the all-fills pair for the books a uid filled on"
+    assert "_caps_b = getattr(self, 'capture_buy_sums', {}) or {}" in src
+    assert "_caps_s = getattr(self, 'capture_sell_sums', {}) or {}" in src
+    assert "_traded = {u: set(_caps_b.get(u) or {}) | set(_caps_s.get(u) or {})" in src and "_caps_b, _caps_s," in src, \
+        "the traded pairs and traded_book_alphas read the all-fills pair for the books a uid filled on"
     assert "_cb, _cs = maker_capture_sums(self)" in src, "the published making gauges read the maker-only pair"
 
 

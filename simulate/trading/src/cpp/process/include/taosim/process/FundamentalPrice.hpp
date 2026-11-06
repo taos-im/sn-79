@@ -48,14 +48,18 @@ struct FundamentalPriceDesc
     int ownRng{1};
     Timestamp gracePeriod{};   // suppress seed-update warnings before this t
     ProcessDesc proc;
-    // float, not double: the Cholesky factor is large and read-only here, and SIMU003TASK004's
-    // multi-asset work halved its footprint. Accumulations widen to double at the two dot
+    // float, not double: the Cholesky factor is large and read-only here, and storing it as float
+    // halves its footprint (see SharedResources). Accumulations widen to double at the two dot
     // products in cholesky_step().
     const Eigen::MatrixXf* L{};
-    // A recorded seed sequence, one `count,price` row per seed step. When set, the step at simulated time t
-    // takes row floor(t / seedInterval) of the file (the first row at one seedInterval) instead of the live
-    // service's newest row, and a step past the last row stops the run. With rngSeed and ownRng=1 the same
-    // config and file reproduce a run offline. Empty: the live file at the run root.
+    // A recorded seed sequence, one row per seed step: `round,randomness` (the public randomness round the validator
+    // delivered and its 64 hex characters, an optional third column ignored) or the older `count,price`. When set,
+    // the step at simulated time t takes row floor(t / seedInterval) of the file (the first row at one seedInterval)
+    // instead of the seed the validator delivers with its batch, and a step past the last row stops the run. With
+    // rngSeed and ownRng=1 the same config and file reproduce a run offline. The validator records one row per seed
+    // it delivers, so its file replays the run it seeded row for row only when every seed step of that run took a
+    // delivered seed. A run with a grace period does not: its grace-period steps, in which nothing is published,
+    // draw random seeds that have no row, and every row after them falls on an earlier step than the one it seeded.
     std::string seedFile{};
 };
 
@@ -103,8 +107,11 @@ public:
     // keeps the file's meaning identical whether or not interpolation is on.
     virtual double loggedValue() const override { return m_state.value; }
 
-    // The generator seed of a step whose seed price is `priceCents`, for book `bookId`.
-    [[nodiscard]] static uint32_t seedFor(int64_t priceCents, uint64_t bookId) noexcept;
+    // The generator seed of a step whose seed value is `value` (the delivered randomness's first 8 bytes, or an
+    // older seed file's price in cents), for book `bookId`.
+    [[nodiscard]] static uint32_t seedFor(int64_t value, uint64_t bookId) noexcept;
+    // Seed steps that found no new seed delivered and drew a random one.
+    [[nodiscard]] uint64_t randomSeedSteps() const noexcept { return m_randomSeedSteps; }
     // Seeds the stream this process draws from (its own with ownRng, else the shared one); a checkpoint
     // restore calls it with the step's recorded seed.
     void reseed(uint64_t seed);
@@ -120,11 +127,11 @@ private:
     struct SeedRow
     {
         int count;
-        int64_t cents;
+        int64_t value;
     };
 
     void cholesky_step(int64_t i);
-    [[nodiscard]] std::optional<SeedRow> liveSeed(Timestamp timestamp) const;
+    [[nodiscard]] std::optional<SeedRow> deliveredSeed(Timestamp timestamp);
     [[nodiscard]] SeedRow recordedSeed(Timestamp timestamp);
 
     simulation::ISimulation* m_simulation;
@@ -136,6 +143,11 @@ private:
     std::string m_seedfile;
     bool m_recordedSeeds{};
     std::vector<SeedRow> m_recorded;
+    uint64_t m_seedGeneration{};
+    uint64_t m_randomSeedSteps{};
+    // The random-seed steps after the grace period, which the log counts: no batch arrives before the grace period
+    // ends, so the steps in it are expected to draw random seeds.
+    uint64_t m_randomSeedStepsAfterGrace{};
     double m_X0, m_mu, m_sigma, m_dt;
     FundamentalPriceState m_state;
     const Eigen::MatrixXf* m_L;

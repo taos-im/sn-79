@@ -51,12 +51,12 @@ inline constexpr uint64_t kStep = 1'000'000'000;
 
 // Two books and two trading populations on a GBM fundamental, so a realization's state holds orders,
 // trades and agent state worth restoring. The wrapper stamps the grid; these values are placeholders.
-inline std::string backgroundXml()
+inline std::string backgroundXml(uint32_t remoteAgentCount = 1)
 {
-    return R"(<Simulation start="0" duration="1" step="1" timescale="ns">
+    return fmt::format(R"(<Simulation start="0" duration="1" step="1" timescale="ns">
     <Agents>
         <MultiBookExchangeAgent name="EXCHANGE" gracePeriod="0" priceDecimals="2" volumeDecimals="4"
-            baseDecimals="4" quoteDecimals="10" remoteAgentCount="1" maxLeverage="4" maxLoan="10000"
+            baseDecimals="4" quoteDecimals="10" remoteAgentCount="{}" maxLeverage="4" maxLoan="10000"
             maintenanceMargin="0.25" initialPrice="300.0" minOrderSize="0.25">
             <Books instanceCount="2" algorithm="PriceTime">
                 <Processes>
@@ -95,7 +95,8 @@ inline std::string backgroundXml()
         <DistributedProxyAgent/>
     </Agents>
 </Simulation>
-)";
+)",
+        remoteAgentCount);
 }
 
 struct RunDesc
@@ -107,6 +108,7 @@ struct RunDesc
     uint64_t ckptNumLastFilesToKeep{100};
     uint64_t gracePeriod{0};
     std::string extraAttrs;
+    uint32_t remoteAgentCount{1};
 };
 
 // One run directory under the system temp dir, removed on destruction. The run id is fixed, so the
@@ -120,7 +122,7 @@ public:
     {
         fs::remove_all(m_base);
         fs::create_directories(m_base);
-        std::ofstream{m_base / "background.xml"} << backgroundXml();
+        std::ofstream{m_base / "background.xml"} << backgroundXml(m_desc.remoteAgentCount);
         std::ofstream{m_base / "wrapper.xml"} << fmt::format(
             R"(<MultiAssetSimulation id="run" threads="{}" seed="42" start="0" step="{}" duration="{}"
     gracePeriod="{}" ckptIntervalInSteps="{}" ckptNumLastFilesToKeep="{}" {}>

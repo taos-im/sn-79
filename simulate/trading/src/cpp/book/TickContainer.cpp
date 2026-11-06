@@ -22,6 +22,7 @@ TickContainer::TickContainer(OrderContainer* orderContainer, taosim::decimal_t p
 
 void TickContainer::updateVolume(taosim::decimal_t deltaVolume) noexcept
 {
+    if (deltaVolume < 0_dec) m_mayHoldGhosts = true;
     m_volume += deltaVolume;
     m_orderContainer->updateVolume(deltaVolume);
 }
@@ -31,6 +32,7 @@ void TickContainer::updateVolume(taosim::decimal_t deltaVolume) noexcept
 void TickContainer::push_back(const TickContainer::value_type& order)
 {
     BaseType::push_back(order);
+    if (order->volume() == 0_dec) m_mayHoldGhosts = true;
     const auto totalVolume = order->totalVolume();
     m_volume += totalVolume;
     m_orderContainer->updateVolume(totalVolume);

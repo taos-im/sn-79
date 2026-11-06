@@ -38,10 +38,9 @@ def sanitize_recent_trades(book_trades) -> tuple[list, int]:
     whole batch. `TradeInfo.model_construct` skips validation (hot path), so a bad id passes silently
     on load and only bites later at `model_dump`, in a different module, as a serializer warning.
 
-    Such an id cannot be repaired. The only known producer was a synthetic
-    `x:<extrinsic>:<agent>:<direction>:<p|f>` fallback, since deleted; no id of that shape was ever
-    written to the tape, so there is nothing to join it to and guessing one would recreate exactly the
-    identity divergence the fallback caused.
+    Such an id cannot be repaired: an id of the synthetic `x:<extrinsic>:<agent>:<direction>:<p|f>` shape
+    names no recorded trade, so there is nothing to join it to, and guessing one would split the trade's
+    identity.
 
     A missing or null id is KEPT: a pre-settlement trade legitimately has no id yet, and dropping
     those would lose real trades, which is worse than the warning.
@@ -144,6 +143,13 @@ def _load_class_vectors(raw) -> dict:
     return out
 
 
+def load_young_books(raw) -> dict:
+    """A saved ``debeta_young_books`` as trade.note_young_books keeps it, its keys and times as ints; {} for none."""
+    raw = raw or {}
+    since = {int(b): int(t) for b, t in (raw.get("since") or {}).items()}
+    return {"span": int(raw.get("span") or 0), "since": since} if since else {}
+
+
 def build_debeta_state(self) -> dict:
     """The de-beta block of the validator-state file: the TIMESTAMPED HISTORIES (making window + skill
     window) plus the reconstruction STATE (per-book inventory + last price). The running sums are rebuilt
@@ -169,6 +175,8 @@ def build_debeta_state(self) -> dict:
     # inside the lookback resumes it
     out["debeta_class_vectors"] = dict(getattr(self, '_debeta_class_vectors', None) or {})
     out["debeta_handover"] = dict(getattr(self, '_debeta_handover', None) or {})
+    # the books a layout change added and when (0.6.7), so a restart inside the lookback keeps the bar where it was
+    out["debeta_young_books"] = dict(getattr(self, '_debeta_young_books', None) or {})
     return out
 
 
@@ -234,7 +242,15 @@ def build_validator_state(
         # update_stats() mutation on the main loop (no await between here).
         "miner_stats": snapshot_miner_stats(self),
         "miner_presence": snapshot_miner_presence(self),
+        "layout": scored_layout(self),
     }
+
+
+def scored_layout(self) -> dict | None:
+    """The layout the saved records are scored on (book_layout.layout_of), so a load onto another layout knows where
+    each class's records belong."""
+    from taos.im.validator.book_layout import layout_of
+    return getattr(self, '_scored_layout', None) or layout_of(getattr(self, 'simulation', None))
 
 
 def snapshot_miner_stats(self: Validator):
@@ -311,6 +327,7 @@ def build_save_light_fields(self: Validator) -> dict:
         "debeta_pool_ema": {k: dict(v or {}) for k, v in (getattr(self, '_debeta_pool_ema', {}) or {}).items()},
         "miner_stats": snapshot_miner_stats(self),
         "miner_presence": snapshot_miner_presence(self),
+        "layout": scored_layout(self),
     }
 
 
@@ -611,18 +628,18 @@ def defragment_histories(self: Validator):
 # solid and freezes the event loop for the whole save.
 _SAVE_STREAM_DEPTH = 2
 
-# Save every Nth scoring interval (default 2 = every 10th sim update at the
-# 5s scoring interval). The ~480MB validator save spans 9-16s of prep+pack+io
-# per firing; at every-interval cadence it was the largest single contributor
-# to the background GIL/io load that stalls scoring-round receives. Trade-off:
-# a crash loses up to N intervals of scoring history. Override via env.
-_SAVE_EVERY_INTERVALS = max(1, int(os.environ.get("SAVE_EVERY_INTERVALS", "2")))
+# Save every Nth scoring interval (default 12 = once a simulated minute at the 5s scoring interval). A save is written
+# by the scoring service while main waits under the reward lock, so a frequent cadence keeps rewards locked for a large
+# share of the time. Trade-off: a crash loses up to N intervals of scoring history (a minute of a three-hour lookback);
+# an engine resume reads the checkpoint's scoring snapshot instead. Override via env.
+_SAVE_EVERY_INTERVALS = max(1, int(os.environ.get("SAVE_EVERY_INTERVALS", "12")))
 
 
 def saves_on_stop(self: Validator) -> bool:
     """The save on stop is simulation mode's. The exchange validator stops as it did: no wait for a last state and no
-    save of its own."""
-    return getattr(getattr(self, 'engine', None), 'mode', 'simulation') != 'exchange'
+    save of its own. Before the engine exists nothing is loaded or accounted, so there is nothing to save."""
+    engine = getattr(self, 'engine', None)
+    return engine is not None and getattr(engine, 'mode', 'simulation') != 'exchange'
 
 
 def _accounted_key(self: Validator):
@@ -656,7 +673,7 @@ def _snapshot(obj):
     return obj
 
 
-def _stream_pack(packer, write, obj, depth):
+def _stream_pack(packer, write, obj, depth, snapshot=True):
     """Write msgpack bytes for `obj` via `write(bytes)`, BYTE-IDENTICAL to
     packer.pack(obj) / msgpack.packb(obj, use_bin_type=True).
 
@@ -667,7 +684,8 @@ def _stream_pack(packer, write, obj, depth):
     single pack() — but it splits one huge C-level pack() (which holds the GIL
     for its entire duration) into many small ones with GIL-switch points
     between, so a large state value can't monopolise the GIL during a save.
-    At depth 0, or for scalars, packs the object whole. Returns bytes written.
+    At depth 0, or for scalars, packs the object whole, through a _snapshot copy unless `snapshot` is False (an
+    object nothing else writes needs none). Returns bytes written.
     """
     total = 0
     if depth > 0 and isinstance(obj, dict):
@@ -681,19 +699,45 @@ def _stream_pack(packer, write, obj, depth):
             chunk = packer.pack(k)
             write(chunk)
             total += len(chunk)
-            total += _stream_pack(packer, write, v, depth - 1)
+            total += _stream_pack(packer, write, v, depth - 1, snapshot)
     elif depth > 0 and isinstance(obj, (list, tuple)):
         seq = list(obj)
         chunk = packer.pack_array_header(len(seq))
         write(chunk)
         total += len(chunk)
         for v in seq:
-            total += _stream_pack(packer, write, v, depth - 1)
+            total += _stream_pack(packer, write, v, depth - 1, snapshot)
     else:
-        chunk = packer.pack(_snapshot(obj))
+        chunk = packer.pack(_snapshot(obj) if snapshot else obj)
         write(chunk)
         total += len(chunk)
     return total
+
+
+# The report payload's parts the preparation builds for the report itself, which nothing else holds or writes, so the
+# pack needs no copy of them. The state the report reads (last_state) joins them in simulation mode, where its accounts
+# are written only by the volume pass at the state's start.
+REPORT_UNSHARED = frozenset({
+    'metagraph_data', 'simulation', 'step_rates', 'round_gaps', 'query_waits', 'reward_gate_waits',
+    'volume_sums', 'maker_volume_sums', 'taker_volume_sums', 'self_volume_sums', 'fee_sums', 'roundtrip_volume_sums',
+    'total_realized_pnl', 'realized_pnl_by_book', 'scores', 'gentrx_scores',
+    'recent_trades', 'recent_miner_trades', 'recent_fee_rates', 'open_positions',
+})
+
+
+def pack_report(data, unshared=frozenset(), depth=None):
+    """The report payload's msgpack bytes, BYTE-IDENTICAL to msgpack.packb(data, use_bin_type=True), streamed as
+    _stream_pack streams them: the parts named in `unshared` are packed as they are, the others through a copy."""
+    import io
+    depth = _SAVE_STREAM_DEPTH if depth is None else depth
+    packer = msgpack.Packer(use_bin_type=True)
+    buf = io.BytesIO()
+    items = list(dict(data).items())
+    buf.write(packer.pack_map_header(len(items)))
+    for k, v in items:
+        buf.write(packer.pack(k))
+        _stream_pack(packer, buf.write, v, depth - 1, snapshot=k not in unshared)
+    return buf.getvalue()
 
 
 async def save_state_async(self: Validator) -> bool:
@@ -1403,7 +1447,7 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
 
     self.debeta_capbuy_hist = _load_hist3("debeta_capbuy_hist")
     self.debeta_capsell_hist = _load_hist3("debeta_capsell_hist")
-    # realized spread (2 Oct 2026); absent from a snapshot written before it, so it warms from empty
+    # realized spread; absent from an older snapshot, so it warms from empty
     self.debeta_realbuy_hist = _load_hist3("debeta_realbuy_hist")
     self.debeta_realsell_hist = _load_hist3("debeta_realsell_hist")
     # the captured pair's taker legs (0.6.6); absent from a snapshot written before it, so the old taker legs stay in
@@ -1459,6 +1503,7 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     })
     self.debeta_plast_alt = {int(b): float(v) for b, v in (validator_state.get("debeta_plast_alt") or {}).items()}
     self._debeta_class_vectors = _load_class_vectors(validator_state.get("debeta_class_vectors"))
+    self._debeta_young_books = load_young_books(validator_state.get("debeta_young_books"))
     _hand = validator_state.get("debeta_handover") or {}
     self._debeta_handover = ({"start": int(_hand.get("start") or 0), "span": int(_hand.get("span") or 0),
                               "carried": _load_class_vectors(_hand.get("carried")),
@@ -1729,6 +1774,8 @@ def _load_validator_state(self):
             _pema = validator_state.get("debeta_pool_ema") or {}
             self._debeta_pool_ema = {str(k): {int(u): float(x) for u, x in (v or {}).items()}
                                      for k, v in _pema.items()}
+            # the layout these records were scored on; an older version's state has none (the engine reads its run's)
+            self._scored_layout = validator_state.get("layout") or None
 
             loaded_activity = validator_state.get("activity_factors", {})
             if loaded_activity and isinstance(list(loaded_activity.values())[0], float):

@@ -53,6 +53,10 @@ SHADOW_REINIT_WAIT_MAX = int(os.environ.get("SHADOW_REINIT_WAIT_MAX", "16"))
 # next boundary, and after FORCE_AFTER deferrals it runs regardless so a permanently busy box still
 # verifies. Unthrottled, a VERIFY holds the reward lock long enough for the queue to cross the
 # query-blocking threshold, and miners go unqueried while it does.
+# Every 60th boundary by default: a VERIFY is a second full scoring and lengthens the round beside it. The parity
+# digest compares the accumulators every SHADOW_PARITY_NS and re-initialises the child on two mismatches in a row,
+# so VERIFY is the end-to-end backstop for what the digest does not cover.
+SCORING_PROC_VERIFY_EVERY = int(os.environ.get("SCORING_PROC_VERIFY_EVERY", "60"))
 SCORING_PROC_VERIFY_MAX_PENDING = int(os.environ.get("SCORING_PROC_VERIFY_MAX_PENDING", "2"))
 SCORING_PROC_VERIFY_FORCE_AFTER = int(os.environ.get("SCORING_PROC_VERIFY_FORCE_AFTER", "3"))
 
@@ -69,10 +73,9 @@ class VerifyScheduler:
 
     A check falls due every `every` boundaries. A due check runs when the reward queue is short
     (scoring_proc_verify_decision); otherwise the WHOLE due period is skipped and counted, and after
-    enough skipped periods the next due check runs regardless. The period is consumed either way: the
-    first cut carried the due flag to the next boundary, where the queue is the same size because the
-    adoption wait alone queues three rounds, so the check merely slid three boundaries and ran at the
-    old cadence (testnet: deferred at boundaries 10, 11, 12, ran at 13). Skipping the
+    enough skipped periods the next due check runs regardless. The period is consumed either way: a due flag
+    carried to the next boundary would find the queue the same size, since the adoption wait alone queues
+    three rounds, so the check would only slide three boundaries and keep the old cadence. Skipping the
     period gives one VERIFY per (force_after + 1) * every boundaries on a busy box and every `every`
     on an idle one.
     """
@@ -115,7 +118,7 @@ _DEBETA_PLAIN = [
     "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist",
     "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
     "debeta_conj_hist", "debeta_conj_farm", "debeta_conj_farm_hist", "debeta_conj_ref", "debeta_conj_clock",
-    "_debeta_class_vectors", "_debeta_handover",
+    "debeta_conj_samples", "_debeta_class_vectors", "_debeta_handover", "_debeta_young_books",
 ]
 
 _STRUCT_NAMES = [
@@ -127,10 +130,9 @@ _STRUCT_NAMES = [
     # Shadow-reward inputs: mutated in place by score_uids each interval, so
     # once initialized the child's own scoring keeps them in lockstep with main.
     "kappa_values", "activity_factors", "pnl_factors",
-    # The de-beta accumulators. Until 0.6.1 the snapshot stopped at the kappa structures, so every
-    # INIT (and every parity re-INIT) restarted the child's making and skill windows from zero while
-    # main's kept going; in cutover mode the child's are the ones that score, so frequent re-INITs
-    # leave the legs computed over a tiny slice of fills.
+    # The de-beta accumulators. A snapshot without them would restart the child's making and skill windows
+    # from zero at every INIT (and every parity re-INIT) while main's kept going; in cutover mode the child's
+    # are the ones that score, so frequent re-INITs would leave the legs computed over a tiny slice of fills.
     *_DEBETA_DD2,
     *_DEBETA_PLAIN,
     # Redelivery dedup ledgers (exchange mode): a child with an empty ledger counts every redelivered
@@ -290,8 +292,8 @@ def pnl_len_vector(s) -> dict:
 
 def mtm_vector(s) -> dict:
     """{uid: (books held, summed mark-to-market, summed inventory on those books)} for debeta_mtm, the uid-level breakdown behind the
-    debeta_mtm component. Since 1 October 2026 the local shadow diverged on that one structure within a
-    round of every INIT with only two hashes in the log; this names the uids so the cause can be read."""
+    debeta_mtm component. A divergence on that structure otherwise shows only as two hashes in the log; this names
+    the uids so the cause can be read."""
     inv = getattr(s, "debeta_inv", {}) or {}          # {book: {uid: inventory}}
     out = {}
     for u, b in (getattr(s, "debeta_mtm", {}) or {}).items():
@@ -511,6 +513,11 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         'trading_ema_n': _tema_n,
         'trading_ema_ts': _tema_ts,
         'debeta_pool_ema': _pema,
+        # the de-beta map this boundary paid, for main's report (reward.debeta_for_report)
+        'debeta_scores': validator_data['debeta_scores'],
+        'debeta_class_summary': getattr(shadow, '_debeta_class_summary', None) or {},
+        'debeta_class_details': getattr(shadow, '_debeta_class_details', None) or {},
+        'debeta_alphas_by_book': getattr(shadow, 'debeta_alphas_by_book', None) or {},
     }
 
 
@@ -564,6 +571,7 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
         **build_debeta_state(shadow),
         "miner_stats": light["miner_stats"],
         "miner_presence": light.get("miner_presence", {}),
+        "layout": light.get("layout"),
     }
     packer = msgpack.Packer(use_bin_type=True)
     tmp = f"{path}.tmp.shadow"
@@ -613,7 +621,7 @@ def apply_state_bytes(shadow: ShadowState, raw: bytes) -> int:
     d = msgpack.unpackb(raw, raw=False, use_list=True, strict_map_key=False)
     # Main flattens a multi-asset request (backgrounds -> instances -> books) in the engine's receive path
     # before it accounts for the round; the replica replays the bytes from before that step, so it must
-    # flatten too or it sees no books at all under the multi-asset layout (2 October 2026).
+    # flatten too or it sees no books at all under the multi-asset layout.
     d, _ = flatten_multiasset_state(d)
     state = MarketSimulationStateUpdate.parse_dict(d)
     shadow.step += 1
@@ -849,7 +857,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                 _apply_one(ts, raw)
             elif kind == "sim_start":
                 old_ts, new_ts, *_rest = payload
-                _book_changes = _rest[0] if _rest else None  # the layout change's per-book map (row 64)
+                _book_changes = _rest[0] if _rest else None  # the layout change's per-book map
                 if shadow is not None:
                     # States teed before this shift are the old run's, and main applied them before shifting: the
                     # child applies them first too. A boundary awaited among them is void, no score follows a run
@@ -1095,8 +1103,8 @@ class ScoringShadow:
                 dropped = 0
                 log_it = False
         if dropped:
-            # A dropped round is a guaranteed parity MISMATCH and re-INIT downstream; until 0.6.1 the
-            # only trace was the dropped= counter on a MATCH line, which a diverging child never prints.
+            # A dropped round is a guaranteed parity MISMATCH and re-INIT downstream, and a diverging child
+            # never prints the dropped= counter of a MATCH line, so the drop is logged here.
             if log_it:
                 import bittensor as bt
                 bt.logging.warning(
@@ -1219,7 +1227,7 @@ class ScoringShadow:
         until it arrives (call via run_in_executor — the wait is GIL-free).
         eager=True means the inputs were already shipped at tee time (the child
         is computing or done — do not send a score_at); otherwise the score_at
-        pull path runs as before. Returns the result dict {'trading','gentrx',
+        pull path runs. Returns the result dict {'trading','gentrx',
         'factors','gentrx_ema'} or None on ANY failure — the caller falls back
         to the in-process get_rewards and a dead child is respawned.
 
@@ -1517,7 +1525,7 @@ class ScoringShadow:
                     f"(applied={applied}, dropped={self._dropped}, reinits={self.reinits}) "
                     f"(main={ {k: mine.get(k) for k in _diff} } shadow={ {k: theirs.get(k) for k in _diff} })"
                 )
-                # The vectors: a dict of named uid vectors since 2 Oct 2026; a bare {uid: len} dict is the
+                # The vectors: a dict of named uid vectors; a bare {uid: len} dict is the
                 # older n_pnl-only form, read the same way so the two sides can be a version apart.
                 def _vectors(v):
                     if isinstance(v, dict) and ("n_pnl" in v or "debeta_mtm" in v):

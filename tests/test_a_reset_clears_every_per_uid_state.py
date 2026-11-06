@@ -66,8 +66,13 @@ EXEMPT = {
     "debeta_conj_farm": "per book, not per uid", "debeta_conj_farm_hist": "per book, not per uid",
     "debeta_conj_ref": "the books' spread and fill-size references", "_conj_dt": "the state's interval, set every update",
     "debeta_conj_clock": "the previous state's time, validator-wide",
+    "debeta_conj_samples": "the books' trailing-hour samples behind the references (0.6.7)",
+    "_scored_debeta": "the map one boundary paid, read only for that boundary's report (0.6.7)",
+    "_sim_push_ts": "the state whose data-service push already started in the miners' wait",
+    "on_query_sent": "a method, which the forward looks up by name",
     # the run-boundary handover (0.6.6): class-keyed vectors whose uids reset_agent_histories pops (its own test)
     "_debeta_class_vectors": "class-keyed; a reset uid is popped from each leg", "_debeta_handover": "class-keyed; likewise",
+    "_debeta_young_books": "per book, when a layout change added it, no uid in it",
     # the report's publish flags, rebuilt at a run open (0.6.6, D4); a reset uid's flag is set False by the engine's reset
     "initial_balances_published": "report flag; the engine's reset path sets a reset uid's to False",
     # configuration, handles and scalars
@@ -75,7 +80,7 @@ EXEMPT = {
     "simulation_config": "the scoring child's copy of the simulation config (skill_bar reads its book count)",
     "_latency_profile": "configuration: the latency_profile dial's per-uid process times, read once from its file",
     "_capped_pairs": "the round's (uid, book) pairs at the volume cap, rebuilt from volume_sums at every query; a reset "
-                     "clears volume_sums and the next round's set follows (row 67)",
+                     "clears volume_sums and the next round's set follows",
     # round timing the report publishes: the validator's own clocks, not per-uid state
     "round_gaps": "wall seconds between states, validator-wide", "query_waits": "the query service's wait per round",
     "reward_gate_waits": "waits for the reward lock, validator-wide", "_round_clock": "the last state's wall time",

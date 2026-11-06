@@ -22,6 +22,7 @@
 
 #include <barrier>
 #include <map>
+#include <optional>
 #include <tuple>
 #include <valarray>
 
@@ -180,6 +181,11 @@ public:
     // own directory below it. A single-config run's root is its log directory.
     [[nodiscard]] const fs::path& runDir() const noexcept { return m_runDir.empty() ? m_logDir : m_runDir; }
     void setRunDir(fs::path dir) { m_runDir = std::move(dir); }
+    // The fundamental's step seed as the validator last delivered it with a batch: the public randomness round and
+    // the first 8 bytes of its randomness. Each delivery bears a new generation, so each book takes it once.
+    struct StepSeed { uint64_t round{}; uint64_t word{}; uint64_t generation{}; };
+    void setStepSeed(uint64_t round, uint64_t word) noexcept { m_stepSeed = {round, word, ++m_stepSeedGeneration}; }
+    [[nodiscard]] const std::optional<StepSeed>& stepSeed() const noexcept { return m_stepSeed; }
     virtual void receiveMessage(Message::Ptr msg) override;
     virtual void configure(const pugi::xml_node& node) override;
 
@@ -257,6 +263,8 @@ private:
     bool m_error = false;
     fs::path m_logDir;
     fs::path m_runDir;
+    std::optional<StepSeed> m_stepSeed;
+    uint64_t m_stepSeedGeneration{};
     taosim::simulation::SimulationConfig m_config2;
     uint32_t m_blockIdx{};
     uint32_t m_blockDim{};

@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""scoring.debeta.capture_market_votes (0.6.4, default off). Off, any print that clears a fill's dust floor votes in
-its capture mid, so two miners trading minimum-size lots to each other off the price move an honest maker's captured
-spread (Emil's review of the 0.6.4 floor, point a1). On, only prints with the background market on one side vote,
-over the same span (the 15 nearest prints a side that clear the floor), reaching on until CAPTURE_MARKET_MIN such
-prints a side vote: no print between two miners moves anyone's mid at any size (it still takes a place in the span,
-so the market prints the mid averages shift a little). Without miner-to-miner prints the two settings read the same
-mid. The batch and live paths agree whatever the batching, and the dial reaches the scorer from config."""
+"""scoring.debeta.capture_market_votes (default off). Off, any print that clears a fill's dust floor votes in its
+capture mid, so two miners trading minimum-size lots to each other off the price move an honest maker's captured
+spread. On, only prints with the background market on one side vote, over the same span (the 15 nearest prints a side
+that clear the floor), reaching on until CAPTURE_MARKET_MIN such prints a side vote: no print between two miners moves
+anyone's mid at any size (it still takes a place in the span, so the market prints the mid averages shift a little).
+Without miner-to-miner prints the two settings read the same mid. The batch and live paths agree whatever the
+batching, and the dial reaches the scorer from config."""
 import copy
 from collections import defaultdict
 from types import SimpleNamespace
@@ -98,7 +98,7 @@ def test_on_a_print_between_two_miners_moves_no_mid_and_a_print_with_the_market_
     base = _mids(clean, True)[i]
     assert abs(_mids(with_miners, True)[i + 1] - base) < 0.0005, "the miners' print is not a voter"
     assert _mids(with_market, True)[i + 1] - base > 0.01, "a print with the background on one side votes"
-    assert _mids(with_miners, False)[i + 1] - base > 0.01, "off, the miners' print votes as before"
+    assert _mids(with_miners, False)[i + 1] - base > 0.01, "off, the miners' print votes"
 
 
 def test_on_the_span_is_kept_and_a_side_short_of_market_votes_reaches_for_them():

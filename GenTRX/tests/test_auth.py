@@ -90,3 +90,21 @@ def test_no_key_configured_is_passthrough(empty):
     assert r.status_code == 200
     r = client.post("/gentrx/state", content=b"\x00")
     assert r.status_code == 200
+
+
+def test_the_key_is_compared_in_constant_time(monkeypatch):
+    import hmac
+
+    calls = []
+    real = hmac.compare_digest
+
+    def _recording(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", _recording)
+    client = TestClient(_build_app(SECRET))
+    assert client.get("/gentrx/version", headers={"X-API-Key": SECRET}).status_code == 200
+    assert client.get("/gentrx/version", headers={"X-API-Key": "wrong-key"}).status_code == 401
+    assert client.get("/gentrx/version").status_code == 401
+    assert calls and all(isinstance(a, bytes) and isinstance(b, bytes) for a, b in calls)

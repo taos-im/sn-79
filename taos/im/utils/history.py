@@ -30,7 +30,7 @@ def _add(side, price, delta, volume_decimals):
 
 def _take(side, price, amount, volume_decimals):
     """_add for a removal that touches only a level that exists (a trade or a cancellation at a price not resting
-    changes nothing, as before)."""
+    changes nothing)."""
     if price not in side:
         return side
     return _add(side, price, -amount, volume_decimals)
@@ -87,7 +87,7 @@ def history(snapshot, events, volume_decimals):
 
             case c if event['y'] == 'c':
                 # Cancel existing order: on the side the event names when it carries one, else the guess from the
-                # best ask (an engine that publishes no side behaves as before)
+                # best ask (for an engine that publishes no side)
                 side_flag = c.get('s')
                 if side_flag is not None:
                     on_ask = int(side_flag) == 1

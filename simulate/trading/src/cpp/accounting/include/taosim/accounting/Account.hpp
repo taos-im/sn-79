@@ -16,11 +16,23 @@ namespace taosim::accounting
 
 //-------------------------------------------------------------------------
 
+// Ids are unique per book, so an account's open orders on a book iterate in the same order in
+// every run, wherever the orders were allocated.
+struct OrderIdLess
+{
+    [[nodiscard]] bool operator()(const Order::Ptr& lhs, const Order::Ptr& rhs) const noexcept
+    {
+        return lhs->id() < rhs->id();
+    }
+};
+
+//-------------------------------------------------------------------------
+
 class Account : public JsonSerializable
 {
 public:
     using Holdings = std::vector<Balances>;
-    using ActiveOrders = std::vector<std::set<Order::Ptr>>;
+    using ActiveOrders = std::vector<std::set<Order::Ptr, OrderIdLess>>;
 
     Account() noexcept = default;
     explicit Account(uint32_t bookCount, std::optional<Balances> balances) noexcept;

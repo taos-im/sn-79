@@ -1639,9 +1639,9 @@ class FinanceAgent(FinanceAgentBase):
         validator hotkey as its second argument: an exchange calling it with one would raise on the
         argument count inside the response builder, which is worse than not calling it.
 
-        ONE MINER'S BUGGY HANDLER COSTS THAT HANDLER, NOT THE RESPONSE. An exception here used to
-        propagate out of the response builder and lose the agent's whole response for the tick -- the
-        SimpleRegressorAgent failure. Each dispatch is isolated and logged.
+        ONE MINER'S BUGGY HANDLER COSTS THAT HANDLER, NOT THE RESPONSE. An exception propagating out
+        of the response builder would lose the agent's whole response for the tick, so each dispatch is
+        isolated and logged.
 
         onStart and onEnd are dispatched only if such an event actually arrives. An exchange does not
         start or end, and firing them off every update would make an agent that initialises in onStart

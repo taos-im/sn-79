@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: MIT
 """One scrape, one cycle: the Prometheus exposition served from a frozen per-cycle snapshot.
 
-Until 30 September 2026 every scrape rendered the live registries on demand while the reporting child was
-still applying the next cycle, so a read could carry a family half rebuilt (three of 206 mainnet board reads
-in the last week lost some or all coldkeys) and families from two cycles, and each scrape paid the whole
-render (about 26 s at mainnet size with the stock client) while holding the GIL against the apply loop.
+A scrape that renders the live registries on demand while the reporting child is still applying the next cycle
+can carry a family half rebuilt (some or all coldkeys missing) and families from two cycles, and each such scrape
+pays the whole render while holding the GIL against the apply loop.
 
 Here the child publishes one CycleSnapshot at the end of each report cycle: the snapshot-backed families
 contribute their frozen dicts (replaced, never mutated, so the reference is enough), the small eager
 families are copied. The first scrape of a cycle renders the body once, in the scrape thread, single-flight;
 later scrapes of the same cycle get the same bytes, and every per-registry endpoint is a slice of them. The
-renderer writes the same text the client's generate_latest writes (the test asserts byte identity), about
-five times faster.
+renderer writes the same text the client's generate_latest writes (the test asserts byte identity), in less
+time.
 
 MVTRX_METRICS_SNAPSHOT=0 restores the per-scrape live render. /metrics serves the board registries without the two
 bulk registries (agent, trades), which keep their own endpoints; MVTRX_METRICS_MAIN=all serves every registry on
@@ -43,11 +42,11 @@ MAIN_MODE = main_mode_from(os.environ.get("MVTRX_METRICS_MAIN"))
 # Name and value escaping as the text exposition writes them: a legacy-valid name goes through unchanged, any other
 # rune becomes an underscore, and a label value escapes backslash, newline and double quote. Written here rather
 # than taken from prometheus_client.openmetrics.exposition, whose escaping functions exist only from 0.22: a host
-# with an older package served HTTP 500 on every metrics family (testnet, 6 October 2026).
+# with an older package would serve HTTP 500 on every metrics family.
 #
 # Speed matters here as much as correctness: a cycle renders a few hundred megabytes, tens of millions of label
-# escapes, in a thread that shares the interpreter with the validator. A per-character check cost four times the
-# client's regex and stalled the testnet validator's metrics server within minutes of its deploy (6 October 2026).
+# escapes, in a thread that shares the interpreter with the validator. A per-character check costs several times
+# the client's regex, enough to stall the metrics server.
 # Names come from a small fixed set and label values repeat heavily (uids, book ids, wallets), so both are cached;
 # the regex check runs once per distinct name, and a value without a special character is returned as it is.
 _LEGACY_METRIC_NAME = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*$')
@@ -175,8 +174,32 @@ class CycleSnapshot:
         self._body = None
         self._ranges = None
         self._lock = threading.Lock()
+        # EACH REGISTRY ON ITS OWN. Each registry renders under its own lock, so /metrics/<registry> never waits
+        # behind the large agent and trade registries.
+        self._part_bytes = {}
+        self._part_locks = {name: threading.Lock() for name, _ in self.parts}
         self._render_seconds = None
         self.renders = 0
+
+    def part(self, name):
+        """One registry's bytes, rendered once (single-flight) per snapshot without touching any other registry."""
+        got = self._part_bytes.get(name)
+        if got is not None:
+            return got
+        lock = self._part_locks.get(name)
+        if lock is None:
+            return b''
+        with lock:
+            if name not in self._part_bytes:
+                out = []
+                for kind, collector, payload in dict(self.parts)[name]:
+                    if kind == 'frozen':
+                        render_frozen(collector._name, collector._documentation, collector._labelnames, payload, out)
+                    else:
+                        for metric in payload:
+                            render_metric(metric, out)
+                self._part_bytes[name] = ''.join(out).encode('utf-8')
+        return self._part_bytes[name]
 
     def render(self):
         """The body and the per-registry byte ranges, rendered once (single-flight) per snapshot."""
@@ -185,22 +208,19 @@ class CycleSnapshot:
         with self._lock:
             if self._body is None:
                 started = time.perf_counter()
-                out = [self.comment()]
+                out = [self.comment().encode('utf-8')]
                 ranges = {}
-                for name, captured in self.parts:
-                    start = sum(len(x) for x in out)
-                    for kind, collector, payload in captured:
-                        if kind == 'frozen':
-                            render_frozen(collector._name, collector._documentation, collector._labelnames,
-                                          payload, out)
-                        else:
-                            for metric in payload:
-                                render_metric(metric, out)
-                    ranges[name] = (start, sum(len(x) for x in out))
+                # Ranges are byte offsets into the UTF-8 body.
+                at = len(out[0])
+                for name, _ in self.parts:
+                    chunk = self.part(name)
+                    ranges[name] = (at, at + len(chunk))
+                    at += len(chunk)
+                    out.append(chunk)
                 self._render_seconds = time.perf_counter() - started
                 self.renders += 1
                 self._ranges = ranges
-                self._body = ''.join(out).encode('utf-8')
+                self._body = b''.join(out)
         return self._body, self._ranges
 
     def comment(self):
@@ -236,17 +256,13 @@ class Exposition:
         return BOARD_REGISTRIES if self.main_mode == 'board' else self._order
 
     def serve(self, name=None):
-        """The bytes for /metrics (name None) or /metrics/<registry>; None before the first publish."""
+        """The bytes for /metrics (name None) or /metrics/<registry>; None before the first publish. A registry's
+        endpoint, and the board's /metrics, render only the registries they serve."""
         snap = self._snapshot
         if snap is None:
             return None
-        body, ranges = snap.render()
-        if name is None:
-            if self.main_mode != 'board':
-                return body
-            head = body[:len(snap.comment().encode('utf-8'))]
-            return head + b''.join(body[ranges[n][0]:ranges[n][1]] for n in self.main_registries() if n in ranges)
-        if name not in ranges:
-            return b''
-        start, end = ranges[name]
-        return body[start:end]
+        if name is not None:
+            return snap.part(name)
+        if self.main_mode != 'board':
+            return snap.render()[0]
+        return snap.comment().encode('utf-8') + b''.join(snap.part(n) for n in self.main_registries())

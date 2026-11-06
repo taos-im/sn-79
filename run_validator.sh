@@ -125,6 +125,7 @@ echo "WALLET_PATH: $WALLET_PATH"
 echo "WALLET_NAME: $WALLET_NAME"
 echo "HOTKEY_NAME: $HOTKEY_NAME"
 echo "NETUID: $NETUID"
+case "$PD_KEY" in ''|'""') echo "PAGERDUTY KEY: not set" ;; *) echo "PAGERDUTY KEY: set" ;; esac
 echo "VALIDATOR_PORT: $VALIDATOR_PORT"
 echo "PROMETHEUS PORT: $PROM_PORT"
 echo "SIMULATION_CONFIG: $SIMULATION_CONFIG"
@@ -170,15 +171,14 @@ case "${AUTO_UPDATE:-branch}" in
 esac
 git submodule sync
 git submodule update --init
-# THE LOCKFILE ON EVERY START, not only at install. A host that already had an older package kept it as
-# long as it satisfied the unpinned requirement; 0.6.3 testnet validators then served HTTP 500 on every
-# metrics family with a prometheus_client older than the pin.
+# THE LOCKFILE ON EVERY START, not only at install: a host that already has an older package keeps it as long
+# as it satisfies the unpinned requirement, which can be below the version the code needs.
 _CONSTRAINTS=""; [ -f constraints.txt ] && _CONSTRAINTS="-c constraints.txt"
 pip install -e . $_CONSTRAINTS
 
 # Strip orphaned packages bittensor ≥8 doesn't need.
 pip uninstall substrate-interface scalecodec py-scale-codec cyscale -y 2>/dev/null || true
-pip install cyscale --force-reinstall --quiet
+pip install cyscale $_CONSTRAINTS --force-reinstall --quiet
 
 if [ "$PRESERVE_SIMULATOR" = "0" ]; then
     echo "Updating C++ Engine"
@@ -251,8 +251,7 @@ MECHID_ARG="--neuron.mechid $MECHID"
 ENGINE_ARGS="--engine simulation --simulation.xml_config ../../../simulate/trading/run/config/$SIMULATION_CONFIG.xml"
 # Benchmark agents config file. Dev-local env files set BENCHMARK_AGENTS to the
 # test config (../config/benchmark_agents_test.json); when unset the validator
-# falls back to its default (../config/benchmark_agents.json). Mirrors the
-# --benchmark.agents wiring in run_validator.sh / run_mvtrx.sh.
+# falls back to its default (../config/benchmark_agents.json).
 BENCHMARK_ARG=""
 [ -n "${BENCHMARK_AGENTS:-}" ] && BENCHMARK_ARG="--benchmark.agents ${BENCHMARK_AGENTS}"
 

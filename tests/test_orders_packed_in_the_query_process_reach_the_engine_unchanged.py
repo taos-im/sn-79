@@ -99,14 +99,15 @@ def test_set_delays_moved_unchanged_and_the_sent_settings_give_the_validators_de
 
 
 def test_each_miners_sent_counts_are_the_ones_main_would_count():
-    """0.6.5's per-miner counters: under neuron.orders_packed main never sees the orders, so the query process counts
-    each miner's placements and cancels by update_sent_stats' rule and main adds them to the miner's block."""
+    """The per-miner counters: under neuron.orders_packed main never sees the orders, so the query process counts each
+    miner's placements, cancels and the orders they name by update_sent_stats' rule and main adds them to the miner's
+    block."""
     random.seed(3)
     main = SimpleNamespace(miner_stats={})
     update_sent_stats(main, reward.set_delays(_validator(), _replies()))
-    counted = {uid: {k: row[k] for k in ("placements_sent", "cancels_sent") if row.get(k)}
+    counted = {uid: {k: row[k] for k in ("placements_sent", "cancels_sent", "cancel_orders_sent") if row.get(k)}
                for uid, row in main.miner_stats.items()}
     random.seed(3)
     packed = QueryService._pack_orders(None, _replies(), delay_settings(_validator()))
     assert {uid: {k: n for k, n in row.items() if n} for uid, row in packed["sent"].items() if any(row.values())} \
-        == counted == {3: {"placements_sent": 3}, 5: {"cancels_sent": 1}}
+        == counted == {3: {"placements_sent": 3}, 5: {"cancels_sent": 1, "cancel_orders_sent": 1}}

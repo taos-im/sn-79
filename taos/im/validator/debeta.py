@@ -1,7 +1,7 @@
 """De-beta scoring component: balanced two-sided spread capture (making) + directional-skill
 (kappa-of-alpha), drift-riding stripped. Combined, rank-weighted by w_make (operator dial).
 
-Offline-validated on mainnet-sim L3. Two properties are deliberate and load-bearing:
+Two properties are deliberate and load-bearing:
 
   Making credit is BALANCED and proportional: two-sided capture measured against a centred mid, with a
   counterparty-concentration discount (p11_discount) so credit earned repeatedly from the same small set
@@ -484,8 +484,8 @@ REALIZED_HORIZON_NS_DEFAULT = 20_000_000_000  # realized spread: a fill is marke
 def _print_time(t, ts):
     """A print's own simulation time: the wire event's `t`, an offline record's `ts`, else the batch stamp. The
     horizon is measured on this clock; `ts` as passed by the caller is the SAMPLED timestamp that keys the windowed
-    histories, and on it every print of a sampling bucket reads alike, so a fill could only mature at the next bucket
-    (found on the 0.6.3 testnet, 6 October 2026)."""
+    histories, and on it every print of a sampling bucket reads alike, so a fill could only mature at the next
+    bucket."""
     v = t.get("t")
     if v is None:
         v = t.get("ts")
@@ -541,7 +541,7 @@ def _trim_window(st, W):
 
 def _finalize_realized_ready(st, book_id, buy_sums, sell_sums, W, buy_hist, sell_hist, ts,
                              now_ns, horizon_ns, flush_ns, force=False, fee_weight=0.0):
-    """Realized spread (2 October 2026): release every pending fill whose print stream has reached the fill's time
+    """Realized spread: release every pending fill whose print stream has reached the fill's time
     plus the horizon with a full forward window after that print, or that has waited horizon + flush_ns of sim
     time on a quiet book, or everything when forced. The fill is booked against the centered window around the
     first print at or after the horizon; a fill released stale or forced with no such print is marked against the
@@ -588,8 +588,8 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
 
     mid_state=None (offline callers passing a whole run as one batch): the centered mid is computed
     over THIS batch, truncating at its edges. At live print density that truncation is the rule,
-    not the exception (on a live board: median 4 prints per state update,
-    90.9% of batches degrade to the plain batch mean, 12.8% of prints see a full window), so live
+    not the exception (a state update carries a few prints a book, so most batches degrade to the
+    plain batch mean and few prints see a full window), so live
     callers pass mid_state ({book: st}) to carry the print window ACROSS batches: each fill is held
     (bounded: the prints of two capture reaches per book) until W forward prints clear its floor, then
     booked against its full centered window at the finalizing call's ts. A fill with no W forward
@@ -600,7 +600,7 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
     When buy_hist/sell_hist ({uid:{book:{ts:incr}}}) + ts are given, increments are also recorded
     at ts so the sums can be windowed (pruned/shifted).
 
-    REALIZED SPREAD (2 October 2026, behind scoring.debeta.making_basis): when real_buy_sums/real_sell_sums are
+    REALIZED SPREAD (behind scoring.debeta.making_basis): when real_buy_sums/real_sell_sums are
     given, every fill is also marked at the first print horizon_ns of sim time after it, against the size-weighted
     average of the background-sided prints in the centered window there (centered_mark)
     (REALIZED_HORIZON_NS_DEFAULT when None) and booked into those sums with the same attribution. Offline, the
@@ -893,7 +893,7 @@ def shrunk_skill_eb(book_alphas_by_uid):
 
 def _rank01(vals):
     """Ties share their block's MINIMUM rank: equal raw values must map to equal ranks (uid order
-    must never decide emissions; 88% of miners share making_raw==0.0 on a live board), and a
+    must never decide emissions, and most miners can share making_raw==0.0), and a
     zero-making mass earns zero relative making credit rather than a positional lottery."""
     order = sorted(range(len(vals)), key=lambda i: vals[i])
     rank = [0.0] * len(vals)
@@ -1018,23 +1018,40 @@ def counterparty_ec(cp, maker, topk=2):
     return my_share - mkt_share
 
 
-def p11_discount(own, cp, uids, strength, topk=2):
+def p11_discount(own, cp, uids, strength, topk=2, ec=None):
     """Apply the P11 counterparty-diversity discount to the making leg: making *= (1 - strength*EC+),
     EC+ = max(0, excess concentration). strength 0 disables. A feeder-fed maker (EC~1) loses ~strength
     of its making; a diverse maker (EC~0) is untouched. Applied to the MAGNITUDE before ranking, so a
+    feeder cannot rank-buy a top making slot it did not earn from the diverse market.
 
     Args:
-        own: The making magnitudes being discounted, mutated in place.
+        own: The making magnitudes being discounted; not modified.
         cp: ``{maker_uid: {taker_uid: vol}}`` counterparty volumes.
         uids: The uids to score.
         strength: Discount strength; 0 disables.
         topk: Counterparty count for the concentration measure.
-    feeder cannot rank-buy a top making slot it did not earn from the diverse market."""
+        ec: p11_ec(cp, uids, topk) when the caller has it, else computed here.
+
+    Returns:
+        ``{uid: discounted making}`` for every uid in ``uids``, a new dict; ``own`` itself when strength is 0."""
     if strength <= 0:
         return own
-    # O(total entries), not O(makers x total entries): build the GLOBAL taker aggregate once and
-    # derive each maker's leave-one-out by subtraction. Numerically identical to the per-maker
-    # rebuild (asserted in tests); the naive form cost 609ms of a 629ms scoring cycle at 251 uids.
+    if ec is None:
+        ec = p11_ec(cp, uids, topk)
+    out = {}
+    for u in uids:
+        e = ec.get(u)
+        out[u] = own.get(u, 0.0) if e is None else own.get(u, 0.0) * max(0.0, 1.0 - strength * e)
+    return out
+
+
+def p11_ec(cp, uids, topk=2):
+    """Each maker's excess concentration EC+ for p11_discount: ``{uid: EC+}``, None for a uid with no counterparty
+    volume. Computed once per counterparty map and reused by every discount on it.
+
+    O(total entries), not O(makers x total entries): the GLOBAL taker aggregate is built once and each maker's
+    leave-one-out derived by subtraction. Numerically identical to the per-maker rebuild (asserted in tests); the
+    naive per-maker rebuild dominated the scoring cycle."""
     g = {}
     g_tot = 0.0
     for cps in cp.values():
@@ -1046,15 +1063,14 @@ def p11_discount(own, cp, uids, strength, topk=2):
         my = cp.get(u, {})
         tot = sum(my.values())
         if tot <= 0:
-            out[u] = own.get(u, 0.0)
+            out[u] = None
             continue
         other_tot = (g_tot - tot) or 1.0
         # Same rule as counterparty_ec: the market bucket is flow, never a counterparty.
         top = sorted((t for t in my if t != MARKET_FLOW), key=lambda t: my[t], reverse=True)[:topk]
         my_share = sum(my[t] for t in top) / tot
         mkt_share = sum((g.get(t, 0.0) - my.get(t, 0.0)) for t in top) / other_tot
-        ec = max(0.0, my_share - mkt_share)
-        out[u] = own.get(u, 0.0) * max(0.0, 1.0 - strength * ec)
+        out[u] = max(0.0, my_share - mkt_share)
     return out
 
 
@@ -1323,9 +1339,9 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
         skill_p11_strength: The counterparty factor applied to the SKILL leg: skill *= max(0,
             1 - strength * EC+), the same excess concentration P11 measures for making, taken from
             ``cp`` at unit strength so it does not depend on p11_strength being on. 0 disables. A
-            maker fed by a dedicated counterparty manufactures per-book alpha on the fed side, and on
-            22 September that was where a feeding ring was paid (skill rank 0.94 to 1.00 with making
-            ranks of 0.003 to 0.36); every genuine skill account measured at exactly 1.0.
+            maker fed by a dedicated counterparty manufactures per-book alpha on the fed side; this
+            factor discounts that skill as P11 discounts the making, and leaves a skill account with
+            no concentrated counterparty at 1.0.
         p11_topk: How many of a maker's largest takers the excess-concentration measure looks at, for
             both discounts. 2 is the shipped scorer; wider scopes expose rings that spread the
             feeding over many takers (see p11_discount).
@@ -1344,8 +1360,9 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
     # configurable. Rollback lives one level up at scoring.debeta.enabled.
     own = balanced_reward_per_book(capture_buy_sums, capture_sell_sums, uids)
     pre_p11 = dict(own)
+    _ec = p11_ec(cp, uids, max(1, int(p11_topk))) if cp is not None and (p11_strength > 0 or skill_p11_strength > 0) else None
     if cp is not None and p11_strength > 0:
-        own = p11_discount(own, cp, uids, p11_strength, topk=max(1, int(p11_topk)))
+        own = p11_discount(own, cp, uids, p11_strength, topk=max(1, int(p11_topk)), ec=_ec)
     pre_s3 = dict(own)
     # The tether reads the pooled rows (cp_tether) when a class run hands P11 its class's rows: liquidity
     # supplied to the market in any class is service, while concentration is judged within the class.
@@ -1377,7 +1394,7 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
     # rank ladder the discount is only partly effective (kappa 9.9 x 0.25 is still top-decile); under
     # a proportional skill pool it lands in full, which is what makes such a pool safe to run.
     if cp is not None and skill_p11_strength > 0:
-        _unit = p11_discount({u: 1.0 for u in uids}, cp, uids, 1.0, topk=max(1, int(p11_topk)))
+        _unit = p11_discount({u: 1.0 for u in uids}, cp, uids, 1.0, topk=max(1, int(p11_topk)), ec=_ec)
         skill_p11f = [max(0.0, 1.0 - float(skill_p11_strength) * (1.0 - _unit.get(u, 1.0))) for u in uids]
     else:
         skill_p11f = [1.0] * len(uids)
@@ -1658,18 +1675,22 @@ def book_alphas_from_drift(mtm, invsum, invn, drift):
             for uid, by_book in book_alphas_by_book(mtm, invsum, invn, drift).items()}
 
 
-def book_alphas_by_book(mtm, invsum, invn, drift):
+def book_alphas_by_book(mtm, invsum, invn, drift, only=None):
     """Same arithmetic as book_alphas_from_drift, but BOOK IDENTITY IS PRESERVED: {uid: {book: alpha}}.
 
     The list form loses it. Each miner's list is built from the set of books THAT MINER traded, so
-    position i is a different book for different miners (measured: 66 distinct list lengths across
-    256 miners on one window). Kappa does not care, being order-blind. Anything CROSS-SECTIONAL does:
+    position i is a different book for different miners (the lists differ in length from
+    miner to miner). Kappa does not care, being order-blind. Anything CROSS-SECTIONAL does:
     comparing miners at the same list index silently compares different books, which invalidates any
-    per-book aggregate computed that way."""
+    per-book aggregate computed that way. `only` ({uid: books}) computes those pairs alone, in the same order, so
+    traded_book_alphas' pairs need not be computed and dropped."""
     out = {}
     for uid in set(mtm) | set(invsum):
         by_book = {}
+        keep = None if only is None else only.get(uid, ())
         for b in set(mtm.get(uid, {})) | set(invsum.get(uid, {})):
+            if keep is not None and b not in keep:
+                continue
             n = invn.get(b, 0)
             if n <= 0:
                 continue
@@ -1717,7 +1738,7 @@ def median_abs_floor(book_alphas_by_uid, scale=0.5):
     return scale * statistics.median(mags)
 
 
-def book_alphas_held_by_book(mtm, heldinv, heldn, helddrift):
+def book_alphas_held_by_book(mtm, heldinv, heldn, helddrift, only=None):
     """Held-period drift strip, book identity preserved: {uid: {book: alpha}}.
 
     The windowed finalizer strips the whole window's drift, so a position closed early keeps being
@@ -1733,13 +1754,18 @@ def book_alphas_held_by_book(mtm, heldinv, heldn, helddrift):
         heldn: ``{uid: {book: n}}`` count of those prints.
         helddrift: ``{uid: {book: drift}}`` price change summed over those prints.
 
+        only: ``{uid: books}``, the pairs to compute (in the same order), or None for every pair.
+
     Returns:
         dict: ``{uid: {book: alpha}}``.
     """
     out = {}
     for uid in set(mtm) | set(heldn):
         by_book = {}
+        keep = None if only is None else only.get(uid, ())
         for b in set(mtm.get(uid, {})) | set(heldn.get(uid, {})):
+            if keep is not None and b not in keep:
+                continue
             n = heldn.get(uid, {}).get(b, 0)
             if n <= 0:
                 continue
@@ -1749,12 +1775,13 @@ def book_alphas_held_by_book(mtm, heldinv, heldn, helddrift):
     return out
 
 
-def book_alphas_by_subwindow(mtm_hist, invsum_hist, invn_hist, drift_hist, t_start, t_end, k):
+def book_alphas_by_subwindow(mtm_hist, invsum_hist, invn_hist, drift_hist, t_start, t_end, k, only=None):
     """The windowed alpha per (uid, book) in each of k equal sub-windows of [t_start, t_end].
 
     Built from the timestamped per-batch histories the rolling window already keeps, so it costs no
     new accumulator. Each sub-window strips its own drift; a sub-window in which the book did not
-    trade is None. With k = 1 the single entry equals book_alphas_by_book over the same span.
+    trade is None. With k = 1 the single entry equals book_alphas_by_book over the same span. `only` ({uid: books},
+    the skill pool) computes those pairs alone: subwindow_skill reads no other.
 
     Returns:
         dict: ``{uid: {book: [alpha or None] * k}}``, or None when k <= 1 or the span is empty.
@@ -1791,7 +1818,10 @@ def book_alphas_by_subwindow(mtm_hist, invsum_hist, invn_hist, drift_hist, t_sta
         m_u = mtm_hist.get(uid, empty)
         s_u = invsum_hist.get(uid, empty)
         by_book = {}
+        keep = None if only is None else only.get(uid, ())
         for b in set(m_u) | set(s_u):
+            if keep is not None and b not in keep:
+                continue
             m_k = sums(m_u.get(b, empty), [0.0] * k)
             s_k = sums(s_u.get(b, empty), [0.0] * k)
             n_row = invn_k.get(b, zeros)

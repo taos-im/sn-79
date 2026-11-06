@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: MIT
 """neuron.query_prebuilt in the query service.
 
-A prebuilt request carries the headers and body Dendrite.call would send and passes an axon's
-verify; every request is signed before the first is sent; a round sends in 0.6.5's round_order and records its
-wait for the report as the fan-out does; a kept
-dendrite's nonces keep rising after the clock steps back; with 0.6.5's neuron.reuse_connections a connection the miner closed is tried once
-more. (Reusing the dendrite across rounds is tested with 0.6.5's option.)
+A prebuilt request carries the headers and body Dendrite.call would send and passes an axon's verify; every request is
+signed before the first is sent; a round sends in round_order and records its wait for the report as the fan-out does;
+a kept dendrite's nonces keep rising after the clock steps back. With neuron.reuse_connections a kept connection the
+miner closed is tried once more on a new one, inside the first attempt's deadline and only while more than RETRY_MIN_S
+of it is left; a miner whose connect fails is not tried again. (Reusing the dendrite across rounds is tested under
+neuron.reuse_connections.)
 
 Offline: a fake dendrite borrows bittensor's own request preparation and reply handling, a fake
 session records each request and echoes its body, and a fake axon applies verify's nonce and
@@ -77,6 +78,48 @@ class _Closed:
         return False
 
 
+class _Unreachable:
+    """A miner no connection reaches: the connect itself fails."""
+
+    def __init__(self, port):
+        self.port = port
+
+    async def __aenter__(self):
+        key = SimpleNamespace(host="127.0.0.1", port=self.port, is_ssl=False, ssl=False)
+        raise aiohttp.ClientConnectorError(key, OSError(111, "Connection refused"))
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _LateClose:
+    """A connection the miner closes after a while, with no answer."""
+
+    def __init__(self, after_s):
+        self.after_s = after_s
+
+    async def __aenter__(self):
+        await asyncio.sleep(self.after_s)
+        raise aiohttp.ServerDisconnectedError()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Hang:
+    """A miner that never answers: the request runs to the timeout it was given."""
+
+    def __init__(self, total):
+        self.total = total
+
+    async def __aenter__(self):
+        await asyncio.sleep(self.total)
+        raise asyncio.TimeoutError()
+
+    async def __aexit__(self, *a):
+        return False
+
+
 class _Session:
     closed = False
 
@@ -84,11 +127,22 @@ class _Session:
         self.keypair = keypair
         self.sent = []
         self.closed_ports = set()
+        self.unreachable_ports = set()
+        self.late = {}          # port -> seconds before the miner closes the first attempt's connection
+        self.hanging = set()    # ports whose later attempts never answer
+        self.timeouts = {}      # port -> the client timeout each attempt was given
 
     def post(self, url, headers, data, timeout):
         self.sent.append(SimpleNamespace(url=url, headers=dict(headers), body=data,
                                          signed_before=len(self.keypair.signed)))
         port = int(headers["bt_header_axon_port"])
+        self.timeouts.setdefault(port, []).append(timeout.total)
+        if port in self.unreachable_ports:
+            return _Unreachable(port)
+        if port in self.late:
+            return _LateClose(self.late.pop(port))
+        if port in self.hanging:
+            return _Hang(timeout.total)
         if port in self.closed_ports:
             self.closed_ports.discard(port)
             return _Closed()
@@ -195,7 +249,7 @@ def test_every_request_is_signed_before_the_first_is_sent():
 
 
 def test_a_prebuilt_round_sends_in_round_order(monkeypatch):
-    # 0.6.5 dispatches every round in a fresh order, so a miner's place in it does not follow its uid.
+    # every round is dispatched in a fresh order, so a miner's place in it does not follow its uid
     monkeypatch.setattr(q, "round_order", lambda uid_list, rng=None: list(enumerate(uid_list))[::-1])
     svc, session = _service(_Keypair())
     _round(svc)
@@ -239,6 +293,37 @@ def test_the_round_instruments_find_the_wait_in_a_prebuilt_round(caplog):
     svc, _ = _service(_Keypair())
     _round(svc)
     lines = [rec.getMessage() for rec in caplog.records]
-    # the two marks the mainnet baseline's round_breakdown.py reads around the miners' wait
+    # the two log marks a breakdown of the round's time reads around the miners' wait
     assert any("fanout query tasks, starting wait" in line for line in lines)
     assert any(re.search(r"Wait completed \(fanout\): (\d+) done, (\d+) pending in ([\d.]+)s", line) for line in lines)
+
+
+def test_a_miner_that_cannot_be_reached_is_not_tried_again():
+    svc, session = _service(_Keypair())
+    svc.config.neuron.reuse_connections = True
+    session.unreachable_ports = {8091}  # the connect fails: nothing to retry on a new connection
+    _, responses, _ = _round(svc)
+    assert len(session.sent) == 2
+    assert str(responses[0].dendrite.status_code) != "200"
+    assert str(responses[1].dendrite.status_code) == "200"
+
+
+def test_the_retry_has_only_what_is_left_of_the_first_attempts_deadline():
+    svc, session = _service(_Keypair())
+    svc.config.neuron.reuse_connections = True
+    session.late = {8091: 0.6}  # the kept connection closes 0.6 s into a 1.0 s timeout
+    session.hanging = {8091}
+    _, responses, _ = _round(svc)
+    first, second = session.timeouts[8091]
+    assert first == svc.config.neuron.timeout
+    assert second <= svc.config.neuron.timeout - 0.6 + 0.05, session.timeouts[8091]
+    assert str(responses[0].dendrite.status_code) != "200"
+
+
+def test_a_late_failure_with_almost_nothing_left_is_not_retried():
+    svc, session = _service(_Keypair())
+    svc.config.neuron.reuse_connections = True
+    session.late = {8091: 0.97}  # 0.03 s of the 1.0 s timeout left: too little for a new connection
+    _, responses, _ = _round(svc)
+    assert len(session.timeouts[8091]) == 1, session.timeouts[8091]
+    assert str(responses[0].dendrite.status_code) != "200"

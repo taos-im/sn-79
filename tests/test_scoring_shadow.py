@@ -620,6 +620,7 @@ def _light_fields():
                             "rejections": 0, "call_time": [0.5]}},
         "miner_presence": {1: [1, 0, 1], 2: [0] * 50},
         "debeta_pool_ema": {"term": {1: 0.2, 2: 0.1}, "share": {1: 0.3, 2: 0.7}},
+        "layout": {"classes": [{"name": "simulation_0", "books": [0, 1], "market": "m0"}]},
     }
 
 
@@ -677,8 +678,10 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "debeta_inv_alt", "debeta_plast_alt",
         "debeta_conj_ref", "debeta_conj_clock",  # the conjunction's references and clock (0.6.6)
         "debeta_class_vectors", "debeta_handover",  # the run-boundary handover (0.6.6)
+        "debeta_young_books",  # the books a layout change added and when (0.6.7)
         "miner_stats",
         "miner_presence",
+        "layout",  # the layout the records are scored on (0.6.7)
     ]
 
     for key in ("step", "simulation_timestamp", "hotkeys", "scores",
@@ -688,6 +691,7 @@ def test_child_save_validator_state_roundtrip(tmp_path):
     assert saved["unnormalized_scores"] == _mp_norm(light["unnormalized_scores"])
     assert saved["miner_stats"] == _mp_norm(light["miner_stats"])
     assert saved["miner_presence"] == _mp_norm(light["miner_presence"])
+    assert saved["layout"] == light["layout"], "the child's file says which layout its records are on, as main's does"
 
     vols = p.snapshot_volume_sums(main)
     heavy = {

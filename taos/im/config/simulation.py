@@ -8,14 +8,16 @@ def add_simulation_args(cls, parser):
     parser.add_argument(
         "--simulation.seeding.fundamental.symbol.coinbase",
         type=str,
-        help="Coinbase spot market symbol price to be used to seed simulation price.",
+        help="Coinbase spot market symbol the seed service subscribes to; its trades are not recorded (the "
+             "fundamental's step seed is a drand round the validator sends).",
         default="BTC-USD",
     )
 
     parser.add_argument(
         "--simulation.seeding.fundamental.symbol.binance",
         type=str,
-        help="Binance spot market symbol price to be used to seed simulation price.",
+        help="Binance spot market symbol the seed service subscribes to; its trades are not recorded (the "
+             "fundamental's step seed is a drand round the validator sends).",
         default="btcusdt",
     )
 

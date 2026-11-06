@@ -1087,8 +1087,7 @@ taosim::book::TickContainer* Book::preventSelfTrade(
             // carried this cancellation, so the miner's order vanished silently -- an STP cancel has no
             // instruction behind it, hence no response path. Dispatch the same response shape a miner
             // cancel gets, addressed to the owner, delivered through the proxy like every other notice.
-            // In BOTH mechanisms: see notifyOwnerCancelled above for why the exchange-service gate that
-            // used to sit here was wrong, and why nothing fires twice without it.
+            // In BOTH mechanisms, ungated: see notifyOwnerCancelled above for why nothing fires twice.
             if (agentId < 0) return true;  // a local agent's: see notifyOwnerCancelled
             auto* proxy = m_simulation->proxy();
             if (proxy == nullptr) {
@@ -1183,11 +1182,19 @@ taosim::book::TickContainer* Book::preventSelfTrade(
 
 void Book::clearFilledOrders() noexcept
 {
+    // Runs after every step on every book, so it reads only the levels TickContainer::mayHoldGhosts marks, and
+    // tests an order's volume, which is zero exactly when its total volume is (leverage is never negative). An
+    // unmarked level holds no ghost, so ghosts are unregistered in the order a full walk would unregister them.
+    static const taosim::decimal_t zero = 0_dec;
     auto impl = [this](auto&& side) {
         for (auto it = side.begin(); it != side.end(); ) {
+            if (!it->mayHoldGhosts()) {
+                ++it;
+                continue;
+            }
             // Remove ghost orders (zero volume) from this level
             for (auto orderIt = it->begin(); orderIt != it->end(); ) {
-                if ((*orderIt)->totalVolume() == 0_dec) {
+                if ((*orderIt)->volume() == zero) {
                     unregisterLimitOrder(*orderIt);
                     orderIt = it->erase(orderIt);
                 } else {
@@ -1200,6 +1207,7 @@ void Book::clearFilledOrders() noexcept
                 it = side.erase(it);
                 m_topOfBook.invalidate();
             } else {
+                it->clearGhostMark();
                 ++it;
             }
         }

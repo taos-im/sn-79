@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The two halves of the 7 October hardening of the realized mark. (1) No plain-average fallback: when the centred
+"""Two guards on the realized mark. (1) No plain-average fallback: when the centred
 window at a fill's horizon holds no background-sided print, the mark reaches outward to the nearest ones, and a fill
 with none in reach books nothing. (2) Each fill's realized spread is clamped to plus or minus its own captured spread
 before the sums, so one fill moves a uid's markout quality by at most its own weight. Both on the batch path and the

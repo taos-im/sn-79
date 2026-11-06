@@ -36,8 +36,9 @@ def base_delay(p_time: float, timeout: float, min_delay: int, max_delay: int, po
     """The base delay a response's process time earns under a delay policy.
 
     curve: the exponential mapping from min_delay to max_delay over the timeout. flat: min_delay. jitter: min_delay
-    plus a uniform draw in [0, jitter] at or under prompt_cutoff seconds, the curve above it. A process time at or over
-    the timeout follows the curve under every policy.
+    plus a uniform draw in [0, jitter] at or under prompt_cutoff seconds; above it the curve, but never under the
+    draw's top, so a slower response never waits less than a prompt one. A process time at or over the timeout follows
+    the curve under every policy.
     """
     if policy == "curve" or p_time >= timeout:
         return _curve_delay(p_time, timeout, min_delay, max_delay)
@@ -46,7 +47,7 @@ def base_delay(p_time: float, timeout: float, min_delay: int, max_delay: int, po
     if policy == "jitter":
         if p_time <= prompt_cutoff:
             return int(min_delay) + rng.randint(0, int(jitter))
-        return _curve_delay(p_time, timeout, min_delay, max_delay)
+        return max(_curve_delay(p_time, timeout, min_delay, max_delay), int(min_delay) + int(jitter))
     raise ValueError(f"unknown delay policy {policy!r}")
 
 
@@ -69,6 +70,17 @@ def latency_profile(self: 'Validator') -> dict[int, float]:
             profile = {}
     self._latency_profile = profile
     return profile
+
+
+DEFAULT_MAX_INSTRUCTION_DELAY_S = 600.0
+
+
+def max_instruction_delay_ns(config) -> int:
+    """The longest delay a miner's instruction may ask for, --neuron.max_instruction_delay_s in nanoseconds (600 s, the
+    engine's maxInstructionDelay default, when it is unset or 0); the query service refuses a longer one at acceptance
+    and the engine holds the same bound."""
+    seconds = float(getattr(getattr(config, 'neuron', None), 'max_instruction_delay_s', None) or 0.0)
+    return int((seconds or DEFAULT_MAX_INSTRUCTION_DELAY_S) * 1_000_000_000)
 
 
 def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationStateUpdate]) -> list[FinanceAgentResponse]:
@@ -99,6 +111,8 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
     jitter = int(getattr(scoring, 'delay_jitter', None) or 0)
     prompt_cutoff = float(getattr(scoring, 'delay_prompt_cutoff', None) or 0.0)
     profile = latency_profile(self)
+    # the engine refuses an instruction delayed past its bound, so the validator's addition stops there
+    bound = min(MAX_INSTRUCTION_DELAY, max_instruction_delay_ns(self.config))
 
     log_messages = []
     for _uid, synapse_response in synapse_responses.items():
@@ -121,8 +135,7 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
                     seen_books.add(book_id)
                 else:
                     instruction_delay = random.randint(min_instruction_delay, max_instruction_delay)
-                # the model bounds what a miner sends; the validator's own addition must land inside the same bound
-                instruction.delay = min(instruction.delay + delay + instruction_delay, MAX_INSTRUCTION_DELAY)
+                instruction.delay = min(instruction.delay + delay + instruction_delay, bound)
             responses.append(response)
             log_messages.append(
                 f"UID {response.agent_id} responded with {len(response.instructions)} instructions "

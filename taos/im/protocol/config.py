@@ -4,10 +4,12 @@
 
 Split out of taos.im.protocol.models, which re-exports every name here; import from either.
 """
+import copy
+import hashlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from xml.etree.ElementTree import Element
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from taos.im.protocol.exchange_config import ExchangeConfig
 from taos.common.protocol import BaseModel
 from taos.im.protocol.orders import Order
@@ -51,7 +53,7 @@ def _balance_fields(
         # (`uniform-50`, `pareto-50`) carry bounds, and the engine renamed those bounds
         # `wealth`/`cap` -> `wealthMin`/`wealthMax` while keeping the old names working
         # (Balances.cpp requiredWealthAttr). Accept either spelling of the lower bound,
-        # preferring `wealth` so every config that still has it parses exactly as before.
+        # preferring `wealth` so every config that still has it parses unchanged.
         if "wealth" in bcfg.attrib:
             wealth = float(bcfg.attrib["wealth"])
         elif "wealthMin" in bcfg.attrib:
@@ -120,6 +122,43 @@ class FeePolicy(BaseModel):
                 prometheus_info[f'simulation_fee_policy_tier_{i}_maker_rate'] = f"{tier.maker_fee * 100:.4f}"
                 prometheus_info[f'simulation_fee_policy_tier_{i}_taker_rate'] = f"{tier.taker_fee * 100:.4f}"
         return prometheus_info
+
+
+# The MarketSimulationConfig fields that are the run's own bookkeeping, not its market, each with the element (from
+# the class file's root) and attribute it is read from below the root; None where it is a root attribute or not read
+# from the class file. A market comparison leaves out exactly these: the validator's per-class market digest the
+# fields, market_source_digest their attributes.
+RUN_BOOKKEEPING_FIELDS = {
+    "simulation_id": None,
+    "logDir": None,
+    "classes": None,
+    "block_count": None,
+    "duration": None,
+    "publish_interval": None,
+    "log_window": None,
+    "remoteAgentCount": ("Agents/MultiBookExchangeAgent", "remoteAgentCount"),
+    "grace_period": ("Agents/MultiBookExchangeAgent", "gracePeriod"),
+    "books_per_block": ("Agents/MultiBookExchangeAgent/Books", "instanceCount"),
+    "book_count": ("Agents/MultiBookExchangeAgent/Books", "instanceCount"),
+    "book_levels": ("Agents/MultiBookExchangeAgent/Books", "maxDepth"),
+    "detailed_book_levels": ("Agents/MultiBookExchangeAgent/Books", "detailedDepth"),
+}
+
+
+def market_source_digest(xml : Element) -> str:
+    """The whole market a class file describes, as a digest: every element and attribute under its root, so a
+    parameter the protocol does not parse counts too, less the run's bookkeeping attributes (RUN_BOOKKEEPING_FIELDS).
+    The root's own attributes are left out: they are the run's (the time grid, the blocks, the port, the
+    checkpointing, which a multi-asset wrapper governs). Whitespace and comments are not the market either. The
+    element passed in is not changed."""
+    xml = copy.deepcopy(xml)
+    for where in RUN_BOOKKEEPING_FIELDS.values():
+        if where is not None:
+            element = xml.find(where[0])
+            if element is not None:
+                element.attrib.pop(where[1], None)
+    body = "".join(ET.canonicalize(ET.tostring(child, encoding="unicode"), strip_text=True) for child in xml)
+    return hashlib.sha256(body.encode()).hexdigest()
 
 
 class MarketSimulationConfig(BaseModel):
@@ -258,6 +297,8 @@ class MarketSimulationConfig(BaseModel):
         futures_agent_order_latency_max (int | None): Maximum order latency for futures agents.
         futures_agent_selection_scale (float | None): Scale factor for futures agent selection.
     """
+    # The class file's whole market (market_source_digest), set where the file is parsed; never serialised.
+    _market_source : str | None = PrivateAttr(default=None)
     simulation_id : str | None = None
     logDir : str | None = None
     
@@ -447,7 +488,7 @@ class MarketSimulationConfig(BaseModel):
         futures_capital_type, futures_base_balance, futures_quote_balance, futures_wealth = _balance_fields(
             Futures_balances_config, init_price, quote_decimals
         )
-        return MarketSimulationConfig(
+        config = MarketSimulationConfig(
             remoteAgentCount=int(MBE_config.attrib['remoteAgentCount']),
             block_count=int(xml.attrib['blockCount']),
 
@@ -520,16 +561,12 @@ class MarketSimulationConfig(BaseModel):
 
             hft_agent_tau = float(HFT_config.attrib['tau']),
             hft_agent_delta = int(HFT_config.attrib['delta']),
-            # BOTH SPELLINGS. 84b6e061 renamed this attribute psiHFT_constant -> psiHFT_quotes in
-            # simulation_0.xml. A bare lookup here is not a degraded field: from_xml runs inside
-            # SimulationEngine.start(), which runs inside the validator's __init__, so it raises
-            # KeyError before the validator exists and pm2 restarts it into the same failure. The
-            # validator ran on its already-parsed copy for ninety minutes and only died when a chain
-            # recycle restarted it -- 54 restarts before it was caught.
-            #
-            # Accepting only the NEW name would move the crash rather than fix it: ten other configs
-            # in that directory still carry the old one, including the acceptance config the engine
-            # itself runs. Same defensive shape as scaleR below, which is why scaleR never bit.
+            # BOTH SPELLINGS: the attribute is psiHFT_quotes, and older configs carry psiHFT_constant.
+            # A bare lookup here is not a degraded field: from_xml runs inside SimulationEngine.start(),
+            # which runs inside the validator's __init__, so it raises KeyError before the validator
+            # exists and pm2 restarts it into the same failure. Accepting only the new name would move
+            # the crash rather than fix it, since configs with the old one remain in use. Same defensive
+            # shape as scaleR below.
             hft_agent_psi = float(
                 HFT_config.attrib['psiHFT_quotes'] if 'psiHFT_quotes' in HFT_config.attrib
                 else HFT_config.attrib['psiHFT_constant'] if 'psiHFT_constant' in HFT_config.attrib
@@ -564,14 +601,13 @@ class MarketSimulationConfig(BaseModel):
             sta_agent_tau = int(STA_config.attrib['tau']),
             sta_agent_tauHist = int(STA_config.attrib['tauHist']),
             # THIS FIELD IS A WIRE CONTRACT WITH MINERS WE DO NOT CONTROL, so its TYPE may not
-            # change. 84b6e061 set tauF="1.4"; int() on that literal raises ValueError and
-            # fails from_xml inside the validator's __init__, so truncate instead of casting
-            # directly. Retyping this to float would have been correct and unshippable: a
-            # miner running an older model validates sta_agent_tauF as int, rejects the WHOLE
-            # MarketSimulationStateUpdate on a fractional value, leaves simulation_config as
-            # None, and dies on `'NoneType' has no attribute 'book_count'` -- a symptom that
-            # names nothing to do with the config. Both acceptance miners did exactly that on
-            # before they were restarted onto the new model.
+            # change. A config may set a fractional tauF (e.g. "1.4"); int() on that literal raises
+            # ValueError and fails from_xml inside the validator's __init__, so truncate instead of
+            # casting directly. Retyping this to float would be correct and unshippable: a miner
+            # running an older model validates sta_agent_tauF as int, rejects the WHOLE
+            # MarketSimulationStateUpdate on a fractional value, leaves simulation_config as None,
+            # and dies on `'NoneType' has no attribute 'book_count'` -- a symptom that names nothing
+            # to do with the config.
             #
             # Unknown fields are IGNORED by the model, so ADDING one is safe where retyping is
             # not. The configured value therefore goes alongside rather than replacing.
@@ -595,6 +631,8 @@ class MarketSimulationConfig(BaseModel):
             futures_agent_order_latency_max = int(Futures_config.attrib['maxOPLatency']),
             futures_agent_selection_scale = float(Futures_config.attrib['scaleR'] if 'scaleR' in Futures_config.attrib else 0.0),
         )
+        config._market_source = market_source_digest(xml)
+        return config
 
     def label(self) -> str:
         """

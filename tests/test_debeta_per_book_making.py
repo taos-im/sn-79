@@ -3,13 +3,13 @@
 The old rule computed making as ``2*min(sum_b buy_b, sum_b sell_b)``. That aggregates first, so a
 miner buying only on book A and selling only on book B presents a balanced GLOBAL pair and is
 indistinguishable from a maker quoting both sides of one book. Fill-level capture is two-sided; the
-aggregation is not. On one mainnet window, 229 of 238 miners are one-sided on at least one
-book, so the two definitions are not interchangeable.
+aggregation is not. A miner one-sided on a book is scored differently by the
+two, so the two definitions are not interchangeable.
 
 The shipped making leg sums ``2*min(buy_b, sell_b)`` over books and clamps the TOTAL. There is no
 flag: rollback lives at ``scoring.debeta.enabled``, and the only extra state a flag could reach was
-de-beta enabled WITH the global rule, which measured worse (+0.292 vs +0.365 against market-maker
-ground truth) and is the configuration carrying the defect above.
+de-beta enabled WITH the global rule, which tracked market-making less well and
+is the configuration carrying the defect above.
 """
 
 from taos.im.validator.debeta import (
@@ -44,7 +44,7 @@ def test_per_book_min_gives_the_one_sided_miner_nothing():
 def test_negative_capture_books_cannot_be_discarded():
     """A loss-making book must count against the miner, not be dropped.
 
-    Capture is (mid - p) * q and is negative on 43% of per-book values on real mainnet data. An
+    Capture is (mid - p) * q and is often negative per book. An
     earlier version clamped at 0 INSIDE the per-book loop, which let a miner keep its profitable
     books and discard the rest - scoring HIGHER than the global rule and rewarding the selective
     one-sidedness this function exists to stop. The clamp belongs on the total.
@@ -90,10 +90,9 @@ def test_making_uses_the_per_book_rule_unconditionally():
 
 
 def test_p11_discount_fast_path_matches_naive():
-    """p11_discount was O(makers x total_cp_entries): counterparty_ec rebuilt the leave-one-out
-    market aggregate from scratch per maker (measured 609ms of a 629ms scoring cycle at mainnet
-    scale). The fast path precomputes the global aggregate once and subtracts; it must be
-    numerically identical to the naive per-maker rebuild."""
+    """The fast path precomputes the global leave-one-out aggregate once and subtracts, instead of
+    rebuilding it from scratch per maker (O(makers x total_cp_entries)); it must be numerically
+    identical to the naive per-maker rebuild."""
     import random
     from taos.im.validator.debeta import counterparty_ec, p11_discount
     random.seed(3)

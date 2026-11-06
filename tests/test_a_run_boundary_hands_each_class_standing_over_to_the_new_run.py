@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: MIT
 """A run boundary that changes the layout or a class's market hands each class's standing over to the new run.
 
-The books' records follow the change map: a book keeps its history only when its market is unchanged, judged on the
-class's whole configuration, the price process included, so no record is scored in another market's pool. The
-standing follows the class: each class's making and skill shares as paid at the end of the old run are carried by the
-class's name, wherever its books now sit and however many there are, and blended into the shares it earns in the new
-run, the carried ones weighing 1 at the boundary and 0 one lookback later. A class new to the layout ramps its weight
-in over the same span, its weight handed to the other classes meanwhile.
+The books' records follow the change map: a class keeps its books' histories only when its market is unchanged,
+judged on the class's whole configuration, the price process included, so no record is scored in another market's
+pool; they follow the class to its books in the new layout, in order. The standing follows the class: each class's
+making and skill shares as paid at the end of the old run are carried by the class's name, wherever its books sit in
+the new layout and however many there are, and blended into the shares it earns in the new run, the carried ones
+weighing 1 at the boundary and 0 one lookback later. A class new to the layout ramps its weight in over the same span,
+its weight handed to the other classes meanwhile.
 """
 import os
 import sys
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_the_validator_scores_the_layout_of_the_run_it_is_on import (  # noqa: E402
-    OLD_RUN, _run_dir, tree as _tree_fixture,
+    NEW_RUN, OLD_RUN, _run_dir, tree as _tree_fixture,
 )
 
 from taos.im.validator import persistence, reward, trade  # noqa: E402
@@ -35,19 +36,24 @@ def _layout(tree, name, comp):
 
 def test_the_change_map_names_the_classes_of_both_layouts(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 6), ("simulation_1", 2)])
-    new = _layout(tree, "20261024_031003", [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
+    new = _layout(tree, NEW_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
     ch = trade.layout_book_changes(old, new)
     assert ch["names_old"] == ["simulation_0", "simulation_1"]
     assert ch["names_new"] == ["simulation_0", "simulation_1", "simulation_2"]
 
 
-def test_the_next_growth_keeps_class_0s_first_books_and_starts_the_rest(tree):
+def test_the_next_growth_keeps_every_classs_records_on_its_first_books_and_starts_the_rest(tree):
     old = _layout(tree, OLD_RUN, [("simulation_0", 4), ("simulation_1", 2), ("simulation_2", 2)])
-    new = _layout(tree, "20261102_124000", [("simulation_0", 8), ("simulation_1", 4), ("simulation_2", 4)])
-    books = trade.layout_book_changes(old, new)["books"]
+    new = _layout(tree, NEW_RUN, [("simulation_0", 8), ("simulation_1", 4), ("simulation_2", 4)])
+    ch = trade.layout_book_changes(old, new)
+    books = ch["books"]
     assert all(books[b] == "keep" for b in range(64)), "class 0's books keep their records"
-    assert all(books[b] == "clear" for b in range(64, 128)), "books that were classes 1 and 2 become class 0"
-    assert all(books[b] == "new" for b in range(128, 256)), "classes 1 and 2 on new books"
+    assert all(books[b] == "new" for b in range(64, 128)), "class 0's added books start empty"
+    assert all(books[b] == "move" for b in range(128, 160)), "class 1's records follow it to its first books"
+    assert all(books[b] == "new" for b in range(160, 192))
+    assert all(books[b] == "move" for b in range(192, 224)), "class 2's records follow it to its first books"
+    assert all(books[b] == "new" for b in range(224, 256))
+    assert ch["classes"] == [], "a class that only gains books keeps its pool"
 
 
 def test_any_change_of_a_classs_market_clears_its_records_the_price_process_included():
@@ -65,14 +71,19 @@ def _vectors():
             "simulation_1": {"making": {3: 1.0}, "skill": {3: 0.7, 4: 0.3}}}
 
 
-def test_the_boundary_carries_each_persisting_class_by_name_and_lists_the_new_ones():
+def test_the_boundary_carries_only_the_classes_whose_pool_restarts_and_lists_the_new_ones():
+    """A kept class keeps its records, so carrying its end-of-run vectors too would count its standing twice for a
+    lookback: only the classes the change map restarts are carried, named in the new layout."""
     v = SimpleNamespace(_debeta_class_vectors=_vectors())
     ch = {"books": {0: "clear"}, "classes": [1], "names_old": ["simulation_0", "simulation_1"],
           "names_new": ["simulation_0", "simulation_1", "simulation_2"]}
     trade.begin_class_handover(v, ch, start_ts=100, span=_H)
     assert v._debeta_handover["start"] == 100 and v._debeta_handover["span"] == _H
-    assert set(v._debeta_handover["carried"]) == {"simulation_0", "simulation_1"}
+    assert set(v._debeta_handover["carried"]) == {"simulation_1"}, "simulation_0 kept its books and is not carried"
     assert v._debeta_handover["new"] == ["simulation_2"]
+    reordered = dict(ch, classes=[1], names_new=["simulation_1", "simulation_0", "simulation_2"])
+    trade.begin_class_handover(v, reordered, start_ts=100, span=_H)
+    assert set(v._debeta_handover["carried"]) == {"simulation_0"}, "the indices name the new layout's classes"
 
 
 def _scorer(now, names, handover):
@@ -123,6 +134,34 @@ def test_a_new_class_ramps_its_weight_in_over_the_lookback():
         assert abs(making[2] - want2) < 1e-9, (w, making)
 
 
+def test_an_absent_miner_keeps_none_of_its_carried_share():
+    """The carried vectors pass the presence gate the fresh shares pass: a uid absent after the
+    boundary is paid nothing from its end-of-run standing, and the class's carried share goes to the present."""
+    uids = [1, 2, 3]
+    fresh = {0: {1: {"making_raw": 0.0, "skill_raw": 0.0, "present": False}, 2: {"making_raw": 1.0, "skill_raw": 0.0},
+                 3: {"making_raw": 3.0, "skill_raw": 0.0}}}
+    carried = {0: {"making": {1: 0.5, 2: 0.5}, "skill": {1: 1.0}}}
+    making, skill = reward.class_pool_shares(fresh, [1.0], uids, {0: 1},
+                                             handover={"w": 0.9, "carried": carried, "new": []})
+    assert making[1] == 0.0 and skill.get(1, 0.0) == 0.0, (making, skill)
+    assert abs(making[2] - (0.9 + 0.1 * 0.25)) < 1e-9 and abs(making[3] - 0.1 * 0.75) < 1e-9, making
+
+
+def test_the_handover_weight_is_read_at_the_scoring_clock_the_cycle_pins():
+    """Main scores a cycle at the timestamp it pins for the scoring child's VERIFY, so the handover's weight and its
+    end are read there too, not at the live clock that has moved on during the adoption wait."""
+    h = {"start": 0, "span": _H, "carried": _vectors(), "new": []}
+    names = ["simulation_0", "simulation_1"]
+    live = _H // 2 + 10 ** 9
+    assert abs(reward.class_handover_now(_scorer(live, names, dict(h)), now=_H // 2)["w"] - 0.5) < 1e-12
+    assert reward.class_handover_now(_scorer(live, names, dict(h)))["w"] < 0.5, "without a pin, the live clock"
+    s = _scorer(_H + 1, names, dict(h))
+    assert reward.class_handover_now(s, now=_H - 1) is not None and s._debeta_handover, "it ends at the pinned clock"
+    r = _scorer(_H + 1, names, dict(h))
+    assert reward.class_handover_now(r, end=False) is None and r._debeta_handover, (
+        "the reporting snapshot's scoring reads the live clock but leaves the ending to the scoring cycle")
+
+
 def test_with_no_handover_the_mixing_is_unchanged():
     uids = [1, 2]
     details = {0: {1: {"making_raw": 1.0}, 2: {"making_raw": 3.0}}}
@@ -137,7 +176,14 @@ def test_the_shift_starts_the_handover_whenever_the_layout_or_a_market_changed()
     src = inspect.getsource(trade.shift_simulation_histories)
     assert "begin_class_handover(self, book_changes, new_ts, lookback)" in src
     rsrc = inspect.getsource(reward.compute_debeta_scores)
-    assert "_handover = class_handover_now(self)" in rsrc and "handover=_handover, vectors_out=_vectors" in rsrc
+    assert "_handover = class_handover_now(self, now, end_handover)" in rsrc
+    assert "handover=_handover, vectors_out=_vectors" in rsrc
+    gsrc = inspect.getsource(reward.get_rewards)
+    assert "now=_pin.get('simulation_timestamp')" in gsrc, "main scores the handover at the pinned timestamp"
+    from taos.im.neurons import validator as vmod
+    assert "debeta_for_report(self, self.last_state.timestamp)" in inspect.getsource(vmod)
+    assert "compute_debeta_scores(self, end_handover=False)" in inspect.getsource(reward.debeta_for_report), (
+        "the reporting snapshot does not end the handover ahead of the scoring cycle")
 
 
 def test_a_restart_inside_the_lookback_resumes_the_handover():

@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The validator's push to the mvtrx service carries, beside the live fills, a reconciliation list of every fill
-seen in the simulation state. That list stated no fee, so the service fell back to the book's schedule for it,
-which is what a trade WOULD cost, not what the engine charged (dev/c26a, 8 October 2026, after the tape fee fix in
-the service). The trade event carries the engine's charge as Tf and Mf; the reconciliation fill states both, so
-the service's _resolve_fill_fees keeps them (a stated fee wins, an explicit zero included) and the tape holds the
-charge the engine took."""
+"""The validator's push to the data service carries, beside the live fills, a reconciliation list of every fill
+seen in the simulation state. The trade event carries the engine's charge as Tf and Mf, and the reconciliation fill
+states both, so the service keeps the charge the engine took (a stated fee wins, an explicit zero included) rather
+than falling back to the book's schedule, which is what a trade would cost, not what the engine charged."""
 import re
 from pathlib import Path
 

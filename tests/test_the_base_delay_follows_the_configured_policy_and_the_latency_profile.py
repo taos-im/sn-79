@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: MIT
 """The base delay a response carries into the simulation decides its place in the queue among the quotes of the same
 tick, since the engine orders equal timestamps by insertion, so the mapping from process time to delay is a market
-design dial rather than a constant. Three policies: curve, the exponential mapping the validator has always applied;
-flat, the minimum delay for every response within the timeout, the responses submitted in a random order; jitter, a
-uniform band over the minimum for a prompt response and the curve beyond a cutoff. A latency profile substitutes a
-configured process time per uid, so two policies can be compared on identical latencies."""
+design dial rather than a constant. Three policies: curve, the exponential mapping from the minimum to the maximum delay
+over the timeout; flat, the minimum delay for every response within the timeout, the responses submitted in a random
+order; jitter, a uniform band over the minimum for a prompt response and the curve beyond a cutoff, never under the
+band's top. A latency profile substitutes a configured process time per uid, so two policies can be compared on
+identical latencies."""
 import argparse
 import json
 import random
@@ -58,7 +59,7 @@ def _first_delays(out):
     return {r.agent_id: r.instructions[0].delay for r in out}
 
 
-def test_the_default_policy_is_the_curve_the_validator_has_always_applied():
+def test_the_default_policy_is_the_curve():
     for p in (0.0, 0.05, 0.12, 0.5, 1.2, 2.9, TIMEOUT, 4.0):
         assert base_delay(p, TIMEOUT, MIN, MAX) == _todays_curve(p)
         assert base_delay(p, TIMEOUT, MIN, MAX, policy="curve", jitter=JITTER, prompt_cutoff=CUTOFF) == _todays_curve(p)
@@ -67,7 +68,7 @@ def test_the_default_policy_is_the_curve_the_validator_has_always_applied():
     assert base_delay(TIMEOUT, TIMEOUT, MIN, MAX) == MAX
 
 
-def test_a_configuration_without_the_new_dials_applies_the_curve_through_set_delays():
+def test_a_configuration_without_the_delay_dials_applies_the_curve_through_set_delays():
     times = {1: 0.0, 2: 0.12, 3: 1.2, 4: TIMEOUT, 5: 3.4}
     out = set_delays(_validator(), _synapses(times))
     assert [r.agent_id for r in out] == [1, 2, 3, 4, 5], "the curve keeps the order the responses arrived in"
@@ -88,6 +89,17 @@ def test_flat_gives_the_minimum_delay_to_every_response_within_the_timeout_and_s
     assert order != sorted(times), "the engine keeps insertion order among equal timestamps, so the list is shuffled"
 
 
+def test_under_the_jitter_policy_a_slower_response_never_waits_less_than_a_prompt_one():
+    """Past the cutoff the delay is at least the band's top and never falls as the process time grows, so a response
+    just past the cutoff never waits less than a prompt one draws."""
+    rng = random.Random(7)
+    prompt_top = MIN + JITTER
+    past = [base_delay(CUTOFF + k * 0.01, TIMEOUT, MIN, MAX, policy="jitter", jitter=JITTER, prompt_cutoff=CUTOFF,
+                       rng=rng) for k in range(1, 251)]
+    assert min(past) >= prompt_top, (min(past), prompt_top)
+    assert all(a <= b for a, b in zip(past, past[1:])), "non-decreasing in process time past the cutoff"
+
+
 def test_jitter_draws_within_the_band_under_the_cutoff_and_follows_the_curve_above_it():
     rng = random.Random(5)
     draws = {base_delay(0.2, TIMEOUT, MIN, MAX, policy="jitter", jitter=JITTER, prompt_cutoff=CUTOFF, rng=rng) for _ in range(300)}
@@ -95,15 +107,19 @@ def test_jitter_draws_within_the_band_under_the_cutoff_and_follows_the_curve_abo
     assert len(draws) > 1, "a band, not a constant"
     at_cutoff = base_delay(CUTOFF, TIMEOUT, MIN, MAX, policy="jitter", jitter=JITTER, prompt_cutoff=CUTOFF, rng=rng)
     assert MIN <= at_cutoff <= MIN + JITTER, "the cutoff is inclusive"
-    for p in (0.51, 1.2, 2.9, TIMEOUT, 3.5):
+    for p in (0.51, 1.2, 2.9):
+        assert base_delay(p, TIMEOUT, MIN, MAX, policy="jitter", jitter=JITTER, prompt_cutoff=CUTOFF, rng=rng) == max(
+            _todays_curve(p), MIN + JITTER), "past the cutoff, never under the band's top"
+    for p in (TIMEOUT, 3.5):
         assert base_delay(p, TIMEOUT, MIN, MAX, policy="jitter", jitter=JITTER, prompt_cutoff=CUTOFF, rng=rng) == _todays_curve(p)
     random.seed(2)
     times = {1: 0.0, 2: 0.3, 3: 0.5, 4: 0.6, 5: 1.2, 6: TIMEOUT}
     delays = _first_delays(set_delays(_validator(delay_policy="jitter", delay_jitter=JITTER, delay_prompt_cutoff=CUTOFF), _synapses(times)))
     for uid in (1, 2, 3):
         assert MIN <= delays[uid] <= MIN + JITTER
-    for uid in (4, 5, 6):
-        assert delays[uid] == _todays_curve(times[uid])
+    for uid in (4, 5):
+        assert delays[uid] == max(_todays_curve(times[uid]), MIN + JITTER)
+    assert delays[6] == _todays_curve(times[6]), "at the timeout the curve under every policy"
 
 
 def test_the_latency_profile_replaces_the_measured_time_for_listed_uids_only_and_is_read_once(tmp_path, monkeypatch):

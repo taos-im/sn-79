@@ -1315,7 +1315,7 @@ class Book(BaseModel):
 
                 case c if isinstance(event, Cancellation):
                     # Cancel existing order: on the side the event names when it carries one, else the guess
-                    # from the best ask (an engine that publishes no side behaves as before)
+                    # from the best ask (for an engine that publishes no side)
                     side = getattr(c, 's', None)
                     if side is not None:
                         on_ask = int(side) == int(OrderDirection.SELL)

@@ -1,10 +1,9 @@
 """The seed service must survive the validator's SIGUSR1 while it is still importing.
 
-sn79_20261007_174656: the validator spawned the seed at 18:08:52, waited its two seconds, wrote the
-handoff file and sent SIGUSR1 at 18:08:56; at 18:09:23 it found the seed dead with exit code -10,
-which is SIGUSR1's default disposition. seed.py installed its handler inside run_seed_service, after
-`import bittensor`, which takes longer than two seconds on a loaded box. With the seed dead nothing
-recorded seeds for the new run. The handler has to be in place before the slow imports.
+The validator spawns the seed, waits two seconds, writes the handoff file and sends SIGUSR1. A
+handler installed after `import bittensor`, which takes longer than two seconds on a loaded box,
+would leave SIGUSR1's default disposition in place, so the signal would kill the seed (exit code -10)
+and nothing would record seeds for the new run. seed.py installs its handler before the slow imports.
 
 The prelude (every top-level statement before `import bittensor`) is run for real in a subprocess
 that then signals itself.

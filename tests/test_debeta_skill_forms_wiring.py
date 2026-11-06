@@ -1,8 +1,8 @@
-"""The 0.6.2 skill-leg dials are wired into the scorer and default to the 0.6.1 leg.
+"""The skill-leg dials are wired into the scorer, and each defaults to the plain skill leg.
 
-With every new dial at its default the de-beta map is the one the previous scorer produced, byte for
-byte, and the new quantities ride along in the detail for the gauges. Each dial then changes the map
-the way its help text says.
+With every dial at its default the de-beta map is the same with or without the held accumulators and the
+per-timestamp histories, and the dials' quantities ride along in the detail for the gauges. Each dial then changes the
+map the way its help text says.
 """
 from collections import defaultdict
 from types import SimpleNamespace
@@ -20,8 +20,8 @@ def _dd2():
 
 
 def _validator(**dials):
-    # skill_min_books stated: the duck declares six books but no layout, and from 0.6.3 an unset bar
-    # derives from the layout (an unknown one keeps the launch count of 20, which would zero this skill)
+    # skill_min_books stated: the duck declares six books but no layout, and an unset bar derives from the
+    # layout (an unknown one keeps the launch count of 20, which would zero this skill)
     from debeta_isolated import isolated
     cfg = isolated(enabled=True, weight=0.5, w_make=0.30, centered_window=15, floor_scale=0.5, min_books=1,
                    presence_gate=1, presence_window=10, skill_min_books=4)
@@ -59,17 +59,19 @@ def _validator(**dials):
     return self
 
 
-def test_defaults_reproduce_the_previous_map_and_publish_the_new_quantities():
+def test_the_defaults_score_alike_without_the_extra_accumulators_and_publish_their_quantities():
     v = _validator()
     scores = compute_debeta_scores(v)
     assert scores and scores[1] > 0
     d = v.debeta_detail[1]
-    for key in ("skill_other", "skill_weakest3", "skill_books_kept", "skill_pool_factor", "notional", "presence_share"):
+    for key in ("skill_books_kept", "skill_pool_factor", "notional", "presence_share"):
         assert key in d, key
+    for key in ("skill_other", "skill_weakest3"):
+        assert key not in d, f"{key}: an unpaid form is not computed"
     assert d["skill_pool_factor"] == 1.0, "no hurdle, whole pool"
     assert d["notional"] > 0
     assert d["presence_share"] == 1.0 and v.debeta_detail[2]["presence_share"] == 0.4
-    # a validator without the new accumulators (a snapshot from before them) still scores
+    # a validator without the extra accumulators (a snapshot that holds none) scores the same
     bare = _validator()
     for name in ("debeta_heldn", "debeta_heldinv", "debeta_helddrift", "debeta_notional",
                  "debeta_mtm_hist", "debeta_invsum_hist", "debeta_invn_hist", "debeta_drift_hist"):
@@ -80,8 +82,9 @@ def test_defaults_reproduce_the_previous_map_and_publish_the_new_quantities():
 def test_held_variant_switches_the_skill_pool():
     drift_v, held_v = _validator(skill_variant="drift"), _validator(skill_variant="held")
     a, b = compute_debeta_scores(drift_v), compute_debeta_scores(held_v)
-    assert drift_v.debeta_detail[2]["skill_raw"] == held_v.debeta_detail[2]["skill_other"]
-    assert held_v.debeta_detail[2]["skill_raw"] == drift_v.debeta_detail[2]["skill_other"]
+    # only the paid form is computed, so there is no other-form detail to pair each variant with: the two variants'
+    # maps or skills are compared with each other instead
+    assert "skill_other" not in drift_v.debeta_detail[2] and "skill_other" not in held_v.debeta_detail[2]
     assert a != b or drift_v.debeta_detail[1]["skill_raw"] != held_v.debeta_detail[1]["skill_raw"]
 
 

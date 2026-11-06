@@ -593,7 +593,7 @@ def restart_simulator(self : Validator, end : bool = False) -> None:
             # THROUGH THE WRAPPER, AND WITH THE KILL TIMEOUT, because pm2 re-runs whatever is
             # registered here verbatim for the rest of the box's life.
             #
-            # A bare `taosim -c latest` replaces the entry run_mvtrx.sh installed, and takes two
+            # A bare `taosim -c latest` replaces the entry the launcher installed, and takes two
             # things with it. The one-shot cold-start marker is read by start_simulator.sh, so
             # nothing that asks for a new simulation can be honoured once this has run -- the
             # request is silently a resume. And pm2 SIGKILLs 1600ms after the signal by default,

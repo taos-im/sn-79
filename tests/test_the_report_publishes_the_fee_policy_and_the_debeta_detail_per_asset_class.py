@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""Operator, morning of 8 October 2026: the dashboards' asset-class selector must reach the fee policy and the
-per-miner de-beta figures too. Each class's own configuration carries its own FeePolicy, so the report publishes
-one fee_policy_info row per class; the class summaries are labelled by the class's name, as book_asset_class and
-simulation_config_info already are; and the per-class per-uid detail the scorer computes for the class pools is
-kept and published as agent_class_gauges, so an agent's making, ranks, factors and books can be read per class.
-No scoring math changes: the scorer keeps a reference to what it already computed."""
+"""The dashboards' asset-class selector reaches the fee policy and the per-miner de-beta figures too. Each class's own
+configuration carries its own FeePolicy, so the report publishes one fee_policy_info row per class; the class summaries
+are labelled by the class's name, as book_asset_class and simulation_config_info already are; and the per-class per-uid
+detail the scorer computes for the class pools is kept and published as agent_class_gauges, so an agent's making, ranks,
+factors and books can be read per class. No scoring math changes: the scorer keeps a reference to what it already
+computed."""
 import inspect
 from types import SimpleNamespace
 
@@ -162,5 +162,7 @@ def test_the_scorer_keeps_the_class_details_and_the_validator_hands_them_to_the_
     rsrc = inspect.getsource(reward)
     assert "self._debeta_class_details = _details" in rsrc, "the per-class detail the class pools are built from is kept for the report"
     assert "self._debeta_class_details = None" in rsrc, "and reset with the class summary every round"
-    assert "'debeta_class_details': getattr(self, '_debeta_class_details', None) or {}" in inspect.getsource(validator)
+    # the report takes them as the scoring of its boundary kept them, or as main's own recomputation left them
+    assert "'debeta_class_details': _class_details" in inspect.getsource(validator)
+    assert "getattr(self, '_debeta_class_details', None) or {}" in inspect.getsource(reward.debeta_for_report)
     assert "self.debeta_class_details = " in inspect.getsource(report)

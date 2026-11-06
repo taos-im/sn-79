@@ -313,10 +313,9 @@ def cleanup_event_loop(self: Validator):
             # Cancelling is right for the long-lived tasks: the query service, the reporting service
             # and the metagraph sync all exist to be stopped. It is wrong for a detached state push,
             # which is one block of data already built and already on its way. Cancel it and its
-            # trades never reach the tape, while the service has already written the same fills down
-            # its per-fill path -- so the fills read as floating free of a tape that was simply never
-            # sent. The losses cluster in the minutes that contain a validator restart, which is
-            # what separates this from a steady-state ingest fault.
+            # trades never reach the data service, while the service has already written the same
+            # fills down its per-fill path -- so the fills read as floating free of a trade record
+            # that was simply never sent, in the minutes around a validator restart.
             _pushes = [t for t in asyncio.all_tasks(self.main_loop)
                        if not t.done() and (t.get_name() or "").startswith(PUSH_TASK_NAME)]
             if _pushes:
@@ -408,11 +407,11 @@ def cleanup_event_loop(self: Validator):
 
 # The engine checkpoints at the last state it published and resumes one step after it. Once the validator stops
 # answering, the listener handles at most one more state, the one the engine checkpoints at, and leaves its loop.
-# That takes about one round: 5 s at the median on mainnet, 12 s at most.
+# That takes about one round, so the wait allows a slow round with a margin.
 STOP_LISTEN_WAIT_S = 15.0
-# The stop save: the rewards queued and a report's preparation, which holds the same lock (up to 12 s on mainnet),
-# stopping the scoring service (up to 3 s), then the write (7 to 15 s on mainnet's state). pm2 kills the validator
-# at its kill timeout, 60 s for one the launcher starts, and the teardown needs the rest.
+# The stop save: the rewards queued and a report's preparation, which holds the same lock, stopping the scoring
+# service, then the write of a large state. pm2 kills the validator at its kill timeout, 60 s for one the launcher
+# starts, and the teardown needs the rest.
 STOP_SAVE_TIMEOUT_S = 35.0
 
 

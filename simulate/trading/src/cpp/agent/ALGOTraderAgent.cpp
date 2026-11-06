@@ -120,10 +120,9 @@ void ALGOTraderVolumeStats::pushLevels(
 
 // One GARCH step, on one return from the shared clock.
 //
-// This used to be folded into pushLevels, taking a return between two mid quotes read at the
-// agent's own depth tick. That tick is `volumeStatsPeriod` plus a market-feed latency draw, so
-// the returns were irregularly spaced, and GARCH is defined on regularly sampled ones. Nothing
-// about the recursion changes here; it is the input that is now what the model assumes.
+// Kept apart from pushLevels because GARCH is defined on regularly sampled returns: the agent's
+// own depth tick is `volumeStatsPeriod` plus a market-feed latency draw, so returns taken between
+// two mid quotes read at that tick would be irregularly spaced.
 void ALGOTraderVolumeStats::pushReturn(double logReturn)
 {
     if (!std::isfinite(logReturn)) return;

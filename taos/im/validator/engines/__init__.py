@@ -34,11 +34,11 @@ def resolve_trade_roles(uid, signal_idx, maker_candidates, counterparty=None):
     agent to agent, so the pool is a real counterparty, and because exactly one side is ever
     absent the representation is unambiguous.
 
-    This replaces two wrong assumptions. `taker_uid = uid` unconditionally recorded a resting
-    fill's agent as the taker, which states the opposite of what happened. And
-    `maker_uid = uid` as the no-counterparty fallback published the agent as its own
-    counterparty: a live notice carried Ma = 171, Ta = 171 while the tape recorded
-    maker_uid = NULL for the same trade, so two surfaces disagreed about one fill.
+    Two assumptions would be wrong here. `taker_uid = uid` unconditionally would record a
+    resting fill's agent as the taker, the opposite of what happened. And
+    `maker_uid = uid` as the no-counterparty fallback would publish the agent as its own
+    counterparty (Ma = Ta on the notice) while the recorded trade carries no maker, so two
+    surfaces would disagree about one fill.
 
     `counterparty` is the OTHER side as the engine stated it (Signal.counterparty_agent_id,
     populated from the trade context's aggressingAgentId). When present it is used directly and
@@ -79,9 +79,9 @@ class NormalizedTradeEvent:
         side; maker is the resting side, or None when the fill was against the pool and there
         is no agent counterparty. Settlement is always against the pool and funds never move
         agent to agent, so an absent maker is the normal case for a marketable order, and it
-        must never be filled in with the taker's own uid: doing so published the miner as its
-        own counterparty (Ma = Ta = 171 on a live notice) while the tape said maker_uid NULL
-        for the same trade. The engine is the source of truth for this; nothing downstream
+        must never be filled in with the taker's own uid: doing so publishes the miner as its
+        own counterparty (Ma = Ta on the notice) while the recorded trade carries no maker. The
+        engine is the source of truth for this; nothing downstream
         should re-derive it.
     """
     book_id:   int

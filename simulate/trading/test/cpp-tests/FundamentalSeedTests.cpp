@@ -3,13 +3,15 @@
  * SPDX-License-Identifier: MIT
  */
 
-// The fundamental's seed: where a realization finds it, what one seed step draws from it, and the offline
+// The fundamental's seed: where a realization takes it, what one seed step draws from it, and the offline
 // mode in which a recorded seed file reproduces a run.
 //
-// A multi-asset realization looks for the seed file at the run root, where the validator writes it. One
-// seed step's draws depend on that step's seed alone: every distribution starts afresh at the reseed and the
-// fractional increment is drawn at its own step. Distinct books draw distinct streams. With seedFile set, the
-// n-th seed step takes row n of the file, so the same config, rngSeed and file give the same run.
+// The validator delivers each seed step's seed with its reply batch: the public randomness round published after
+// the miners' reply deadline, which nobody holds before replying. A book takes a delivered seed once; a step with
+// none new draws a random seed. One seed step's draws depend on that step's seed alone: every distribution starts
+// afresh at the reseed and the fractional increment is drawn at its own step. Distinct books draw distinct streams.
+// With seedFile set, the n-th seed step takes row n of the file, the rounds the validator recorded (or an older
+// file's prices), so the same config, rngSeed and file give the same run.
 
 #include "MultiAssetRunFixture.hpp"
 
@@ -19,6 +21,7 @@
 #include <taosim/process/FuturesSignal.hpp>
 #include <taosim/process/helpers.hpp>
 #include <taosim/serialization/msgpack/common.hpp>
+#include <taosim/simulation/util.hpp>
 
 #include <fmt/format.h>
 #include <gtest/gtest.h>
@@ -78,6 +81,7 @@ struct ProcessDesc
     std::string seedFile{};
     fs::path runDir{};
     uint64_t simSeed{s_simSeed};
+    Timestamp gracePeriod{};
 };
 
 // A fundamental on a bare simulation: the grid, the shared stream and the fBm factor it needs, no agents.
@@ -108,7 +112,7 @@ struct Process
             .epsilon = 0.2,
             .interpolate = 0,
             .ownRng = desc.ownRng,
-            .gracePeriod = 0,
+            .gracePeriod = desc.gracePeriod,
             .proc = {.updatePeriod = s_interval},
             .L = &L,
             .seedFile = desc.seedFile
@@ -148,10 +152,16 @@ Draws stepOnce(Process& p, int step)
     return {after.W - before.W, after.dJ - before.dJ, after.V(step)};
 }
 
-// The live service's file as the engine reads it: its newest complete row.
-void writeLiveSeed(const fs::path& dir, int count, std::string_view price)
+// The seed a validator delivers with its batch for the next seed step.
+void deliver(Process& p, uint64_t round, uint64_t word)
 {
-    std::ofstream{dir / "fundamental_seed.csv"} << fmt::format("{},{}\n", count, price);
+    p.sim->setStepSeed(round, word);
+}
+
+// 32 bytes of randomness as the validator records them, whose first 8 are `word`.
+std::string randomnessHex(uint64_t word)
+{
+    return fmt::format("{:016x}{:048x}", word, 0xC0FFEEull * word);
 }
 
 std::string recordedSeedFile(const fs::path& dir, int rows)
@@ -164,28 +174,91 @@ std::string recordedSeedFile(const fs::path& dir, int rows)
     return path.generic_string();
 }
 
-static constexpr std::string_view s_prices[] = {
-    "", "67000.12", "67001.40", "67000.95", "67002.33", "67003.10", "67001.88", "67004.20", "67005.05"};
+static constexpr uint64_t s_words[] = {
+    0, 0x8f3a1c2d4e5b6a79ull, 0x1b2c3d4e5f60718aull, 0xa9b8c7d6e5f40312ull, 0x0123456789abcdefull,
+    0xfedcba9876543210ull, 0x5a5a5a5aa5a5a5a5ull, 0x13579bdf2468ace0ull, 0x7777888899990000ull};
 
 }  // namespace
 
 //-------------------------------------------------------------------------
 
-TEST(FundamentalSeedTest, ARealizationReadsTheSeedAtTheRunRoot)
+TEST(FundamentalSeedTest, AStepTakesTheSeedTheValidatorDelivered)
 {
     const TempDir root{"root"};
     Process p{{.runDir = root.path()}};
-    EXPECT_EQ(fs::path{p.fp->seedFile()}, root.path() / "fundamental_seed.csv");
-
+    // A seed file at the run root is not read: a step's seed is the round delivered with the batch.
     std::ofstream{root.path() / "fundamental_seed.csv"} << "1,67000.12\n2,67000.50\n";
+    deliver(p, 41'234'567, s_words[1]);
     p.fp->update(s_interval);
-    EXPECT_EQ(p.fp->state().lastCount, 2) << "the newest complete row at the run root was not read";
-    EXPECT_EQ(p.fp->state().lastSeed, FundamentalPrice::seedFor(6'700'050, 5));
+    EXPECT_EQ(p.fp->state().lastCount, 41'234'567) << "the step did not take the delivered round";
+    EXPECT_EQ(p.fp->state().lastSeed, FundamentalPrice::seedFor(static_cast<int64_t>(s_words[1]), 5));
+    EXPECT_EQ(p.fp->randomSeedSteps(), 0u);
 }
 
 //-------------------------------------------------------------------------
 
-TEST(FundamentalSeedTest, EveryRealizationLooksForTheSeedAtTheRunRoot)
+TEST(FundamentalSeedTest, ADeliveredSeedIsTakenOnceAndAStepWithoutOneDrawsARandomSeed)
+{
+    Process p{{}};
+    deliver(p, 7, s_words[2]);
+    p.fp->update(1 * s_interval);
+    const auto first = p.fp->state().lastSeed;
+    p.fp->update(2 * s_interval);
+    EXPECT_EQ(p.fp->randomSeedSteps(), 1u) << "the step reused the seed of the step before";
+    EXPECT_EQ(p.fp->state().lastCount, 7) << "a random step names no round";
+    deliver(p, 8, s_words[2]);
+    p.fp->update(3 * s_interval);
+    EXPECT_EQ(p.fp->state().lastCount, 8);
+    EXPECT_EQ(p.fp->state().lastSeed, first) << "the same randomness seeds the same stream whatever its round";
+    EXPECT_EQ(p.fp->randomSeedSteps(), 1u);
+}
+
+//-------------------------------------------------------------------------
+
+// A step that finds no new seed is logged from the first such step after the grace period, in which no batch arrives
+// to deliver one, and every thousandth after; every such step counts in randomSeedSteps, the grace period's too.
+TEST(FundamentalSeedTest, TheFirstStepAfterTheGracePeriodWithoutASeedIsLogged)
+{
+    Process p{{.gracePeriod = 2 * s_interval}};
+    auto printedAt = [&](int step) {
+        testing::internal::CaptureStdout();
+        p.fp->update(step * s_interval);
+        std::fflush(stdout);
+        return testing::internal::GetCapturedStdout();
+    };
+    static constexpr std::string_view s_warning = "no new fundamental seed delivered";
+    const auto inGrace = printedAt(1);
+    EXPECT_EQ(inGrace.find(s_warning), std::string::npos) << "a step in the grace period was logged: " << inGrace;
+    const auto first = printedAt(2);
+    EXPECT_NE(first.find(s_warning), std::string::npos) << "the first step after the grace period was not logged";
+    EXPECT_NE(first.find("(1 so far)"), std::string::npos) << "the count is not the steps after the grace period: "
+                                                            << first;
+    const auto second = printedAt(3);
+    EXPECT_EQ(second.find(s_warning), std::string::npos) << "the second step after the grace period was logged";
+    EXPECT_EQ(p.fp->randomSeedSteps(), 3u);
+}
+
+//-------------------------------------------------------------------------
+
+TEST(FundamentalSeedTest, EveryBookOfARealizationTakesTheOneDeliveredSeed)
+{
+    Process a{{.bookId = 5}};
+    FundamentalPrice second{FundamentalPriceDesc{
+        .simulation = a.sim.get(), .bookId = 6, .seedInterval = s_interval, .X0 = 300.0, .mu = 0.0, .sigma = 0.3,
+        .dt = 1.0 / s_steps, .lambda = 2.0, .muJump = 0.0, .sigmaJump = 0.02, .hurst = 0.729, .epsilon = 0.2,
+        .interpolate = 0, .ownRng = 1, .gracePeriod = 0, .proc = {.updatePeriod = s_interval}, .L = &a.L}};
+    deliver(a, 9, s_words[3]);
+    a.fp->update(s_interval);
+    second.update(s_interval);
+    EXPECT_EQ(a.fp->state().lastCount, 9);
+    EXPECT_EQ(second.state().lastCount, 9) << "the second book of the realization did not take the seed";
+    EXPECT_EQ(second.randomSeedSteps(), 0u);
+    EXPECT_NE(a.fp->state().lastSeed, second.state().lastSeed) << "two books shared one stream";
+}
+
+//-------------------------------------------------------------------------
+
+TEST(FundamentalSeedTest, EveryRealizationLooksForTheExternalSeedAtTheRunRoot)
 {
     const taosim::test::multiasset_run::MultiAssetRun run{"fpseed-root"};
     const auto orchestrator = run.build();
@@ -193,7 +266,7 @@ TEST(FundamentalSeedTest, EveryRealizationLooksForTheSeedAtTheRunRoot)
     ASSERT_FALSE(realizations.empty());
     for (const auto& sim : realizations) {
         EXPECT_NE(sim->logDir(), run.root()) << "a realization logs into its own directory";
-        EXPECT_EQ(sim->runDir(), run.root()) << sim->logDir().string() << " looks for its seed elsewhere";
+        EXPECT_EQ(sim->runDir(), run.root()) << sim->logDir().string() << " looks for its external seed elsewhere";
     }
 }
 
@@ -209,8 +282,8 @@ TEST(FundamentalSeedTest, AStepsDrawsDependOnItsOwnSeedAlone)
             Process b{{.ownRng = ownRng, .runDir = dirB.path()}};
             std::vector<Draws> drawsA, drawsB;
             for (int step = 1; step <= k; ++step) {
-                writeLiveSeed(dirA.path(), step, s_prices[step]);
-                writeLiveSeed(dirB.path(), step, step == k - 1 ? "61234.56" : s_prices[step]);
+                deliver(a, step, s_words[step]);
+                deliver(b, step, step == k - 1 ? 0x6123456000000000ull : s_words[step]);
                 drawsA.push_back(stepOnce(a, step));
                 drawsB.push_back(stepOnce(b, step));
             }
@@ -229,8 +302,8 @@ TEST(FundamentalSeedTest, DistinctBooksDrawDistinctStreams)
     const TempDir dirA{"bookA"}, dirB{"bookB"};
     Process a{{.bookId = 5, .runDir = dirA.path()}};
     Process b{{.bookId = 6, .runDir = dirB.path()}};
-    writeLiveSeed(dirA.path(), 1, "67000.20");
-    writeLiveSeed(dirB.path(), 1, "67000.10");
+    deliver(a, 1, s_words[4]);
+    deliver(b, 1, s_words[4]);
     const auto drawsA = stepOnce(a, 1), drawsB = stepOnce(b, 1);
     EXPECT_NE(drawsA.dW, drawsB.dW) << "two books shared one stream";
     EXPECT_NE(a.fp->state().lastSeed, b.fp->state().lastSeed);
@@ -255,6 +328,109 @@ TEST(FundamentalSeedTest, ARecordedSeedFileReproducesTheFundamental)
 
 //-------------------------------------------------------------------------
 
+TEST(FundamentalSeedTest, TheRecordedRoundsReplayTheRunTheirDeliveriesSeeded)
+{
+    const TempDir dir{"rounds"};
+    const auto path = dir.path() / "recorded_rounds.csv";
+    {
+        std::ofstream ofs{path};
+        for (int step = 1; step <= s_steps; ++step) {
+            ofs << fmt::format("{},{},{}\n", 41'000'000 + step, randomnessHex(s_words[step]), step * s_interval);
+        }
+    }
+    Process live{{.simSeed = 1}};
+    Process replay{{.seedFile = path.generic_string(), .simSeed = 2}};
+    for (int step = 1; step <= s_steps; ++step) {
+        deliver(live, 41'000'000 + step, s_words[step]);
+        live.fp->update(step * s_interval);
+        replay.fp->update(step * s_interval);
+        EXPECT_EQ(replay.fp->state().lastCount, 41'000'000 + step);
+        EXPECT_EQ(live.fp->value(), replay.fp->value()) << "the replay parted from the live run at step " << step;
+    }
+}
+
+//-------------------------------------------------------------------------
+
+TEST(FundamentalSeedTest, TheBatchCarriesTheRoundAndItsRandomness)
+{
+    const auto packed = [](auto&& packSeed) {
+        msgpack::sbuffer buf;
+        msgpack::packer<msgpack::sbuffer> pk{buf};
+        pk.pack_map(2);
+        pk.pack(std::string{"responses"});
+        pk.pack_array(0);
+        pk.pack(std::string{"seed"});
+        packSeed(pk);
+        return msgpack::unpack(buf.data(), buf.size());
+    };
+    const std::string bytes{"\x8f\x3a\x1c\x2d\x4e\x5b\x6a\x79" "0123456789abcdefghijklmnopqrstuv", 40};
+    auto bin = packed([&](auto& pk) {
+        pk.pack_array(2);
+        pk.pack(uint64_t{41'234'567});
+        pk.pack_bin(32);
+        pk.pack_bin_body(bytes.data(), 32);
+    });
+    const auto seed = taosim::simulation::readStepSeed(bin.get());
+    ASSERT_TRUE(seed.has_value());
+    EXPECT_EQ(seed->round, 41'234'567u);
+    EXPECT_EQ(seed->word, s_words[1]) << "the first 8 bytes, big-endian";
+
+    auto hex = packed([&](auto& pk) {
+        pk.pack_array(2);
+        pk.pack(uint64_t{5});
+        pk.pack(randomnessHex(s_words[3]));
+    });
+    ASSERT_TRUE(taosim::simulation::readStepSeed(hex.get()).has_value());
+    EXPECT_EQ(taosim::simulation::readStepSeed(hex.get())->word, s_words[3]);
+
+    auto shortBin = packed([&](auto& pk) {
+        pk.pack_array(2);
+        pk.pack(uint64_t{5});
+        pk.pack_bin(4);
+        pk.pack_bin_body(bytes.data(), 4);
+    });
+    EXPECT_FALSE(taosim::simulation::readStepSeed(shortBin.get()).has_value()) << "fewer than 8 bytes is no seed";
+    auto notAPair = packed([](auto& pk) { pk.pack(uint64_t{5}); });
+    EXPECT_FALSE(taosim::simulation::readStepSeed(notAPair.get()).has_value());
+
+    msgpack::sbuffer buf;
+    msgpack::packer<msgpack::sbuffer> pk{buf};
+    pk.pack_map(1);
+    pk.pack(std::string{"responses"});
+    pk.pack_array(0);
+    const auto none = msgpack::unpack(buf.data(), buf.size());
+    EXPECT_FALSE(taosim::simulation::readStepSeed(none.get()).has_value()) << "a batch without the member";
+}
+
+//-------------------------------------------------------------------------
+
+// Randomness sent as text is read from its first 16 characters, every one of them a hex digit: a sign, white space, a
+// 0x prefix or any other character there makes the member no seed, rather than a seed read from part of it.
+TEST(FundamentalSeedTest, RandomnessSentAsTextIsSixteenHexDigitsOrNoSeed)
+{
+    const auto batch = [](std::string_view randomness) {
+        msgpack::sbuffer buf;
+        msgpack::packer<msgpack::sbuffer> pk{buf};
+        pk.pack_map(1);
+        pk.pack(std::string{"seed"});
+        pk.pack_array(2);
+        pk.pack(uint64_t{5});
+        pk.pack(std::string{randomness});
+        return msgpack::unpack(buf.data(), buf.size());
+    };
+    const auto upper = batch("8F3A1C2D4E5B6A79" + std::string(48, '0'));
+    ASSERT_TRUE(taosim::simulation::readStepSeed(upper.get()).has_value()) << "upper-case hex is hex";
+    EXPECT_EQ(taosim::simulation::readStepSeed(upper.get())->word, s_words[1]);
+    for (const std::string_view head : {"0x8f3a1c2d4e5b6a", " 8f3a1c2d4e5b6a7", "+8f3a1c2d4e5b6a7", "-000000000000001",
+                                        "8f3a1c2dzzzzzzzz"}) {
+        const auto bad = batch(std::string{head} + std::string(48, '0'));
+        EXPECT_FALSE(taosim::simulation::readStepSeed(bad.get()).has_value())
+            << "randomness starting \"" << head << "\" was read as a seed";
+    }
+}
+
+//-------------------------------------------------------------------------
+
 TEST(FundamentalSeedTest, ARecordedSeedFileThatEndsStopsTheRun)
 {
     const TempDir dir{"short"};
@@ -263,6 +439,24 @@ TEST(FundamentalSeedTest, ARecordedSeedFileThatEndsStopsTheRun)
     p.fp->update(2 * s_interval);
     EXPECT_THROW(p.fp->update(3 * s_interval), std::runtime_error)
         << "a recorded run went on without its seed";
+}
+
+//-------------------------------------------------------------------------
+
+TEST(FundamentalSeedTest, AMalformedRowOfARecordedSeedFileNamesBothForms)
+{
+    const TempDir dir{"malformed"};
+    const auto path = dir.path() / "malformed.csv";
+    std::ofstream{path} << "1,not-a-seed\n";
+    Process p{{.seedFile = path.generic_string()}};
+    try {
+        p.fp->update(s_interval);
+        ADD_FAILURE() << "a malformed row was read";
+    } catch (const std::runtime_error& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("round,randomness"), std::string::npos) << what;
+        EXPECT_NE(what.find("count,price"), std::string::npos) << what;
+    }
 }
 
 //-------------------------------------------------------------------------

@@ -3,8 +3,8 @@
 """
 Exchange-mode validator config Pydantic model.
 
-Kept in its own module so the public testnet release (sim-only) can omit it
-via apply_testnet.sh without disturbing the rest of taos.im.protocol.
+Kept in its own module so a sim-only release can leave it out without
+disturbing the rest of taos.im.protocol.
 """
 import xml.etree.ElementTree as ET
 

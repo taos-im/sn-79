@@ -1,19 +1,19 @@
-"""One book with a bad timestamp must not stall every other book.
+"""One book's outlier clock cannot hold the aggregator's clock, so it cannot stall every other book.
 
-Book 70 held an exchange-scale timestamp (1.53e15 ns, 425 sim-hours) while the
-other 128 books sat at ~2.45e12 (0.68h). The tail-flush test compared each book against the GLOBAL
-MAX, so all 128 were 1,528,085s "behind" a 300s interval and flushed on every loop -- producing
-1-3 second pages of ~217 rows against train_seq_len=512, which surfaces downstream as
-"no trainable pages" with nothing actually wrong with training.
+The tail flush flushes a book once it is a whole interval behind the aggregator's clock. That clock is the median of
+the books' last timestamps, not their maximum: a single book whose timestamp sits far ahead of the rest leaves the
+clock where the other books are, so none of them is flushed on every loop into pages too short to train on, while a
+book that has stopped is still a whole interval behind and is flushed.
 """
 
 
 INTERVAL_NS = 300_000_000_000          # parquet_interval_ns: 5 sim-minutes
-SIM_NOW = 2_455_000_000_000            # ~0.68 sim-hours, where the healthy books sit
-POISON = 1_530_540_000_000_000         # ~425 sim-hours, exchange scale
+SIM_NOW = 3_600_000_000_000            # one sim-hour, where the healthy books sit
+OUTLIER = 1_000 * SIM_NOW              # a clock far ahead of every other book's
+BOOKS = 16
 
 
-def _healthy_books(n=128):
+def _healthy_books(n=BOOKS):
     # Books tick at slightly different times, all within a few seconds of each other.
     return {b: SIM_NOW - (b % 7) * 1_000_000_000 for b in range(n)}
 
@@ -29,32 +29,32 @@ def _stalled_by_median(last_ts):
     return [b for b, t in last_ts.items() if (clock - t) >= INTERVAL_NS]
 
 
-def test_max_clock_stalls_everything_when_one_book_is_poisoned():
-    """The old behaviour, pinned so the regression is recognisable if it returns."""
+def test_max_clock_stalls_everything_when_one_book_is_an_outlier():
+    """A clock taken as the maximum flags every other book: the case the median clock is chosen against."""
     books = _healthy_books()
-    books[70] = POISON
+    books[5] = OUTLIER
     stalled = _stalled_by_max(books)
-    # 127 = every book except the poisoned one itself, which is zero from its own clock.
-    assert len(stalled) == 127, len(stalled)
-    assert 70 not in stalled
+    # every book except the outlier itself, which is zero from its own clock
+    assert len(stalled) == BOOKS - 1, len(stalled)
+    assert 5 not in stalled
 
 
-def test_median_clock_is_unmoved_by_one_poisoned_book():
+def test_median_clock_is_unmoved_by_one_outlier_book():
     books = _healthy_books()
-    books[70] = POISON
+    books[5] = OUTLIER
     stalled = _stalled_by_median(books)
     assert stalled == [], stalled                  # nothing stalled; the outlier cannot move a median
 
 
 def test_median_clock_still_detects_a_genuinely_stalled_book():
-    """The fix must not blind the check -- a book that really has stopped is still flushed."""
+    """The median clock still flags a book that has stopped."""
     books = _healthy_books()
     books[42] = SIM_NOW - (INTERVAL_NS * 2)        # genuinely 10 sim-minutes behind
     assert _stalled_by_median(books) == [42]
 
 
-def test_median_survives_several_poisoned_books():
+def test_median_survives_several_outlier_books():
     books = _healthy_books()
-    for b in (70, 71, 72):
-        books[b] = POISON
+    for b in (5, 6, 7):
+        books[b] = OUTLIER
     assert _stalled_by_median(books) == []

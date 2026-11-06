@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The miner library rebuilds each book from the events it received and compares the result with the snapshot the
 validator published. The rebuild rounds every level to the book's volume decimals; the published level keeps the
-engine's full precision (RECON 557.0339 against TARGET 557.03394573 on the 6 October testnet log), so an exact
-comparison flagged a mismatch on every partially filled level. A level matches within half a volume increment, a
+engine's full precision (557.0339 rebuilt against 557.03394573 published), so an exact comparison would flag a
+mismatch on every partially filled level. A level matches within half a volume increment, a
 level within that of zero counts as absent, and each book is rounded to its own grid, not the first class's."""
 import copy
 from types import SimpleNamespace

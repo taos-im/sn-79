@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: MIT
 """The per-agent scoring maps of the data-service ingest push, built in one place.
 
-Three pushers used to build these maps by hand: the exchange path (`_build_agent_scoring_maps`), the
-simulation path (an inlined copy of the same twenty lines) and the reporting child (a thinner copy that
-sent a DIFFERENT quantity under `agent_kappa`: the kappa `score` where the other two sent `total`). The
-copies had already drifted, and none of them carried the de-beta decomposition, so the UI could not show
-what emissions follow. Every pusher now composes its scoring keys from the functions here.
+Every pusher, the exchange path (`_build_agent_scoring_maps`), the simulation path and the reporting
+child, composes its scoring keys from the functions here, so all three send the same quantity under each
+key (`agent_kappa` is the kappa `total` everywhere) and the de-beta decomposition the UI shows.
 
 Conventions the sinks rely on: uids are strings, values are floats, and a uid whose value is unknown is
 OMITTED rather than sent as null. The sinks coerce with `float(... or 0)`, so a null would render an

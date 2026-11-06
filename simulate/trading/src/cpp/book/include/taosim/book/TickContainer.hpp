@@ -58,6 +58,12 @@ public:
 
     void updateVolume(taosim::decimal_t deltaVolume) noexcept;
 
+    // Whether an order of this level may have reached zero volume since the level's zero-volume orders were last
+    // cleared (Book::clearFilledOrders). Every change to a resting order's volume is charged to its level through
+    // updateVolume, so a reduction marks the level; a level starts marked, however it was built.
+    [[nodiscard]] bool mayHoldGhosts() const noexcept { return m_mayHoldGhosts; }
+    void clearGhostMark() noexcept { m_mayHoldGhosts = false; }
+
     bool operator<(const TickContainer& rhs) const noexcept { return m_price < rhs.price(); }
     bool operator<(taosim::decimal_t price) const noexcept { return m_price < price; }
 
@@ -71,6 +77,7 @@ private:
     OrderContainer* m_orderContainer{};
     taosim::decimal_t m_price{};
     taosim::decimal_t m_volume{};
+    bool m_mayHoldGhosts{true};
 };
 
 //-------------------------------------------------------------------------

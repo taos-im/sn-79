@@ -2,12 +2,10 @@
 """The counterparty factor extended to the skill leg.
 
 P11 discounts a maker's captured spread by the excess concentration of the takers that filled it, so a
-maker fed by a dedicated counterparty cannot rank-buy a making slot. It never reached the skill leg,
-and on 22 September the tape showed that is where a feeding ring is paid: fed makers with making ranks
-of 0.003 to 0.36 held skill ranks of 0.94 to 1.00 on four to nine books, because feeding at chosen
-prices manufactures per-book alpha on the fed side. Against real alphas, applying the same factor
-to skill touches no account outside the pattern (every genuine skill winner at exactly 1.000) and is
-cloning-invariant under a proportional skill pool.
+maker fed by a dedicated counterparty cannot rank-buy a making slot. The same factor applies
+to the skill leg, since feeding at chosen prices can manufacture per-book alpha on the fed side; it
+leaves a maker with no concentrated takers at exactly 1.0 and is cloning-invariant under a
+proportional skill pool.
 
 The dial is `scoring.debeta.skill_p11_strength`, default 0, which reproduces the shipped leg exactly.
 """
@@ -141,10 +139,9 @@ def _split_fed_maker(background_makers, dedicated, market_leak, k):
 
 
 def test_on_a_realistic_field_the_factor_is_near_invariant_under_cloning():
-    """Sixty diverse makers, the ring about one per cent of all flow, as on the mainnet board where
-    the real-board split of fed maker 230 measured x1.001. Every clone carries the same excess
+    """Sixty diverse makers, the ring about one per cent of all flow. Every clone carries the same excess
     concentration, so the same factor, and additive alpha times the same factor barely moves. The
-    residual (measured 1.065 at k=16) is P11's leave-one-out market share: part of the dedicated
+    residual is P11's leave-one-out market share: part of the dedicated
     taker's flow now sits with the other clones and reads as market flow to each. Pinned at 1.10."""
     paid_one, paid_many, factors = _split_fed_maker(60, 800.0, 200.0, 16)
     assert max(factors) - min(factors) < 1e-9
@@ -153,12 +150,9 @@ def test_on_a_realistic_field_the_factor_is_near_invariant_under_cloning():
 
 
 def test_the_limit_when_a_ring_is_a_large_share_of_the_whole_market():
-    """Documented so it is not rediscovered. With no background field the ring is near half of all
-    flow, and leave-one-out breaks: each clone sees most of the dedicated taker's flow as market
-    flow, the factor rises from 0.20 to 0.63 and the operator is paid about three times as much for
-    splitting. P11 weakens as a ring grows toward dominating the market's miner flow. On mainnet the
-    largest ring is a few per cent of miner flow and this does not bind; it would on an exchange
-    board with few participants, which is one more reason exchange mode needs its own calibration."""
+    """With no background field a ring is near half of all flow and leave-one-out weakens: each clone
+    sees most of the dedicated taker's flow as market flow, so the factor rises. P11 holds while a ring
+    is a small share of the market's miner flow, and this pins where that stops."""
     paid_one, paid_many, factors = _split_fed_maker(0, 800.0, 200.0, 16)
     assert paid_one > 0
     assert paid_many / paid_one > 2.0
@@ -177,9 +171,8 @@ def test_randomised_boards_default_is_the_off_path():
 
 
 def test_the_call_site_builds_the_counterparty_map_for_the_skill_discount_too():
-    """The scorer receives `cp` from compute_debeta_scores. Until 22 September that map was built only
-    when the MAKING discount was on, so with p11_strength 0 the skill-leg factor never saw a map and
-    silently stayed at 1.0, while the dial's help text promised independence. Read from source
+    """The scorer receives `cp` from compute_debeta_scores, built whichever discount is on, so with
+    p11_strength 0 the skill-leg factor still sees the map, as the dial's help text promises. Read from source
     because compute_debeta_scores is a validator method; the property is that the line building `cp`
     is conditioned on the skill strength as well as the making one."""
     import pathlib

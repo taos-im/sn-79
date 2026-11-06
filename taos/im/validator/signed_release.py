@@ -8,7 +8,7 @@ The update check (hourly, at startup and at the run end) and the launcher follow
             branch, applied as a fast-forward, and only when ``git verify-tag`` accepts its SSH signature against
             ``.github/allowed_signers`` as it stands in the tree the validator is already running. The trust anchor
             is the code in place: a release that adds a key to that file is verified against the file before it.
-    branch  (default) the tracked branch's tip, as before 0.6.4.
+    branch  (default) the tracked branch's tip.
     off     no self-update.
 
 This module imports nothing from the package, so the launcher can run it by path before installing anything:

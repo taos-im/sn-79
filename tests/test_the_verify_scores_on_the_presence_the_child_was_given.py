@@ -44,8 +44,8 @@ class _Stop(Exception):
 def _capture(monkeypatch):
     seen = {}
 
-    def _debeta(self, absent=None, presence=None):
-        seen.update(absent=absent, presence=presence)
+    def _debeta(self, absent=None, presence=None, now=None):
+        seen.update(absent=absent, presence=presence, now=now)
         raise _Stop
 
     monkeypatch.setattr(reward, "build_scoring_config", lambda self: {})
@@ -61,14 +61,14 @@ def test_get_rewards_hands_the_pinned_presence_to_the_scorer(monkeypatch):
     seen, v = _capture(monkeypatch)
     with pytest.raises(_Stop):
         reward.get_rewards(v, pinned_inputs={"simulation_timestamp": 5, "absent": [3], "presence": {1: 0.5}})
-    assert seen == {"absent": [3], "presence": {1: 0.5}}
+    assert seen == {"absent": [3], "presence": {1: 0.5}, "now": 5}, "the pinned timestamp weighs the handover"
 
 
 def test_get_rewards_without_a_pin_scores_on_the_live_windows(monkeypatch):
     seen, v = _capture(monkeypatch)
     with pytest.raises(_Stop):
         reward.get_rewards(v)
-    assert seen == {"absent": None, "presence": None}
+    assert seen == {"absent": None, "presence": None, "now": None}
 
 
 def test_the_verify_pins_the_presence_the_child_was_given():

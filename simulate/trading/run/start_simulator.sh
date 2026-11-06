@@ -14,6 +14,8 @@
 #
 # exec, not a plain call: pm2 signals the process it started, and the engine must receive that SIGTERM
 # itself or it never reaches the barrier that writes the shutdown checkpoint.
+#
+# A host sets the engine's worker count with TAOSIM_THREADS, in place of the config's threads attribute.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
@@ -41,8 +43,8 @@ fi
 # the engine would have come up on the wrong one.
 CONFIG=${1:-${SIMULATION_CONFIG:-multiasset_simulation_0}}
 
-# A directory is resumable only with a SIMULATION checkpoint in it. The exchange service writes
-# state.ckpt into logs/ckpt and must never be mistaken for one; the engine's own runDirLatest()
+# A directory is resumable only with a SIMULATION checkpoint in it. A checkpoint store at logs/ckpt
+# holding state.ckpt is not one and must never be mistaken for one; the engine's own runDirLatest()
 # applies the same common.ckpt test.
 # RESUMABLE MEANS THE NEWEST RUN DIRECTORY, NOT ANY OF THEM.
 #
@@ -58,19 +60,20 @@ CONFIG=${1:-${SIMULATION_CONFIG:-multiasset_simulation_0}}
 # THE NEWEST RUN DIRECTORY THAT IS A RUN, NOT AN ARTEFACT.
 #
 # Signalling the taosim child lets pm2 autorestart the wrapper, and that restart can open a run
-# directory a second before a deliberate relaunch does, holding config.xml and nothing else. The
-# newest directory is then that empty one, resumable() finds no checkpoint in it, and a resumable run
-# cold-starts instead: the rewind the resume logic exists to prevent, caused by a directory no
-# simulation ever ticked in.
+# directory a second before a deliberate relaunch does, holding only config.xml and the run's
+# class_files/ (which a fresh run writes just before config.xml). The newest directory is then that
+# one, resumable() finds no checkpoint in it, and a resumable run cold-starts instead: the rewind the
+# resume logic exists to prevent, caused by a directory no simulation ever ticked in.
 #
-# A directory holding only config.xml is such an artefact. Skipping it does NOT reopen the hazard the
-# newest-only rule guards against -- that rule exists so a SUPERSEDED simulation is never resumed, and
-# a directory with no ticks supersedes nothing. Anything with a ckpt/ directory or any log output is
-# treated as a real run and still answered on.
+# A directory holding only config.xml (class_files/ aside) is such an artefact. Skipping it does NOT
+# reopen the hazard the newest-only rule guards against -- that rule exists so a SUPERSEDED simulation
+# is never resumed, and a directory with no ticks supersedes nothing. Anything with a ckpt/ directory
+# or any log output is treated as a real run and still answered on.
 _newest_real_rundir() {
-    # SKIP ONLY THE UNAMBIGUOUS ARTEFACT: a directory holding config.xml AND NOTHING ELSE. A pm2
-    # autorestart that dies immediately leaves exactly that, and treating it as the newest run makes
-    # resumable() answer about an empty directory, so a live run cold-starts and loses its tape.
+    # SKIP ONLY THE UNAMBIGUOUS ARTEFACT: a directory holding ONLY config.xml and the run's class_files/
+    # (which a fresh run writes just before config.xml). A pm2 autorestart that dies immediately leaves
+    # exactly that, and treating it as the newest run makes resumable() answer about a directory no
+    # simulation ticked in, so a live run cold-starts and loses its tape.
     #
     # AN EMPTY DIRECTORY IS NOT THAT CASE, and must count as real. A simulation that has just been
     # opened does not write its first checkpoint for about twelve minutes, and for part of that it has
@@ -81,10 +84,10 @@ _newest_real_rundir() {
     #
     # The tie-break, when the two cases cannot be told apart by content, is the one that test states:
     # opening a new simulation is visible everywhere, a silent rewind is visible nowhere. So anything
-    # that is not exactly-config.xml-only counts as real.
+    # that is not exactly config.xml-only (class_files/ aside) counts as real.
     local d _entries
     for d in $(ls -d logs/*/ 2>/dev/null | grep -E 'logs/[0-9]{8}_[0-9]{6}/$' | sort -r); do
-        _entries=$(ls -A "$d" 2>/dev/null)
+        _entries=$(ls -A "$d" 2>/dev/null | grep -vx 'class_files')
         [ "$_entries" = "config.xml" ] && continue
         printf '%s' "$d"
         return 0
@@ -131,14 +134,17 @@ if [ -f "$COLD_ONCE" ]; then
     echo "simulator: one-shot cold-start marker consumed; the restart after this one will resume"
 fi
 
-# A RESUME MUST BE THE SAME LAYOUT. `-c latest` resumes the newest run directory under its OWN saved
-# config.xml, whatever config/$CONFIG.xml now names. When the configured layout changed since that run
-# was opened (0.6.3: the default moved from the single-market simulation_0 to the multi-asset
-# multiasset_simulation_0, and an acceptance layout's second class was replaced), resuming would bring
-# back the old layout under a validator configured for the new one, the mechanism mismatch the
-# acceptance gate catches after the fact. Compared here before the decision: the root element and the
-# ordered list of <Background> declarations (name, path, instanceCount) of the saved config against the
-# requested one. A difference opens a new simulation from the requested config and says so.
+# A RESTART NEVER ENDS A RUN EARLY. `-c latest` resumes the newest run directory under its OWN saved
+# config.xml, whatever config/$CONFIG.xml now names, and the validator scores a resumed multi-asset run on
+# that run's own layout (engines/simulation.py, _follow_resumed_run_layout); the configured layout opens
+# with the next run, which the validator starts from config/$CONFIG.xml when this one ends. So a release
+# that changes the default layout takes effect on every host at its next run boundary, however its
+# restarts fall, rather than at its first restart after the update.
+#
+# What is still refused is a run of the other kind: a single-market run under a multi-asset config, or the
+# reverse (for example simulation_0.xml against multiasset_simulation_0.xml). The validator follows a
+# multi-asset run's layout only, so resuming across kinds would score one simulation on the other's books.
+# To open the configured layout now: touch .cold_start_once and restart.
 layout_of() {
     local f="$1"
     [ -f "$f" ] || { echo "missing"; return; }
@@ -155,28 +161,33 @@ layout_of() {
         :done' | sed -E 's#([^ ]+) ([^ ]*/)?([^ /]+) ([^ ]+)#\1 \3 \4#' | tr '\n' ';')
     echo "${root}|${bgs}"
 }
-same_layout_as_latest() {
+resumable_kind_as_latest() {
     local newest
     # The SAME directory resumable() answered on, or the two can disagree about which run is latest.
     newest=$(_newest_real_rundir)
     [ -n "$newest" ] || return 1
     # a run directory the engine opened always carries its config.xml; without one there is nothing to
-    # compare and the decision stays what it was (resume), as the acceptance's cold-start test expects
+    # compare and the decision stays what it was (resume)
     [ -f "${newest}config.xml" ] || return 0
     local have want
     have=$(layout_of "${newest}config.xml")
     want=$(layout_of "config/$CONFIG.xml")
     [ "$have" = "$want" ] && return 0
-    echo "simulator: the latest run (${newest}) is a different layout [${have}] from config/$CONFIG.xml [${want}]; not resuming it"
+    if [ "${have%%|*}" = "${want%%|*}" ]; then
+        echo "simulator: the latest run (${newest}) is layout [${have}], config/$CONFIG.xml is [${want}]; resuming the run," \
+             "the configured layout opens with the next run (touch .cold_start_once and restart to open it now)"
+        return 0
+    fi
+    echo "simulator: the latest run (${newest}) is a ${have%%|*} run and config/$CONFIG.xml a ${want%%|*} one; not resuming it"
     return 1
 }
 if [ "$COLD_START" = "1" ]; then
     echo "simulator: cold start requested, starting a new simulation from config/$CONFIG.xml"
-elif resumable && same_layout_as_latest; then
+elif ! resumable; then
+    echo "simulator: no simulation checkpoint under logs/, so there is nothing to resume"
+elif resumable_kind_as_latest; then
     echo "simulator: resuming the latest checkpoint (-c latest); the run and its trade ids continue"
     exec "$BIN" -c latest
-else
-    echo "simulator: no simulation checkpoint under logs/, so there is nothing to resume"
 fi
 echo "simulator: starting a new simulation from config/$CONFIG.xml"
 exec "$BIN" -f "config/$CONFIG.xml"

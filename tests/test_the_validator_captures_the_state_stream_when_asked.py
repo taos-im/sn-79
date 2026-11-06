@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
-"""The scoring acceptance's replay harness certifies the pay a validator produces from the state it receives, so
-the validator must be able to record that state: the raw bytes of every update, one file per update named by its
+"""A replay of the state a validator receives reproduces the pay it produces, so the validator can record that
+state: the raw bytes of every update, one file per update named by its
 timestamp, only when STATE_CAPTURE_DIR is set, within a byte budget, and never at the cost of the listener loop."""
 import os
 import re

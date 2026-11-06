@@ -400,7 +400,8 @@ def test_a_second_signal_during_the_stop_lets_the_save_finish(_signal_handlers):
     import taos.im.neurons.validator as V
 
     calls = []
-    stopping = SimpleNamespace(_cleanup_done=True, cleanup=lambda: calls.append("cleanup"))
+    stopping = SimpleNamespace(_cleanup_done=True, engine=SimpleNamespace(mode="simulation"),
+                               cleanup=lambda: calls.append("cleanup"))
     V.Validator._setup_signal_handlers(stopping)
     signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
     assert calls == [], "a second signal started another cleanup"

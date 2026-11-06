@@ -57,6 +57,13 @@ struct ResourceAllocationDesc
 };
 
 //-------------------------------------------------------------------------
+// The worker count a host sets in its environment (TAOSIM_THREADS), over the wrapper's threads attribute: a
+// positive integer, else nothing (unset or empty; any other value is logged and ignored). Hosts differ in cores
+// while the shipped layout is one file.
+
+[[nodiscard]] std::optional<uint32_t> threadsFromEnvironment(const char* value);
+
+//-------------------------------------------------------------------------
 // The resolved layout: how many worker threads, and how the N Simulations are
 // spread over them as cohorts. The barrier is sized to workerCount, decoupling
 // the Simulation count from the core count.
@@ -84,8 +91,7 @@ struct ResourceAllocation
 
 //-------------------------------------------------------------------------
 // Adjust a background <Simulation> config into one concrete realization: stamp
-// the per-realization id (quote balances stay per book, as in a single market; the
-// shared-wallet stamp was removed on 30 September 2026). `seed`, when given, is
+// the per-realization id (quote balances stay per book, as in a single market). `seed`, when given, is
 // stamped as `rngSeed` (the attribute Simulation reads),
 // overriding any the background declares; when absent the background's own
 // rngSeed (or device seeding) stands. Returns an owned copy; the source node is

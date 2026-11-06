@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The engine rests a leveraged order at volume x (1 + leverage) and removes the same when it is cancelled
 (simulate/trading/src/cpp/book/Book.cpp, the placement and the cancel path dividing by 1 + leverage). Both replays
-in the miner library added and removed the order's own quantity, so a leveraged order left q x leverage on the
-level after its cancellation: on the 7 October capture every remaining mismatch inside the published window was one
-(book 21, order 23637, q 992.5902 at leverage 0.0113 published 1003.8065 and left 11.2163 behind). Both replays
-rest q x (1 + l) when the order carries leverage and remove the same on its cancellation, keyed by order id.
+in the miner library rest q x (1 + l) when the order carries leverage and remove the same on its cancellation, keyed
+by order id, so a leveraged order leaves nothing of itself on the level once it is cancelled.
 
 The reference replay reconciles toward the levels the book publishes, so each case gives it the levels the engine
 would publish and asks whether the replay matches them without a discrepancy."""
@@ -56,7 +54,7 @@ def test_the_dict_replay_does_the_same():
     assert _dict([o, c], {}) == {}
 
 
-def test_an_unleveraged_order_behaves_as_before_in_both_replays():
+def test_an_unleveraged_order_rests_its_own_quantity_in_both_replays():
     matched, discrepancies, last = _ref([{"y": "o", "id": 1, "timestamp": 1, "quantity": 2.0, "side": 0, "price": 100.0}],
                                         start={100.0: 1.0}, published={100.0: 3.0})
     assert matched and last == {100.0: 3.0}, discrepancies
