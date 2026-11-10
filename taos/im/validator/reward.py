@@ -2066,6 +2066,7 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 'p11_topk': int(debeta_dial(_dcfg, 'p11_topk')),
                 'mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
                 'mark_window': int(debeta_dial(_dcfg, 'mark_window')),
+                'fill_charge': str(debeta_dial(_dcfg, 'fill_charge')),
                 'making_pool': str(debeta_dial(_dcfg, 'making_pool')),
                 # resolved here so the scoring child and the pool read the same count as the legs
                 'skill_min_books': skill_bar(self),

@@ -362,15 +362,16 @@ def init_alt_mark_state(self):
             setattr(self, _name, {})
 
 
-def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=None):
-    """One book's batch into the alternative mark's leg: the paid leg's accumulate_book_mtm on its own state."""
+def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=None, fill_charge="none"):
+    """One book's batch into the alternative mark's leg: the paid leg's accumulate_book_mtm on its own state, the
+    fill charge the paid leg's, so the two marks differ in the mark alone."""
     accumulate_book_mtm(
         self.debeta_mtm_alt, self.debeta_invsum_alt, self.debeta_invn_alt, self.debeta_inv_alt,
         self.debeta_pfirst_alt, self.debeta_plast_alt, book_id, trades,
         mtm_hist=self.debeta_mtm_alt_hist, invsum_hist=self.debeta_invsum_alt_hist, invn_hist=self.debeta_invn_alt_hist,
         drift=self.debeta_drift_alt, drift_hist=self.debeta_drift_alt_hist, ts=ts,
         mark_state=self.debeta_mark_state_alt, mark_mode=mark_mode, mark_window=mark_window,
-        mark_mid=book_mid(book) if mark_mode == 'mid' else None,
+        mark_mid=book_mid(book) if mark_mode == 'mid' else None, fill_charge=fill_charge,
     )
 
 
@@ -996,6 +997,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         _mark_mode = str(debeta_dial(_debeta_cfg, 'mark_mode'))
         _mark_window = int(debeta_dial(_debeta_cfg, 'mark_window'))
         _mark_alt = str(debeta_dial(_debeta_cfg, 'mark_mode_alt'))
+        # the fill charge: a taker fill pays its price against the mark at the fill, under both marks
+        _fill_charge = str(debeta_dial(_debeta_cfg, 'fill_charge'))
         # realized spread: the horizon a fill is marked at, sim seconds; accumulated at every making_basis
         _realized_ns = int(float(debeta_dial(_debeta_cfg, 'making_horizon_s')) * 1e9)
         # fee-aware making (0.6.4): the share of each maker fee netted from the maker's captured and realized spread
@@ -1055,14 +1058,15 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     drift_hist=self.debeta_drift_hist, ts=sampled_timestamp,
                     mark_state=self.debeta_mark_state, mark_mode=_mark_mode,
                     mark_window=_mark_window,
-                    mark_mid=book_mid(book) if _mark_mode == 'mid' else None,
+                    mark_mid=book_mid(book) if _mark_mode == 'mid' else None, fill_charge=_fill_charge,
                     heldn=self.debeta_heldn, heldinv=self.debeta_heldinv, helddrift=self.debeta_helddrift,
                     notional=self.debeta_notional, heldn_hist=self.debeta_heldn_hist,
                     heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
                     notional_hist=self.debeta_notional_hist,
                 )
                 if _mark_alt not in ('none', _mark_mode):
-                    accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp)
+                    accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp,
+                                        fill_charge=_fill_charge)
                 accumulate_maker_notional(self, bookId, de_trades, ts=sampled_timestamp)
                 accumulate_counterparty_rows(self, bookId, de_trades, ts=sampled_timestamp)  # P11, pooled and per class
         if trades:

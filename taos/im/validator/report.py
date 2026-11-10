@@ -416,6 +416,10 @@ class ReportingService:
         self.prometheus_miner_identity = _SnapshotCollector('miner_identity', 'Per-miner identity (hotkey/coldkey/axon) for historical attribution; value always 1.0, re-series on re-registration or axon change.', ['wallet', 'netuid', 'sim_id', 'agent_id', 'hotkey', 'coldkey', 'axon_ip', 'axon_port'], carry_forward=False)
         self.registry_miner.register(self.prometheus_miner_identity)
         self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid', 'sim_id'], registry=self.registry_validator)
+        # the step seed's commitment for the current run and the reveal of the ended run's secret: what anyone
+        # needs to check afterwards that every seed was HMAC(secret, the public drand round)
+        self.prometheus_seed_info = Info('fundamental_seed', "The step seed's secret: the current run's commitment and the ended run's reveal.",
+                                         ['wallet', 'netuid', 'sim_id', 'kind'], registry=self.registry_validator)
         # One info row per asset class (0.6.3): the class's own market configuration with its book range, so the
         # dashboard's Simulation Config table shows every class. A single market is one row named "market".
         self.prometheus_simconfig_info = Info('simulation_config', 'Market configuration per asset class.',
@@ -724,6 +728,9 @@ class ReportingService:
         self.query_waits = list(data.get('query_waits') or [])
         self.reward_gate_waits = list(data.get('reward_gate_waits') or [])
         self.fundamental_seed_sources = dict(data.get('fundamental_seed_sources') or {})
+        for _key in ('fundamental_seed_commit', 'fundamental_seed_reveal'):
+            setattr(self, _key, dict(data[_key]) if isinstance(data.get(_key), dict) else None)
+        self.fundamental_seed_clock = list(data.get('fundamental_seed_clock') or [])
         self.pending_reward_tasks = int(data.get('pending_reward_tasks') or 0)
         self.debeta_scores = {int(uid): float(v) for uid, v in (data.get('debeta_scores', {}) or {}).items()}
         self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
@@ -1100,10 +1107,31 @@ def round_block_gauges(ms) -> list:
 
 
 def fundamental_seed_gauges(self) -> list:
-    """How many step seeds each source gave since the validator started, as (gauge, value): drand's HTTP endpoints,
-    the chain's Drand pallet and the random fallback, and how often two endpoints served different randomness."""
+    """How many step seeds each source gave since the validator started, as (gauge, value): drand's HTTP endpoints
+    (two operators agreeing, or one operator's alone), the chain's Drand pallet and the random fallback, how often
+    two endpoints served different randomness, how many secrets were committed and revealed; and the clock skew, the
+    smallest recent sample of the reply window's close against drand's latest round (negative: the host clock runs
+    slow), 0 before the first sample."""
     src = dict(getattr(self, 'fundamental_seed_sources', None) or {})
-    return [(f"fundamental_seed_{k}", float(src.get(k, 0))) for k in ("drand", "chain", "random", "drand_disagree")]
+    out = [(f"fundamental_seed_{k}", float(src.get(k, 0)))
+           for k in ("drand", "chain", "random", "drand_disagree", "drand_one_operator", "commit", "reveal")]
+    samples = [float(x) for x in (getattr(self, 'fundamental_seed_clock', None) or [])]
+    out.append(("fundamental_seed_clock_skew_s", min(samples) if samples else 0.0))
+    return out
+
+
+def fundamental_seed_info(self) -> list:
+    """(kind, fields) for the seed's info metric: the current run's commitment (its run and the secret's sha256) and
+    the ended run's reveal (run, commitment, secret), each when the validator has one. Never the current secret."""
+    out = []
+    commit = getattr(self, 'fundamental_seed_commit', None)
+    if isinstance(commit, dict) and commit.get('commit'):
+        out.append(("commitment", {"run": str(commit.get('run', '')), "commit": str(commit['commit'])}))
+    reveal = getattr(self, 'fundamental_seed_reveal', None)
+    if isinstance(reveal, dict) and reveal.get('secret'):
+        out.append(("reveal", {"run": str(reveal.get('run', '')), "commit": str(reveal.get('commit', '')),
+                               "secret": str(reveal['secret'])}))
+    return out
 
 
 def round_timing_gauges(self) -> list:
@@ -1159,6 +1187,8 @@ def publish_validator_gauges(self: ReportingService):
         self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
     for _name, _value in fundamental_seed_gauges(self):
         self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
+    for _kind, _fields in fundamental_seed_info(self):
+        self.prometheus_seed_info.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, kind=_kind).info(_fields)
     cpu_usage = psutil.cpu_percent()
     memory_info = psutil.virtual_memory()
     memory_usage = memory_info.percent

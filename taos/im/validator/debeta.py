@@ -1482,7 +1482,7 @@ def combined_reward(making, skill, w_make=0.65):
 def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades, *,
                         mtm_hist=None, invsum_hist=None, invn_hist=None,
                         drift=None, drift_hist=None, ts=None,
-                        mark_state=None, mark_mode="last", mark_window=0, mark_mid=None,
+                        mark_state=None, mark_mode="last", mark_window=0, mark_mid=None, fill_charge="none",
                         heldn=None, heldinv=None, helddrift=None, notional=None,
                         heldn_hist=None, heldinv_hist=None, helddrift_hist=None, notional_hist=None):
     """Accumulate the drift-strip inputs for kappa-of-alpha over ONE book's ordered trade batch,
@@ -1517,6 +1517,13 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
             the best bid and ask), the mark for every trade of the batch; None (a state without both sides) keeps
             the previous mark. No bounce by construction, one state of lag, no window, so a sparse book marks as
             well as a dense one.
+        fill_charge: ``"none"`` values every fill at the mark, the fill price entering the notional only, so a
+            taker that sweeps a thin book is scored as if it traded at the mark;
+            ``"taker"`` charges the aggressor its price against the mark at the fill, a buyer (mark - fill) x q and a
+            seller (fill - mark) x q, so the sweep pays what it paid over the mark and keeps only what the mark then
+            does; ``"both"`` credits the resting side at its fill price too (the spread the making leg already
+            pays). Nothing under ``"last"``, where the mark is the fill. The charge is one more term of mtm, in its
+            history like the marked moves, so a boundary shift and a prune carry it.
     None means the first new-sim trade emits no dp, so the boundary jump never enters drift.
 
     M1 settlement-style marking (mark_mode != "last"): the marked series is a rolling reference
@@ -1601,6 +1608,14 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
         ma = _uid(t.get("Ma", -1))
         ta = _uid(t.get("Ta", -1))
         buyer, seller = (ta, ma) if int(t["s"]) == 0 else (ma, ta)
+        if fill_charge != "none" and p != fill_p:
+            # the fill at its price against the mark: what a sweep pays over the mark is its own cost, not a move
+            for u, c in ((buyer, (p - fill_p) * q), (seller, (fill_p - p) * q)):
+                if u < 0 or (fill_charge == "taker" and u != ta):
+                    continue
+                mtm[u][book_id] = mtm[u].get(book_id, 0.0) + c
+                if mtm_hist is not None:
+                    _hadd2(mtm_hist, u, book_id, ts, c)
         if buyer >= 0:
             binv[buyer] = binv.get(buyer, 0.0) + q
         if seller >= 0:

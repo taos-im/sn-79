@@ -500,6 +500,7 @@ def test_an_exchange_stop_keeps_its_periodic_save_and_its_exit_on_a_second_signa
     v = _shell(tmp_path)
     v.engine.mode = "exchange"
     v.last_state = SimpleNamespace(timestamp=4 * _S)
+    v._last_save_period = -1  # a running validator whose state has just crossed into a new save period
     v.shared_state_saving = False
     v.querying = False
     v._cleanup_done = True

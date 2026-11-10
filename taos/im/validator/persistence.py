@@ -24,6 +24,7 @@ import bittensor as bt
 from taos.im.utils.save import save_state_worker
 from taos.im.protocol.models import TradeInfo
 from taos.im.validator.debeta import sum_hist_2level, sum_hist_1level
+from taos.im.validator import fundamental_seed
 from taos.im.protocol.events import trade_event_from_wire
 
 if TYPE_CHECKING:
@@ -221,6 +222,9 @@ def build_validator_state(
         "debeta_pool_ema": {k: dict(v or {}) for k, v in (getattr(self, '_debeta_pool_ema', {}) or {}).items()},
         "inventory_history": inventory_snapshot,
         "kappa_values": self.kappa_values,
+        # the step seed's secret for the run, its commitment and the ended run's reveal, and the clock-skew samples, so
+        # a restart mid-run keeps seeding under the committed secret
+        **fundamental_seed.state_to_save(self),
         "realized_pnl_history": realized_pnl_snapshot,
         "open_positions": open_positions_snapshot,
         "unnormalized_scores": self.unnormalized_scores,
@@ -1049,7 +1053,17 @@ def schedule_save(self: Validator) -> None:
     Returns:
         None
     """
-    if not self.last_state or self.last_state.timestamp % (_SAVE_EVERY_INTERVALS * self.config.scoring.interval) != 4_000_000_000:
+    if not self.last_state:
+        return
+    # the first state of each save period, counted from 4 s past it: a state stepping each second lands there itself,
+    # one stepping in 12 s blocks never does, so the period is crossed rather than matched; the first state after a
+    # start only records its period
+    period = (self.last_state.timestamp - 4_000_000_000) // (_SAVE_EVERY_INTERVALS * self.config.scoring.interval)
+    last = getattr(self, '_last_save_period', None)
+    if last is None or period < last:
+        self._last_save_period = period
+        return
+    if period == last:
         return
     if getattr(self, '_cleanup_done', False) and saves_on_stop(self):
         return
@@ -1059,6 +1073,7 @@ def schedule_save(self: Validator) -> None:
     if self.querying:
         bt.logging.warning(f"Skipping save at step {self.step} — query in progress")
         return
+    self._last_save_period = period
     import threading
     bt.logging.debug(f"[SAVE] Scheduling from thread: {threading.current_thread().name}")
     bt.logging.debug(f"[SAVE] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
@@ -1830,6 +1845,7 @@ def _load_validator_state(self):
                         if k in book_ids_set
                     }
 
+            fundamental_seed.restore_state(self, validator_state)
             bt.logging.info("Processing kappa values...")
             if 'kappa_values' in validator_state:
                 loaded_kappa = validator_state['kappa_values']

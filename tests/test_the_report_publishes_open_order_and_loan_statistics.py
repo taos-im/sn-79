@@ -55,13 +55,12 @@ def test_the_uid_totals_sum_the_books():
     }
 
 
-def test_the_book_gauges_name_every_field_and_skip_a_missing_price():
+def test_the_book_gauges_publish_counts_and_loans_but_not_a_makers_quotes():
     row = ost.BookOrders(2, 0, 3.0, 0.0, 9.0, None, 9.0, 0.0, 1)
-    assert dict(ost.book_gauges(row)) == {
-        'open_bids': 2, 'open_asks': 0, 'resting_bid_volume': 3.0, 'resting_ask_volume': 0.0,
-        'best_bid_price': 9.0, 'open_loans': 1}
-    assert set(ost.BOOK_GAUGES) == {'open_bids', 'open_asks', 'resting_bid_volume', 'resting_ask_volume',
-                                    'best_bid_price', 'best_ask_price', 'open_loans'}
+    assert dict(ost.book_gauges(row)) == {'open_bids': 2, 'open_asks': 0, 'open_loans': 1}
+    assert set(ost.BOOK_GAUGES) == {'open_bids', 'open_asks', 'open_loans'}, (
+        "a book's own best bid and ask and its resting volume per side give a maker's quoting away; the public "
+        "series carry the counts per book and the totals per uid")
 
 
 def test_the_reporter_publishes_them_and_evicts_the_series_it_published_last_cycle_and_not_this_one():

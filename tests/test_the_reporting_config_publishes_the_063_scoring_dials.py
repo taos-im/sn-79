@@ -22,7 +22,8 @@ EXPECTED = {
     "debeta_capture_market_votes": 0,
     "debeta_skill_share_ema": 0,
     "debeta_mark_mode": "mid",
-    "debeta_mark_mode_alt": "last",
+    "debeta_mark_mode_alt": "median",
+    "debeta_fill_charge": "taker",
 }
 
 

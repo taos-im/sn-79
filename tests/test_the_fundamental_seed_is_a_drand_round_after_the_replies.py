@@ -64,7 +64,8 @@ def _run(closed, http, chain):
 
     async def http_get(r):
         asked.append((r, clock.t))
-        return http(r, clock.t)
+        got = http(r, clock.t)
+        return (got, "drand") if got is not None else None
 
     async def chain_get(r):
         return chain(r, clock.t)
@@ -76,36 +77,43 @@ def _run(closed, http, chain):
 def test_the_round_is_taken_from_drand_once_it_is_published():
     closed = fs.round_time(500) + 1.0
     (r, rnd, src), asked, t = _run(closed, lambda r, t: b"\x07" * 32, lambda r, t: None)
-    assert (r, rnd, src) == (501, b"\x07" * 32, "drand")
-    assert all(at >= fs.round_time(501) for _r, at in asked), "never asked before the round is scheduled"
-    assert t - closed <= fs.PERIOD_S + 0.5
+    assert (r, rnd, src) == (502, b"\x07" * 32, "drand"), "the first round a period past the close"
+    assert all(at >= fs.round_time(502) for _r, at in asked), "never asked before the round is scheduled"
+    assert t - closed <= fs.MARGIN_S + fs.PERIOD_S + 0.5
 
 
 def test_the_chain_answers_when_drand_does_not():
     closed = fs.round_time(500) + 1.0
     (r, rnd, src), _asked, _t = _run(closed, lambda r, t: None,
-                                     lambda r, t: b"\x09" * 32 if t > fs.round_time(501) + 1 else None)
-    assert (r, rnd, src) == (501, b"\x09" * 32, "chain")
+                                     lambda r, t: b"\x09" * 32 if t > fs.round_time(502) + 1 else None)
+    assert (r, rnd, src) == (502, b"\x09" * 32, "chain")
 
 
 def test_after_the_wait_a_random_seed_goes_as_round_zero():
     closed = fs.round_time(500) + 1.0
     (r, rnd, src), _asked, t = _run(closed, lambda r, t: None, lambda r, t: None)
-    assert r == 0 and src == "random" and len(rnd) == 32 and t - closed >= fs.RANDOM_AFTER_S
+    assert r == 0 and src == "random" and len(rnd) == 32 and t - closed >= fs.RANDOM_AFTER_S + fs.MARGIN_S
 
 
 def test_attach_sends_the_seed_records_it_and_counts_its_source(tmp_path):
-    v = SimpleNamespace(simulation=SimpleNamespace(publish_interval=S, logDir=str(tmp_path)))
+    run_dir = tmp_path / "20261108_120000"
+    run_dir.mkdir()
+    v = SimpleNamespace(simulation=SimpleNamespace(publish_interval=S, logDir=str(run_dir)))
 
-    async def fake_seed(closed_at, http_get, chain_get, now=None, sleep=None):
+    async def fake_seed(closed_at, http_get, chain_get, now=None, sleep=None, min_round=0):
         return 42, b"\xab" * 32, "drand"
 
+    async def no_latest():
+        return None
+
     batch = {"responses": [1], "capped": []}
-    out = asyncio.run(fs.attach(v, batch, 29 * S, closed_at=0.0, seed_fn=fake_seed))
-    assert out == {"responses": [1], "capped": [], "seed": [42, b"\xab" * 32]}
-    assert (tmp_path / "fundamental_seed.csv").read_text() == f"42,{'ab' * 32},{29 * S}\n"
-    assert v.fundamental_seed_sources == {"drand": 1}
-    same = asyncio.run(fs.attach(v, batch, 30 * S, closed_at=0.0, seed_fn=fake_seed))
+    out = asyncio.run(fs.attach(v, batch, 29 * S, closed_at=0.0, seed_fn=fake_seed, latest_fn=no_latest))
+    value = fs.step_value(bytes.fromhex(v.fundamental_seed_secret["secret"]), b"\xab" * 32)
+    assert out == {"responses": [1], "capped": [], "seed": [42, value]}
+    assert (run_dir / "fundamental_seed.csv").read_text() == f"42,{value.hex()},{29 * S}\n"
+    assert (run_dir / "fundamental_seed_drand.csv").read_text() == f"42,{'ab' * 32},{29 * S},drand\n"
+    assert v.fundamental_seed_sources == {"commit": 1, "drand": 1}
+    same = asyncio.run(fs.attach(v, batch, 30 * S, closed_at=0.0, seed_fn=fake_seed, latest_fn=no_latest))
     assert same is batch, "no boundary in the reply window: the batch goes as it is"
 
 
@@ -124,11 +132,12 @@ def test_the_seed_service_does_not_write_the_fundamental_seed_file():
 
 def test_an_http_round_needs_two_endpoints_agreeing():
     a, b = b"\x01" * 32, b"\x02" * 32
-    assert fs.agreed([a, a, None, None]) == (a, False)
-    assert fs.agreed([a, None, None, None]) == (None, False), "one endpoint alone is not enough"
-    assert fs.agreed([a, b, None, None]) == (None, True), "two that differ are a disagreement"
-    assert fs.agreed([a, a, b, None]) == (a, True), "a majority of two is taken, the odd one counted"
-    assert fs.agreed([None] * 4) == (None, False)
+    api, cf, api2, api3 = fs.ENDPOINTS
+    assert fs.agreed([(api, a), (cf, a), (api2, None), (api3, None)]) == (a, "drand", False)
+    assert fs.agreed([(api, a), (cf, None), (api2, None), (api3, None)]) == (None, None, False), "one alone is not enough"
+    assert fs.agreed([(api, a), (cf, b), (api2, None), (api3, None)]) == (None, None, True), "two that differ disagree"
+    assert fs.agreed([(api, a), (cf, a), (api2, b), (api3, None)]) == (a, "drand", True), "the odd one counted"
+    assert fs.agreed([(b_, None) for b_ in fs.ENDPOINTS]) == (None, None, False)
 
 
 def test_the_sources_reach_the_validator_gauges():
@@ -136,7 +145,9 @@ def test_the_sources_reach_the_validator_gauges():
     st = SimpleNamespace(fundamental_seed_sources={"drand": 3, "random": 1, "drand_disagree": 2})
     out = dict(report.fundamental_seed_gauges(st))
     assert out == {"fundamental_seed_drand": 3.0, "fundamental_seed_chain": 0.0, "fundamental_seed_random": 1.0,
-                   "fundamental_seed_drand_disagree": 2.0}
+                   "fundamental_seed_drand_disagree": 2.0, "fundamental_seed_drand_one_operator": 0.0,
+                   "fundamental_seed_commit": 0.0, "fundamental_seed_reveal": 0.0,
+                   "fundamental_seed_clock_skew_s": 0.0}
 
 
 @pytest.mark.parametrize("field", ["randomness", "signature"])

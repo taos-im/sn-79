@@ -31,20 +31,37 @@ def test_the_default_is_every_twelfth_interval_and_the_variable_overrides_it():
     assert _reloaded("3") == 3
 
 
-def test_a_save_is_scheduled_once_a_simulated_minute_at_the_five_second_interval(monkeypatch):
+S = 10 ** 9
+
+
+def _fired(monkeypatch, step_s, seconds=600, busy=()):
+    """The simulation seconds at which schedule_save dispatches a save, one validator stepping every step_s; a step in
+    busy finds the previous save still running."""
     monkeypatch.setattr(persistence, "_SAVE_EVERY_INTERVALS", 12)
     # schedule_save's debug line asks for the current loop, which an earlier test in the suite may have unset
     monkeypatch.setattr(persistence.asyncio, "get_event_loop", lambda: None)
     calls = []
     loop = SimpleNamespace(call_soon_threadsafe=lambda f: calls.append(1), create_task=lambda c: None)
-    S = 10 ** 9
+    v = SimpleNamespace(config=SimpleNamespace(scoring=SimpleNamespace(interval=5 * S)), querying=False,
+                        main_loop=loop, _cleanup_done=False)
     fired = []
-    for t in range(0, 600 * S, S):
-        v = SimpleNamespace(last_state=SimpleNamespace(timestamp=t), config=SimpleNamespace(
-            scoring=SimpleNamespace(interval=5 * S)), shared_state_saving=False, querying=False, main_loop=loop,
-            _cleanup_done=False, step=t // S)
+    for t in range(0, seconds * S, step_s * S):
+        v.last_state, v.step, v.shared_state_saving = SimpleNamespace(timestamp=t), t // S, (t // S) in busy
         before = len(calls)
         persistence.schedule_save(v)
         if len(calls) > before:
             fired.append(t // S)
-    assert fired == [4 + 60 * k for k in range(10)]
+    return fired
+
+
+def test_a_save_is_scheduled_once_a_simulated_minute_at_the_five_second_interval(monkeypatch):
+    assert _fired(monkeypatch, 1) == [4 + 60 * k for k in range(10)]
+
+
+def test_twelve_second_blocks_save_once_a_simulated_minute_too(monkeypatch):
+    # a source stepping one 12 s block at a time never sits 4 s past a minute
+    assert _fired(monkeypatch, 12) == [12 + 60 * k for k in range(10)]
+
+
+def test_a_save_skipped_while_one_runs_is_taken_at_the_next_state(monkeypatch):
+    assert _fired(monkeypatch, 12, seconds=180, busy={12})[:2] == [24, 72]

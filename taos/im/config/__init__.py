@@ -612,8 +612,12 @@ def add_im_validator_args(cls, parser):
              "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
              "'median' = window median (robust: moving it needs a sustained majority of prints); "
              "'mid' = the book's mid-quote from each state (no bounce, one state of lag, no window, so a "
-             "sparse book marks as well as a dense one). Default 'mid' (the last-trade mark pays the "
-             "bid-ask bounce to makers as skill); 'last' marks on the last trade.",
+             "sparse book marks as well as a dense one). Default 'mid': the last-trade "
+             "mark pays the bid-ask bounce to makers as skill; the mid paid a taker for its own price impact, the "
+             "mid moving with its multi-level orders, which fill_charge now takes at the fill. The window median, "
+             "movable only by a sustained majority of prints, lags the price in a trend, and a fill charged against "
+             "that lag can flip a taker's alpha with the book's drift, so it is published beside the mid, not paid. "
+             "'last' marks on the last trade.",
         default="mid",
     )
 
@@ -632,8 +636,22 @@ def add_im_validator_args(cls, parser):
         help="A second mark accumulated beside the paid one, its skill published per uid "
              "(debeta_skill_mark_alt, debeta_skill_net_alpha_mark_alt) so a change of mark is judged on live data "
              "before it pays; 'none', or the paid mark's own name, skips the leg. Pay reads mark_mode alone. "
-             "Default 'last', the last-trade mark, so both legs are published beside each other.",
-        default="last",
+             "Default 'median', the window median over mark_window prints, read on live data beside the paid mid.",
+        default="median",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.fill_charge",
+        type=str,
+        choices=["none", "taker", "both"],
+        help="Charge each fill its price against the mark at the fill, in the skill leg under both marks. "
+             "'taker' (the default) charges the aggressor: a buyer (mark - fill) x q, a seller the "
+             "reverse, so a sweep through a thin book pays what it paid over the mark instead of being scored at "
+             "the mark; the resting side stays "
+             "marked, its spread being the making leg's. 'both' credits the resting side at its fill price too. "
+             "'none' values every fill at the mark. Nothing under mark_mode=last, where the mark is "
+             "the fill.",
+        default="taker",
     )
 
     parser.add_argument(

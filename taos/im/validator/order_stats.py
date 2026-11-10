@@ -3,9 +3,10 @@
 """Each miner's resting orders and open loans, summarised for the report.
 
 The state carries every account's open orders ('o') and loans ('l') per book. The dashboards show a summary: per uid
-and book the orders and resting volume by side, the miner's own best bid and ask and the open loans; per uid the same
-counts, the resting notional by side and the books it rests on. Books with no order and no loan are left out, so the
-per-book series follow the books a miner uses.
+and book the orders by side and the open loans; per uid the same counts, the resting notional by side and the books it
+rests on. A book's own best bid and ask and its resting volume per side stay out of the published series: together they
+are a maker's quoting. Books with no order and no loan are left out, so the per-book series follow the books a miner
+uses.
 """
 from typing import NamedTuple
 
@@ -28,10 +29,6 @@ class BookOrders(NamedTuple):
 BOOK_GAUGES = {
     'open_bids': 'bids',
     'open_asks': 'asks',
-    'resting_bid_volume': 'bid_volume',
-    'resting_ask_volume': 'ask_volume',
-    'best_bid_price': 'best_bid',
-    'best_ask_price': 'best_ask',
     'open_loans': 'loans',
 }
 
@@ -100,7 +97,7 @@ NO_ORDERS = {'open_bids': 0, 'open_asks': 0, 'resting_bid_notional': 0.0, 'resti
 
 
 def book_gauges(row: BookOrders):
-    """``(gauge name, value)`` for one book, leaving out a best price the miner has no order for."""
+    """``(gauge name, value)`` for one book."""
     for name, field in BOOK_GAUGES.items():
         value = getattr(row, field)
         if value is not None:

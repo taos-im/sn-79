@@ -2309,6 +2309,7 @@ if __name__ != "__mp_main__":
                 'query_waits': list(self.query_waits[-100:]),
                 'reward_gate_waits': list(self.reward_gate_waits[-100:]),
                 'fundamental_seed_sources': dict(getattr(self, 'fundamental_seed_sources', None) or {}),
+                **fundamental_seed.report_fields(self),
                 'pending_reward_tasks': self._pending_reward_tasks,
                 'volume_sums': volume_sums_flat,
                 'maker_volume_sums': maker_volume_sums_flat,
@@ -2412,6 +2413,7 @@ if __name__ != "__mp_main__":
                         # 0.6.6: the skill leg's mark and the alternative published beside it
                         'debeta_mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
                         'debeta_mark_mode_alt': str(debeta_dial(_dcfg, 'mark_mode_alt')),
+                        'debeta_fill_charge': str(debeta_dial(_dcfg, 'fill_charge')),
                         # 0.6.6: the conjunction's band per class and its size gate
                         'debeta_conjunction_bounds': str(debeta_dial(_dcfg, 'conjunction_bounds')),
                         'debeta_conjunction_min_size_frac': float(debeta_dial(_dcfg, 'conjunction_min_size_frac')),

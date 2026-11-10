@@ -3,7 +3,8 @@
 """A second mark is accumulated beside the paid one and its skill is published per uid, so a change of mark is judged
 on live data before it pays (the captured and realized making bases' pattern of 0.6.3).
 
-scoring.debeta.mark_mode_alt (default last since 0.6.6, beside the paid mid) names the other mark; the trade path keeps a second set of mark-to-market
+scoring.debeta.mark_mode_alt (default median, beside the paid mid) names the other mark; the trade path keeps a
+second set of mark-to-market
 accumulators under it (mtm, inventory time-sum, print count, drift, with their windowed histories, pruned and shifted
 with the paid set), the scorer derives the alternative skill with the paid leg's floor rule and bar, and the report
 publishes debeta_skill_mark_alt and debeta_skill_net_alpha_mark_alt per uid. Pay reads the paid mark alone. The leg
@@ -20,8 +21,8 @@ def _t(p, q, s, ma, ta):
     return {"p": p, "q": q, "s": s, "Ma": ma, "Ta": ta}
 
 
-def test_the_paid_mark_defaults_to_mid_the_alternative_to_last_and_the_leg_names_are_classified():
-    assert debeta_defaults()["mark_mode"] == "mid" and debeta_defaults()["mark_mode_alt"] == "last"
+def test_the_paid_mark_defaults_to_mid_the_alternative_to_median_and_the_leg_names_are_classified():
+    assert debeta_defaults()["mark_mode"] == "mid" and debeta_defaults()["mark_mode_alt"] == "median"
     for n in ("debeta_mtm_alt", "debeta_invsum_alt", "debeta_invn_alt", "debeta_drift_alt", "debeta_inv_alt",
               "debeta_pfirst_alt", "debeta_plast_alt", "debeta_mark_state_alt",
               "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist"):
@@ -38,7 +39,7 @@ def test_the_trade_path_accumulates_both_marks_from_one_batch():
     trade.accumulate_alt_mark(v, 0, [_t(100.2, 1.0, 0, -1, 7)], book, "mid", 0, ts=2)
     assert v.debeta_mtm_alt[5][0] == 0.0 and v.debeta_mark_state_alt[0]["prev"] == 100.1
     assert v.debeta_invn_alt[0] == 2
-    assert "accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp)" in \
+    assert "accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp," in \
         inspect.getsource(trade.update_trade_volumes)
     assert "if _mark_alt not in ('none', _mark_mode):" in inspect.getsource(trade.update_trade_volumes)
 
