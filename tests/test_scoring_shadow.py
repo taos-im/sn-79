@@ -23,6 +23,8 @@ from taos.im.validator.scoring_shadow import (
     _send_frame,
     _STRUCT_NAMES,
     compute_parity_digest,
+    kept_frame,
+    kept_from_frame,
 )
 from taos.im.validator.trade import update_trade_volumes
 
@@ -119,19 +121,10 @@ def _fresh_main(uids=_UIDS, books=_BOOKS):
 
 
 def _state(ts, trades):
-    """Duck-typed state: .timestamp/.notices/.books/.accounts as trade.py reads them.
-    trades: list of (taker_uid, maker_uid, book, qty, price, side)."""
-    notices = defaultdict(list)
-    for taker, maker, book, qty, price, side in trades:
-        ev = NormalizedTradeEvent(
-            book_id=book, quantity=qty, price=price, side=side,
-            maker_uid=maker, taker_uid=taker, maker_fee=qty * price * 0.001,
-            taker_fee=qty * price * 0.002, timestamp=ts,
-        ).to_notice_dict()
-        notices[taker].append(ev)
-        if maker != taker:
-            notices[maker].append(ev)
-    return SimpleNamespace(timestamp=ts, notices=dict(notices), books={}, accounts={})
+    """Duck-typed state: .timestamp/.notices/.books/.accounts as trade.py reads them, a book for every fill
+    (tests/tsc.py). trades: list of (taker_uid, maker_uid, book, qty, price, side)."""
+    from tsc import fill_state
+    return fill_state(ts, trades, book_count=_BOOKS)
 
 
 _ROUNDS = [
@@ -143,12 +136,16 @@ _ROUNDS = [
 
 
 def _snapshot_to_shadow(main):
-    """The exact INIT path: plainify -> pickle -> unpickle -> rebuild -> ShadowState."""
+    """The exact INIT path: plainify -> pickle -> unpickle -> rebuild -> ShadowState, and the kept accounts'
+    msgpack frame."""
     parts = {}
     for name in _STRUCT_NAMES:
         # getattr default as in send_init: structures main has not created yet (the exchange-only dedup
         # ledger in sim mode, the de-beta accumulators before the first round) ship as empty shells.
         parts[name] = pickle.loads(pickle.dumps(_plainify(getattr(main, name, {})), protocol=5))
+    kept = kept_frame(main)
+    if kept is not None:
+        parts["kept_accounts"] = kept_from_frame(kept)
     knobs = {
         "_last_prune_timestamp": main._last_prune_timestamp,
         "_last_accounted_ts": getattr(main, "_last_accounted_ts", None),
@@ -165,29 +162,20 @@ def _snapshot_to_shadow(main):
 
 
 def _main_score(main, sim_ts, deregs=()):
-    """Replica of get_rewards' trading path (score_uids + Pareto) on `main` —
-    what the validator computes and records for the shadow comparison."""
-    from taos.im.validator.reward import distribute_rewards, score_uids
+    """Main's trading path on `main`'s own structures: the pipeline shadow_score runs (score_uids with the de-beta
+    accumulators, the track-record EMA, the making pool, the floor and the Pareto allocation), which is the one
+    get_rewards runs. The earlier replica shipped kappa, activity and P&L alone, so with the config duck lacking
+    scoring.debeta it scored the legacy path while the child scored de-beta: the two agreed only while no uid
+    traded."""
+    from taos.im.validator.scoring_shadow import shadow_score
 
-    all_uids = list(range(main.effective_max_uids))
-    vd = {
-        'kappa_values': main.kappa_values,
-        'kappa_cache': {},
-        'activity_factors': main.activity_factors,
-        'pnl_factors': main.pnl_factors,
-        'roundtrip_volumes': main.roundtrip_volumes,
-        'realized_pnl_history': main.realized_pnl_history,
-        'config': _scoring_cfg(),
-        'simulation_config': _sim_cfg(),
-        'simulation_timestamp': sim_ts,
-        'uids': all_uids,
-        'deregistered_uids': list(deregs),
-        'device': 'cpu',
-        'gentrx_scores': {},
-        'gentrx_ema': {},
-    }
-    trading, _g = score_uids(vd)
-    return [float(x) for x in distribute_rewards([trading[u] for u in all_uids], _scoring_cfg()).tolist()]
+    if not hasattr(main, 'scoring_config'):
+        main.scoring_config = pickle.loads(pickle.dumps(_scoring_cfg()))
+    if not hasattr(main, 'simulation_config'):
+        main.simulation_config = _sim_cfg()
+    if not hasattr(main, 'kappa_cache'):
+        main.kappa_cache = {}
+    return shadow_score(main, sim_ts, list(deregs))['trading']
 
 
 def test_shadow_replicates_main_exactly():
@@ -299,7 +287,7 @@ def _raw_state(ts, trades):
     import msgpack
     st = _state(ts, trades)
     return msgpack.packb(
-        {"timestamp": ts, "books": {}, "accounts": {}, "notices": st.notices},
+        {"timestamp": ts, "books": st.books, "accounts": {}, "notices": st.notices},
         use_bin_type=True,
     )
 
@@ -526,7 +514,7 @@ def test_reset_derived_from_state_parity():
     st = _state(5 * _S, [(1, 2, 0, 1.0, 100.0, 0)])
     st.notices[VUID] = [{'y': 'RDRA', 'r': [{'u': True, 'a': 1}]}]
     raw = msgpack.packb(
-        {"timestamp": 5 * _S, "books": {}, "accounts": {}, "notices": st.notices},
+        {"timestamp": 5 * _S, "books": st.books, "accounts": {}, "notices": st.notices},
         use_bin_type=True,
     )
 
@@ -546,7 +534,7 @@ def test_reset_derived_from_state_parity():
     st2 = _state(6 * _S, [(1, 3, 0, 2.0, 101.0, 1)])
     update_trade_volumes(main, st2)
     raw2 = msgpack.packb(
-        {"timestamp": 6 * _S, "books": {}, "accounts": {}, "notices": st2.notices},
+        {"timestamp": 6 * _S, "books": st2.books, "accounts": {}, "notices": st2.notices},
         use_bin_type=True,
     )
     apply_state_bytes(shadow, raw2)
@@ -659,7 +647,7 @@ def test_child_save_validator_state_roundtrip(tmp_path):
     saved = msgpack.unpackb(open(path, "rb").read(), raw=False, strict_map_key=False)
     assert list(saved.keys()) == [
         "step", "simulation_timestamp", "hotkeys", "scores", "gentrx_scores",
-        "activity_factors", "pnl_factors", "inventory_history", "kappa_values",
+        "activity_factors", "pnl_factors", "inventory_history", "kappa_values", "debeta_seam_ts",
         "realized_pnl_history", "open_positions", "unnormalized_scores",
         "deregistered_uids", "trading_score_ema", "trading_score_ema_ts",
         "trading_score_ema_n", "debeta_pool_ema", "trade_volumes", "roundtrip_volumes",
@@ -674,6 +662,7 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "debeta_captkbuy_hist", "debeta_captksell_hist",  # the captured pair's taker legs (0.6.6)
         "debeta_cpc_hist",  # the per-asset-class counterparty rows (0.6.3), after the pooled histories
         "debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist",
+        "debeta_msg_hist", "debeta_fill_hist", "debeta_dusttake_hist", "debeta_dustmake_hist",
         "debeta_inv", "debeta_plast",
         "debeta_inv_alt", "debeta_plast_alt",
         "debeta_conj_ref", "debeta_conj_clock",  # the conjunction's references and clock (0.6.6)
@@ -761,3 +750,34 @@ def test_request_save_unavailable_returns_none():
     sh.initialized = False
     sh._last_teed_ts = 0
     assert sh.request_save("/tmp/x", {}) is None
+
+
+def test_the_fixtures_states_carry_a_book_for_every_fill_and_the_accounting_runs_on_both_sides():
+    """With no book in the state the per-uid fill write raised into the guard on main and the child
+    alike and the parity tests compared two sides that had accounted nothing. Now no accounting failure is
+    suppressed, and a trading uid's FIFO and realized P&L differ from zero after its round trip, on both sides."""
+    main = _fresh_main()
+    suppressed = []
+    main.pagerduty_alert = lambda msg, details=None: suppressed.append(msg)
+    for st in _ROUNDS:
+        assert set(st.books) == set(range(_BOOKS)) and set(st.books) >= {n["b"] for ns in st.notices.values() for n in ns}
+        update_trade_volumes(main, st)
+    assert suppressed == [], suppressed
+    # uid 1 holds 4.5 long on book 0 (3 at 100 as taker, 1.5 at 101 as maker) and no round trip yet
+    assert [q for _ts, q, _p, _f in main.open_positions[1][0]["longs"]] == [3.0, 1.5]
+    assert all(not v for v in main.realized_pnl_history[1].values()), dict(main.realized_pnl_history[1])
+    shadow = _snapshot_to_shadow(main)
+    shadow_suppressed = []
+    shadow.pagerduty_alert = lambda msg, details=None: shadow_suppressed.append(msg)
+    # uid 1 sells 1 at 102 as the taker: the round trip closes a third of its first long with a realized gain
+    st = _state(6 * _S, [(1, 2, 0, 1.0, 102.0, 1)])
+    update_trade_volumes(main, st)
+    update_trade_volumes(shadow, st)
+    assert suppressed == [] and shadow_suppressed == []
+    for side in (main, shadow):
+        assert [q for _ts, q, _p, _f in side.open_positions[1][0]["longs"]] == [2.0, 1.5]
+        # realized_pnl_history is {uid: {ts: {book: pnl}}}: the 6 s round closed 1 of the 3 bought at 100 at 102
+        realized = sum(float(d.get(0, 0.0)) for d in side.realized_pnl_history[1].values() if isinstance(d, dict))
+        assert realized > 0.0, dict(side.realized_pnl_history[1])
+        assert side.roundtrip_volume_sums[1][0] > 0.0
+    assert compute_parity_digest(shadow) == compute_parity_digest(main)

@@ -45,7 +45,7 @@ MessagePayload::Ptr PayloadFactory::createFromJsonMessage(const rapidjson::Value
     else if (type == "RETRIEVE_ORDERS") {
         return RetrieveOrdersPayload::fromJson(payloadJson);
     }
-    else if (type == "CANCEL_ORDERS") {
+    else if (type == "CANCEL_ORDERS" || type == "EXPIRE_ORDERS") {
         return CancelOrdersPayload::fromJson(payloadJson);
     }
     else if (type == "CLOSE_POSITIONS") {
@@ -183,7 +183,7 @@ MessagePayload::Ptr PayloadFactory::createFromMessagePack(
     else if (type == "RETRIEVE_ORDERS") {
         return makePayload.operator()<RetrieveOrdersPayload>();
     }
-    else if (type == "CANCEL_ORDERS") {
+    else if (type == "CANCEL_ORDERS" || type == "EXPIRE_ORDERS") {
         return makePayload.operator()<CancelOrdersPayload>();
     }
     else if (type == "CLOSE_POSITIONS") {

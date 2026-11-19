@@ -54,6 +54,27 @@ public:
     [[nodiscard]] taosim::decimal_t getMaxLoan() const noexcept { return m_config2.maxLoan; }
     [[nodiscard]] const taosim::exchange::ExchangeConfig& config2() const noexcept { return m_config2; }
     [[nodiscard]] auto&& retainRecord(this auto&& self) noexcept { return self.m_retainRecord; }
+    // Publish full account info only for the (account, book) entries changed since the last delivered publish.
+    [[nodiscard]] auto&& dirtyAccountsOnly(this auto&& self) noexcept { return self.m_dirtyAccountsOnly; }
+    // Under dirtyAccountsOnly, every N-th delivered publish lists an agent in full whatever its marks, a different
+    // slice of agents each time (0: never), so a validator that missed a state recovers within N publishes.
+    [[nodiscard]] auto&& fullAccountsEvery(this auto&& self) noexcept { return self.m_fullAccountsEvery; }
+    // N from the exchange's config; on unless the config turns it off, so no validator copy can drift for good.
+    static constexpr uint32_t kFullAccountsEveryDefault = 30;
+    [[nodiscard]] static uint32_t fullAccountsEveryOf(pugi::xml_node node) noexcept
+    {
+        return node.attribute("fullAccountsEvery").as_uint(kFullAccountsEveryDefault);
+    }
+    // This publish lists the agent in full on every book: dirtyAccountsOnly is off, the validator asked, or the
+    // rotation's turn.
+    [[nodiscard]] bool accountInFull(AgentId agentId) const noexcept;
+    // A change to the account on the book. Under sharedQuoteBalances the quote is one balance for all the
+    // agent's books, so every book is marked.
+    void markDirty(taosim::accounting::Account& account, BookId bookId) noexcept;
+    // The validator answered the published state: marks are cleared, the rotation moves on, a request is served.
+    void accountsDelivered();
+    // The validator asked for every account in full in the next publish (after a restart, say).
+    void requestFullAccounts() noexcept { m_fullAccountsRequested = true; }
     [[nodiscard]] bool sharedQuoteBalances() const noexcept { return m_orderIdCounter && m_tradeIdCounter; }
 
     // The shared trade id counter. The exchange service reads it to repair
@@ -93,6 +114,9 @@ public:
         PlaceOrderLimitPayload::Ptr order;
         // The id the placement was acknowledged under, so a restored remainder keeps it.
         std::optional<OrderID> orderId;
+        // A GTT order's absolute deadline in the sweep's seconds, from the block it was placed in: a remainder
+        // restored blocks later continues this order and dies when it would have.
+        std::optional<Timestamp> gttDeadline;
     };
 
     // `order` may be NULL, and that is meaningful rather than an error: a MARKET order can
@@ -104,18 +128,7 @@ public:
         TradeID id,
         AgentId agentId,
         PlaceOrderLimitPayload::Ptr order,
-        std::optional<OrderID> orderId = std::nullopt) noexcept
-    {
-        m_poolPlacements.insert_or_assign(
-            id, PoolPlacement{.agentId = agentId, .order = order, .orderId = orderId});
-        m_poolPlacementOrder.push_back(id);
-        // Bounded: a correction arrives within a batch or two, so history beyond that is dead
-        // weight on a live exchange carrying 129 books.
-        while (m_poolPlacementOrder.size() > s_poolPlacementCapacity) {
-            m_poolPlacements.erase(m_poolPlacementOrder.front());
-            m_poolPlacementOrder.pop_front();
-        }
-    }
+        std::optional<OrderID> orderId = std::nullopt) noexcept;
 
     [[nodiscard]] const PoolPlacement* poolPlacement(TradeID id) const noexcept
     {
@@ -163,6 +176,11 @@ public:
 
     [[nodiscard]] const taosim::config::ExchangeAgentConfig& config() const noexcept { return m_config; }
 
+    // OFF-GRID ORDERS, under offGridOrders="refuse": why a miner's order is refused for a price or a
+    // size off the book's grid, if it is. Public so every caller that places a miner's order applies the same rule.
+    [[nodiscard]] std::optional<OrderErrorCode> offGrid(const PlaceOrderLimitPayload& order) const noexcept;
+    [[nodiscard]] std::optional<OrderErrorCode> offGrid(const PlaceOrderMarketPayload& order) const noexcept;
+
     // The validator's (agent, book) pairs at or over its volume cap, local book ids, replaced with each reply
     // batch that carries them. A placement from a pair in the set is refused when it reaches the exchange.
     void setCappedPairs(std::vector<std::pair<AgentId, BookId>> pairs);
@@ -186,6 +204,10 @@ private:
     void handleLocalMessage(const Message::Ptr&  msg);
     void handleLocalPlaceMarketOrder(const Message::Ptr&  msg);
     void handleLocalPlaceLimitOrder(const Message::Ptr&  msg);
+
+    // A background agent's order rounded to the nearest grid point under offGridOrders="refuse".
+    void roundOntoGrid(PlaceOrderLimitPayload& order) const noexcept;
+    void roundOntoGrid(PlaceOrderMarketPayload& order) const noexcept;
     void handleLocalRetrieveOrders(const Message::Ptr&  msg);
     void handleLocalCancelOrders(const Message::Ptr&  msg);
     void handleLocalClosePositions(const Message::Ptr&  msg);
@@ -217,6 +239,10 @@ private:
     taosim::exchange::ExchangeConfig m_config2;
     bool m_retainRecord{};
     bool m_replayLog{};
+    bool m_dirtyAccountsOnly{};
+    uint32_t m_fullAccountsEvery{};
+    uint64_t m_accountsDeliveries{};
+    bool m_fullAccountsRequested{};
     std::vector<std::unique_ptr<taosim::book::L2Logger>> m_L2Loggers;
     std::vector<std::unique_ptr<taosim::book::L3EventLogger>> m_L3EventLoggers;
     std::vector<std::unique_ptr<taosim::book::FeeLogger>> m_feeLoggers;

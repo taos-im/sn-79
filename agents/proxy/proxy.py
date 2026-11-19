@@ -35,6 +35,7 @@ from taos.im.protocol.models import MultiAssetSimulationConfig
 from taos.im.protocol.simulator import SimulatorResponseBatch
 from taos.im.protocol.events import SimulationStartEvent
 from taos.im.validator.engines.simulation import flatten_multiasset_state
+from taos.im.validator.kept_accounts import fill_accounts
 from taos.im.validator.reward import set_delays
 
 from ypyjson import YpyObject
@@ -287,6 +288,23 @@ class Proxy(Validator):
                         pass
         bt.logging.info(f"GenTRX: delivered to {len(assignments)} agents via HTTP")
 
+    def _complete_accounts(self, message: dict) -> bool:
+        """Fill in the account entries an engine under dirtyAccountsOnly left out, from the last full copy of each,
+        as the validator does (SimulationEngine._complete_accounts): the agents see complete accounts either way.
+        False when some could not be filled, as for a proxy that has just started: the state is then answered with no
+        instructions and a request for every account in full, so the next state is complete."""
+        if not message.get("dirtyAccountsOnly"):
+            return True
+        if getattr(self, "_kept_accounts", None) is None:
+            self._kept_accounts = {}
+        missing = fill_accounts(self._kept_accounts, message.get("accounts") or {}, message.get("books"),
+                                message.get("bookFees"))
+        if missing:
+            bt.logging.warning(f"[ACCOUNTS] {missing} account entries left out with no full copy yet: state skipped, "
+                               f"every account asked for in full")
+            return False
+        return True
+
     async def _listen(self):
         def receive(mq_req) -> dict:
             msg, priority = mq_req.receive()
@@ -352,6 +370,9 @@ class Proxy(Validator):
                 # single-market shape (canonical book ids are globally unique, so
                 # the merge is lossless). Single-market states pass through as-is.
                 message, _instance_metas = flatten_multiasset_state(message)
+                if not self._complete_accounts(message):
+                    response = {"responses": [], "fullAccounts": True}
+                    continue
                 state = MarketSimulationStateUpdate.parse_dict(message)
                 response = await self.handle_state(message, state, receive_start)
             except Exception:

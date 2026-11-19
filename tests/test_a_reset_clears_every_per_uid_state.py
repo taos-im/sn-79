@@ -52,6 +52,8 @@ CLEARED = {
     "debeta_helddrift", "debeta_notional", "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist",
     "debeta_invsum_hist", "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist",
     "debeta_notional_hist", "debeta_cp", "debeta_cp_hist",
+    "debeta_msg_hist", "debeta_fill_hist", "debeta_msgs", "debeta_fills",
+    "debeta_dusttake_hist", "debeta_dustmake_hist", "debeta_dusttakes", "debeta_dustmakes",   # dust fills
     # main-side smoothing and presence carried across rounds
     "_trading_score_ema", "_trading_score_ema_n", "_debeta_pool_ema", "_gentrx_ema", "gentrx_scores",
     "miner_presence", "_trading_score_ema_pre",
@@ -66,6 +68,7 @@ EXEMPT = {
     "debeta_conj_farm": "per book, not per uid", "debeta_conj_farm_hist": "per book, not per uid",
     "debeta_conj_ref": "the books' spread and fill-size references", "_conj_dt": "the state's interval, set every update",
     "debeta_conj_clock": "the previous state's time, validator-wide",
+    "debeta_seam_ts": "the run change's time on the new clock, validator-wide, not a uid's (0.6.8, the seam split)",
     "debeta_conj_samples": "the books' trailing-hour samples behind the references (0.6.7)",
     "_scored_debeta": "the map one boundary paid, read only for that boundary's report (0.6.7)",
     "_sim_push_ts": "the state whose data-service push already started in the miners' wait",
@@ -96,7 +99,14 @@ EXEMPT = {
     "_debeta_class_shares": "per-round output (the class-mixed pool shares, rebuilt from the accumulators)",
     "_debeta_class_summary": "per-round output (the per-class summary the report publishes)",
     "_debeta_class_details": "per-round output (the per-class per-uid detail the report publishes as agent_class_gauges)",
+    "_debeta_carry": "per-round output (a carried class's w, carried and paid shares, published while its run-boundary handover runs)",
     "_debeta_class_map_cache": "layout cache (book to asset class), keyed by the simulation object, not by uid",
+    "accounting_profile": "per-state output (the state's accounting time and counts, only logged)",
+    "legs_clock": "the per-entry legs' cadence (the last run's time and the states since), one for all uids",
+    "legs_elsewhere": "main's flag: the scoring service alone runs the per-entry legs",
+    "service_legs": "the service's last shipped inventory view and legs time, published only, one for all uids",
+    "_slot_cache": "derived cache of the uids whose volume slots are set up, keyed by object identity",
+    "_ib_cache": "derived cache of the uids whose starting balances are taken, keyed by object identity",
     "debeta_presence_shares": "per-round, from presence", "_trading_score_ema_ts": "a timestamp",
     # keyed by book or by trade id, not by uid
     "debeta_invn": "book-keyed", "debeta_invn_hist": "book-keyed", "debeta_drift": "book-keyed",
@@ -109,7 +119,7 @@ EXEMPT = {
     "fee_sums": "not read by the pay path's scoring", "recent_trades": "book-keyed trade tape",
     "_gentrx": "object; its _scores are cleared by handle_deregistration",
     # runtime handles and flags of the query service, the reporter and load bookkeeping
-    "_histories_rebased_at_load": "load counter", "_last_prune_timestamp": "clock", "_run_changes_recovered": "counter",
+    "capture_fee_check": "counter (the per-state fee check, validator-wide)", "_histories_rebased_at_load": "load counter", "_last_prune_timestamp": "clock", "_run_changes_recovered": "counter",
     "_last_accounted_ts": "clock", "_resumes_restored": "counter", "_resumes_unrestored": "counter",
     "_pending_reward_tasks": "task queue", "_start_query_service": "method", "dendrite": "network handle",
     "get_extended_metagraph": "method", "hotkeys": "chain view", "miner_net_lock": "lock",

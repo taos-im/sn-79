@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from taos.im.neurons.validator import Validator
 
 
-DELAY_POLICIES = ("curve", "flat", "jitter")
+DELAY_POLICIES = ("curve", "flat", "jitter", "measured")
 
 
 def _curve_delay(p_time: float, timeout: float, min_delay: int, max_delay: int) -> int:
@@ -40,6 +40,9 @@ def base_delay(p_time: float, timeout: float, min_delay: int, max_delay: int, po
     draw's top, so a slower response never waits less than a prompt one. A process time at or over the timeout follows
     the curve under every policy.
     """
+    if policy == "measured" and p_time < timeout:
+        # the venue's own time: the response waits exactly as long as the miner took (exchange mode)
+        return max(int(max(float(p_time), 0.0) * SECOND_NS), 0)
     if policy == "curve" or p_time >= timeout:
         return _curve_delay(p_time, timeout, min_delay, max_delay)
     if policy == "flat":
@@ -75,6 +78,31 @@ def latency_profile(self: 'Validator') -> dict[int, float]:
 DEFAULT_MAX_INSTRUCTION_DELAY_S = 600.0
 
 
+SECOND_NS = 1_000_000_000
+DEFAULT_POLICY_BY_MODE = {"simulation": "curve", "exchange": "measured"}
+
+
+def resolve_delay_policy(policy, engine_mode) -> str:
+    """The delay policy in force: an explicit dial wins; without one, the simulation's curve or the exchange's measured
+    response time, on which the venue runs."""
+    if policy:
+        return str(policy)
+    return DEFAULT_POLICY_BY_MODE.get(str(engine_mode or "simulation"), "curve")
+
+
+def queued_order_delay(received_ns, round_open_ns, bound: int) -> int:
+    """The delay a queued (interface or API) order carries into the round: how long after the previous round opened
+    the service received it, so it joins the queue where its receipt put it, not ahead of every miner.
+    0 without a receipt stamp or a previous open, 0 for a receipt before the open, the engine's bound at most."""
+    if received_ns is None or round_open_ns is None:
+        return 0
+    try:
+        d = int(received_ns) - int(round_open_ns)
+    except (TypeError, ValueError):
+        return 0
+    return int(min(max(d, 0), int(bound)))
+
+
 def max_instruction_delay_ns(config) -> int:
     """The longest delay a miner's instruction may ask for, --neuron.max_instruction_delay_s in nanoseconds (600 s, the
     engine's maxInstructionDelay default, when it is unset or 0); the query service refuses a longer one at acceptance
@@ -104,7 +132,8 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
     max_delay = scoring.max_delay
     min_instruction_delay = scoring.min_instruction_delay
     max_instruction_delay = scoring.max_instruction_delay
-    policy = getattr(scoring, 'delay_policy', None) or "curve"
+    engine_mode = getattr(getattr(self, 'engine', None), 'mode', None) or getattr(scoring, 'engine_mode', None)
+    policy = resolve_delay_policy(getattr(scoring, 'delay_policy', None), engine_mode)
     if policy not in DELAY_POLICIES:
         bt.logging.warning(f"Unknown delay policy {policy!r}; the curve applies")
         policy = "curve"
@@ -127,10 +156,14 @@ def set_delays(self: 'Validator', synapse_responses: dict[int, MarketSimulationS
                     p_time = measured
             delay = base_delay(p_time, timeout, min_delay, max_delay, policy, jitter, prompt_cutoff)
             seen_books = set()
+            if policy == "measured":
+                # the venue's queue: every instruction at the measured delay, a response's cancels before its placements
+                # (a replace lands as cancel then place), no random spread
+                response.instructions.sort(key=lambda i: 0 if getattr(i, "type", None) == "CANCEL_ORDERS" else 1)
             for instruction in response.instructions:
                 book_id = instruction.bookId
 
-                if book_id not in seen_books:
+                if policy == "measured" or book_id not in seen_books:
                     instruction_delay = 0
                     seen_books.add(book_id)
                 else:

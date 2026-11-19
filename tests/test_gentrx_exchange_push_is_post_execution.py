@@ -58,8 +58,12 @@ def test_the_early_push_is_not_used_for_exchange():
 
 
 def test_simulation_still_pushes_early():
-    """Simulation must keep its pre-existing behaviour: the sim has already matched."""
+    """Simulation must keep its pre-existing behaviour: the sim has already matched. The push runs in
+    _pre_request_work (from on_query_sent, in the miners' wait, or after the forward when no query was sent), which
+    handle_state still reaches before the exchange injection."""
     src = _handle_state_source()
     inject = src.index("for _ef in _recon_now.get(")
-    pushes = [m.start() for m in re.finditer(r"push_state\(state\)", src)]
-    assert any(p < inject for p in pushes), "simulation lost its early push"
+    calls = [m.start() for m in re.finditer(r"self\._pre_request_work\(state\)", src)]
+    assert any(p < inject for p in calls), "simulation lost its early push"
+    work = inspect.getsource(validator_mod.Validator._pre_request_work)
+    assert "self._gentrx.push_state(state)" in work and '!= "exchange"' in work

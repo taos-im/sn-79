@@ -162,7 +162,10 @@ def test_the_first_instruction_per_book_gets_no_instruction_delay_under_every_po
     out = set_delays(v, _synapses({7: 0.2}, books=(0, 1, 0)))
     first_a, first_b, second_a = (i.delay for i in out[0].instructions)
     assert first_a == first_b, "the first instruction on each book carries the base delay alone"
-    assert MIN_I <= second_a - first_a <= MAX_I, "a later instruction on the same book adds the instruction delay"
+    if policy == "measured":
+        assert second_a == first_a, "the venue's time: no random spread between a response's instructions"
+    else:
+        assert MIN_I <= second_a - first_a <= MAX_I, "a later instruction on the same book adds the instruction delay"
 
 
 @pytest.mark.parametrize("policy", DELAY_POLICIES)
@@ -179,13 +182,17 @@ def test_the_dials_are_declared_with_the_curve_as_the_default():
     parser = argparse.ArgumentParser()
     add_im_validator_args(None, parser)
     config = parser.parse_args([])
-    assert getattr(config, "scoring.delay_policy") == "curve"
+    assert getattr(config, "scoring.delay_policy") is None, "unset: resolved by engine mode (delays.resolve_delay_policy)"
+    assert delays_module.resolve_delay_policy(None, "simulation") == "curve"
+    assert delays_module.resolve_delay_policy(None, None) == "curve"
+    assert delays_module.resolve_delay_policy(None, "exchange") == "measured"
+    assert delays_module.resolve_delay_policy("flat", "exchange") == "flat", "an explicit choice wins"
     assert getattr(config, "scoring.delay_jitter") == JITTER
     assert getattr(config, "scoring.delay_prompt_cutoff") == CUTOFF
     assert getattr(config, "scoring.latency_profile") == ""
     with pytest.raises(SystemExit):
         parser.parse_args(["--scoring.delay_policy", "fastest"])
-    assert set(DELAY_POLICIES) == {"curve", "flat", "jitter"}
+    assert set(DELAY_POLICIES) == {"curve", "flat", "jitter", "measured"}
 
 
 def test_the_query_process_delays_by_the_policy_and_the_profile_main_holds(tmp_path):

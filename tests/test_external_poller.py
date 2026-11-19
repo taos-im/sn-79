@@ -83,7 +83,8 @@ def test_drain_returns_and_clears_buffer():
     eng = _StubEngine([])
     eng._external_buffer = [{"a": 1}, {"a": 2}]
     drained = eng._drain_external_orders()
-    assert drained == [{"a": 1}, {"a": 2}]
+    # each order leaves the drain at the delay of its receipt: 0 without the service's stamp
+    assert drained == [{"a": 1, "delay": 0}, {"a": 2, "delay": 0}]
     assert eng._external_buffer == []
     # a second drain yields nothing — exactly-once hand-off to the round
     assert eng._drain_external_orders() == []
@@ -102,7 +103,7 @@ def test_poll_loop_fills_buffer_and_ensure_is_idempotent():
         await asyncio.sleep(0.05)
         drained = await _drain_after_stop(eng)
         # both batches accumulated across polls; one drain hands them all off
-        assert {"o": 1} in drained and {"o": 2} in drained and {"o": 3} in drained
+        assert {"o": 1, "delay": 0} in drained and {"o": 2, "delay": 0} in drained and {"o": 3, "delay": 0} in drained
         assert eng.fetch_calls >= 2
 
     asyncio.run(go())

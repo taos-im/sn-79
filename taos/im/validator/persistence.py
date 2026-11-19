@@ -132,7 +132,8 @@ _DEBETA_HIST3 = ("debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hi
                  "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
                  "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
                  "debeta_conj_hist", "debeta_captkbuy_hist", "debeta_captksell_hist")
-_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist")
+_DEBETA_HIST2 = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist",
+                 "debeta_msg_hist", "debeta_fill_hist", "debeta_dusttake_hist", "debeta_dustmake_hist")
 
 
 def _load_class_vectors(raw) -> dict:
@@ -225,6 +226,8 @@ def build_validator_state(
         # the step seed's secret for the run, its commitment and the ended run's reveal, and the clock-skew samples, so
         # a restart mid-run keeps seeding under the committed secret
         **fundamental_seed.state_to_save(self),
+        # the run change on the new clock, so a restart inside the window still strips each run on its own
+        "debeta_seam_ts": getattr(self, 'debeta_seam_ts', None),
         "realized_pnl_history": realized_pnl_snapshot,
         "open_positions": open_positions_snapshot,
         "unnormalized_scores": self.unnormalized_scores,
@@ -827,6 +830,7 @@ async def save_state_async(self: Validator) -> bool:
                     f"{total_pnl_entries} P&L entries, {total_vol_entries} volume entries"
                 )
 
+                await pull_service_legs(self)
                 simulation_state_data, validator_state_data, prep_time = await construct_save_data_async(self)
                 _saved_key = _accounted_key(self)
 
@@ -917,6 +921,7 @@ async def save_state_async(self: Validator) -> bool:
                             "[SAVE-OFFLOAD] scoring service save failed — in-process fallback"
                         )
                         async with self._reward_lock:
+                            await pull_service_legs(self)
                             _val_data = await construct_validator_state_async(self)
 
                 if _child_result is None:
@@ -1080,6 +1085,24 @@ def schedule_save(self: Validator) -> None:
     self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(save_state_async(self)))
 
 
+async def pull_service_legs(self: Validator) -> bool:
+    """While the scoring service alone runs the per-entry legs (0.6.8 D3), a save main writes itself first takes the
+    service's copies, or it would write the ones main last loaded. Call under the reward lock. Returns whether main
+    holds the service's legs."""
+    if not getattr(self, 'legs_elsewhere', False):
+        return False
+    shadow = getattr(self, '_scoring_shadow', None)
+    if shadow is None:
+        return False
+    from taos.im.validator.scoring_shadow import install_pulled_legs
+    legs = await asyncio.get_running_loop().run_in_executor(None, lambda: shadow.request_legs(timeout=60.0))
+    if install_pulled_legs(self, legs):
+        return True
+    bt.logging.warning("[SAVE] the scoring service's per-entry legs could not be pulled: the save writes main's "
+                       "last loaded copies of the inventory, at-best and conjunction histories")
+    return False
+
+
 async def save_state_sync(self: Validator):
     """Save validator state synchronously from an async context.
 
@@ -1142,6 +1165,7 @@ async def save_state_on_stop(self: Validator) -> bool:
         self._stop_save_begun = True
         shadow = getattr(self, '_scoring_shadow', None)
         if shadow is not None:
+            await pull_service_legs(self)
             await loop.run_in_executor(None, shadow.stop)
             self._scoring_shadow = None
         accounted = getattr(self, '_last_accounted_ts', None)
@@ -1509,6 +1533,18 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
     self.debeta_cp = sum_hist_2level(self.debeta_cp_hist)
     self.debeta_invn = sum_hist_1level(self.debeta_invn_hist)
     self.debeta_drift = sum_hist_1level(self.debeta_drift_hist)
+    # the order-to-trade reading: counts, so the sums are integers
+    self.debeta_msg_hist = {u: {ts: int(v) for ts, v in tsd.items()} for u, tsd in _load_hist2("debeta_msg_hist").items()}
+    self.debeta_fill_hist = {u: {ts: int(v) for ts, v in tsd.items()} for u, tsd in _load_hist2("debeta_fill_hist").items()}
+    self.debeta_msgs = {u: int(v) for u, v in sum_hist_1level(self.debeta_msg_hist).items()}
+    self.debeta_fills = {u: int(v) for u, v in sum_hist_1level(self.debeta_fill_hist).items()}
+    # the dust-fill reading: counts too
+    self.debeta_dusttake_hist = {u: {ts: int(v) for ts, v in tsd.items()}
+                                 for u, tsd in _load_hist2("debeta_dusttake_hist").items()}
+    self.debeta_dustmake_hist = {u: {ts: int(v) for ts, v in tsd.items()}
+                                 for u, tsd in _load_hist2("debeta_dustmake_hist").items()}
+    self.debeta_dusttakes = {u: int(v) for u, v in sum_hist_1level(self.debeta_dusttake_hist).items()}
+    self.debeta_dustmakes = {u: int(v) for u, v in sum_hist_1level(self.debeta_dustmake_hist).items()}
     # reconstruction STATE (pfirst is vestigial in the windowed path — drift replaces it)
     self.debeta_pfirst = {}
     self.debeta_plast = {int(b): float(v) for b, v in (validator_state.get("debeta_plast") or {}).items()}
@@ -1846,6 +1882,8 @@ def _load_validator_state(self):
                     }
 
             fundamental_seed.restore_state(self, validator_state)
+            # the run change on the new clock: None when the state predates the seam or no roll is inside the window
+            self.debeta_seam_ts = validator_state.get('debeta_seam_ts')
             bt.logging.info("Processing kappa values...")
             if 'kappa_values' in validator_state:
                 loaded_kappa = validator_state['kappa_values']

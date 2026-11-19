@@ -8,7 +8,8 @@ market are the same in both keeps its records in order: its k-th book takes the 
 whatever the two ids are, so a class that grows keeps every record on its first books and its added books start
 empty, and a class whose ids shift (a class before it grew) takes its records along. A class whose market changed
 starts fresh and restarts its pool; a class new to the layout starts empty; an old book that is no new book's source
-is dropped.
+is dropped, and when it belonged to a class that shrank, that class's standing carries through the run-boundary
+handover so the records it held still count until they would have aged out.
 
 rekey_books moves every book-keyed structure the validator and the scoring service hold by such a map, before the
 boundary's shift puts them on the new run's clock. BOOK_KEYED says where each structure holds its book; a structure
@@ -48,8 +49,12 @@ BOOK_KEYED = {
 # keyed by class index: follow their class by name, and start empty for a class that restarts
 CLASS_KEYED = ("debeta_cpc", "debeta_cpc_hist")
 NOT_BOOK_KEYED = (
+    "debeta_msg_hist", "debeta_fill_hist", "debeta_msgs", "debeta_fills",   # per uid, the order-to-trade reading
+    "debeta_dusttake_hist", "debeta_dustmake_hist", "debeta_dusttakes", "debeta_dustmakes",   # dust fills
+    "capture_fee_check",   # validator-wide, the per-state fee check's counts
     "agent_pnl_total", "debeta_cp", "debeta_cp_hist", "debeta_conj_clock", "_debeta_class_vectors",
-    "_debeta_handover", "_debeta_seen_tids", "_volume_seen_tids", "_debeta_young_books",
+    "_debeta_handover", "_debeta_seen_tids", "_volume_seen_tids", "_debeta_young_books", "legs_clock",
+    "debeta_seam_ts",   # the run change on the new clock (0.6.8, the seam split), validator-wide
 )
 
 
@@ -79,13 +84,16 @@ def book_changes(old: dict | None, new: dict | None) -> dict:
     class's market changed: it starts fresh), new (no predecessor: it starts empty), and every old book that is no new
     book's source and not a new book, drop. ``dest``: every old book to the new id its records go to, or None.
     ``classes``: the classes whose pools restart, those whose market changed; a class that keeps, moves or gains books
-    keeps its pool, and a class new to the layout has no pool to restart and ramps in. ``class_sources``: each
-    new class's index in the old layout, where it had one. ``names_old``/``names_new``: the class names in order."""
+    keeps its pool, and a class new to the layout has no pool to restart and ramps in. ``shrunk``: the classes that
+    keep their market but lose books; the lost books' records have no book of their market to go to, so the class's
+    standing carries through the run-boundary handover instead (trade.begin_class_handover:
+    every existing book carries over, only the genuinely new start blank). ``class_sources``: each new class's
+    index in the old layout, where it had one. ``names_old``/``names_new``: the class names in order."""
     if not old or not new:
         return {"books": {}, "classes": []}
     old_classes, new_classes = old["classes"], new["classes"]
     by_name = {c["name"]: (j, c) for j, c in enumerate(old_classes)}
-    books, dest, restart, class_sources = {}, {}, [], {}
+    books, dest, restart, class_sources, shrunk = {}, {}, [], {}, []
     for i, c in enumerate(new_classes):
         found = by_name.get(c["name"])
         same_market = found is not None and found[1]["market"] == c["market"]
@@ -93,6 +101,8 @@ def book_changes(old: dict | None, new: dict | None) -> dict:
             class_sources[i] = found[0]
             if not same_market:
                 restart.append(i)
+            elif len(c["books"]) < len(found[1]["books"]):
+                shrunk.append(i)
         prev = found[1]["books"] if same_market else []
         for k, b in enumerate(c["books"]):
             if k < len(prev):
@@ -105,7 +115,7 @@ def book_changes(old: dict | None, new: dict | None) -> dict:
             dest.setdefault(b, None)
             if b not in books:
                 books[b] = "drop"
-    return {"books": books, "dest": dest, "classes": restart, "class_sources": class_sources,
+    return {"books": books, "dest": dest, "classes": restart, "shrunk": shrunk, "class_sources": class_sources,
             "names_old": [c["name"] for c in old_classes], "names_new": [c["name"] for c in new_classes]}
 
 

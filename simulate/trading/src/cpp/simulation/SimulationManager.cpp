@@ -505,6 +505,10 @@ void SimulationManager::publishStateMessagePack()
         }
         return;
     }
+    // Answered, so the state arrived: what it listed in full need not be listed again (dirtyAccountsOnly).
+    for (const auto& simulation : m_simulations) {
+        simulation->exchange()->accountsDelivered();
+    }
 
     if (m_measureStepWallClockTime) {
         const auto t = getTime();
@@ -619,6 +623,13 @@ void SimulationManager::publishStateMessagePack()
     const msgpack::object* responsesVal{};
     for (const auto& [k, v] : obj.via.map) {
         const auto key = k.as<std::string_view>();
+        if (key == "fullAccounts") {
+            // Every account in full in the next publish (dirtyAccountsOnly), asked by a validator that lacks them.
+            if (v.type == msgpack::type::BOOLEAN && v.as<bool>()) {
+                for (const auto& simulation : m_simulations) simulation->exchange()->requestFullAccounts();
+            }
+            continue;
+        }
         if (key != "responses" && obj.via.map.size > 1) continue;
         responsesVal = &v;
     }

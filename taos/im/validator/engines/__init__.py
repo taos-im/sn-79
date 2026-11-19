@@ -107,6 +107,14 @@ class NormalizedTradeEvent:
     # reconciliation names the orders.
     taker_order_id:      int = 0
     maker_order_id:      int = 0
+    # Settlement legs as the engine executed them. A buyer's fee is charged in BASE, rounded up to the
+    # base grid, with the overshoot returned in quote; these are TRUE zeros in exchange mode, where
+    # nothing is charged, so they are stated. quote_settled is emitted only when the producer knows it.
+    maker_fee_base:      float = 0.0
+    maker_fee_refund:    float = 0.0
+    taker_fee_base:      float = 0.0
+    taker_fee_refund:    float = 0.0
+    quote_settled:       Optional[float] = None
 
     def to_notice_dict(self) -> dict:
         """This trade as the compact notice dict miners receive.
@@ -130,7 +138,13 @@ class NormalizedTradeEvent:
             'Ta': self.taker_uid,
             'Mf': self.maker_fee,
             'Tf': self.taker_fee,
+            'Mfb': self.maker_fee_base,
+            'Mfr': self.maker_fee_refund,
+            'Tfb': self.taker_fee_base,
+            'Tfr': self.taker_fee_refund,
         }
+        if self.quote_settled is not None:
+            d['qs'] = self.quote_settled
         if self.close_reason is not None:
             d['cr'] = self.close_reason
         if self.linked_order_id is not None:
@@ -255,6 +269,10 @@ class MarketEngine(ABC):
             response: The validator response.
         """
 
+    def ask_full_accounts(self) -> None:
+        """A state was answered without being read: the next answer asks for every account in full, where the engine
+        sends only the accounts that changed. The exchange engine has no account deltas."""
+
     def start(self) -> None:
         """Called once from validator.__init__() after base setup is done."""
 
@@ -272,9 +290,38 @@ class MarketEngine(ABC):
     _EXTERNAL_POLL_INTERVAL = 1.0
 
     def _ensure_external_poller(self) -> None:
-        """Start the background poll task on first call (requires a running loop)."""
+        """Start the background poll task on first call (requires a running loop). The poller's start opens the
+        first round for the queued orders' delays, so the first drain after a start has an open to measure against
+        instead of giving every queued order delay 0 for one round."""
         if getattr(self, "_external_poll_task", None) is None:
+            import time as _time
+
+            if getattr(self, "_round_open_ns", None) is None:
+                self._round_open_ns = _time.time_ns()
+                self._note_round_open(self._round_open_ns)
             self._external_poll_task = asyncio.ensure_future(self._external_orders_loop())
+
+    _ROUND_OPENS_KEPT = 8
+
+    def _note_round_open(self, open_ns: int) -> None:
+        """Keeps the last few rounds' opens (a deque), so a queued order's delay is measured from the open of the
+        round its receipt fell in, whichever that was."""
+        from collections import deque
+
+        opens = getattr(self, "_round_opens", None)
+        if opens is None:
+            opens = self._round_opens = deque(maxlen=self._ROUND_OPENS_KEPT)
+        opens.append(int(open_ns))
+
+    def _open_of_receipt(self, received_ns):
+        """The latest kept open at or before the receipt (the open of the round the order arrived in), or None when
+        the receipt is older than every kept open."""
+        opens = getattr(self, "_round_opens", None) or ()
+        try:
+            r = int(received_ns)
+        except (TypeError, ValueError):
+            return None
+        return max((o for o in opens if o <= r), default=None)
 
     async def _external_orders_loop(self) -> None:
         while True:
@@ -291,13 +338,52 @@ class MarketEngine(ABC):
             await asyncio.sleep(self._EXTERNAL_POLL_INTERVAL)
 
     def _drain_external_orders(self) -> list:
-        """Return buffered external instructions and clear the buffer.
+        """Return buffered external instructions and clear the buffer, each at the delay of its receipt.
 
         Sync with no await between the read and the reset, so it is atomic
         against the background poller under single-threaded asyncio.
+
+        A queued order carries the service's receipt stamp (``receivedNs``, wall-clock nanoseconds); its delay in
+        the round is how long after the previous round opened the service received it
+        (delays.queued_order_delay), so it joins the queue where its receipt put it, not ahead of every miner. The
+        stamp is taken off the instruction, which goes to the engine in its own dict format.
         """
+        import time as _time
+
+        from taos.im.validator.delays import MAX_INSTRUCTION_DELAY, max_instruction_delay_ns, queued_order_delay
+
         instrs = self._external_buffer
         self._external_buffer = []
+        previous_open = getattr(self, "_round_open_ns", None)
+        self._round_open_ns = _time.time_ns()
+        self._note_round_open(self._round_open_ns)
+        validator = getattr(self, "validator", None)
+        try:
+            bound = min(MAX_INSTRUCTION_DELAY, max_instruction_delay_ns(validator.config)) if validator is not None else MAX_INSTRUCTION_DELAY
+        except (AttributeError, TypeError, ValueError):
+            bound = MAX_INSTRUCTION_DELAY
+        unstamped, late, delay_max = 0, 0, 0
+        for instr in instrs:
+            if isinstance(instr, dict):
+                received = instr.pop("receivedNs", None)
+                if received is None:
+                    unstamped += 1
+                    open_ns = None
+                else:
+                    # the poller fetches every second, so a receipt from the last second before a drain is buffered
+                    # after it; its delay is still its phase in the round it arrived in (the latest kept open at or
+                    # before the receipt), not 0 at the head of the next round
+                    open_ns = self._open_of_receipt(received)
+                    try:
+                        if previous_open is not None and int(received) < int(previous_open):
+                            late += 1
+                    except (TypeError, ValueError):
+                        pass
+                instr["delay"] = queued_order_delay(received, open_ns, bound)
+                delay_max = max(delay_max, int(instr["delay"]))
+        # what this round's drain handed over, read by the validator's gauges:
+        # late counts the receipts before the previous open, how often the poller lagged a drain
+        self.queued_order_counts = {"drained": len(instrs), "unstamped": unstamped, "late": late, "delay_max_ns": delay_max}
         return instrs
 
     def _stop_external_poller(self) -> None:

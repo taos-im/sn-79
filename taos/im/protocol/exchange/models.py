@@ -229,6 +229,15 @@ class TradeInfo(BaseModel):
         maker_id (int): ID of the resting order.
         maker_agent_id (int): ID of the agent placing the resting order.
         maker_fee (float | None): Transaction fee paid by the maker agent.
+        taker_fee_base (float | None): Base docked from the taker's credit when its fee was charged in base
+            (the taker bought): the quote fee converted at the trade price and rounded UP to the base grid.
+            0 when not applicable; None when the record predates the field.
+        taker_fee_refund (float | None): Quote returned to the taker for the round-up overshoot of `taker_fee_base`.
+        maker_fee_base (float | None): As `taker_fee_base`, for the maker (the maker bought).
+        maker_fee_refund (float | None): As `taker_fee_refund`, for the maker.
+        quote_settled (float | None): Gross quote credited to the seller before its fee -- the buyer's notional
+            (collateral plus loan under leverage); on a full fill the committed reservation rather than
+            price * quantity.
     """
     y : str = "t"
     i : int = Field(alias='id')
@@ -239,9 +248,14 @@ class TradeInfo(BaseModel):
     Ti : int = Field(alias='taker_id')
     Ta : int = Field(alias='taker_agent_id')
     Tf : float | None = Field(alias='taker_fee', default=None)
+    Tfb : float | None = Field(alias='taker_fee_base', default=None)
+    Tfr : float | None = Field(alias='taker_fee_refund', default=None)
     Mi : int = Field(alias='maker_id')
     Ma : int = Field(alias='maker_agent_id')
     Mf : float | None = Field(alias='maker_fee', default=None)
+    Mfb : float | None = Field(alias='maker_fee_base', default=None)
+    Mfr : float | None = Field(alias='maker_fee_refund', default=None)
+    qs : float | None = Field(alias='quote_settled', default=None)
 
     @property
     def type(self) -> str:
@@ -303,14 +317,44 @@ class TradeInfo(BaseModel):
         """Readable accessor for wire field ``Mf``; ``maker_fee`` is its serialized alias."""
         return self.Mf
 
+    @property
+    def taker_fee_base(self) -> float | None:
+        """Readable accessor for wire field ``Tfb``; ``taker_fee_base`` is its serialized alias."""
+        return self.Tfb
+
+    @property
+    def taker_fee_refund(self) -> float | None:
+        """Readable accessor for wire field ``Tfr``; ``taker_fee_refund`` is its serialized alias."""
+        return self.Tfr
+
+    @property
+    def maker_fee_base(self) -> float | None:
+        """Readable accessor for wire field ``Mfb``; ``maker_fee_base`` is its serialized alias."""
+        return self.Mfb
+
+    @property
+    def maker_fee_refund(self) -> float | None:
+        """Readable accessor for wire field ``Mfr``; ``maker_fee_refund`` is its serialized alias."""
+        return self.Mfr
+
+    @property
+    def quote_settled(self) -> float | None:
+        """Readable accessor for wire field ``qs``; ``quote_settled`` is its serialized alias."""
+        return self.qs
+
     @classmethod
     def from_event(self, event : dict):
         """
         Method to extract model data from simulation event in the format required by the MarketSimulationStateUpdate synapse.
         """
+        # Absent on records written before the settlement legs existed: left None, never read as 0.
+        settlement = event.get('settlement', {})
         return TradeInfo(id=event['tradeId'],timestamp=event['timestamp'],quantity=event['volume'],side=event['direction'],price=event['price'],
                          taker_agent_id=event['aggressingAgentId'], taker_id=event['aggressingOrderId'], maker_agent_id=event['restingAgentId'], maker_id=event['restingOrderId'],
-                         maker_fee=event['fees']['maker'], taker_fee=event['fees']['taker'])
+                         maker_fee=event['fees']['maker'], taker_fee=event['fees']['taker'],
+                         maker_fee_base=settlement.get('makerFeeBase'), maker_fee_refund=settlement.get('makerRefund'),
+                         taker_fee_base=settlement.get('takerFeeBase'), taker_fee_refund=settlement.get('takerRefund'),
+                         quote_settled=settlement.get('quoteSettled'))
 
     @classmethod
     def from_json(self, json : dict):
@@ -325,7 +369,10 @@ class TradeInfo(BaseModel):
         """
         return TradeInfo.model_construct(id=json['i'],timestamp=json['t'],quantity=json['q'],side=json['s'],price=json['p'],
                          taker_agent_id=json['Ta'], taker_id=json['Ti'], maker_agent_id=json['Ma'], maker_id=json['Mi'],
-                         maker_fee=json['Mf'], taker_fee=json['Tf'])
+                         maker_fee=json['Mf'], taker_fee=json['Tf'],
+                         maker_fee_base=json.get('Mfb'), maker_fee_refund=json.get('Mfr'),
+                         taker_fee_base=json.get('Tfb'), taker_fee_refund=json.get('Tfr'),
+                         quote_settled=json.get('qs'))
 
 class Cancellation(BaseModel):
     """

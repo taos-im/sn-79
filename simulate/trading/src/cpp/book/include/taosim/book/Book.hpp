@@ -157,6 +157,10 @@ private:
     void emitL2Signal([[maybe_unused]] auto&&... args) const { m_signals.L2(this); }
     void setupL2Signal();
 
+    // Whether the order is an IOC or FOK, in which case what matching left of it has been cancelled.
+    [[nodiscard]] bool cancelImmediateRemainder(const LimitOrder::Ptr& order);
+    void announceCancellation(OrderID orderId, AgentId ownerId, taosim::decimal_t volume);
+
     Simulation* m_simulation;
     BookId m_id;
     // Slow trailing reference for the price band. Deliberately NOT bestBid/bestAsk: a band referenced to

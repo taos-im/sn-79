@@ -77,6 +77,9 @@ if __name__ != "__mp_main__":
     from taos.im.validator.trade import history_clock_health as _history_clock_health
     from taos.im.validator.engines import NormalizedState, NormalizedTradeEvent, SimulationEngine, RepeatedState
     from taos.im.validator import fundamental_seed
+    from taos.im.validator import queued_orders
+    from taos.im.validator import price_band
+    from taos.im.validator import exchange_phases
 
     # Optional exchange-mode component; not part of this tree. Import is guarded, so a validator without
     # it starts normally and simply does not surface those notices.
@@ -241,6 +244,9 @@ if __name__ != "__mp_main__":
             taker_uid=taker,
             maker_fee=float(fill.get('maker_fee', 0.0) or 0.0),
             taker_fee=float(fill.get('taker_fee', 0.0) or 0.0),
+            # The on-chain tao that moved; stated when the fill carries it, else left unknown rather than
+            # fabricated as 0.
+            quote_settled=float(fill['tao_volume']) if fill.get('tao_volume') is not None else None,
             trade_id=fill.get('trade_id'),
             taker_order_id=int(fill.get('taker_order_id', 0) or 0),
             maker_order_id=int(fill.get('maker_order_id', 0) or 0),
@@ -610,6 +616,9 @@ if __name__ != "__mp_main__":
             self.query_notify_write = -1  # mark as closed
 
             queue_name = f"/{self._query_ipc_prefix}_query_{self.config.wallet.hotkey}"
+            from taos.im.validator import offmain_build
+            self._offmain_status = offmain_build.status_path(queue_name)
+            self._offmain_sent = None
 
             # Wait for the ready signal BEFORE opening IPC resources.
             # The query subprocess sends b'R' only after setup_ipc() finishes — which
@@ -1083,6 +1092,9 @@ if __name__ != "__mp_main__":
             self._scoring_shadow = None
             self._shadow_applied_ts = 0
             self._scoring_proc_cutover = False
+            # 0.6.8 D3: with the cutover service up, it alone runs the per-entry legs (inventory, at-best, the
+            # conjunction; none paid) and main takes what the report reads of them from its scores
+            self.legs_elsewhere = False
             self._scoring_proc_n = 0
             self._scoring_proc_verify_sched = None
             if getattr(self.config, 'engine', 'simulation') != 'exchange' and not self.config.mock:
@@ -1101,6 +1113,7 @@ if __name__ != "__mp_main__":
                         _shadow_cores = self.reward_cores if self._scoring_proc_cutover else _leftover
                         self._scoring_shadow = ScoringShadow(cores=_shadow_cores)
                         self._scoring_shadow.start()
+                        self.legs_elsewhere = bool(self._scoring_proc_cutover)
                         bt.logging.info(
                             f"Scoring service started (mode: "
                             f"{'CUTOVER' if self._scoring_proc_cutover else 'shadow'}, "
@@ -1110,6 +1123,7 @@ if __name__ != "__mp_main__":
                 except Exception as e:
                     self._scoring_shadow = None
                     self._scoring_proc_cutover = False
+                    self.legs_elsewhere = False
                     bt.logging.warning(f"Scoring service unavailable: {e}")
 
             self.maintaining = False
@@ -1129,6 +1143,9 @@ if __name__ != "__mp_main__":
             self.round_gaps = []
             self.query_waits = []
             self.reward_gate_waits = []
+            # each state's accounting, main's and the scoring service's: (wall, thread CPU[, legs ran]) seconds
+            self.accounting_times = []
+            self.service_accounting_times = []
             self._round_clock = None
             self._saving = False
             self._reporting = False
@@ -1280,6 +1297,9 @@ if __name__ != "__mp_main__":
                 self.engine._push_fill_notify = _push_fill_notifications
             else:
                 self.engine = SimulationEngine(self.config, self)
+                # lever offmain_build (off unless named on): each state's size goes to the query process as it is read
+                from taos.im.validator import offmain_build
+                self.engine._on_state_bytes = lambda size: offmain_build.on_state_bytes(self, size)
             self.engine.start()
 
         def _load_benchmark_agents(self):
@@ -2150,20 +2170,7 @@ if __name__ != "__mp_main__":
 
             bt.logging.debug("Building minimal inventory...")
             inv_start = time.time()
-            minimal_inventory = {}
-            for uid, hist in self.inventory_history.items():
-                if not hist:
-                    continue
-                timestamps = sorted(hist.keys())
-                n = len(timestamps)
-                if n >= 3:
-                    minimal_inventory[uid] = {
-                        timestamps[0]: hist[timestamps[0]],
-                        timestamps[-2]: hist[timestamps[-2]],
-                        timestamps[-1]: hist[timestamps[-1]]
-                    }
-                elif n > 0:
-                    minimal_inventory[uid] = {ts: hist[ts] for ts in timestamps}
+            minimal_inventory = report_inventory(self)
             bt.logging.debug(f"Built minimal inventory ({time.time()-inv_start:.4f}s)")
 
             bt.logging.debug("Serializing volume sums...")
@@ -2290,11 +2297,17 @@ if __name__ != "__mp_main__":
                 # Scoring-service health (parity matches/mismatches, re-INITs, tee drops, suspension) for
                 # the validator gauges: a re-INIT storm truncates the de-beta window, and these show it.
                 'scoring_shadow': (
-                    self._scoring_shadow.health()
+                    {**self._scoring_shadow.health(), **legs_health(self)}
                     if getattr(self, '_scoring_shadow', None) is not None else None
                 ),
                 # A run change that was not applied leaves stamps ahead of the clock; the gauge says so.
                 'history_clock': _history_clock_health(self),
+                # The queued (interface or API) orders drained, as totals of every drain.
+                'queued_orders': queued_orders.health(getattr(self, 'engine', None)),
+                # What the price band cut and refused, as totals.
+                'price_band': price_band.health(getattr(self, 'engine', None)),
+                # The exchange engine's round timed by phase, per chain block.
+                'exchange_phases': exchange_phases.health(getattr(self, 'engine', None)),
                 # Exchange settlement counters for the validator gauges.
                 'exchange_settlement': (
                     self.engine.settlement_health()
@@ -2308,6 +2321,8 @@ if __name__ != "__mp_main__":
                 'round_gaps': list(self.round_gaps[-100:]),
                 'query_waits': list(self.query_waits[-100:]),
                 'reward_gate_waits': list(self.reward_gate_waits[-100:]),
+                'accounting_times': list(self.accounting_times[-100:]),
+                'service_accounting_times': list(self.service_accounting_times[-100:]),
                 'fundamental_seed_sources': dict(getattr(self, 'fundamental_seed_sources', None) or {}),
                 **fundamental_seed.report_fields(self),
                 'pending_reward_tasks': self._pending_reward_tasks,
@@ -2327,6 +2342,7 @@ if __name__ != "__mp_main__":
                 'activity_factors': self.activity_factors,
                 'debeta_class_summary': _class_summary,
                 'debeta_class_details': _class_details,
+                'debeta_carry': carry_for_report(self, self.last_state.timestamp),
                 'capture_floor_stats': capture_floor_stats(getattr(self, 'debeta_capture_mid', None)),
                 'capture_settle_by_class': capture_settle_by_class(
                     capture_settle_counts(getattr(self, 'debeta_capture_mid', None)), class_map(self)),
@@ -2355,7 +2371,7 @@ if __name__ != "__mp_main__":
                 'shared_state_rewarding': self.shared_state_rewarding,
                 'current_block': self.current_block,
                 'uid': self.uid,
-                'levers': levers.states(),
+                'levers': levers.states() | levers.opt_in_states(),
                 'reconciliation': dict(getattr(getattr(self, 'engine', None), '_pending_reconciliation', None) or {}),
                 # Exchange engine: include chain-level events and delegates for the data service.
                 # block_events feeds the L3 stream (StakeAdded/StakeRemoved etc.).
@@ -2412,8 +2428,12 @@ if __name__ != "__mp_main__":
                         'debeta_skill_share_ema': int(debeta_dial(_dcfg, 'skill_share_ema')),
                         # 0.6.6: the skill leg's mark and the alternative published beside it
                         'debeta_mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
+                        'debeta_making_otr_threshold': float(debeta_dial(_dcfg, 'making_otr_threshold')),
+                        'debeta_making_otr_power': float(debeta_dial(_dcfg, 'making_otr_power')),
                         'debeta_mark_mode_alt': str(debeta_dial(_dcfg, 'mark_mode_alt')),
                         'debeta_fill_charge': str(debeta_dial(_dcfg, 'fill_charge')),
+                        'debeta_seam_split': int(debeta_dial(_dcfg, 'seam_split')),
+                        'debeta_charge_ref': str(debeta_dial(_dcfg, 'charge_ref')),
                         # 0.6.6: the conjunction's band per class and its size gate
                         'debeta_conjunction_bounds': str(debeta_dial(_dcfg, 'conjunction_bounds')),
                         'debeta_conjunction_min_size_frac': float(debeta_dial(_dcfg, 'conjunction_min_size_frac')),
@@ -2588,7 +2608,13 @@ if __name__ != "__mp_main__":
                 self.miner_stats = result['miner_stats']
 
             except Exception as e:
-                self.pagerduty_alert(f"Error sending to reporting service: {e}", details={"trace": traceback.format_exc()})
+                # A report cut off by the validator's own shutdown is a stop, not a failure: cleanup() sets
+                # _cleanup_done and closes the executors, and run_in_executor then raises this (as the listener).
+                if getattr(self, '_cleanup_done', False) or "cannot schedule new futures after shutdown" in str(e):
+                    bt.logging.info(f"Reporting at step {reporting_step} stopped by the shutdown ({e}).")
+                else:
+                    self.pagerduty_alert(f"Error sending to reporting service: {e}",
+                                         details={"trace": traceback.format_exc()})
             finally:
                 self._reporting = False
                 bt.logging.info(f"Completed reporting for step {reporting_step} ({time.time() - start:.4f}s)")
@@ -2653,6 +2679,16 @@ if __name__ != "__mp_main__":
                         # and against the MVTRX push builder via the two-step
                         # atomic-snapshot pattern in _build_sim_push_payload.
                         self._update_trade_volumes(state)
+                        _aprof = getattr(self, 'accounting_profile', None)
+                        if _aprof:
+                            bt.logging.info(accounting_profile_line(_aprof))
+                            self.accounting_times.append((round(_aprof['wall'], 4), round(_aprof['cpu'], 4)))
+                            del self.accounting_times[:-1000]
+                        if getattr(self.engine, "dirty_accounts_only", False):
+                            # This state's accounts, complete (the engine module filled them in): what a scoring
+                            # INIT ships, so the child fills the entries left out of later states from the same
+                            # point main applied. Nothing writes into them after this state's handling.
+                            self.kept_accounts = state.accounts
                         _pending_resets = getattr(state, '_pending_resets', None)
                         if _pending_resets:
                             self.engine.apply_resets(_pending_resets)
@@ -2675,6 +2711,7 @@ if __name__ != "__mp_main__":
                         if timestamp % self.config.scoring.interval != 0:
                             bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
                             return
+                        await self._forward_done_wait(state)
                         bt.logging.info("Starting reward calculation...")
                         calc_start = time.time()
                         loop = asyncio.get_event_loop()
@@ -2737,6 +2774,11 @@ if __name__ != "__mp_main__":
                                 )
                                 _shadow.request_reinit()
                                 adopted = None
+                            if adopted is not None and adopted.get('legs') is not None:
+                                # the service alone runs the per-entry legs: what the report reads of them
+                                self.service_legs = adopted['legs']
+                                self.service_accounting_times.extend(adopted['legs'].get('accounting') or ())
+                                del self.service_accounting_times[:-1000]
                             if adopted is None and _shadow.initialized:
                                 bt.logging.warning("[SCORING-PROC] child scoring unavailable — in-process fallback")
                                 # Self-heal beyond parity: a child that is alive+initialized but
@@ -2852,13 +2894,16 @@ if __name__ != "__mp_main__":
                                 self._trading_score_ema_ts = adopted.get('trading_ema_ts')
                                 self._debeta_pool_ema = {str(k): {int(u): float(x) for u, x in (v or {}).items()}
                                                          for k, v in (adopted.get('debeta_pool_ema') or {}).items()}
-                        # a VERIFY boundary pays main's own result, so its report reads main's computation
-                        if adopted is not None and not _verify and adopted.get('debeta_scores') is not None:
+                        # a VERIFY boundary pays main's own result, so its report reads main's computation, unless
+                        # the service alone runs the per-entry legs, whose published figures main no longer has
+                        if adopted is not None and (not _verify or getattr(self, 'legs_elsewhere', False)) \
+                                and adopted.get('debeta_scores') is not None:
                             self._scored_debeta = {
                                 'ts': timestamp,
                                 'scores': {int(u): float(s) for u, s in adopted['debeta_scores'].items()},
                                 'class_summary': adopted.get('debeta_class_summary') or {},
                                 'class_details': adopted.get('debeta_class_details') or {},
+                                'carry': adopted.get('debeta_carry') or {},
                             }
                             # main runs no de-beta compute on this boundary: the per-book alpha gauges read the
                             # service's alphas
@@ -3178,13 +3223,83 @@ if __name__ != "__mp_main__":
             and the encode run while the miners answer instead of in the next round. The push reads the state and the
             validator's maps, nothing of the answers."""
             from taos.im.validator import levers
-            # turned off at runtime (levers.py), the push starts after the forward
-            if getattr(self.engine, 'mode', None) == 'exchange' or not levers.enabled('push_in_wait'):
+            if getattr(self.engine, 'mode', None) == 'exchange':
                 return
-            url = self._sim_push_url()
-            if url:
-                self._sim_push_ts = state.timestamp
-                _spawn_push(self._push_sim_state_bg(state, url))
+            # each turned off at runtime (levers.py) takes its old path: the push starts after the forward, the
+            # pre-request work runs after it
+            if levers.enabled('push_in_wait'):
+                url = self._sim_push_url()
+                if url:
+                    self._sim_push_ts = state.timestamp
+                    _spawn_push(self._push_sim_state_bg(state, url))
+            if levers.enabled('prereq_in_wait'):
+                try:
+                    self._pre_request_work(state)
+                    state._pre_request_ok = True
+                except Exception:
+                    bt.logging.exception("pre-request work in the miners' wait failed")
+            # the accounting reads the state and the accumulators, nothing of the answers: it runs in the wait too,
+            # once this state's pre-request work has run there and stashed the resets it applies (a failed one leaves
+            # the reward to its place after the forward); a boundary state's scoring waits for the forward's end
+            # (_forward_done_wait)
+            if levers.enabled('reward_in_wait') and getattr(state, '_pre_request_ok', False):
+                state._forward_done = asyncio.Event()
+                self.reward(state)
+
+        # How long a boundary state's scoring waits for its forward's end past the query timeout before it scores
+        # without it; reached only when nothing signalled the end (a path that left handle_state unseen).
+        FORWARD_DONE_GRACE_S = 60.0
+
+        async def _forward_done_wait(self, state) -> None:
+            """A state whose reward started in the miners' wait: its boundary scoring reads that round's answers
+            (miner_presence), so it waits for the forward's end, which handle_state signals where it spawned the
+            reward before, and the listener whatever handle_state's exit was. Returns at once for any other state."""
+            done = getattr(state, '_forward_done', None)
+            if done is None or done.is_set():
+                return
+            limit = float(self.config.neuron.global_query_timeout) + float(self.FORWARD_DONE_GRACE_S)
+            try:
+                await asyncio.wait_for(done.wait(), timeout=limit)
+            except asyncio.TimeoutError:
+                bt.logging.error(f"The forward's end at {state.timestamp} was never signalled ({limit:.0f}s): "
+                                 "its boundary scoring goes on without it")
+
+        def _pre_request_work(self, state) -> None:
+            """The pre-request work that feeds nothing the miners' request carries: the reset notices stashed for
+            _reward, the placement counts and, in simulation, the GenTRX push. Once per state: from on_query_sent in
+            simulation, in the miners' wait; after the forward when the query was not sent, before the reward is
+            scheduled; before the forward for the exchange engine, whose settled fills join the notices there."""
+            if getattr(state, '_pre_request_done', False):
+                return
+            state._pre_request_done = True
+            from taos.im.validator.forward import update_placement_stats
+            self.process_resets(state)
+            update_placement_stats(self, state.notices, ts=state.timestamp)
+
+            # GenTRX: enqueue the raw state for the background packager.
+            # As of PR-1 of the GenTRX isolation plan, push_state() does
+            # NO extract_state / msgpack work synchronously — it just
+            # appends a state-object reference to a bounded queue (drop-
+            # oldest on overflow), which is sub-millisecond. The heavy
+            # extract + pack runs on `GenTRX-pack` worker thread, the
+            # HTTP POST on `GenTRX-tx` worker thread. Neither sits on
+            # the validator's hot path.
+            # SIMULATION ONLY HERE. The simulator has already matched by the time this state
+            # arrives, so book['e'] is populated and this is the right moment to push.
+            #
+            # EXCHANGE MUST NOT PUSH HERE. Nothing has matched yet: orders go to the LOB and settle
+            # in self.engine.execute(state, miner_responses) further down, and the authoritative 't'
+            # events are only then injected into state.books[nid]['e'] from the reconciliation's
+            # executed_fills. Pushing here handed the exchange aggregator books with EMPTY event
+            # lists on every tick -- measured with both agents trading:
+            # "ingest: 8 tick(s), 80 book-slot(s), 0 event(s)". No events means no rows, no parquet
+            # page, one book in /data-status, and the val split then consumed that one book so every
+            # round was skipped. The exchange mechanism could never train.
+            if self._gentrx is not None and getattr(self.engine, "mode", None) != "exchange":
+                try:
+                    self._gentrx.push_state(state)
+                except Exception as _gex:
+                    bt.logging.warning(f"[GTX] handle_state push_state error: {_gex}")
 
         async def _push_sim_state_bg(self, state, url: str) -> None:
             """Async wrapper: build the MVTRX push payload in a dedicated
@@ -3303,34 +3418,11 @@ if __name__ != "__mp_main__":
                         debug_text += "EMPTY" + "\n"
                 bt.logging.debug("\n" + debug_text.strip("\n"))
 
-            # Process deregistration notices
-            self.process_resets(state)
-            update_placement_stats(self, state.notices)
-
-            # GenTRX: enqueue the raw state for the background packager.
-            # As of PR-1 of the GenTRX isolation plan, push_state() does
-            # NO extract_state / msgpack work synchronously — it just
-            # appends a state-object reference to a bounded queue (drop-
-            # oldest on overflow), which is sub-millisecond. The heavy
-            # extract + pack runs on `GenTRX-pack` worker thread, the
-            # HTTP POST on `GenTRX-tx` worker thread. Neither sits on
-            # the validator's hot path.
-            # SIMULATION ONLY HERE. The simulator has already matched by the time this state
-            # arrives, so book['e'] is populated and this is the right moment to push.
-            #
-            # EXCHANGE MUST NOT PUSH HERE. Nothing has matched yet: orders go to the LOB and settle
-            # in self.engine.execute(state, miner_responses) further down, and the authoritative 't'
-            # events are only then injected into state.books[nid]['e'] from the reconciliation's
-            # executed_fills. Pushing here handed the exchange aggregator books with EMPTY event
-            # lists on every tick -- measured with both agents trading:
-            # "ingest: 8 tick(s), 80 book-slot(s), 0 event(s)". No events means no rows, no parquet
-            # page, one book in /data-status, and the val split then consumed that one book so every
-            # round was skipped. The exchange mechanism could never train.
-            if self._gentrx is not None and getattr(self.engine, "mode", None) != "exchange":
-                try:
-                    self._gentrx.push_state(state)
-                except Exception as _gex:
-                    bt.logging.warning(f"[GTX] handle_state push_state error: {_gex}")
+            # The reset notices, the placement counts and the GenTRX push feed nothing the miners' request carries: in
+            # simulation they run from on_query_sent, in the miners' wait (_pre_request_work). The exchange engine merges
+            # its settled fills into the notices below, so there they keep their place before it.
+            if self.engine.mode == 'exchange':
+                self._pre_request_work(state)
 
             # Surface settled fills to miners before the synapse goes out.
             #
@@ -3361,6 +3453,8 @@ if __name__ != "__mp_main__":
             miner_responses = await forward(self, state)
             _rp_fwd1 = time.time()
             bt.logging.debug(f"Gathered Response Batch ({time.time()-start}s)")
+            # a state whose query was not sent (observing, a failed hand-off) runs it here, before the reward reads it
+            self._pre_request_work(state)
 
             # Exchange: send instructions to LOB, execute on-chain, inject trade events
             if self.engine.mode == 'exchange':
@@ -3695,7 +3789,12 @@ if __name__ != "__mp_main__":
             # Calculate latest rewards, update miner scores, save state and publish metrics
             _rp_sched0 = time.time()
             self.maintain()
-            self.reward(state)
+            _forward_done = getattr(state, '_forward_done', None)
+            if _forward_done is not None:
+                # this state's reward started in the miners' wait; its boundary scoring reads the answers from here
+                _forward_done.set()
+            else:
+                self.reward(state)
             self.save_state()
             self.report()
             _rp_end = time.time()
@@ -3885,6 +3984,7 @@ if __name__ != "__mp_main__":
                         break
                     response = {"responses": []}
                     raw_message = None
+                    normalized_state = None
                     answer = True
                     try:
                         raw_message, normalized_state, receive_start = await self.engine.receive()
@@ -3942,11 +4042,17 @@ if __name__ != "__mp_main__":
                             f"Exception in listener loop: {ex}",
                             details={"trace": traceback.format_exc()}
                         )
+                        # The answer below still counts as delivered at the engine.
+                        self.engine.ask_full_accounts()
                     finally:
                         # Don't attempt to respond during teardown — respond()
                         # also hits run_in_executor/IPC on torn-down resources.
                         if answer and not getattr(self, '_cleanup_done', False):
                             self.engine.respond(raw_message, response)
+                        # a reward started in the miners' wait: its scoring waits for this, whatever handle_state's exit
+                        _forward_done = getattr(normalized_state, '_forward_done', None)
+                        if _forward_done is not None:
+                            _forward_done.set()
             finally:
                 self._listener_stopped.set()
 
@@ -4126,7 +4232,9 @@ if __name__ != "__mp_main__":
             """
             cleanup(self)
 
-    from taos.im.validator.trade import match_trade_fifo, update_trade_volumes
+    from taos.im.validator.trade import (
+        accounting_profile_line, legs_health, match_trade_fifo, report_inventory, update_trade_volumes,
+    )
     from taos.im.validator.state_capture import submit_capture
     from taos.im.validator.cleanup import (
         cleanup_ipc, cleanup_executors, cleanup_event_loop, cleanup
@@ -4173,8 +4281,8 @@ if __name__ == "__main__":
     _warnings.showwarning = _showwarning_with_stack
 
     from taos.im.validator.update import check_repo, classify_changes, update_validator, check_simulator, rebuild_simulator, restart_simulator
-    from taos.im.validator.forward import forward, notify, deliver_gentrx, update_placement_stats
-    from taos.im.validator.reward import get_rewards, debeta_for_report
+    from taos.im.validator.forward import forward, notify, deliver_gentrx
+    from taos.im.validator.reward import get_rewards, debeta_for_report, carry_for_report
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:
         raise Exception("taos validator requires Ubuntu >= 22.04!")

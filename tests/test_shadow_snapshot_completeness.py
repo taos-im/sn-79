@@ -46,6 +46,15 @@ KNOBS = {
     # derived cache: the book-to-class map keyed by the simulation object's identity, rebuilt on first use in
     # whichever process reads it (the ids differ in the child, so a snapshot of it could only be stale)
     "_debeta_class_map_cache",
+    # the state's accounting profile (0.6.8): written whole at the end of every update and only logged, so each
+    # process keeps its own and nothing reads it as state
+    "accounting_profile",
+    # main's flag that the scoring service alone runs the per-entry legs (0.6.8 D3): the child must not have it,
+    # or it would run none either
+    "legs_elsewhere",
+    # derived caches: which uids' volume slots and starting balances are set up, keyed by the
+    # structures' object identity, so they rebuild on first use in whichever process reads them
+    "_slot_cache", "_ib_cache",
 }
 
 DEBETA_ATTRS = [
@@ -112,7 +121,7 @@ def _fill_state(ts, fills):
             "Ti": 10 * n, "Ta": taker, "Tf": qty * price * 0.002,
             "Mi": 10 * n + 1, "Ma": maker, "Mf": qty * price * 0.001,
         })
-    # a best bid and ask round each book's last print, the levels the mid-quote mark (the paid mark since 0.6.6)
+    # a best bid and ask round each book's last print, the levels the mid-quote mark (the paid mark)
     # reads from a state: without them the mark never moves and the accumulators below stay empty
     for b in books.values():
         last = float(b["e"][-1]["p"])

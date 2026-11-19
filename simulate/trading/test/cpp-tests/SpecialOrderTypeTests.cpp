@@ -13,14 +13,20 @@
 #include <taosim/matching/ClearingManager.hpp>
 #include <taosim/matching/FeePolicy.hpp>
 #include <taosim/matching/FeePolicyWrapper.hpp>
+#include <taosim/agent/DistributedProxyAgent.hpp>
+#include <taosim/message/ExchangeAgentMessagePayloads.hpp>
+#include <taosim/message/MultiBookMessagePayloads.hpp>
 #include <taosim/message/PayloadFactory.hpp>
 
 #include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <boost/signals2.hpp>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 //-------------------------------------------------------------------------
 
@@ -108,9 +114,13 @@ struct SimSetup
     MultiBookExchangeAgent* exchange{};
     Book::Ptr book;
 
-    void setUp()
+    void setUp(double maxPriceBand = 0.0)
     {
         nodes = taosim::util::parseSimulationFile(kTestDataPath / "MultiAgentFees.xml");
+        if (maxPriceBand > 0.0) {
+            nodes.simulation.child("Agents").child("MultiBookExchangeAgent").append_attribute("maxPriceBand") =
+                maxPriceBand;
+        }
         simulation = std::make_unique<Simulation>();
         simulation->setDebug(false);
         simulation->configure(nodes.simulation);
@@ -768,7 +778,287 @@ INSTANTIATE_TEST_SUITE_P(
         }));
 
 //-------------------------------------------------------------------------
+// Time in force after matching
+//
+// The up-front check sizes an IOC or FOK to what the book holds when the order is validated, and
+// that size funds its reservation. The book can hold less by the time the order matches: whatever
+// matching leaves of an IOC or FOK is cancelled and its owner told, never rested. A GTC's leftover
+// rests.
+//-------------------------------------------------------------------------
+
+struct TimeInForceAfterMatchingTest : Test
+{
+    struct Validated
+    {
+        PlaceOrderLimitPayload::Ptr payload;
+        OrderResult result;
+    };
+
+    void SetUp() override
+    {
+        sim.setUp();
+        proxy = sim.simulation->proxy();
+        ASSERT_NE(proxy, nullptr);
+        proxy->clearMessages();
+        miner = sim.exchange->accounts().registerRemote();
+    }
+
+    // The exchange's check of a placement, which sizes the order and reserves for it.
+    [[nodiscard]] Validated validate(
+        OrderDirection direction, decimal_t volume, decimal_t price, TimeInForce timeInForce)
+    {
+        const auto payload = MessagePayload::create<PlaceOrderLimitPayload>(
+            direction, volume, price, 0_dec, SimSetup::bookId, Currency::BASE,
+            std::nullopt, false, timeInForce, std::nullopt, STPFlag::CO);
+        const auto result = sim.exchange->clearingManager().handleOrder(
+            LimitOrderDesc{.agentId = miner, .payload = payload});
+        return {payload, result};
+    }
+
+    // The placement of a validated order, at the size the check gave it.
+    [[nodiscard]] LimitOrder::Ptr place(const Validated& validated)
+    {
+        const auto& payload = validated.payload;
+        return sim.book->placeLimitOrder(
+            OrderClientContext{miner},
+            Timestamp{},
+            validated.result.orderSize,
+            payload->direction,
+            payload->price,
+            payload->leverage,
+            payload->stpFlag,
+            payload->settleFlag,
+            payload->postOnly,
+            payload->timeInForce);
+    }
+
+    // Another agent's order at the touch loses `volume` between the check and the match.
+    void shrinkTouch(OrderDirection side, decimal_t volume)
+    {
+        const auto level =
+            side == OrderDirection::BUY ? sim.book->bestBuyLevel() : sim.book->bestSellLevel();
+        ASSERT_TRUE(level.has_value());
+        const auto order = level->get().getFirstActiveOrder();
+        ASSERT_NE(order, nullptr);
+        ASSERT_TRUE(sim.book->cancelOrder(order->id(), volume));
+    }
+
+    // The volume the owner was told was cancelled from the order, if it was told.
+    [[nodiscard]] std::optional<decimal_t> toldCancelled(OrderID orderId) const
+    {
+        for (const auto& msg : proxy->messages()) {
+            if (msg->type != "RESPONSE_DISTRIBUTED_CANCEL_ORDERS") continue;
+            const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+            if (pld == nullptr || pld->agentId != miner) continue;
+            const auto sub = std::dynamic_pointer_cast<CancelOrdersResponsePayload>(pld->payload);
+            if (sub == nullptr || sub->requestPayload == nullptr) continue;
+            for (const auto& cancellation : sub->requestPayload->cancellations) {
+                if (cancellation.id == orderId) return cancellation.volume.value_or(0_dec);
+            }
+        }
+        return std::nullopt;
+    }
+
+    // The volume the L3 record carries as cancelled from the order, if it carries a cancellation: the tape and
+    // the venue's view of the book read the order's end from it.
+    [[nodiscard]] std::optional<decimal_t> recordedCancelled(OrderID orderId) const
+    {
+        for (const auto& entry : sim.exchange->L3Record().at(SimSetup::bookId)) {
+            if (const auto* cancel = std::get_if<taosim::event::CancellationEvent>(&entry)) {
+                if (cancel->cancellation.id == orderId) return cancel->cancellation.volume.value_or(0_dec);
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] auto& balances() { return sim.exchange->accounts().at(miner).at(SimSetup::bookId); }
+
+    [[nodiscard]] bool hasActiveOrders()
+    {
+        return !sim.exchange->accounts().at(miner).activeOrders().at(SimSetup::bookId).empty();
+    }
+
+    SimSetup sim;
+    taosim::agent::DistributedProxyAgent* proxy{};
+    AgentId miner{};
+};
+
+TEST_F(TimeInForceAfterMatchingTest, AnIocLeftoverIsCancelledAndItsOwnerTold)
+{
+    const auto ioc = validate(OrderDirection::BUY, 2_dec, 303_dec, TimeInForce::IOC);
+    ASSERT_EQ(ioc.result.ec, OrderErrorCode::VALID);
+    ASSERT_EQ(ioc.result.orderSize, 2_dec) << "the up-front cut sizes the IOC to the 2 resting at 303";
+    shrinkTouch(OrderDirection::SELL, 1_dec);
+
+    const auto order = place(ioc);
+
+    EXPECT_EQ(sim.book->bestAsk(), 307_dec) << "the IOC did not take the 1 left at its limit";
+    EXPECT_FALSE(sim.book->getOrder(order->id()).has_value()) << "the IOC's leftover rests";
+    EXPECT_EQ(sim.book->bestBid(), 297_dec) << "the IOC's leftover rests as the best bid";
+    EXPECT_EQ(order->volume(), 0_dec) << "the IOC's leftover was not cancelled";
+    EXPECT_FALSE(hasActiveOrders()) << "the IOC is still one of its owner's active orders";
+    EXPECT_EQ(balances().quote->getReserved(), 0_dec) << "the leftover's reservation was kept";
+    const auto told = toldCancelled(order->id());
+    ASSERT_TRUE(told.has_value()) << "the owner was not told its IOC's leftover was cancelled";
+    EXPECT_EQ(*told, 1_dec);
+    EXPECT_EQ(recordedCancelled(order->id()), std::optional<decimal_t>{1_dec})
+        << "the L3 record does not carry the IOC's leftover as cancelled, so the tape reads it as resting";
+}
+
+TEST_F(TimeInForceAfterMatchingTest, ASellIocLeftoverIsCancelledAndItsOwnerTold)
+{
+    const auto ioc = validate(OrderDirection::SELL, 4_dec, 291_dec, TimeInForce::IOC);
+    ASSERT_EQ(ioc.result.ec, OrderErrorCode::VALID);
+    ASSERT_EQ(ioc.result.orderSize, 4_dec)
+        << "the up-front cut sizes the IOC to the 1 resting at 297 and the 3 at 291";
+    shrinkTouch(OrderDirection::BUY, 1_dec);
+
+    const auto order = place(ioc);
+
+    EXPECT_EQ(sim.book->bestBid(), 0_dec) << "the IOC did not take the 3 left at its limit";
+    EXPECT_FALSE(sim.book->getOrder(order->id()).has_value()) << "the IOC's leftover rests";
+    EXPECT_EQ(sim.book->bestAsk(), 303_dec) << "the IOC's leftover rests as the best ask";
+    EXPECT_EQ(order->volume(), 0_dec) << "the IOC's leftover was not cancelled";
+    EXPECT_FALSE(hasActiveOrders()) << "the IOC is still one of its owner's active orders";
+    EXPECT_EQ(balances().base.getReserved(), 0_dec) << "the leftover's reservation was kept";
+    const auto told = toldCancelled(order->id());
+    ASSERT_TRUE(told.has_value()) << "the owner was not told its IOC's leftover was cancelled";
+    EXPECT_EQ(*told, 1_dec);
+    EXPECT_EQ(recordedCancelled(order->id()), std::optional<decimal_t>{1_dec})
+        << "the L3 record does not carry the IOC's leftover as cancelled, so the tape reads it as resting";
+}
+
+TEST_F(TimeInForceAfterMatchingTest, AGtcLeftoverStillRests)
+{
+    const auto gtc = validate(OrderDirection::BUY, 2_dec, 303_dec, TimeInForce::GTC);
+    ASSERT_EQ(gtc.result.ec, OrderErrorCode::VALID);
+    shrinkTouch(OrderDirection::SELL, 1_dec);
+
+    const auto order = place(gtc);
+
+    const auto rest = sim.book->getOrder(order->id());
+    ASSERT_TRUE(rest.has_value()) << "a GTC's leftover must rest";
+    EXPECT_EQ((*rest)->volume(), 1_dec);
+    EXPECT_EQ(sim.book->bestBid(), 303_dec);
+    EXPECT_TRUE(hasActiveOrders());
+    EXPECT_FALSE(toldCancelled(order->id()).has_value()) << "a resting GTC was announced as cancelled";
+    EXPECT_FALSE(recordedCancelled(order->id()).has_value()) << "a resting GTC was recorded as cancelled";
+}
+
+TEST_F(TimeInForceAfterMatchingTest, AFokThatPassesTheUpFrontCheckFillsWhole)
+{
+    const auto fok = validate(OrderDirection::BUY, 5_dec, 307_dec, TimeInForce::FOK);
+    ASSERT_EQ(fok.result.ec, OrderErrorCode::VALID);
+    ASSERT_EQ(fok.result.orderSize, 5_dec);
+
+    const auto order = place(fok);
+
+    EXPECT_EQ(order->volume(), 0_dec) << "the FOK did not fill whole";
+    EXPECT_FALSE(sim.book->getOrder(order->id()).has_value());
+    const auto touch = sim.book->bestSellLevel();
+    ASSERT_TRUE(touch.has_value());
+    EXPECT_EQ(touch->get().price(), 307_dec) << "the FOK did not take the 2 at 303";
+    ASSERT_NE(touch->get().getFirstActiveOrder(), nullptr);
+    EXPECT_EQ(touch->get().getFirstActiveOrder()->volume(), 5_dec) << "the FOK did not take 3 at 307";
+    EXPECT_FALSE(hasActiveOrders());
+    EXPECT_FALSE(toldCancelled(order->id()).has_value())
+        << "a FOK that filled whole was announced as cancelled";
+}
+
+TEST_F(TimeInForceAfterMatchingTest, AFokLeftoverIsCancelledNeverRested)
+{
+    const auto fok = validate(OrderDirection::BUY, 2_dec, 303_dec, TimeInForce::FOK);
+    ASSERT_EQ(fok.result.ec, OrderErrorCode::VALID);
+    shrinkTouch(OrderDirection::SELL, 1_dec);
+
+    const auto order = place(fok);
+
+    EXPECT_FALSE(sim.book->getOrder(order->id()).has_value()) << "the FOK's leftover rests";
+    EXPECT_EQ(sim.book->bestBid(), 297_dec) << "the FOK's leftover rests as the best bid";
+    EXPECT_FALSE(hasActiveOrders()) << "the FOK is still one of its owner's active orders";
+    const auto told = toldCancelled(order->id());
+    ASSERT_TRUE(told.has_value()) << "the owner was not told its FOK's leftover was cancelled";
+    EXPECT_EQ(*told, 1_dec);
+    EXPECT_EQ(recordedCancelled(order->id()), std::optional<decimal_t>{1_dec})
+        << "the L3 record does not carry the FOK's leftover as cancelled, so the tape reads it as resting";
+}
+
+//-------------------------------------------------------------------------
 
 }  // namespace
 
 //-------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------
+// THE INSTRUCTION LOG CARRIES EVERY ORDER THAT CAN TAKE LIQUIDITY ON ARRIVAL. Under an active band a buy
+// predicts no sweep, so the placement check's instantTrade is false for a buy that crosses the asks; the instruction
+// line comes from the order crossing the opposite best price, not from that prediction.
+
+namespace
+{
+
+struct InstructionLogUnderTheBand
+{
+    SimSetup sim;
+    AgentId miner{};
+    std::vector<OrderID> logged;
+    boost::signals2::scoped_connection feed;
+
+    explicit InstructionLogUnderTheBand(double band)
+    {
+        sim.setUp(band);
+        if (band > 0.0) {
+            sim.book->bandRefCached() = 300_dec;
+            sim.book->bandSeeded() = true;
+        }
+        miner = sim.exchange->accounts().registerRemote();
+        feed = sim.exchange->signals().at(SimSetup::bookId)->instructionLog.connect(
+            [this](taosim::InstructionLogContext ctx) { logged.push_back(ctx.orderId); });
+    }
+
+    // The check and the placement, as the exchange runs them for a miner's limit.
+    LimitOrder::Ptr buy(decimal_t volume, decimal_t price)
+    {
+        const auto payload = MessagePayload::create<PlaceOrderLimitPayload>(
+            OrderDirection::BUY, volume, price, 0_dec, SimSetup::bookId, Currency::BASE,
+            std::nullopt, false, TimeInForce::GTC, std::nullopt, STPFlag::CO);
+        const auto result = sim.exchange->clearingManager().handleOrder(
+            LimitOrderDesc{.agentId = miner, .payload = payload});
+        EXPECT_EQ(result.ec, OrderErrorCode::VALID);
+        return sim.book->placeLimitOrder(
+            OrderClientContext{miner}, Timestamp{}, result.orderSize, payload->direction, payload->price,
+            payload->leverage, payload->stpFlag, payload->settleFlag, payload->postOnly, payload->timeInForce);
+    }
+
+    [[nodiscard]] bool wasLogged(OrderID id) const { return std::ranges::find(logged, id) != logged.end(); }
+};
+
+}  // namespace
+
+TEST(InstructionLogUnderTheBand, ABandedBuyThatTakesLiquidityOnArrivalIsLogged)
+{
+    InstructionLogUnderTheBand t{0.10};
+    ASSERT_EQ(t.sim.book->bandLimit(true), 330_dec) << "the band is active, 10 per cent around 300";
+    const auto order = t.buy(1_dec, 305_dec);
+    ASSERT_NE(order, nullptr);
+    EXPECT_EQ(order->volume(), 0_dec) << "the buy took 1 of the 2 resting at 303";
+    EXPECT_TRUE(t.wasLogged(order->id())) << "a banded buy that took liquidity on arrival has no instruction line";
+}
+
+TEST(InstructionLogUnderTheBand, ABandedBuyThatRestsBelowTheAsksIsNotAnInstruction)
+{
+    InstructionLogUnderTheBand t{0.10};
+    const auto order = t.buy(1_dec, 300_dec);
+    ASSERT_NE(order, nullptr);
+    EXPECT_EQ(order->volume(), 1_dec) << "nothing at or below 300 to take";
+    EXPECT_FALSE(t.wasLogged(order->id())) << "an order that rests is the order log's, not an instruction";
+}
+
+TEST(InstructionLogUnderTheBand, WithTheBandOffATakingBuyIsLoggedAsBefore)
+{
+    InstructionLogUnderTheBand t{0.0};
+    const auto order = t.buy(1_dec, 305_dec);
+    ASSERT_NE(order, nullptr);
+    EXPECT_TRUE(t.wasLogged(order->id()));
+}
+

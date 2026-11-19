@@ -287,6 +287,37 @@ void SLTPContainer::removeOrder(BookId bookId, OrderID orderId)
 
 //-------------------------------------------------------------------------
 
+void SLTPContainer::rearm(SLTPEntry entry)
+{
+    if (entry.bookId >= m_books.size() || entry.volume <= 0_dec) return;
+    m_books[entry.bookId].armed.push_back(std::move(entry));
+}
+
+//-------------------------------------------------------------------------
+
+void SLTPContainer::fireArmed(BookId bookId, decimal_t price)
+{
+    if (bookId >= m_books.size() || !m_dispatch) return;
+    auto& armed = m_books[bookId].armed;
+    if (armed.empty()) return;
+    // Taken out first: a dispatch the band cuts again re-arms into the emptied list, for the next call.
+    auto due = std::exchange(armed, {});
+    for (auto& entry : due) {
+        const bool past = entry.cross == SLTPCross::AT_OR_ABOVE ? price >= entry.triggerPrice : price <= entry.triggerPrice;
+        if (!past) {
+            armed.push_back(std::move(entry));
+            continue;
+        }
+        util::SLTPDebugger::log(
+            "fireArmed: {} fires again for order#{} agent#{} book={} volume={} triggerPrice={} observedPrice={}",
+            entry.isSL ? "SL" : "TP", entry.originatingOrderId, entry.agentId, bookId, entry.volume,
+            entry.triggerPrice, price);
+        m_dispatch(entry, price);
+    }
+}
+
+//-------------------------------------------------------------------------
+
 void SLTPContainer::onPriceUpdate(BookId bookId, decimal_t price)
 {
     if (bookId >= m_books.size()) return;

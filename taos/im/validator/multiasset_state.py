@@ -30,6 +30,7 @@ def flatten_multiasset_state(raw_dict: dict) -> tuple[dict, list[dict]]:
     books: dict = {}
     accounts: dict = {}
     notices: dict = {}
+    book_fees: dict = {}
     metas: list[dict] = []
     flat_idx = 0
     for bg in raw_dict.get("backgrounds") or []:
@@ -70,9 +71,13 @@ def flatten_multiasset_state(raw_dict: dict) -> tuple[dict, list[dict]]:
                 account.update(holdings or {})
             for agent_id, agent_notices in (instance.get("notices") or {}).items():
                 notices.setdefault(agent_id, []).extend(agent_notices or [])
+            # dirtyAccountsOnly: each book's shared fee rates, keyed by its canonical id like the books
+            book_fees.update(instance.get("bookFees") or {})
 
     flat = {k: v for k, v in raw_dict.items() if k != "backgrounds"}
     flat["books"] = books
     flat["accounts"] = accounts
     flat["notices"] = notices
+    if book_fees:
+        flat["bookFees"] = book_fees
     return flat, metas

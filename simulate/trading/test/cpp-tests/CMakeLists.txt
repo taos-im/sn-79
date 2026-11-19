@@ -58,6 +58,7 @@ add_executable(taosim-tests
     PublishedStateTests.cpp
     FundamentalSeedTests.cpp
     RunClassFilesTests.cpp
+    AccountPackTests.cpp
 )
 # Some test sources are not present in every distribution of this tree; guard on existence so the
 # target always configures.

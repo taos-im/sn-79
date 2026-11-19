@@ -11,7 +11,7 @@
     generalMsgEndpoint="/account" useMessagePack="1" measureStepWallClockTime="1"
     ckptIntervalInSteps="60" ckptNumLastFilesToKeep="3" ckptMeasureWallClockTime="1" ckptNumWorkers="8">
     <Agents>
-        <MultiBookExchangeAgent name="EXCHANGE" remoteAgentCount="264" gracePeriod="600000000000"
+        <MultiBookExchangeAgent name="EXCHANGE" dirtyAccountsOnly="1" remoteAgentCount="264" gracePeriod="600000000000"
             priceDecimals="4" volumeDecimals="4" baseDecimals="4" quoteDecimals="10"
             maxLeverage="4" maxLoan="10000" maintenanceMargin="0.10" maxOpenOrders="100"
             initialPrice="313.0114" minOrderSize="0.2396" maxPriceBand="0.10">
@@ -24,7 +24,7 @@
                         lambda="0.000206" muJump="0.0" sigmaJump="0.0113" updatePeriod="30000000000"
                         Hurst="0.729" epsilon="0.0315" ownRng="1"/>
                     <FuturesSignal name="external" lambda="0.001155" seedInterval="10000000000" updatePeriod="10000000000"/>
-                    <MagneticField name="magneticfield" numRows="32" beta="0.874" alpha="10.3" 
+                    <MagneticField name="magneticfield" numRows="32" beta="0.827" alpha="12.9" 
                         updatePeriod="60000000000"/>
                 </Processes>
             </Books>
@@ -92,11 +92,11 @@
             opLatencyScaleRay="0.235"
             tau="2"
             delta="750000000"
-            gHFT="0.1"
-            sigmaSqr="0.0036"
-            kappa="78"
+            gHFT="0.27"
+            sigmaSqr="0.0034"
+            kappa="85"
             spread="0.0015"
-            orderMean="-0.0943"
+            orderMean="0.211"
             orderSTD="1.4"
             noiseRay="0.41"
             shiftPercentage="0.021"
@@ -104,7 +104,7 @@
             spreadSensitivityExp="1.5"
             spreadSensitivityBase="0.00015"
             rateMax="0.0075"
-            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="10" minSpreadTicks="2526" inventoryHorizon="1.1" undercutTicks="1" quoteSizeVolumeFrac="4.7" acdOmega="3.64" spreadRefPrice="300"
+            marginNoiseSTD="0.00001" varGain="0.0" varFastBars="30" varSlowBars="900" varRatioCap="4.0" minDMD="1000000" maxDMD="600000000000" psiHFT_quotes="1" minSpreadTicks="1908" inventoryHorizon="0.5" undercutTicks="115" quoteSizeVolumeFrac="4.3" acdOmega="3.69" spreadRefPrice="300"
             >
             <Balances>
                 <Base total="479.2158" maxLeverage="4" maxLoan="10000" />
@@ -122,11 +122,11 @@
 			maxOPLatency="300000000"
 			meanVolume="2.3"
             tau="1800000000000"
-            balanceCoef="0.4"
-            acdOmega="2.729"
+            balanceCoef="0.34"
+            acdOmega="2.738"
 			acdAlpha="0.45"
 			acdBeta="0.45"
-            acdGamma="0.62"
+            acdGamma="1.1"
             sigmaExp="6.84e-08"
             weight="0.053"
             minDMD="30000000000"
@@ -172,17 +172,17 @@
             delayMean="10000000000"
             delaySTD="1000000000"
             sigmaN="0.7"
-            sigmaC="1.5"
-            sigmaF="2.9"
-            tau="181619736749"
+            sigmaC="0.81"
+            sigmaF="0.7"
+            tau="60166708469"
             tauHist="50"
-            tauF="20"
+            tauF="11"
             volGuard="0.000001"
             sigmaEps="0.002"
-            r_aversion="40900"
+            r_aversion="40200"
             HARA="2.0"
             regimeChangeFlag="0"
-            acdOmega="4.75"
+            acdOmega="4.6"
             acdAlpha="0.15"
 			acdBeta="0.65"
             minDMD="2000000000"
@@ -191,6 +191,7 @@
             <Balances
                 type="uniform-50"
                 wealthMin="20000.0"
+                qMin="0.53"
                 wealthMax="158000.0"
                 price="313.0114"
             />

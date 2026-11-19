@@ -515,6 +515,6 @@
    "side": 1,
    "timestamp": 1
   },
-  "json": "{\"y\":\"t\",\"i\":1,\"s\":1,\"t\":1,\"q\":1.5,\"p\":1.5,\"Ti\":null,\"Ta\":null,\"Tf\":null,\"Mi\":null,\"Ma\":null,\"Mf\":null}"
+  "json": "{\"y\":\"t\",\"i\":1,\"s\":1,\"t\":1,\"q\":1.5,\"p\":1.5,\"Ti\":null,\"Ta\":null,\"Tf\":null,\"Mi\":null,\"Ma\":null,\"Mf\":null,\"Tfb\":null,\"Tfr\":null,\"Mfb\":null,\"Mfr\":null,\"qs\":null}"
  }
 }

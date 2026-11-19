@@ -58,8 +58,15 @@ def _structures(main):
     return {n: tsc._plain(getattr(main, n)) for n in sorted(set(_STRUCT_NAMES)) if hasattr(main, n)}
 
 
-def _run(per_uid, states):
+def _every_state_main():
+    """main with a scoring interval of one state, so the per-entry legs run every state (per_entry_legs_due)."""
     main = tss._fresh_main(uids=UIDS, books=BOOKS)
+    main.config.scoring.interval = tss._S
+    return main
+
+
+def _run(per_uid, states):
+    main = _every_state_main()
     original = trade._per_book_touch
     if per_uid:
         trade._per_book_touch = lambda self, books, debeta_on: (None, None, None)
@@ -102,14 +109,14 @@ def test_a_malformed_book_fails_only_the_uids_that_hold_it():
         del st.books[0]["a"]  # a book the books loop reads (by .get) and get_inventory_value cannot (by ['a'])
         for u in range(UIDS // 2):
             st.accounts[u].pop(0, None)  # half the uids hold no account on the malformed book
-    main = tss._fresh_main(uids=UIDS, books=BOOKS)
+    main = _every_state_main()
     main.pagerduty_alert = lambda *a, **k: None
     for st in states:
         trade.update_trade_volumes(main, copy.deepcopy(st))
     last = states[-1].timestamp
     for u in range(UIDS // 2):
         assert last in main.inventory_history[u], f"uid {u} holds no account on the malformed book and is accounted"
-    ref = tss._fresh_main(uids=UIDS, books=BOOKS)
+    ref = _every_state_main()
     ref.pagerduty_alert = lambda *a, **k: None
     original = trade._per_book_touch
     trade._per_book_touch = lambda self, books, debeta_on: (None, None, None)

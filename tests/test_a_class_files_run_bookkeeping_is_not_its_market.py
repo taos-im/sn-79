@@ -79,3 +79,29 @@ def test_one_list_names_the_runs_bookkeeping_for_both():
 def test_a_copy_is_digested_like_its_original():
     root = _root()
     assert market_source_digest(copy.deepcopy(root)) == market_source_digest(root)
+
+
+def _delivery_changed(value):
+    root = _root()
+    if value is None:
+        root.find(MBE).attrib.pop("dirtyAccountsOnly", None)
+    else:
+        root.find(MBE).set("dirtyAccountsOnly", value)
+    return root
+
+
+def test_how_the_engine_sends_the_state_is_not_the_market():
+    """Sending only the accounts a step changed (dirtyAccountsOnly) changes what crosses the wire, not the market the
+    class simulates: a class file with it on, off or absent digests the same, from the source and from the parsed
+    config, so turning it on keeps every class's records at the next run."""
+    base = market_source_digest(_delivery_changed(None))
+    parsed = trade._market_digest(MarketSimulationConfig.from_xml(_delivery_changed(None)))
+    for value in ("1", "0"):
+        assert market_source_digest(_delivery_changed(value)) == base, value
+        assert trade._market_digest(MarketSimulationConfig.from_xml(_delivery_changed(value))) == parsed, value
+
+
+def test_every_attribute_the_digest_leaves_out_names_an_element_of_a_class_file():
+    root = _root()
+    for path, attribute in pconfig.DELIVERY_ATTRIBUTES:
+        assert root.find(path) is not None, (path, attribute)

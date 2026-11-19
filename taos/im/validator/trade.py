@@ -19,6 +19,7 @@ from taos.im.protocol.events import trade_event_from_wire
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.config import RUN_BOOKKEEPING_FIELDS
 from taos.im.config import debeta_dial
+from taos.im.validator.block_stats import note_otr
 from taos.im.validator.debeta import (
     _hadd1, _hadd2, accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
     drop_uid_from_pending, flush_capture_state,
@@ -337,6 +338,161 @@ def accumulate_conjunction(self, uid_item, books, accounts_uid, dt, ts=None, ban
                 _hadd2(self.debeta_conj_hist, uid_item, book_id, ts, val)
 
 
+def accumulate_order_legs(self, uid_item, books, accounts_uid, dt, ts=None, best=None, bands=None, at_best=True,
+                          conj=True, weight=1):
+    """One state's at-best and conjunction legs for a uid, reading each account's resting orders once: what
+    accumulate_at_best and then accumulate_conjunction leave, value for value and key for key, each sum taken over the
+    orders in their order. at_best, conj: whether each leg runs (main has its structures). weight: the states this run
+    stands for (per_entry_legs_due), by which at-best's states and size at the best are counted; the conjunction is
+    weighted by dt, the time since its last run. Returns the resting orders read."""
+    conj = conj and bool(dt)
+    if not (at_best or conj):
+        return 0
+    read = 0
+    for book_id, account in (accounts_uid or {}).items():
+        book = books.get(book_id) if isinstance(books, dict) else None
+        if book is None:
+            continue
+        orders = (account.get('o') if isinstance(account, dict) else getattr(account, 'o', None)) or []
+        if not orders:
+            continue
+        band = None
+        if conj:
+            band = bands.get(book_id) if bands is not None else _conj_band(self, book_id, book)
+        if not at_best and band is None:
+            continue
+        read += len(orders)
+        if at_best:
+            if best is not None:
+                bb, ba = best[book_id]
+            else:
+                bb = _level_price(book.get('b') if isinstance(book, dict) else getattr(book, 'b', None))
+                ba = _level_price(book.get('a') if isinstance(book, dict) else getattr(book, 'a', None))
+        if band is not None:
+            _mid, low, high, gate = band
+        size = bid = ask = 0.0
+        for o in orders:
+            if isinstance(o, dict):
+                p = o.get('p')
+                if p is None:
+                    continue
+                s = int(o.get('s'))
+                q = float(o.get('q') or 0.0)
+            else:
+                p = getattr(o, 'p', None)
+                if p is None:
+                    continue
+                s = int(getattr(o, 's'))
+                q = float(getattr(o, 'q') or 0.0)
+            p = float(p)
+            if at_best and ((s == 0 and bb is not None and p == bb) or (s == 1 and ba is not None and p == ba)):
+                size += q
+            if band is not None:
+                if s == 0 and p >= low:
+                    bid += q
+                elif s == 1 and p <= high:
+                    ask += q
+        if at_best and size > 0.0:
+            if weight != 1:
+                size *= weight
+            self.debeta_at_best[uid_item][book_id] = self.debeta_at_best[uid_item].get(book_id, 0.0) + weight
+            self.debeta_best_size[uid_item][book_id] = self.debeta_best_size[uid_item].get(book_id, 0.0) + size
+            if ts is not None:
+                _hadd2(self.debeta_at_best_hist, uid_item, book_id, ts, 1.0 * weight)
+                _hadd2(self.debeta_best_size_hist, uid_item, book_id, ts, size)
+        if band is not None and bid >= gate and ask >= gate and min(bid, ask) > 0.0:
+            val = min(bid, ask) * float(dt)
+            self.debeta_conj[uid_item][book_id] = self.debeta_conj[uid_item].get(book_id, 0.0) + val
+            if ts is not None:
+                _hadd2(self.debeta_conj_hist, uid_item, book_id, ts, val)
+    return read
+
+
+def accounting_profile_line(p):
+    """The state's accounting profile (update_trade_volumes' accounting_profile) as one log line."""
+    return ("[ACCOUNTING-PROFILE] " + " ".join(f"{k}={p[k]:.3f}s" for k in ("wall", "cpu", "books", "prune", "uids",
+                                                                           "legs", "inventory", "post"))
+            + f" entries={p['entries']} orders={p['orders']} due={p.get('due', 1)}")
+
+
+# The structures only the per-entry legs keep, with their clocks. None is paid. While the scoring service runs the
+# legs (legs_elsewhere, 0.6.8 D3) main's copies are the last loaded or pulled ones and the service's are current.
+LEGS_OWN = ("inventory_history", "inventory_quote", "debeta_at_best", "debeta_best_size", "debeta_at_best_hist",
+            "debeta_best_size_hist", "debeta_conj", "debeta_conj_hist", "debeta_conj_farm", "debeta_conj_farm_hist",
+            "debeta_conj_clock", "legs_clock")
+# A state this far or less behind the legs' last run was counted by it: a replay after the scoring service's re-INIT
+# or a resume to an engine checkpoint. Farther behind is a new run's clock.
+LEGS_REPLAY_NS = 600 * 10 ** 9
+
+
+def per_entry_legs_due(self, ts):
+    """Whether this state runs the per-entry legs (the inventory's value, at-best and the conjunction with its farm
+    reference), and the states the run stands for. None of them is paid: the report and the published detail read
+    them. In the simulation they run at the first state at or past
+    each scoring interval's boundary, and at a new run's clock; on the exchange, whose states are a block apart, every
+    state. Never where the scoring service runs them (legs_elsewhere, D3). The weight is the states accounted since the
+    last run, this one included; at a new run's clock it is 1, the old run's waiting states going with its
+    histories."""
+    if getattr(self, 'legs_elsewhere', False):
+        return False, 0
+    clock = getattr(self, 'legs_clock', None)
+    if not isinstance(clock, dict):
+        clock = self.legs_clock = {}
+    interval = int(getattr(getattr(getattr(self, 'config', None), 'scoring', None), 'interval', 0) or 0)
+    last = clock.get('last')
+    n = clock.get('n', 0) + 1
+    if getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange' or interval <= 0 or last is None:
+        weight = n
+    elif int(ts) <= int(last):
+        if int(last) - int(ts) < LEGS_REPLAY_NS:
+            return False, 0
+        weight = 1
+    elif int(ts) // interval > int(last) // interval:
+        weight = n
+    else:
+        clock['n'] = n
+        return False, 0
+    clock['n'] = 0
+    clock['last'] = int(ts)
+    return True, weight
+
+
+def minimal_inventory(inventory_history):
+    """Each uid's first, previous and newest inventory entry: what the report reads of the history."""
+    out = {}
+    for uid, hist in inventory_history.items():
+        if not hist:
+            continue
+        timestamps = sorted(hist.keys())
+        if len(timestamps) >= 3:
+            out[uid] = {timestamps[0]: hist[timestamps[0]], timestamps[-2]: hist[timestamps[-2]],
+                        timestamps[-1]: hist[timestamps[-1]]}
+        else:
+            out[uid] = {ts: hist[ts] for ts in timestamps}
+    return out
+
+
+def legs_health(self):
+    """For the validator gauges: whether the scoring service alone runs the per-entry legs, and how many simulated
+    seconds behind the clock its last run is (-1 before it has shipped one), so a board line can flag them stale."""
+    if not getattr(self, 'legs_elsewhere', False):
+        return {"legs_in_service": 0, "legs_age_s": 0.0}
+    ts = (getattr(self, 'service_legs', None) or {}).get('ts')
+    now = getattr(self, 'simulation_timestamp', None)
+    age = -1.0 if ts is None or now is None else max(0.0, (int(now) - int(ts)) / 1e9)
+    return {"legs_in_service": 1, "legs_age_s": age}
+
+
+def report_inventory(self):
+    """The inventory history the report reads: the scoring service's, shipped with its scores, while it alone runs
+    the per-entry legs (D3), main's last loaded or pulled copy until it has shipped one; main's own otherwise."""
+    if getattr(self, 'legs_elsewhere', False):
+        shipped = (getattr(self, 'service_legs', None) or {}).get('inventory')
+        if shipped is not None:
+            return shipped
+    return minimal_inventory(getattr(self, 'inventory_history', None) or {})
+
+
 def accumulate_conjunction_farm(self, books, dt, ts=None):
     """One state: on each book with a band, the gate's size times the interval, what a quote at the gate's size on
     both sides would score."""
@@ -362,7 +518,7 @@ def init_alt_mark_state(self):
             setattr(self, _name, {})
 
 
-def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=None, fill_charge="none"):
+def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=None, fill_charge="none", charge_ref="mark"):
     """One book's batch into the alternative mark's leg: the paid leg's accumulate_book_mtm on its own state, the
     fill charge the paid leg's, so the two marks differ in the mark alone."""
     accumulate_book_mtm(
@@ -371,7 +527,7 @@ def accumulate_alt_mark(self, book_id, trades, book, mark_mode, mark_window, ts=
         mtm_hist=self.debeta_mtm_alt_hist, invsum_hist=self.debeta_invsum_alt_hist, invn_hist=self.debeta_invn_alt_hist,
         drift=self.debeta_drift_alt, drift_hist=self.debeta_drift_alt_hist, ts=ts,
         mark_state=self.debeta_mark_state_alt, mark_mode=mark_mode, mark_window=mark_window,
-        mark_mid=book_mid(book) if mark_mode == 'mid' else None, fill_charge=fill_charge,
+        mark_mid=book_mid(book) if mark_mode == 'mid' else None, fill_charge=fill_charge, charge_ref=charge_ref,
     )
 
 
@@ -425,6 +581,45 @@ class MissingNoticeField(Exception):
     affected trade. A wrong number that looks fine is worse than a missing update, because nothing
     downstream can tell it apart from a correct one.
     """
+
+
+def capture_fee_disagreements(book_id, fills, notices) -> int:
+    """How many booked sides of a book's fills disagree with the notice their uid received (the
+    per-state check behind the fee fix): for every fill the de-beta accumulators book (fee_complete_sides applied),
+    the maker's notice for that trade (y ET, the same book and trade id) must carry the fill's maker fee and the
+    taker's its taker fee; a booked side whose uid has no such notice, or whose notice carries another fee, is one
+    disagreement. No miner can produce such a fill: the count is a check on the validator's own two paths, published
+    as a gauge and expected at 0."""
+    by_uid = {}
+    for uid, uid_notices in (notices or {}).items():
+        for n in uid_notices or ():
+            y = n.get("y") if isinstance(n, dict) else getattr(n, "y", None)
+            if y not in ("ET", "EVENT_TRADE"):
+                continue
+            b = n.get("b") if isinstance(n, dict) else getattr(n, "b", None)
+            i = n.get("i") if isinstance(n, dict) else getattr(n, "i", None)
+            if b == book_id and i is not None:
+                by_uid.setdefault((int(uid), int(i)), n)
+    bad = 0
+    for t in fills or ():
+        tid = t.get("i")
+        if tid is None:
+            continue
+        for agent_key, fee_key in (("Ma", "Mf"), ("Ta", "Tf")):
+            uid = t.get(agent_key)
+            if uid is None or int(uid) < 0:
+                continue
+            n = by_uid.get((int(uid), int(tid)))
+            if n is None:
+                bad += 1
+                continue
+            nf = n.get(fee_key) if isinstance(n, dict) else getattr(n, fee_key, None)
+            try:
+                if abs(float(nf) - float(t[fee_key])) > 1e-9 * max(1.0, abs(float(t[fee_key]))):
+                    bad += 1
+            except (KeyError, TypeError, ValueError):
+                bad += 1
+    return bad
 
 
 def fee_complete_sides(t: dict) -> dict | None:
@@ -773,12 +968,15 @@ def _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, 
                 self.fee_sums[uid_item][book_id] = self.fee_sums[uid_item].get(book_id, 0.0) + deltas['fee']
     # Initialize zero P&L for timestamps with no trades
 
-def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timestamp, sampled_timestamp, should_prune, volume_prune_threshold, volume_decimals, volume_deltas, realized_pnl_updates, roundtrip_volume_updates, uids_to_round, best=None, bands=None, mids=None):
+def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timestamp, sampled_timestamp, should_prune, volume_prune_threshold, volume_decimals, volume_deltas, realized_pnl_updates, roundtrip_volume_updates, uids_to_round, best=None, bands=None, mids=None, prof=None, legs_due=True, legs_weight=1):
     """Per-UID trade-volume / FIFO-PnL / inventory processing.
 
     Pure extraction of the per-UID loop body of update_trade_volumes; logic
     unchanged. Shared accumulators (volume_deltas, realized_pnl_updates,
     roundtrip_volume_updates, uids_to_round) are mutated in place by reference.
+    prof: the state's accounting profile, given the order legs' and the inventory's time and the entries and orders
+    read. legs_due, legs_weight: per_entry_legs_due's answer; off it, the inventory's value and the order legs wait,
+    and a new account's starting balances are still taken.
     """
     from taos.im.utils.reward import get_inventory_value
     # Initialize trade volumes structure if needed
@@ -811,16 +1009,28 @@ def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timesta
                         uids_to_round.add(uid_item)
                     trade_volumes_uid[book_id][role] = pruned
 
-    # Initialize sampled timestamp entries
-    for book_id in books.keys():
-        if book_id not in trade_volumes_uid:
-            trade_volumes_uid[book_id] = {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
-        book_trade_volumes = trade_volumes_uid[book_id]
-        if sampled_timestamp not in book_trade_volumes['total']:
-            book_trade_volumes['total'][sampled_timestamp] = 0.0
-            book_trade_volumes['maker'][sampled_timestamp] = 0.0
-            book_trade_volumes['taker'][sampled_timestamp] = 0.0
-            book_trade_volumes['self'][sampled_timestamp] = 0.0
+    # Initialize sampled timestamp entries, once a sampling interval for a uid whose volumes have not changed: every
+    # writer of a uid's volumes replaces them whole (a reset, a load, a run change, a defragment) or moves them (a
+    # benchmark's new uid), and a book stripped at a layout change is dropped from them, so the same object, holding
+    # every book of the state, with this interval's slot on the first, has every slot this loop would create.
+    slot_cache = getattr(self, '_slot_cache', None)
+    if slot_cache is None:
+        slot_cache = self._slot_cache = {}
+    _first = next(iter(books), None)
+    _c = slot_cache.get(uid_item)
+    if not (_c is not None and _c[0] == sampled_timestamp and _c[1] is trade_volumes_uid
+            and books.keys() <= trade_volumes_uid.keys()
+            and (_first is None or sampled_timestamp in trade_volumes_uid[_first]['total'])):
+        for book_id in books.keys():
+            if book_id not in trade_volumes_uid:
+                trade_volumes_uid[book_id] = {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
+            book_trade_volumes = trade_volumes_uid[book_id]
+            if sampled_timestamp not in book_trade_volumes['total']:
+                book_trade_volumes['total'][sampled_timestamp] = 0.0
+                book_trade_volumes['maker'][sampled_timestamp] = 0.0
+                book_trade_volumes['taker'][sampled_timestamp] = 0.0
+                book_trade_volumes['self'][sampled_timestamp] = 0.0
+        slot_cache[uid_item] = (sampled_timestamp, trade_volumes_uid)
 
     # Process trade notices
     _process_uid_notices(self, uid_item, notices, timestamp, sampled_timestamp, trade_volumes_uid, volume_deltas, realized_pnl_updates, roundtrip_volume_updates, uids_to_round)
@@ -829,21 +1039,37 @@ def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timesta
 
     # Update inventory history
     if uid_item in accounts:
+        _t = time.perf_counter()
         initial_balances_uid = self.initial_balances[uid_item]
         accounts_uid = accounts[uid_item]
 
-        for bookId, account in accounts_uid.items():
-            if bookId not in initial_balances_uid:
-                initial_balances_uid[bookId] = {'BASE': None, 'QUOTE': None, 'WEALTH': None}
-            initial_balance_book = initial_balances_uid[bookId]
-            if initial_balance_book['BASE'] is None:
-                initial_balance_book['BASE'] = account.get('BASE', (account.get('bb') or {}).get('t', 0.0))
-            if initial_balance_book['QUOTE'] is None:
-                initial_balance_book['QUOTE'] = account.get('QUOTE', (account.get('qb') or {}).get('t', 0.0))
-            if initial_balance_book['WEALTH'] is None:
-                initial_balance_book['WEALTH'] = account['WEALTH'] if 'WEALTH' in account else get_inventory_value(account, books[bookId])
+        # A new account's starting balances, taken when it is first seen. Once taken for every account the uid holds
+        # they stay, until a writer replaces the uid's balances whole (a reset, a load, a run change) or moves them
+        # (a benchmark's new uid; a reset's entries for every book wait unfilled until the uid holds an account there):
+        # the same object, every account the uid holds now among the books this pass filled in it, needs no pass.
+        ib_cache = getattr(self, '_ib_cache', None)
+        if ib_cache is None:
+            ib_cache = self._ib_cache = {}
+        _ic = ib_cache.get(uid_item)
+        if not (_ic is not None and _ic[0] is initial_balances_uid and accounts_uid.keys() <= _ic[1]):
+            for bookId, account in accounts_uid.items():
+                if bookId not in initial_balances_uid:
+                    initial_balances_uid[bookId] = {'BASE': None, 'QUOTE': None, 'WEALTH': None}
+                initial_balance_book = initial_balances_uid[bookId]
+                if initial_balance_book['BASE'] is None:
+                    initial_balance_book['BASE'] = account.get('BASE', (account.get('bb') or {}).get('t', 0.0))
+                if initial_balance_book['QUOTE'] is None:
+                    initial_balance_book['QUOTE'] = account.get('QUOTE', (account.get('qb') or {}).get('t', 0.0))
+                if initial_balance_book['WEALTH'] is None:
+                    initial_balance_book['WEALTH'] = account['WEALTH'] if 'WEALTH' in account else get_inventory_value(account, books[bookId])
+            filled = frozenset(accounts_uid)
+            if _ic is not None and _ic[0] is initial_balances_uid:
+                filled |= _ic[1]
+            ib_cache[uid_item] = (initial_balances_uid, filled)
 
-        if mids is not None:
+        if not legs_due:
+            current_inventory = None
+        elif mids is not None:
             current_inventory = {
                 book_id: (accounts_uid[book_id]['WEALTH'] if 'WEALTH' in accounts_uid[book_id] else _value_at(accounts_uid[book_id], mids[book_id])) - initial_balances_uid[book_id]['WEALTH']
                 for book_id in books
@@ -855,12 +1081,22 @@ def _process_uid_trade_volumes(self, uid_item, books, accounts, notices, timesta
                 for book_id, book in books.items()
                 if book_id in accounts_uid
             }
-        if hasattr(self, 'debeta_at_best'):
-            accumulate_at_best(self, uid_item, books, accounts_uid, ts=sampled_timestamp, best=best)
-        if hasattr(self, 'debeta_conj'):
-            accumulate_conjunction(self, uid_item, books, accounts_uid, dt=self._conj_dt, ts=sampled_timestamp, bands=bands)
+        if prof is not None:
+            prof['inventory'] += time.perf_counter() - _t
+            prof['entries'] += len(accounts_uid)
+        _ab, _cj = hasattr(self, 'debeta_at_best'), hasattr(self, 'debeta_conj')
+        if legs_due and (_ab or _cj):
+            _t = time.perf_counter()
+            _read = accumulate_order_legs(self, uid_item, books, accounts_uid, self._conj_dt if _cj else 0.0,
+                                          ts=sampled_timestamp, best=best, bands=bands, at_best=_ab, conj=_cj,
+                                          weight=legs_weight)
+            if prof is not None:
+                prof['legs'] += time.perf_counter() - _t
+                prof['orders'] += _read or 0
     else:
         current_inventory = {book_id: 0.0 for book_id in books}
+    if not legs_due:
+        return
     # The first, the previous and the newest entry, whether or not the uid has an account this update.
     hist = self.inventory_history.setdefault(uid_item, {})
     if len(hist) < 2:
@@ -931,6 +1167,9 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         Logs errors when UID-level processing fails but continues processing remaining UIDs.
     """
     total_start = time.time()
+    _w0, _c0 = time.perf_counter(), time.thread_time()
+    prof = dict.fromkeys(("books", "prune", "uids", "legs", "inventory", "post"), 0.0)
+    prof["entries"] = prof["orders"] = 0
 
     books = state.books
     timestamp = state.timestamp
@@ -982,6 +1221,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         for _name in ('debeta_invn', 'debeta_pfirst', 'debeta_plast', 'debeta_drift'):
             if not hasattr(self, _name):
                 setattr(self, _name, {})  # invn/drift running (per book); pfirst/plast STATE
+        init_otr_state(self)
         if not hasattr(self, 'debeta_mark_state'):
             self.debeta_mark_state = {}  # STATE (M1 rolling settlement-mark window; re-based at boundary, not persisted)
         init_alt_mark_state(self)
@@ -999,6 +1239,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         _mark_alt = str(debeta_dial(_debeta_cfg, 'mark_mode_alt'))
         # the fill charge: a taker fill pays its price against the mark at the fill, under both marks
         _fill_charge = str(debeta_dial(_debeta_cfg, 'fill_charge'))
+        _charge_ref = str(debeta_dial(_debeta_cfg, 'charge_ref'))
         # realized spread: the horizon a fill is marked at, sim seconds; accumulated at every making_basis
         _realized_ns = int(float(debeta_dial(_debeta_cfg, 'making_horizon_s')) * 1e9)
         # fee-aware making (0.6.4): the share of each maker fee netted from the maker's captured and realized spread
@@ -1015,7 +1256,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         for _name in ('debeta_capbuy_hist', 'debeta_capsell_hist', 'debeta_realbuy_hist', 'debeta_realsell_hist', 'debeta_mtm_hist',
                       'debeta_invsum_hist', 'debeta_invn_hist', 'debeta_drift_hist', 'debeta_cp_hist',
                       'debeta_heldn_hist', 'debeta_heldinv_hist', 'debeta_helddrift_hist', 'debeta_notional_hist',
-                      'debeta_captkbuy_hist', 'debeta_captksell_hist'):
+                      'debeta_captkbuy_hist', 'debeta_captksell_hist', 'debeta_msg_hist', 'debeta_fill_hist',
+                      'debeta_dusttake_hist', 'debeta_dustmake_hist'):
             if not hasattr(self, _name):
                 setattr(self, _name, {})
 
@@ -1024,12 +1266,21 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     # built once. Stays under the _debeta_on gate, so the OFF and sim paths are byte-identical.
     _debeta_exchange = _debeta_on and getattr(getattr(self, 'engine', None), 'mode', 'simulation') == 'exchange'
     _et_batches = {}
+    # the per-state fee check's counts, {"total": since the start, "state": this state} (snapshotted)
+    _fee_check = getattr(self, 'capture_fee_check', None)
+    if _fee_check is None:
+        _fee_check = self.capture_fee_check = {}
+    _fee_check['state'] = 0
     if _debeta_exchange:
         if not hasattr(self, '_debeta_seen_tids'):
             self._debeta_seen_tids = {}  # {trade_id: ts} carried + windowed-pruned; redelivery dedupe
         _et_batches = et_book_batches(notices, self._debeta_seen_tids, sampled_timestamp)
 
-    _conj_dt = conjunction_interval(self, timestamp) if _debeta_on else 0.0
+    _t = time.perf_counter()
+    _legs_due, _legs_weight = per_entry_legs_due(self, timestamp)
+    prof["due"] = int(_legs_due)
+    # the conjunction's interval runs from the legs' last run, so presence and the farm are weighted by it
+    _conj_dt = conjunction_interval(self, timestamp) if (_debeta_on and _legs_due) else 0.0
     self._conj_dt = _conj_dt
     for bookId, book in books.items():
         trades = [event for event in book.get('e', []) if event['y'] == 't']
@@ -1039,7 +1290,14 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             # both, so a fill is not double-counted between the parallel 't' copy and the ET notice.
             de_trades = _et_batches.get(bookId, []) if _debeta_exchange else trades
             de_trades = [x for x in map(fee_complete_sides, de_trades) if x is not None]
+            if de_trades and not _debeta_exchange:
+                _bad = capture_fee_disagreements(bookId, de_trades, notices)
+                if _bad:
+                    _fee_check['total'] = _fee_check.get('total', 0) + _bad
+                    _fee_check['state'] = _fee_check.get('state', 0) + _bad
+                    bt.logging.warning(f"Book {bookId}: {_bad} booked fill side(s) disagree with their notice's fee (fee check)")
             if de_trades:
+                _dust_fills = {}
                 accumulate_book_capture(
                     self.capture_buy_sums, self.capture_sell_sums, bookId, de_trades, _capture_w,
                     buy_hist=self.debeta_capbuy_hist, sell_hist=self.debeta_capsell_hist,
@@ -1049,7 +1307,12 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     horizon_ns=_realized_ns, now_ns=timestamp,
                     min_size=_min_order_size(self, bookId), fee_weight=_fee_w, market_votes=_market_votes,
                     taker=(self.capture_taker_buy_sums, self.capture_taker_sell_sums, self.debeta_captkbuy_hist, self.debeta_captksell_hist),
+                    dust_out=_dust_fills,
                 )
+                # the fills under their floor, counted for their takers and makers over the making window
+                for _u, _d in _dust_fills.items():
+                    note_otr(self, _u, "dust_take", sampled_timestamp, _d["takes"])
+                    note_otr(self, _u, "dust_make", sampled_timestamp, _d["makes"])
                 accumulate_book_mtm(
                     self.debeta_mtm, self.debeta_invsum, self.debeta_invn, self.debeta_inv,
                     self.debeta_pfirst, self.debeta_plast, bookId, de_trades,
@@ -1059,6 +1322,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     mark_state=self.debeta_mark_state, mark_mode=_mark_mode,
                     mark_window=_mark_window,
                     mark_mid=book_mid(book) if _mark_mode == 'mid' else None, fill_charge=_fill_charge,
+                    charge_ref=_charge_ref,
                     heldn=self.debeta_heldn, heldinv=self.debeta_heldinv, helddrift=self.debeta_helddrift,
                     notional=self.debeta_notional, heldn_hist=self.debeta_heldn_hist,
                     heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
@@ -1066,7 +1330,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 )
                 if _mark_alt not in ('none', _mark_mode):
                     accumulate_alt_mark(self, bookId, de_trades, book, _mark_alt, _mark_window, ts=sampled_timestamp,
-                                        fill_charge=_fill_charge)
+                                        fill_charge=_fill_charge, charge_ref=_charge_ref)
                 accumulate_maker_notional(self, bookId, de_trades, ts=sampled_timestamp)
                 accumulate_counterparty_rows(self, bookId, de_trades, ts=sampled_timestamp)  # P11, pooled and per class
         if trades:
@@ -1102,6 +1366,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                             real_buy_hist=self.debeta_realbuy_hist, real_sell_hist=self.debeta_realsell_hist,
                             horizon_ns=_realized_ns, now_ns=timestamp, fee_weight=_fee_w,
                             taker=(self.capture_taker_buy_sums, self.capture_taker_sell_sums, self.debeta_captkbuy_hist, self.debeta_captksell_hist),)
+    prof["books"] = time.perf_counter() - _t
+    _t = time.perf_counter()
 
     # De-beta live prune. BOTH legs share ONE window, the kappa lookback. Pruning making on the
     # 24h volume-assessment window, each leg inheriting the retention of the legacy leg it
@@ -1130,6 +1396,12 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
         prune_hist_2level(self.debeta_notional_hist, self.debeta_notional, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_invn_hist, self.debeta_invn, _debeta_prune_threshold)
         prune_hist_1level(self.debeta_drift_hist, self.debeta_drift, _debeta_prune_threshold)
+        if getattr(self, 'debeta_msg_hist', None) is not None:
+            prune_hist_1level(self.debeta_msg_hist, self.debeta_msgs, _debeta_prune_threshold)
+            prune_hist_1level(self.debeta_fill_hist, self.debeta_fills, _debeta_prune_threshold)
+        if getattr(self, 'debeta_dusttake_hist', None) is not None:
+            prune_hist_1level(self.debeta_dusttake_hist, self.debeta_dusttakes, _debeta_prune_threshold)
+            prune_hist_1level(self.debeta_dustmake_hist, self.debeta_dustmakes, _debeta_prune_threshold)
         if hasattr(self, 'debeta_mtm_alt_hist'):
             prune_hist_2level(self.debeta_mtm_alt_hist, self.debeta_mtm_alt, _debeta_prune_threshold)
             prune_hist_2level(self.debeta_invsum_alt_hist, self.debeta_invsum_alt, _debeta_prune_threshold)
@@ -1150,6 +1422,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             self._volume_seen_tids = {k: v for k, v in self._volume_seen_tids.items()
                                       if v >= volume_prune_threshold}
 
+    prof["prune"] = time.perf_counter() - _t
+    _t = time.perf_counter()
     volume_deltas = {}
     realized_pnl_updates = {}
     roundtrip_volume_updates = {}
@@ -1159,7 +1433,7 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
     # bands read, and nothing in the uid loop changes them. If any book's touch cannot be read, the whole state uses
     # the per-uid path, where only the uids holding that book fail
     try:
-        _best, _bands, _mids = _per_book_touch(self, books, _debeta_on)
+        _best, _bands, _mids = _per_book_touch(self, books, _debeta_on) if _legs_due else (None, None, None)
     except Exception:
         bt.logging.debug("per-book touch unreadable this state; the legs read each book per uid", exc_info=True)
         _best = _bands = _mids = None
@@ -1171,10 +1445,12 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 self, uid_item, books, accounts, notices, timestamp, sampled_timestamp,
                 should_prune, volume_prune_threshold, volume_decimals, volume_deltas,
                 realized_pnl_updates, roundtrip_volume_updates, uids_to_round,
-                best=_best, bands=_bands, mids=_mids,
+                best=_best, bands=_bands, mids=_mids, prof=prof, legs_due=_legs_due, legs_weight=_legs_weight,
             )
         except Exception as ex:
             self.pagerduty_alert(f"Failed to update trade data for UID {uid_item}: {ex}", details={"trace": traceback.format_exc()})
+    prof["uids"] = time.perf_counter() - _t
+    _t = time.perf_counter()
 
     if should_prune:
         lookback_time = self.config.scoring.kappa.lookback
@@ -1303,6 +1579,9 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                                 self.realized_pnl_history[uid_item][ts][book_id],
                                 volume_decimals
                             )
+    prof["post"] = time.perf_counter() - _t
+    prof["wall"], prof["cpu"] = time.perf_counter() - _w0, time.thread_time() - _c0
+    self.accounting_profile = prof
     total_time = time.time() - total_start
     if should_prune:
         bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s (pruned, {uid_count} UIDs)")
@@ -1369,8 +1648,12 @@ def begin_class_handover(self, book_changes, start_ts, span):
     records follow the change map; the standing follows the class."""
     names_old = list(book_changes.get("names_old") or [])
     names_new = list(book_changes.get("names_new") or [])
-    # a kept class keeps its records, so only the classes whose pool restarts carry their standing
+    # a kept class keeps its records, so only the classes whose pool restarts carry their standing, and the classes
+    # that shrank (their lost books' records have no book of their market to go to, while every
+    # existing book carries over): at the boundary they pay the standing earned on all their old books, blending into
+    # what the kept books earn over one lookback, the time the lost books' history would have taken to age out
     restarted = {names_new[i] for i in (book_changes.get("classes") or []) if 0 <= int(i) < len(names_new)}
+    restarted |= {names_new[i] for i in (book_changes.get("shrunk") or []) if 0 <= int(i) < len(names_new)}
     vectors = getattr(self, "_debeta_class_vectors", None) or {}
     carried = {n: {"making": {int(u): float(x) for u, x in (v.get("making") or {}).items()},
                    "skill": {int(u): float(x) for u, x in (v.get("skill") or {}).items()}}
@@ -1416,6 +1699,8 @@ _TWO_LEVEL_HISTS = (
 )
 _ONE_LEVEL_HISTS = (
     ("debeta_invn_hist", "debeta_invn"), ("debeta_drift_hist", "debeta_drift"),
+    ("debeta_msg_hist", "debeta_msgs"), ("debeta_fill_hist", "debeta_fills"),
+    ("debeta_dusttake_hist", "debeta_dusttakes"), ("debeta_dustmake_hist", "debeta_dustmakes"),
     ("debeta_invn_alt_hist", "debeta_invn_alt"), ("debeta_drift_alt_hist", "debeta_drift_alt"),
     ("debeta_conj_farm_hist", "debeta_conj_farm"),
 )
@@ -1496,6 +1781,21 @@ def strip_books_at_boundary(self, reset_books, reset_classes, log=None):
             cpc[c] = {}
 
 
+def seam_nudge(hists_2level, hists_1level, seam_ts):
+    """Move any history entry landing exactly on the seam to one unit before it, so the old run's entries all sit
+    before the seam and the new run's at or after it (an old fill at the old run's last timestamp maps onto the seam
+    exactly). Values unchanged, so every running sum stays equal to its history."""
+    for h in hists_2level:
+        for d2 in (h or {}).values():
+            for tsd in d2.values():
+                if seam_ts in tsd:
+                    tsd[seam_ts - 1] = tsd.get(seam_ts - 1, 0.0) + tsd.pop(seam_ts)
+    for h in hists_1level:
+        for tsd in (h or {}).values():
+            if seam_ts in tsd:
+                tsd[seam_ts - 1] = tsd.get(seam_ts - 1, 0.0) + tsd.pop(seam_ts)
+
+
 def shift_simulation_histories(
     self, old_ts: int, new_ts: int, *,
     book_count: int, volume_decimals: int, lookback: int,
@@ -1509,6 +1809,7 @@ def shift_simulation_histories(
     Extracted verbatim from SimulationEngine.on_start so main AND the shadow
     scoring service run the SAME transition (the shadow receives a
     ("sim_start", (old_ts, new_ts)) frame and calls this on its own container).
+    The per-entry legs' clock restarts with the run.
     Deterministic in (structures, old_ts, new_ts, knobs) — no wall clock.
 
     NOTE: simulation-restart only. It is NEVER invoked in exchange mode: the
@@ -1527,6 +1828,7 @@ def shift_simulation_histories(
     # by the trade update; a start that arrives before the first update needs them here.
     init_alt_mark_state(self)
     init_liquidity_state(self)
+    self.legs_clock = {}
     _log = log or (lambda m: None)
     book_ids = list(book_ids) if book_ids is not None else list(range(book_count))
     # a layout change between the runs: every structure goes to the new layout's books before the shift, the
@@ -1546,6 +1848,12 @@ def shift_simulation_histories(
             strip_books_at_boundary(self, {b for b, d in _bk.items() if d in ("clear", "drop")},
                                     list(book_changes.get("classes", []) or []), log=_log)
         begin_class_handover(self, book_changes, new_ts, lookback)
+        # the classes that carry their standing and the classes new to the layout, by name: the boundary line counts
+        # pools that restart, and a class that only lost books carries without one
+        _h = getattr(self, "_debeta_handover", None) or {}
+        if _h.get("span"):
+            _log(f"[DEBETA-HANDOVER] start: carried={','.join(sorted(_h.get('carried') or {})) or '-'} "
+                 f"new={','.join(_h.get('new') or []) or '-'} span={int(_h['span'])}")
         note_young_books(self, book_changes, new_ts, lookback)
     new_threshold = new_ts - lookback
     new_volume_threshold = new_ts - volume_assessment_period
@@ -1716,6 +2024,12 @@ def shift_simulation_histories(
         shift_hist_2level(self.debeta_notional_hist, self.debeta_notional, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_invn_hist, self.debeta_invn, old_ts, new_ts, new_threshold)
         shift_hist_1level(self.debeta_drift_hist, self.debeta_drift, old_ts, new_ts, new_threshold)
+        if getattr(self, 'debeta_msg_hist', None) is not None:
+            shift_hist_1level(self.debeta_msg_hist, self.debeta_msgs, old_ts, new_ts, new_threshold)
+            shift_hist_1level(self.debeta_fill_hist, self.debeta_fills, old_ts, new_ts, new_threshold)
+        if getattr(self, 'debeta_dusttake_hist', None) is not None:
+            shift_hist_1level(self.debeta_dusttake_hist, self.debeta_dusttakes, old_ts, new_ts, new_threshold)
+            shift_hist_1level(self.debeta_dustmake_hist, self.debeta_dustmakes, old_ts, new_ts, new_threshold)
         if hasattr(self, 'debeta_mtm_alt_hist'):
             shift_hist_2level(self.debeta_mtm_alt_hist, self.debeta_mtm_alt, old_ts, new_ts, new_threshold)
             shift_hist_2level(self.debeta_invsum_alt_hist, self.debeta_invsum_alt, old_ts, new_ts, new_threshold)
@@ -1729,6 +2043,14 @@ def shift_simulation_histories(
         if hasattr(self, 'debeta_conj_hist'):
             shift_hist_2level(self.debeta_conj_hist, self.debeta_conj, old_ts, new_ts, new_threshold)
             shift_hist_1level(self.debeta_conj_farm_hist, self.debeta_conj_farm, old_ts, new_ts, new_threshold)
+        # The seam (0.6.8): the run change on the new clock, so the finalizer strips each run on its own
+        # (debeta.book_alphas_split); an old entry landing exactly on it is moved just before it.
+        self.debeta_seam_ts = new_ts
+        seam_nudge([self.debeta_mtm_hist, self.debeta_invsum_hist, self.debeta_heldn_hist, self.debeta_heldinv_hist,
+                    self.debeta_helddrift_hist, getattr(self, 'debeta_mtm_alt_hist', None),
+                    getattr(self, 'debeta_invsum_alt_hist', None)],
+                   [self.debeta_invn_hist, self.debeta_drift_hist, getattr(self, 'debeta_invn_alt_hist', None),
+                    getattr(self, 'debeta_drift_alt_hist', None)], new_ts)
         # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
         self.debeta_inv = defaultdict(lambda: defaultdict(float))
         self.debeta_pfirst = {}
@@ -1810,7 +2132,8 @@ def rebase_entries_beyond_clock(self, now: int, *, lookback: int, log=None, inve
                  "debeta_notional_hist", "debeta_mtm_alt_hist", "debeta_invsum_alt_hist",
                  "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
                  "debeta_conj_hist")
-    one_level = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist")
+    one_level = ("debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist",
+                 "debeta_msg_hist", "debeta_fill_hist", "debeta_dusttake_hist", "debeta_dustmake_hist")
     other = ("realized_pnl_history", "inventory_history", "trade_volumes", "roundtrip_volumes")
 
     def stamps(d):
@@ -1987,6 +2310,15 @@ def _taker_pair(self):
     return None if any(p is None for p in parts) else parts
 
 
+def init_otr_state(self) -> None:
+    """The order-to-trade reading's histories and running sums and the dust-fill reading's,
+    created when absent: a state restored from before them starts them empty."""
+    for _name in ('debeta_msg_hist', 'debeta_fill_hist', 'debeta_msgs', 'debeta_fills',
+                  'debeta_dusttake_hist', 'debeta_dustmake_hist', 'debeta_dusttakes', 'debeta_dustmakes'):
+        if not isinstance(getattr(self, _name, None), dict):
+            setattr(self, _name, {})
+
+
 def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     """Zero one UID's history/scoring structures (deregistration reset).
 
@@ -2017,6 +2349,10 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     self.inventory_history[uid] = {}
     if getattr(self, 'inventory_quote', None) is not None:
         self.inventory_quote.pop(uid, None)
+    for _name in ('debeta_msg_hist', 'debeta_fill_hist', 'debeta_msgs', 'debeta_fills',
+                  'debeta_dusttake_hist', 'debeta_dustmake_hist', 'debeta_dusttakes', 'debeta_dustmakes'):
+        if isinstance(getattr(self, _name, None), dict):
+            getattr(self, _name).pop(uid, None)
     self.trade_volumes[uid] = {
         bookId: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
         for bookId in book_ids

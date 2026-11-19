@@ -839,7 +839,7 @@ TEST_F(SelfTradePreventionTest, GttExpiryIsScheduledAtTheDeadlineSoItsAnswerIsNo
     while (!queue.empty()) {
         auto msg = queue.top();
         queue.pop();
-        if (msg->type == "CANCEL_ORDERS") { cancel = msg; break; }
+        if (msg->type == "EXPIRE_ORDERS") { cancel = msg; break; }
     }
     ASSERT_NE(cancel, nullptr) << "a GTT placement schedules its own expiry cancel";
     EXPECT_EQ(cancel->occurrence, now + expiry);
@@ -849,3 +849,49 @@ TEST_F(SelfTradePreventionTest, GttExpiryIsScheduledAtTheDeadlineSoItsAnswerIsNo
         << "an expiry that arrives later than it occurs is answered that much later again";
 }
 
+// A local agent's GTT order: its expiry on an order already gone says nothing (it answered 'Order IDs
+// ... do not exist'), and on a resting one it cancels the order and answers as a cancel.
+TEST_F(SelfTradePreventionTest, AGttExpiryOfALocalOrderAlreadyGoneSaysNothing)
+{
+    const Timestamp now = simulation->currentTimestamp();
+    auto& queue = simulation->messageQueue();
+    const auto drain = [&] {
+        std::vector<::Message::Ptr> out;
+        while (!queue.empty()) {
+            out.push_back(queue.top());
+            queue.pop();
+        }
+        return out;
+    };
+    const auto place = [&] {
+        exchange->receiveMessage(::Message::create(
+            now, now, "agent1", exchange->name(), "PLACE_ORDER_LIMIT",
+            MessagePayload::create<PlaceOrderLimitPayload>(
+                OrderDirection::BUY, 1_dec, 290_dec, DEC(0.), bookId, Currency::BASE, std::nullopt, false,
+                taosim::TimeInForce::GTT, std::optional<Timestamp>{60'000'000'000}, STPFlag::CO)));
+        ::Message::Ptr expiry;
+        for (const auto& msg : drain()) {
+            if (msg->type == "EXPIRE_ORDERS") expiry = msg;
+        }
+        return expiry;
+    };
+    drain();
+
+    const auto gone = place();
+    ASSERT_NE(gone, nullptr);
+    const OrderID goneId = std::static_pointer_cast<CancelOrdersPayload>(gone->payload)->cancellations.at(0).id;
+    ASSERT_TRUE(exchange->books()[bookId]->cancelOrder(goneId, std::nullopt)) << "the owner cancels it first";
+    exchange->receiveMessage(gone);
+    for (const auto& msg : drain()) {
+        EXPECT_NE(msg->type, "ERROR_RESPONSE_CANCEL_ORDERS") << "the expiry of an order already gone sent a notice";
+    }
+
+    const auto resting = place();
+    ASSERT_NE(resting, nullptr);
+    const OrderID restingId = std::static_pointer_cast<CancelOrdersPayload>(resting->payload)->cancellations.at(0).id;
+    exchange->receiveMessage(resting);
+    EXPECT_FALSE(exchange->books()[bookId]->getOrder(restingId).has_value()) << "the expired order is on the book";
+    const auto answers = drain();
+    EXPECT_TRUE(std::ranges::any_of(answers, [](const auto& m) { return m->type == "RESPONSE_CANCEL_ORDERS"; }))
+        << "the owner is not told its order expired";
+}

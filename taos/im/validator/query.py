@@ -26,6 +26,7 @@ import msgpack
 from taos.im.protocol.simulator import PackedOrders
 from taos.im.validator.block_stats import sent_counts
 from taos.im.validator.delays import set_delays
+from taos.im.validator import offmain_build
 from taos.im.protocol.instructions import PlaceOrderInstruction
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.utils.compress import reply_bounds
@@ -234,6 +235,11 @@ class DendriteManager:
             await session.close()
         dendrite._session = None
 
+# The answer for a round that queries no miner, as query_miners gives it when none is reachable.
+_NOT_QUERIED = {"success": True, "responses": {}, "validation_stats": {
+    "total_responses": 0, "total_instructions": 0, "success": 0, "timeouts": 0, "failures": 0}}
+
+
 def build_axon_synapses(request_data, uid_list, level, engine, parallel_workers):
     """Compress the books once, then build and compress each queried miner's synapse: in the query process, or in the
     main process with neuron.query_prepayload. Returns (compressed_books, axon_synapses)."""
@@ -352,6 +358,9 @@ class QueryService:
         self.request_shm = None
         self.response_shm = None
         self.notify_fd = config.notify_fd if hasattr(config, 'notify_fd') else None
+        # lever offmain_build: created on the first state main announces, so with the lever off it never exists
+        self._offmain = None
+        self._offmain_status = None
 
     def setup_ipc(self):
         """
@@ -373,7 +382,7 @@ class QueryService:
         queue_name = f"/{getattr(self.config, 'ipc_prefix', 'validator')}_query_{self.config.wallet.hotkey}"
 
         # Unlink any stale IPC resources left behind by a previous crash
-        for _name in (f"{queue_name}_req_shm", f"{queue_name}_res_shm"):
+        for _name in (f"{queue_name}_req_shm", f"{queue_name}_res_shm", offmain_build.status_path(queue_name)):
             try:
                 posix_ipc.unlink_shared_memory(_name)
                 bt.logging.info(f"Unlinked stale shared memory: {_name}")
@@ -415,6 +424,7 @@ class QueryService:
         self.request_mem = mmap.mmap(self.request_shm.fd, self.request_shm.size)
         self.response_mem = mmap.mmap(self.response_shm.fd, self.response_shm.size)
 
+        self._offmain_status = offmain_build.status_path(queue_name)
         bt.logging.info(f"IPC setup complete: {queue_name}")
 
     async def initialize(self):
@@ -1424,6 +1434,23 @@ class QueryService:
                 await DendriteManager.close_session(self.dendrite)
                 self.dendrite = old_dendrite
 
+    def _offmain_complete(self, request_data):
+        """Main's hand-over (lever offmain_build) made whole with this process's parse of the same state and built here
+        with main's own function. None when this process does not hold that state (it should, since main hands over
+        only a state whose status says so): the round then queries no miner, as when none is reachable."""
+        start = time.time()
+        compression = self.config.compression
+        try:
+            if self._offmain is None:
+                raise offmain_build.NotParsed("no state has been announced to this process")
+            built = self._offmain.complete(request_data, self.wallet.hotkey.ss58_address, compression.level,
+                                           compression.engine, compression.parallel_workers)
+        except offmain_build.NotParsed as exc:
+            bt.logging.error(f"[OFFMAIN] cannot build the hand-over, no miner queried this round: {exc}")
+            return None
+        bt.logging.info(f"[OFFMAIN] built the miners' requests ({time.time()-start:.4f}s).")
+        return built
+
     async def run(self):
         """
         Main event loop for the standalone query service.
@@ -1456,7 +1483,16 @@ class QueryService:
                 bt.logging.info(f"Received message at {receive_time}")
                 command = message.decode('utf-8')
 
-                if command == 'query':
+                if command.startswith(offmain_build.COMMAND):
+                    # a state main has just read (lever offmain_build): parse it now, beside main; no notification
+                    seq, size = offmain_build.parse_message(command)
+                    if self._offmain is None:
+                        self._offmain = offmain_build.Builder(self._offmain_status)
+                    parse_start = time.time()
+                    ready = self._offmain.on_state(seq, size)
+                    bt.logging.info(f"[OFFMAIN] state {seq} read and parsed ({time.time()-parse_start:.4f}s), "
+                                    f"{'ready' if ready else 'not complete: main builds it'}")
+                elif command == 'query':
                     read_start = time.time()
                     bt.logging.info(f"Starting read, {read_start - receive_time:.4f}s after receive")                    
                     self.request_mem.seek(0)
@@ -1472,8 +1508,10 @@ class QueryService:
                     
                     request_data = pickle.loads(request_bytes)
                     bt.logging.info(f"Read Query request data ({time.time()-read_start:.4f}s).")
+                    if request_data.get(offmain_build.KEY) is not None:
+                        request_data = self._offmain_complete(request_data)
 
-                    result = await self.query_miners(request_data)
+                    result = await self.query_miners(request_data) if request_data is not None else _NOT_QUERIED
                     del request_data
 
                     write_start = time.time()

@@ -25,6 +25,7 @@ zero effect on scoring — the child's structures are observed, never consumed.
 import hashlib
 import multiprocessing
 import os
+import io
 import pickle
 import struct
 import threading
@@ -113,6 +114,8 @@ _DEBETA_PLAIN = [
     "debeta_capture_mid", "debeta_cp", "debeta_cpc", "debeta_cpc_hist",
     "debeta_capbuy_hist", "debeta_capsell_hist", "debeta_realbuy_hist", "debeta_realsell_hist", "debeta_mtm_hist", "debeta_invsum_hist",
     "debeta_invn_hist", "debeta_drift_hist", "debeta_cp_hist", "debeta_captkbuy_hist", "debeta_captksell_hist",
+    "debeta_msgs", "debeta_fills", "debeta_msg_hist", "debeta_fill_hist", "capture_fee_check",
+    "debeta_dusttakes", "debeta_dustmakes", "debeta_dusttake_hist", "debeta_dustmake_hist",
     "debeta_heldn_hist", "debeta_heldinv_hist", "debeta_helddrift_hist", "debeta_notional_hist",
     "debeta_invn_alt", "debeta_pfirst_alt", "debeta_plast_alt", "debeta_drift_alt", "debeta_mark_state_alt",
     "debeta_mtm_alt_hist", "debeta_invsum_alt_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist",
@@ -130,6 +133,9 @@ _STRUCT_NAMES = [
     # Shadow-reward inputs: mutated in place by score_uids each interval, so
     # once initialized the child's own scoring keeps them in lockstep with main.
     "kappa_values", "activity_factors", "pnl_factors",
+    # the run change on the new clock (0.6.8, the seam split): a child started inside the window after a roll must
+    # strip each run on its own as main does; None when no roll is inside the window
+    "debeta_seam_ts",
     # The de-beta accumulators. A snapshot without them would restart the child's making and skill windows
     # from zero at every INIT (and every parity re-INIT) while main's kept going; in cutover mode the child's
     # are the ones that score, so frequent re-INITs would leave the legs computed over a tiny slice of fills.
@@ -138,6 +144,9 @@ _STRUCT_NAMES = [
     # Redelivery dedup ledgers (exchange mode): a child with an empty ledger counts every redelivered
     # fill again.
     "_debeta_seen_tids", "_volume_seen_tids",
+    # The per-entry legs' cadence (trade.per_entry_legs_due, 0.6.8): the child must run the inventory, at-best and
+    # the conjunction at the same states as main, with the same weights.
+    "legs_clock",
 ]
 
 
@@ -172,6 +181,23 @@ def cutover_enabled() -> bool:
         return True
 
 
+def init_timings_line(timings: dict, top: int = 5) -> str:
+    """The INIT's cost in one line: the structures' total seconds and bytes, then the `top` slowest as
+    name seconds (MB, the slowest of its three steps)."""
+    if not timings:
+        return "no structures"
+    def total(t):
+        return t["plainify_s"] + t["pickle_s"] + t["send_s"]
+    secs = sum(total(t) for t in timings.values())
+    size = sum(t["bytes"] for t in timings.values())
+    slowest = sorted(timings.items(), key=lambda kv: -total(kv[1]))[:top]
+    parts = []
+    for name, t in slowest:
+        step = max(("plainify", t["plainify_s"]), ("pickle", t["pickle_s"]), ("send", t["send_s"]), key=lambda x: x[1])[0]
+        parts.append(f"{name} {total(t):.2f}s ({t['bytes'] / 1e6:.1f} MB, {step})")
+    return f"{len(timings)} structures {secs:.2f}s {size / 1e6:.1f} MB; slowest: " + ", ".join(parts)
+
+
 def _plainify(obj):
     """Recursively convert dict-likes to plain dicts so lambda-factory
     defaultdicts pickle; deques, tuples and model objects pass through
@@ -183,6 +209,45 @@ def _plainify(obj):
     if isinstance(obj, list):
         return [_plainify(v) for v in obj]
     return obj
+
+
+class _PlainPickler(pickle.Pickler):
+    """Pickles a structure as _plainify would copy it, without the copy: every defaultdict, whatever
+    its factory (lambdas do not pickle), goes to the stream as a plain dict with the same items, nested ones through
+    the same override as the pickler reaches them; deques, lists, tuples and model objects pickle natively. The child
+    loads plain dicts, as it did from the copy. On mainnet's 128/64/64 save the copy was 7.7 of the INIT's 14.7 s at
+    rest (trade_volumes alone 3.2 s for 189 MB)."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, dict) and type(obj) is not dict:
+            return (dict, (), None, None, iter(obj.items()))
+        return NotImplemented
+
+
+def dump_plain(obj) -> bytes:
+    """pickle.dumps(_plainify(obj), protocol 5) without the plain copy."""
+    buf = io.BytesIO()
+    _PlainPickler(buf, protocol=5).dump(obj)
+    return buf.getvalue()
+
+
+def kept_frame(validator) -> bytes | None:
+    """Main's kept accounts (set only under dirtyAccountsOnly) as one msgpack frame for the INIT, or None. They are
+    the engine's own msgpack output, plain dicts and lists, so they need neither _plainify nor pickle: one C-level pack
+    in place of a Python walk of every entry under the reward lock (0.08 s against 0.95 to 1.87 s at 256 books). They are not
+    one of _STRUCT_NAMES, so no checkpoint carries them: after a restore the first state cannot be completed and the
+    engine is asked for every account in full."""
+    kept = getattr(validator, "kept_accounts", None)
+    if not kept:
+        return None
+    import msgpack
+    return msgpack.packb(kept, use_bin_type=True)
+
+
+def kept_from_frame(blob: bytes) -> dict:
+    """The kept accounts an INIT's frame carries, keyed by agent and book id as main keeps them."""
+    import msgpack
+    return msgpack.unpackb(blob, raw=False, strict_map_key=False)
 
 
 def _rebuild_structs(parts: dict) -> dict:
@@ -234,13 +299,16 @@ def _rebuild_structs(parts: dict) -> dict:
 
     for name in _DEBETA_DD2:
         out[name] = dd_float_2(parts.get(name, {}))
-    for name in _DEBETA_PLAIN + ["_debeta_seen_tids", "_volume_seen_tids"]:
+    for name in _DEBETA_PLAIN + ["_debeta_seen_tids", "_volume_seen_tids", "legs_clock"]:
         out[name] = parts.get(name, {})
 
     for name in ("trade_volumes", "inventory_history", "inventory_quote", "initial_balances",
                  "recent_trades", "recent_miner_trades",
                  "kappa_values", "activity_factors", "pnl_factors"):
         out[name] = parts.get(name, {})
+    if "kept_accounts" in parts:  # the INIT's own frame (kept_frame), not one of _STRUCT_NAMES
+        out["kept_accounts"] = parts["kept_accounts"]
+    out["debeta_seam_ts"] = parts.get("debeta_seam_ts")   # a scalar, None without a roll inside the window
 
     return out
 
@@ -349,6 +417,7 @@ class ShadowState:
     functions on the SAME shapes."""
 
     def __init__(self, structs: dict, knobs: dict):
+        self.kept_accounts = {}
         for name, value in structs.items():
             setattr(self, name, value)
         self._last_prune_timestamp = knobs.get("_last_prune_timestamp")
@@ -365,6 +434,8 @@ class ShadowState:
         self.validator_uid = knobs.get("validator_uid")
         self.kappa_cache = {}
         self.deregistered_uids = []
+        # 0.6.8 D3: main runs no per-entry legs, so this replica's are the only current ones
+        self.legs_here = bool(knobs.get("legs_here", False))
 
     def pagerduty_alert(self, message, details=None):
         """Raise a PagerDuty alert from the shadow process.
@@ -374,6 +445,70 @@ class ShadowState:
             details: Structured context attached to the incident.
         """
         print(f"[SHADOW] pagerduty (suppressed): {message}", flush=True)
+
+
+def set_aside_legs(shadow) -> dict | None:
+    """The per-entry legs' structures of a replica that alone runs them, kept across a re-INIT: main's copies are
+    stale while the service runs the legs (0.6.8 D3), so an INIT must not replace them."""
+    from taos.im.validator.trade import LEGS_OWN
+    if shadow is None or not getattr(shadow, "legs_here", False):
+        return None
+    return {name: getattr(shadow, name) for name in LEGS_OWN if hasattr(shadow, name)}
+
+
+def install_legs(shadow, kept: dict | None) -> None:
+    """After an INIT, for a replica that alone runs the legs: its own legs set aside at the re-INIT replace main's
+    copies; a fresh replica keeps main's (the last saved or pulled) with both clocks restarted, so its first run
+    counts only itself and not the time it was down."""
+    if not getattr(shadow, "legs_here", False):
+        return
+    if kept:
+        for name, value in kept.items():
+            setattr(shadow, name, value)
+    else:
+        shadow.legs_clock = {}
+        shadow.debeta_conj_clock = {}
+
+
+def note_accounting(shadow) -> None:
+    """Keep the state's accounting time (wall, thread CPU, legs ran), for the next score's legs report: the service's
+    own cost per state, which must stay under the time between states."""
+    p = getattr(shadow, "accounting_profile", None)
+    if not p:
+        return
+    recent = shadow.__dict__.setdefault("accounting_recent", [])
+    recent.append((round(p["wall"], 4), round(p["cpu"], 4), int(p.get("due", 1))))
+    del recent[:-200]
+
+
+def legs_report(shadow) -> dict:
+    """What the report reads of the legs, shipped with each score while the service alone runs them: each uid's
+    first, previous and newest inventory entry, the time of the legs' last run, and the states' accounting times
+    since the last score."""
+    from taos.im.validator.trade import minimal_inventory
+    recent = shadow.__dict__.pop("accounting_recent", None) or []
+    return {"inventory": minimal_inventory(getattr(shadow, "inventory_history", None) or {}),
+            "ts": (getattr(shadow, "legs_clock", None) or {}).get("last"), "accounting": recent}
+
+
+def legs_frame(shadow) -> dict | None:
+    """The legs' structures, plain, for a save main writes itself (ScoringShadow.request_legs)."""
+    from taos.im.validator.trade import LEGS_OWN
+    if shadow is None:
+        return None
+    return {name: _plainify(getattr(shadow, name)) for name in LEGS_OWN if hasattr(shadow, name)}
+
+
+def install_pulled_legs(validator, plain: dict | None) -> bool:
+    """Main takes the service's legs, with main's container shells, before writing a save of its own."""
+    from taos.im.validator.trade import LEGS_OWN
+    if not plain:
+        return False
+    rebuilt = _rebuild_structs(plain)
+    for name in LEGS_OWN:
+        if name in plain:
+            setattr(validator, name, rebuilt[name])
+    return True
 
 
 def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
@@ -407,7 +542,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
     """
     from taos.im.config import debeta_dial
     from taos.im.validator.reward import (apply_track_record_ema, compute_debeta_scores, making_pool_inputs,
-                                          pool_pay_vector, score_uids, skill_bar, smoothed_skill_share)
+                                          note_skill_share, paid_skill_share, pool_pay_vector, score_uids,
+                                          skill_bar, smoothed_skill_share)
 
     shadow.deregistered_uids = list(deregs)
     # the scorer's clock: the run-boundary handover's weight is read against it, as in main
@@ -496,10 +632,14 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         _skill_sm = smoothed_skill_share(_dcfg, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _class_shares,
                                          _pema, shadow.deregistered_uids, sim_ts, _hl, _n_snap, _last_snap, _scorable,
                                          skill_min_books=skill_bar(shadow))
+    # the skill share the pool pays, noted per uid beside the making share for main's report (0.6.8)
+    _skill_paid = paid_skill_share(_pool_mode, _pool, getattr(shadow, 'debeta_detail', {}) or {}, all_uids,
+                                   skill_bar(shadow), _class_shares, _skill_sm)
+    note_skill_share(shadow.kappa_values, _skill_paid, all_uids)
     distributed = pool_pay_vector(
         _pool_mode, _pool, getattr(shadow, 'debeta_detail', {}) or {}, all_uids, _ladder, trading_scores, _share,
         shadow.scoring_config, skill_bar(shadow), class_shares=_class_shares,
-        skill_share=_skill_sm)
+        skill_share=_skill_paid)
     return {
         'trading': [float(x) for x in distributed.tolist()],
         'gentrx': [float(gentrx_scores_out[uid]) for uid in all_uids],
@@ -517,6 +657,8 @@ def shadow_score(shadow: ShadowState, sim_ts: int, deregs: list,
         'debeta_scores': validator_data['debeta_scores'],
         'debeta_class_summary': getattr(shadow, '_debeta_class_summary', None) or {},
         'debeta_class_details': getattr(shadow, '_debeta_class_details', None) or {},
+        # a class carrying its standing through the run-boundary handover (0.6.8): w, carried and paid, for the board
+        'debeta_carry': getattr(shadow, '_debeta_carry', None) or {},
         'debeta_alphas_by_book': getattr(shadow, 'debeta_alphas_by_book', None) or {},
     }
 
@@ -550,6 +692,8 @@ def child_save_validator_state(shadow, light: dict, path: str) -> int:
         "pnl_factors": shadow.pnl_factors,
         "inventory_history": snapshot_inventory_history(shadow),
         "kappa_values": shadow.kappa_values,
+        # the run change on the new clock (0.6.8, the seam split); the child sets it on its own sim_start frame
+        "debeta_seam_ts": getattr(shadow, 'debeta_seam_ts', None),
         "realized_pnl_history": snapshot_realized_pnl_history(shadow),
         "open_positions": snapshot_open_positions(shadow),
         "unnormalized_scores": light["unnormalized_scores"],
@@ -615,6 +759,7 @@ def apply_state_bytes(shadow: ShadowState, raw: bytes) -> int:
     accounting. Returns the state timestamp."""
     import msgpack
     from taos.im.protocol import MarketSimulationStateUpdate
+    from taos.im.validator.kept_accounts import fill_accounts
     from taos.im.validator.multiasset_state import flatten_multiasset_state
     from taos.im.validator.trade import update_trade_volumes
 
@@ -623,6 +768,12 @@ def apply_state_bytes(shadow: ShadowState, raw: bytes) -> int:
     # before it accounts for the round; the replica replays the bytes from before that step, so it must
     # flatten too or it sees no books at all under the multi-asset layout.
     d, _ = flatten_multiasset_state(d)
+    if d.get("dirtyAccountsOnly"):
+        missing = fill_accounts(shadow.__dict__.setdefault("kept_accounts", {}), d.get("accounts") or {},
+                                d.get("books"), d.get("bookFees"))
+        if missing:
+            # Main skips such a state and never tees it, so this is a child whose INIT carried no accounts.
+            print(f"[SHADOW] {missing} account entries left out with no full copy", flush=True)
     state = MarketSimulationStateUpdate.parse_dict(d)
     shadow.step += 1
     update_trade_volumes(shadow, state)
@@ -718,6 +869,7 @@ def _shadow_child_main(sock, cores, parity_ns):
         # shifts first and applies it second.
         held = None
         pending_save = None         # (expect_ts, path, light, mono_deadline)
+        kept_legs = None            # the legs of a replica that alone runs them, across a re-INIT (0.6.8 D3)
 
         def _maybe_save():
             # Fire the pending save once the replica has caught up to its
@@ -755,6 +907,8 @@ def _shadow_child_main(sock, cores, parity_ns):
                 result = shadow_score(shadow, sim_ts, deregs, gtx_scores, gtx_ema,
                                       t_ema, t_ema_n, t_ema_ts, absent=absent, presence=presence,
                                       debeta_pool_ema=pool_ema)
+                if getattr(shadow, "legs_here", False) and isinstance(result, dict):
+                    result["legs"] = legs_report(shadow)
                 _send_frame(sock, ("scores", (s_ts, result, time.time() - t0)))
             except Exception as e:
                 import traceback
@@ -768,6 +922,7 @@ def _shadow_child_main(sock, cores, parity_ns):
             nonlocal applied, awaiting_score_at, last_applied_ts
             t0 = time.time()
             apply_state_bytes(shadow, raw)
+            note_accounting(shadow)
             applied += 1
             last_applied_ts = ts
             if ts % parity_ns == 0:
@@ -818,9 +973,13 @@ def _shadow_child_main(sock, cores, parity_ns):
             if kind == "init_part":
                 name, blob = payload
                 init_parts[name] = pickle.loads(blob)
+            elif kind == "init_kept":
+                init_parts["kept_accounts"] = kept_from_frame(payload)
             elif kind == "init_done":
                 base_ts, knobs = payload
                 shadow = ShadowState(_rebuild_structs(init_parts), knobs)
+                install_legs(shadow, kept_legs)
+                kept_legs = None
                 # Child-local loky sizing: score on the child's own cores (or a
                 # small unpinned pool when it has no dedicated slice).
                 kcfg = shadow.scoring_config['scoring']['kappa']
@@ -900,6 +1059,7 @@ def _shadow_child_main(sock, cores, parity_ns):
                         reset_agent_histories(shadow, uid, book_ids)
                     print(f"[SHADOW] resets applied: {payload}", flush=True)
             elif kind == "reinit":
+                kept_legs = set_aside_legs(shadow) or kept_legs
                 shadow = None
                 base_ts = None
                 init_parts = {}
@@ -908,6 +1068,12 @@ def _shadow_child_main(sock, cores, parity_ns):
                 awaiting_score_at = None
                 pending_save = None
                 print("[SHADOW] state dropped — awaiting fresh INIT", flush=True)
+            elif kind == "legs_pull":
+                try:
+                    _send_frame(sock, ("legs", legs_frame(shadow)))
+                except Exception as e:
+                    print(f"[SHADOW] legs pull failed: {e}", flush=True)
+                    _send_frame(sock, ("legs", None))
             elif kind == "save":
                 expect_ts, path, light = payload
                 if shadow is None:
@@ -1041,6 +1207,7 @@ class ScoringShadow:
         # Save offload (Stage B v2): the child writes the validator-state file
         # from its replica; main only ships the light main-only fields.
         self._save_futures = {}
+        self._legs_futures = deque()
         self._last_teed_ts = 0
         self.matches = 0
         self.mismatches = 0
@@ -1318,6 +1485,28 @@ class ScoringShadow:
         self._executor.submit(_send)
         return expect_ts, fut
 
+    def request_legs(self, timeout: float = 60.0):
+        """The per-entry legs' structures, plain, from a service that alone runs them (0.6.8 D3), for a save main
+        writes itself; None when the service is not alive or not initialized, or does not answer in time."""
+        if not self.is_alive() or not self.initialized:
+            return None
+        import concurrent.futures
+        fut = concurrent.futures.Future()
+        self._legs_futures.append(fut)
+
+        def _send():
+            try:
+                _send_frame(self._sock, ("legs_pull", None))
+            except Exception:
+                if not fut.done():
+                    fut.set_result(None)
+
+        self._executor.submit(_send)
+        try:
+            return fut.result(timeout=timeout)
+        except Exception:
+            return None
+
     def request_reinit(self, storm: bool = True) -> None:
         """Self-heal: drop the child's state and re-run INIT on the next round
         (triggered automatically after consecutive parity mismatches). Counted
@@ -1463,11 +1652,21 @@ class ScoringShadow:
 
         def _do_init():
             t0 = time.time()
+            # what the INIT costs per structure (plainify, pickle, send), kept on the handle and logged
+            # with the slowest, so the bed and testnet say which structures make the send long under the reward lock
+            timings = {}
             try:
                 for name in _STRUCT_NAMES:
-                    plain = _plainify(getattr(validator, name, {}))
-                    _send_frame(self._sock, ("init_part", (name, pickle.dumps(plain, protocol=5))))
-                    del plain
+                    t1 = time.time()
+                    # one pass: the structure is pickled as its plain copy would be, without making the copy
+                    blob = dump_plain(getattr(validator, name, {}))
+                    t3 = time.time()
+                    _send_frame(self._sock, ("init_part", (name, blob)))
+                    timings[name] = {"plainify_s": 0.0, "pickle_s": t3 - t1, "send_s": time.time() - t3, "bytes": len(blob)}
+                    del blob
+                kept = kept_frame(validator)
+                if kept is not None:
+                    _send_frame(self._sock, ("init_kept", kept))
                 from taos.im.validator.reward import build_scoring_config, build_simulation_config_dict
                 knobs = {
                     "_last_prune_timestamp": getattr(validator, "_last_prune_timestamp", None),
@@ -1482,10 +1681,13 @@ class ScoringShadow:
                     "simulation_config": build_simulation_config_dict(validator),
                     "scoring_interval": validator.config.scoring.interval,
                     "validator_uid": getattr(validator, 'uid', None),
+                    "legs_here": bool(getattr(validator, 'legs_elsewhere', False)),
                 }
                 _send_frame(self._sock, ("init_done", (base_ts, knobs)))
+                self.last_init_timings = timings
                 import bittensor as bt
-                bt.logging.info(f"[SHADOW] init snapshot sent (base_ts={base_ts}, {time.time()-t0:.2f}s)")
+                bt.logging.info(f"[SHADOW] init snapshot sent (base_ts={base_ts}, {time.time()-t0:.2f}s): "
+                                + init_timings_line(timings))
             except Exception as e:
                 import bittensor as bt
                 bt.logging.warning(f"[SHADOW] init failed: {e}")
@@ -1682,6 +1884,12 @@ class ScoringShadow:
                     fut = self._score_futures.pop(ts, None)
                     if fut is not None:
                         fut.set_result(None)
+                elif kind == "legs":
+                    while self._legs_futures:
+                        fut = self._legs_futures.popleft()
+                        if not fut.done():
+                            fut.set_result(payload)
+                            break
                 elif kind == "save_done":
                     ts, nbytes, secs = payload
                     fut = self._save_futures.pop(ts, None)
@@ -1720,6 +1928,10 @@ class ScoringShadow:
             fut = self._save_futures.pop(ts, None)
             if fut is not None and not fut.done():
                 fut.set_result(None)
+        while self._legs_futures:
+            fut = self._legs_futures.popleft()
+            if not fut.done():
+                fut.set_result(None)
 
 
 def _num(v, default, cast):
@@ -1753,6 +1965,8 @@ def _config_duck(config):
                 trade_volume_sampling_interval=config.scoring.activity.trade_volume_sampling_interval,
             ),
             kappa=SimpleNamespace(lookback=config.scoring.kappa.lookback),
+            # the per-entry legs' cadence (trade.per_entry_legs_due): without it the child ran them every state
+            interval=getattr(config.scoring, 'interval', 0),
             # De-beta gates both the trade.py accumulators and compute_debeta_scores, so the child carries every
             # dial main's config holds; a dial main lacks takes the parser default, as main's own reads do.
             debeta=_debeta_duck(_d),

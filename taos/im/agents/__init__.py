@@ -1296,6 +1296,19 @@ class FinanceAgentBase(SimulationAgent):
         """
         pass
 
+    def onPriceBand(self, event : PriceBandEvent) -> None:
+        """
+        Handler for an order or a close cut at the pool's price band (exchange mode): the part that would have moved
+        the pool's price past the band was not filled. Told once per order or close; see PriceBandEvent.
+
+        Args:
+            event (PriceBandEvent): The cut, with its book, side, ids, the volume not filled and the kind.
+
+        Returns:
+            None
+        """
+        pass
+
     def onTrade(self, event : TradeEvent, validator: str = None) -> None:
         """
         Handler for event where an order is traded in the simulator.  To be implemented by subclasses.
@@ -1675,6 +1688,8 @@ class FinanceAgent(FinanceAgentBase):
                         self.onTrade(event, getattr(getattr(state, "dendrite", None), "hotkey", None))
                     case "EVENT_SIMULATION_END" | "ESE":
                         ended = event
+                    case "EPB":
+                        self.onPriceBand(event)
                     case _:
                         pass
             except Exception:
@@ -1913,14 +1928,18 @@ class StateHistoryManager:
         snapshot: L2Snapshot | None = None
 
         try:
-            # Detect gaps or inconsistencies in history
-            has_gap = (
-                (book_id not in self.gap[validator] or not self.gap[validator][book_id])
-                and (
-                    (book_id in self.history[validator] and self.history[validator][book_id].end != state.timestamp - state.config.publish_interval)
-                    or (book_id in self.last_snapshot[validator] and self.last_snapshot[validator][book_id].timestamp != state.timestamp - state.config.publish_interval)
-                )
+            # Detect gaps or inconsistencies in history. While a book is already in a gap its history ends before
+            # the gap, so only the last snapshot can show another one: a state skipped before the book recovered
+            # leaves that snapshot more than one interval old, and rebuilding from it would replay one interval's
+            # events onto an older book.
+            previous = state.timestamp - state.config.publish_interval
+            in_gap = bool(self.gap[validator].get(book_id))
+            history_breaks = book_id in self.history[validator] and self.history[validator][book_id].end != previous
+            snapshot_breaks = (
+                book_id in self.last_snapshot[validator]
+                and self.last_snapshot[validator][book_id].timestamp != previous
             )
+            has_gap = snapshot_breaks or (not in_gap and history_breaks)
             if has_gap:
                 # Clear outdated snapshots and handle small/large gaps
                 if book_id in self.last_snapshot[validator]:

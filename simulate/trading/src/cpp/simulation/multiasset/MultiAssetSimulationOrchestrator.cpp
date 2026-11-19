@@ -264,6 +264,10 @@ void publishState(Impl& impl, std::span<const taosim::serialization::HumanReadab
         fmt::println("Stop requested while waiting for the validator; this step goes unanswered");
         return;
     }
+    // Answered, so the state arrived: what it listed in full need not be listed again (dirtyAccountsOnly).
+    for (const auto& sim : sims) {
+        sim->exchange()->accountsDelivered();
+    }
 
     bipc::shared_memory_object shmRes{
         bipc::open_only, SimulationManager::s_remoteResponsesShmName.data(), bipc::read_write};
@@ -343,10 +347,18 @@ void publishState(Impl& impl, std::span<const taosim::serialization::HumanReadab
             sim->setStepSeed(seed->round, seed->word);
         }
     }
-    // The member named "responses", or the only member, as SimulationManager reads it.
+    // The member named "responses", or the only member, as SimulationManager reads it. The answer may also ask for
+    // every account in full in the next publish (dirtyAccountsOnly).
     const msgpack::object* responsesObj{};
     for (const auto& [k, v] : obj.via.map) {
-        if (obj.via.map.size == 1 || (k.type == msgpack::type::STR && k.as<std::string_view>() == "responses")) {
+        const bool named = k.type == msgpack::type::STR;
+        if (named && k.as<std::string_view>() == "fullAccounts") {
+            if (v.type == msgpack::type::BOOLEAN && v.as<bool>()) {
+                for (const auto& sim : sims) sim->exchange()->requestFullAccounts();
+            }
+            continue;
+        }
+        if (obj.via.map.size == 1 || (named && k.as<std::string_view>() == "responses")) {
             responsesObj = &v;
         }
     }

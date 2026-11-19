@@ -8,17 +8,29 @@ def add_simulation_args(cls, parser):
     parser.add_argument(
         "--simulation.seeding.fundamental.symbol.coinbase",
         type=str,
-        help="Coinbase spot market symbol the seed service subscribes to; its trades are not recorded (the "
-             "fundamental's step seed is a drand round the validator sends).",
+        help="Ignored, kept so a launcher that still passes it starts: the seed service no longer subscribes to "
+             "the fundamental's Coinbase symbol (its step seed is a drand round the validator sends).",
         default="BTC-USD",
     )
 
     parser.add_argument(
         "--simulation.seeding.fundamental.symbol.binance",
         type=str,
-        help="Binance spot market symbol the seed service subscribes to; its trades are not recorded (the "
-             "fundamental's step seed is a drand round the validator sends).",
+        help="Ignored, kept so a launcher that still passes it starts: the seed service no longer subscribes to "
+             "the fundamental's Binance symbol (its step seed is a drand round the validator sends).",
         default="btcusdt",
+    )
+
+    from taos.im.config import _flag
+    parser.add_argument(
+        "--simulation.seeding.drand",
+        type=_flag,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Take the fundamental's step seed from a drand quicknet round (default on). Off ('false'): no drand "
+             "endpoint is asked; the chain's Drand pulse is taken where there is a chain, else 32 random bytes go "
+             "as round 0 at once.",
     )
 
     parser.add_argument(

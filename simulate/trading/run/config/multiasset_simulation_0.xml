@@ -1,12 +1,11 @@
 <!--
-  THE PUBLISHED DEFAULT LAYOUT from 0.6.7, three classes: eight realizations of simulation_0 (books 0-127), four of
-  simulation_1 (128-191) and four of simulation_2 (192-255), sixteen books each, 256 in all; the layout
-  run_validator.sh runs by default. simulation_2.xml is the third class, its own market parameters over
-  simulation_1.xml's step, blocks, checkpoints and logging, on a finer price grid, so it comes last. Book ids run
-  consecutively across the realizations and the coarsest grid comes first, as every layout must. When a validator
-  moves from the 128-book layout (multiasset_simulation_0_64_32_32.xml) to this one, each class's per-book records
-  move to its first books: simulation_0's stay at 0-63, simulation_1's move from 64-95 to 128-159, simulation_2's
-  from 96-127 to 192-223, and the added books start empty.
+  THE PUBLISHED DEFAULT LAYOUT from 0.6.8, four classes: four realizations each of simulation_0 (books 0-63),
+  simulation_1 (64-127), simulation_2 (128-191) and simulation_3 (192-255), sixteen books each, 256 in all; the layout
+  run_validator.sh runs by default. simulation_2.xml and simulation_3.xml are on the finest price grid, so they come
+  last. Book ids run consecutively across the realizations and the coarsest grid comes first, as every layout must.
+  When a validator moves from the 0.6.7 layout (multiasset_simulation_0_128_64_64.xml) to this one, simulation_0
+  keeps its first 64 books (0-63) and its old 64-127 end, simulation_1's records move from 128-191 to 64-127,
+  simulation_2's from 192-255 to 128-191, and simulation_3 starts empty on 192-255.
 -->
 <MultiAssetSimulation
     traceTime="1"
@@ -25,8 +24,9 @@
     ckptNumWorkers="4"
     ckptMeasureWallClockTime="1">
 
-    <Background name="simulation_0" path="simulation_0.xml" instanceCount="8"/>
+    <Background name="simulation_0" path="simulation_0.xml" instanceCount="4"/>
     <Background name="simulation_1" path="simulation_1.xml" instanceCount="4"/>
     <Background name="simulation_2" path="simulation_2.xml" instanceCount="4"/>
+    <Background name="simulation_3" path="simulation_3.xml" instanceCount="4"/>
 
 </MultiAssetSimulation>

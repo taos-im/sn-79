@@ -37,7 +37,7 @@ from taos.im.validator.book_layout import (  # noqa: E402
 )
 
 tree = _tree_fixture
-pytestmark = pytest.mark.skipif(not all((CONFIGS / n).exists() for n in [*NEEDED, "multiasset_simulation_0.xml"]),
+pytestmark = pytest.mark.skipif(not all((CONFIGS / n).exists() for n in [*NEEDED, "multiasset_simulation_0_128_64_64.xml"]),
                                 reason="the class files are not here")
 
 _S = tss._S
@@ -56,8 +56,8 @@ def _ranges(sim):
 
 # ── the published layouts ─────────────────────────────────────────────────────────────────────────────────────────
 
-def test_the_published_default_is_128_64_64_and_the_old_layout_is_kept_by_name():
-    new, old = _parse("multiasset_simulation_0.xml"), _parse("multiasset_simulation_0_64_32_32.xml")
+def test_the_0_6_7_layout_is_128_64_64_and_the_older_layout_is_kept_by_name():
+    new, old = _parse("multiasset_simulation_0_128_64_64.xml"), _parse("multiasset_simulation_0_64_32_32.xml")
     assert _composition(new) == NEW and len(new.book_ids) == 256
     assert _ranges(new) == [("simulation_0", 0, 127), ("simulation_1", 128, 191), ("simulation_2", 192, 255)]
     assert _composition(old) == OLD and len(old.book_ids) == 128
@@ -66,7 +66,7 @@ def test_the_published_default_is_128_64_64_and_the_old_layout_is_kept_by_name()
 
 
 def test_the_change_map_from_64_32_32_to_128_64_64():
-    ch = trade.layout_book_changes(_parse("multiasset_simulation_0_64_32_32.xml"), _parse("multiasset_simulation_0.xml"))
+    ch = trade.layout_book_changes(_parse("multiasset_simulation_0_64_32_32.xml"), _parse("multiasset_simulation_0_128_64_64.xml"))
     books, dest = ch["books"], ch["dest"]
     assert {b: books[b] for b in range(64)} == {b: "keep" for b in range(64)}
     assert all(dest[b] == b for b in range(64)), "simulation_0's books keep their ids"
@@ -81,7 +81,7 @@ def test_the_change_map_from_64_32_32_to_128_64_64():
 
 def test_a_class_whose_market_changes_while_it_grows_starts_fresh():
     old = layout_of(_parse("multiasset_simulation_0_64_32_32.xml"))
-    new = copy.deepcopy(layout_of(_parse("multiasset_simulation_0.xml")))
+    new = copy.deepcopy(layout_of(_parse("multiasset_simulation_0_128_64_64.xml")))
     new["classes"][1]["market"] = "another market"
     ch = book_changes(old, new)
     assert all(ch["books"][b] == "clear" for b in range(128, 192)), "no record is scored in another market's pool"
@@ -91,7 +91,7 @@ def test_a_class_whose_market_changes_while_it_grows_starts_fresh():
 
 
 def test_the_same_layout_and_no_old_layout_change_nothing():
-    lay = layout_of(_parse("multiasset_simulation_0.xml"))
+    lay = layout_of(_parse("multiasset_simulation_0_128_64_64.xml"))
     ch = book_changes(lay, copy.deepcopy(lay))
     assert set(ch["books"].values()) == {"keep"} and ch["classes"] == []
     assert book_changes(None, lay) == {"books": {}, "classes": []}
@@ -121,13 +121,13 @@ def _at(holder, name, kind, book):
             for u, kv in d.items() if isinstance(kv, dict)}
 
 
-def _boundary(main, book_ids, changes):
+def _boundary(main, book_ids, changes, log=None):
     if not hasattr(main.config.scoring, "debeta"):
         main.config.scoring.debeta = SimpleNamespace(making_fee_weight=0.0, centered_window=15)
     trade.shift_simulation_histories(
         main, old_ts=6 * _S, new_ts=0, book_count=len(book_ids), volume_decimals=4, lookback=10800 * _S,
         volume_assessment_period=3600 * _S, miner_wealth=50000.0, effective_max_uids=tss._UIDS,
-        book_ids=book_ids, book_changes=changes)
+        book_ids=book_ids, book_changes=changes, log=log)
 
 
 # the fixture trades two books; as two classes of one book each that grow to two books each, class B moves from 1 to 2
@@ -189,7 +189,8 @@ def test_a_strip_moves_nothing_else():
 # ── the open, after a restart in the old run and after a validator was down across the boundary ──────────────────
 
 def _start_on_the_default(tree):
-    shutil.copy(CONFIGS / "multiasset_simulation_0.xml", tree.config_dir / "multiasset_simulation_0.xml")
+    # the three-class 128/64/64 default, kept by name now that four classes hold the published name; copied in under it.
+    shutil.copy(CONFIGS / "multiasset_simulation_0_128_64_64.xml", tree.config_dir / "multiasset_simulation_0.xml")
     tree.v.config.simulation.xml_config = str(tree.config_dir / "multiasset_simulation_0.xml")
     tree.engine._load_config()
     assert _composition(tree.v.simulation) == NEW
@@ -256,7 +257,7 @@ def test_a_saved_layout_is_the_one_the_open_compares(tree, monkeypatch):
 
 def test_the_saved_state_names_the_layout_its_records_are_on():
     lay = layout_of(_parse("multiasset_simulation_0_64_32_32.xml"))
-    v = SimpleNamespace(_scored_layout=lay, simulation=_parse("multiasset_simulation_0.xml"))
+    v = SimpleNamespace(_scored_layout=lay, simulation=_parse("multiasset_simulation_0_128_64_64.xml"))
     assert persistence.scored_layout(v) == lay, "the records' layout, not the loaded config's"
     v._scored_layout = None
     assert persistence.scored_layout(v) == layout_of(v.simulation)
@@ -269,7 +270,7 @@ def _vectors(names):
 
 
 def test_a_count_change_restarts_no_class_and_runs_no_handover():
-    ch = trade.layout_book_changes(_parse("multiasset_simulation_0_64_32_32.xml"), _parse("multiasset_simulation_0.xml"))
+    ch = trade.layout_book_changes(_parse("multiasset_simulation_0_64_32_32.xml"), _parse("multiasset_simulation_0_128_64_64.xml"))
     assert ch["classes"] == []
     holder = SimpleNamespace(_debeta_class_vectors=_vectors(["simulation_0", "simulation_1", "simulation_2"]))
     trade.begin_class_handover(holder, ch, 0, 3600 * _S)
@@ -278,7 +279,7 @@ def test_a_count_change_restarts_no_class_and_runs_no_handover():
 
 def test_a_count_change_with_one_market_changed_restarts_and_carries_that_class_alone():
     old = layout_of(_parse("multiasset_simulation_0_64_32_32.xml"))
-    new = copy.deepcopy(layout_of(_parse("multiasset_simulation_0.xml")))
+    new = copy.deepcopy(layout_of(_parse("multiasset_simulation_0_128_64_64.xml")))
     new["classes"][2]["market"] = "simulation_2 with its sigma changed"
     ch = book_changes(old, new)
     assert ch["classes"] == [2]
@@ -342,10 +343,68 @@ def test_from_128_64_64_to_64_64_64_64_the_shrunk_class_drops_its_tail_and_the_o
     ch = trade.layout_book_changes(old, new)
     dest = ch["dest"]
     assert all(dest[b] == b for b in range(64))
-    assert all(dest[b] is None for b in range(64, 128)), "simulation_0's last four realizations are dropped"
+    assert all(dest[b] is None for b in range(64, 128)), "simulation_0's last four realizations have no book to go to"
     assert all(dest[128 + k] == 64 + k for k in range(64)), "simulation_1 moves down to 64-127"
     assert all(dest[192 + k] == 128 + k for k in range(64)), "simulation_2 moves down to 128-191"
     assert all(ch["books"][b] == "new" for b in range(192, 256)) and ch["classes"] == []
+    assert ch["shrunk"] == [0], "simulation_0 lost books; its pool does not restart"
+
+
+def test_a_shrunk_class_carries_its_standing_so_no_miner_loses_what_it_earned_on_the_dropped_books(tmp_path):
+    """Every existing book carries over and only the genuinely new books start blank.
+    simulation_0's last 64 books have no book of their market in a 64/64/64/64 layout, so their per-book records cannot
+    move; the class's standing carries instead. Its end-of-run making and skill shares, earned over all 128 books,
+    pass through the run-boundary handover: at the boundary the class pays them exactly, and they blend into the
+    shares the class earns on its kept books over one lookback, the time the dropped books' history would have taken
+    to age out. simulation_1 and _2 move with their records and carry nothing; simulation_3 alone starts blank."""
+    old, new = _four_class_tree(tmp_path / "a", [8, 4, 4]), _four_class_tree(tmp_path / "b", [4, 4, 4, 4])
+    ch = trade.layout_book_changes(old, new)
+    vectors = {"simulation_0": {"making": {1: 0.2, 2: 0.8}, "skill": {1: 0.9, 3: 0.1}},
+               "simulation_1": {"making": {1: 1.0}, "skill": {}}, "simulation_2": {"making": {2: 1.0}, "skill": {2: 1.0}}}
+    holder = SimpleNamespace(_debeta_class_vectors=vectors)
+    trade.begin_class_handover(holder, ch, 100 * _S, 3600 * _S)
+    h = holder._debeta_handover
+    assert set(h["carried"]) == {"simulation_0"}, "the shrunk class alone carries its standing"
+    assert h["carried"]["simulation_0"] == {"making": {1: 0.2, 2: 0.8}, "skill": {1: 0.9, 3: 0.1}}
+    assert h["new"] == ["simulation_3"], "the new class still ramps in"
+    from taos.im.validator import reward
+    names = ["simulation_0", "simulation_1", "simulation_2", "simulation_3"]
+    holder.simulation_config = {"class_names": names}
+    holder.simulation = None
+    at_start = reward.class_handover_now(holder, now=100 * _S, end=False)
+    assert at_start["w"] == 1.0 and set(at_start["carried"]) == {0} and at_start["new"] == [3]
+    halfway = reward.class_handover_now(holder, now=(100 + 1800) * _S, end=False)
+    assert halfway["w"] == 0.5 and set(halfway["carried"]) == {0}
+    assert reward.class_handover_now(holder, now=(100 + 3600) * _S, end=False) is None, "run out after one lookback"
+    blended = reward._blend_shares({1: 0.2, 2: 0.8}, {1: 1.0}, 1.0, [1, 2])
+    assert blended == {1: 0.2, 2: 0.8}, "at the boundary the class pays the standing it earned on all 128 books"
+
+
+def test_a_class_that_only_grows_or_moves_still_carries_nothing(tmp_path):
+    old, new = _four_class_tree(tmp_path / "a", [4, 2, 2]), _four_class_tree(tmp_path / "b", [4, 4, 4, 4])
+    ch = trade.layout_book_changes(old, new)
+    assert ch["shrunk"] == []
+    holder = SimpleNamespace(_debeta_class_vectors=_vectors(["simulation_0", "simulation_1", "simulation_2"]))
+    trade.begin_class_handover(holder, ch, 0, 3600 * _S)
+    assert holder._debeta_handover["carried"] == {}
+
+
+def test_the_boundary_logs_which_classes_carry_their_standing_and_which_are_new():
+    """The boundary line counts the pools that restart, and a class that only lost books carries without one, so the
+    handover's start names its classes by name: what an operator reads at the deploy. A change that only moves or adds
+    books logs none."""
+    old = {"classes": [{"name": "A", "books": [0, 1], "market": "a"}, {"name": "B", "books": [2], "market": "b"}]}
+    new = {"classes": [{"name": "A", "books": [0], "market": "a"}, {"name": "B", "books": [1], "market": "b"},
+                       {"name": "C", "books": [2], "market": "c"}]}
+    main, lines = tsc._debeta_main(), []
+    main._debeta_class_vectors = _vectors(["A", "B"])
+    _boundary(main, [0, 1, 2], book_changes(old, new), log=lines.append)
+    starts = [x for x in lines if x.startswith("[DEBETA-HANDOVER] start:")]
+    assert starts == [f"[DEBETA-HANDOVER] start: carried=A new=C span={10800 * _S}"]
+    quiet, lines = tsc._debeta_main(), []
+    quiet._debeta_class_vectors = _vectors(["A", "B"])
+    _boundary(quiet, [0, 1, 2, 3], book_changes(_TWO, _FOUR), log=lines.append)
+    assert not [x for x in lines if "[DEBETA-HANDOVER] start" in x], "a class that only grows carries nothing"
 
 
 def test_a_moved_grown_and_new_class_layout_keeps_every_structure_consistent():

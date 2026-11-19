@@ -5,7 +5,7 @@
     generalMsgEndpoint="/account" useMessagePack="1" measureStepWallClockTime="1"
     ckptIntervalInSteps="60" ckptNumLastFilesToKeep="3" ckptMeasureWallClockTime="1" ckptNumWorkers="8">
     <Agents>
-        <MultiBookExchangeAgent name="EXCHANGE" remoteAgentCount="264" gracePeriod="600000000000"
+        <MultiBookExchangeAgent name="EXCHANGE" dirtyAccountsOnly="1" remoteAgentCount="264" gracePeriod="600000000000"
             priceDecimals="2" volumeDecimals="4" baseDecimals="4" quoteDecimals="10"
             maxLeverage="4" maxLoan="10000" maintenanceMargin="0.10" maxOpenOrders="100"
             initialPrice="29.57" minOrderSize="2.5364" maxPriceBand="0.10">

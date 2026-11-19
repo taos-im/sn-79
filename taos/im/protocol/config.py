@@ -144,19 +144,25 @@ RUN_BOOKKEEPING_FIELDS = {
     "detailed_book_levels": ("Agents/MultiBookExchangeAgent/Books", "detailedDepth"),
 }
 
+# Attributes of a class file that set how the engine sends the state, not the market it simulates, each as (element
+# below the root, attribute). The protocol parses none of them, so only market_source_digest leaves them out.
+DELIVERY_ATTRIBUTES = (
+    ("Agents/MultiBookExchangeAgent", "dirtyAccountsOnly"),
+)
+
 
 def market_source_digest(xml : Element) -> str:
     """The whole market a class file describes, as a digest: every element and attribute under its root, so a
-    parameter the protocol does not parse counts too, less the run's bookkeeping attributes (RUN_BOOKKEEPING_FIELDS).
-    The root's own attributes are left out: they are the run's (the time grid, the blocks, the port, the
-    checkpointing, which a multi-asset wrapper governs). Whitespace and comments are not the market either. The
-    element passed in is not changed."""
+    parameter the protocol does not parse counts too, less the run's bookkeeping attributes (RUN_BOOKKEEPING_FIELDS)
+    and the attributes that set how the state is sent (DELIVERY_ATTRIBUTES). The root's own attributes are left out:
+    they are the run's (the time grid, the blocks, the port, the checkpointing, which a multi-asset wrapper governs).
+    Whitespace and comments are not the market either. The element passed in is not changed."""
     xml = copy.deepcopy(xml)
-    for where in RUN_BOOKKEEPING_FIELDS.values():
-        if where is not None:
-            element = xml.find(where[0])
-            if element is not None:
-                element.attrib.pop(where[1], None)
+    left_out = [where for where in RUN_BOOKKEEPING_FIELDS.values() if where is not None] + list(DELIVERY_ATTRIBUTES)
+    for path, attribute in left_out:
+        element = xml.find(path)
+        if element is not None:
+            element.attrib.pop(attribute, None)
     body = "".join(ET.canonicalize(ET.tostring(child, encoding="unicode"), strip_text=True) for child in xml)
     return hashlib.sha256(body.encode()).hexdigest()
 

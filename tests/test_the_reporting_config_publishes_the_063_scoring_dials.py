@@ -24,6 +24,7 @@ EXPECTED = {
     "debeta_mark_mode": "mid",
     "debeta_mark_mode_alt": "median",
     "debeta_fill_charge": "taker",
+    "debeta_seam_split": 1,
 }
 
 

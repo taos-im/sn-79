@@ -7,8 +7,8 @@
             <FeePolicy type="tiered" historySlots="30" slotPeriod="864">
                 <Tier volumeRequired="0" makerFee="0.05" takerFee="0.1"/>
                 <Tier volumeRequired="100" makerFee="0.04" takerFee="0.08"/>
-                <Tier volumeRequired="500" makerFee="-0.02" takerFee="-0.04"/>
-                <Tier volumeRequired="1000" makerFee="-0.03" takerFee="-0.06"/>
+                <Tier volumeRequired="500" makerFee="-0.02" takerFee="0.04"/>
+                <Tier volumeRequired="1000" makerFee="-0.03" takerFee="0.06"/>
             </FeePolicy>
             <Books instanceCount="1" algorithm="PriceTime" maxDepth="21"/>
             <Balances>

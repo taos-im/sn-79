@@ -260,6 +260,9 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
             p.baseIncrementDecimals, p.quoteIncrementDecimals);
     }
 
+    m_dirtyAccountsOnly = node.attribute("dirtyAccountsOnly").as_bool();
+    m_fullAccountsEvery = fullAccountsEveryOf(node);
+
     // TODO: split this function up.
     try {
         m_config2 = taosim::exchange::makeExchangeConfig(node);
@@ -675,6 +678,30 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
 
 //-------------------------------------------------------------------------
 
+void MultiBookExchangeAgent::recordPoolPlacement(
+    TradeID id, AgentId agentId, PlaceOrderLimitPayload::Ptr order, std::optional<OrderID> orderId) noexcept
+{
+    // The deadline in the sweep's unit, SECONDS from the block's chain time, as L3Backlog's gttDeadlineSeconds and the
+    // per-batch scan build it: the block this placement is made in plus the order's period.
+    std::optional<Timestamp> gttDeadline;
+    if (order && order->expiryPeriod) {
+        const auto blockTs = simulation()->blockTimestamp();
+        const auto nowSeconds = blockTs != 0 ? blockTs / 1'000'000'000ULL : simulation()->currentTimestamp();
+        gttDeadline = nowSeconds + *order->expiryPeriod / 1'000'000'000ULL;
+    }
+    m_poolPlacements.insert_or_assign(
+        id, PoolPlacement{.agentId = agentId, .order = order, .orderId = orderId, .gttDeadline = gttDeadline});
+    m_poolPlacementOrder.push_back(id);
+    // Bounded: a correction arrives within a batch or two, so history beyond that is dead
+    // weight on a live exchange carrying 129 books.
+    while (m_poolPlacementOrder.size() > s_poolPlacementCapacity) {
+        m_poolPlacements.erase(m_poolPlacementOrder.front());
+        m_poolPlacementOrder.pop_front();
+    }
+}
+
+//-------------------------------------------------------------------------
+
 void MultiBookExchangeAgent::receiveMessage(Message::Ptr msg)
 {
     try {
@@ -769,7 +796,7 @@ enum class DistributedRequest
     }
     if (type == "DISTRIBUTED_PLACE_ORDER_LIMIT") return PLACE_ORDER_LIMIT;
     if (type == "DISTRIBUTED_RETRIEVE_ORDERS") return RETRIEVE_ORDERS;
-    if (type == "DISTRIBUTED_CANCEL_ORDERS") return CANCEL_ORDERS;
+    if (type == "DISTRIBUTED_CANCEL_ORDERS" || type == "DISTRIBUTED_EXPIRE_ORDERS") return CANCEL_ORDERS;
     if (type == "DISTRIBUTED_CLOSE_POSITIONS") return CLOSE_POSITIONS;
     if (type == "DISTRIBUTED_RESET_AGENT") return RESET_AGENT;
     return std::nullopt;
@@ -1122,6 +1149,22 @@ void MultiBookExchangeAgent::handleDistributedPlaceMarketOrder(const Message::Pt
     if (m_replayLog && !isMarginCall) {
         m_replayEventLoggers.at(subPayload->bookId)->log(msg);
     }
+    // A miner's own size off the grid is refused, not cut (under offGridOrders="refuse"); a margin call
+    // or an SL/TP close, which the engine sizes itself, never is.
+    if (!isMarginCall && subPayload->closeReason == 0) {
+        if (const auto ec = offGrid(*subPayload)) {
+            simulation()->logDebug("Off-grid Market Order Placement by Distributed Agent - {} : {}", *ec, payload);
+            if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
+            return fastRespondToMessage(
+                msg,
+                "ERROR",
+                MessagePayload::create<DistributedAgentResponsePayload>(
+                    payload->agentId,
+                    MessagePayload::create<PlaceOrderMarketErrorResponsePayload>(
+                        subPayload,
+                        MessagePayload::create<ErrorResponsePayload>(OrderErrorCode2StrView(*ec).data()))));
+        }
+    }
 
     if (simulation()->debug()) {
         const auto& balances = simulation()->exchange()->accounts()[payload->agentId][subPayload->bookId];
@@ -1214,6 +1257,20 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(const Message::Ptr
 
     if (m_replayLog) {
         m_replayEventLoggers.at(subPayload->bookId)->log(msg);
+    }
+    // A MINER'S PRICE OR SIZE OFF THE GRID IS REFUSED, not cut (under offGridOrders="refuse"). Judged on
+    // what the miner sent, before the engine's own adjustment below can move the price off the grid.
+    if (const auto ec = offGrid(*subPayload)) {
+        simulation()->logDebug("Off-grid Limit Order Placement by Distributed Agent - {} : {}", *ec, payload);
+        if (simulation()->m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
+        return fastRespondToMessage(
+            msg,
+            "ERROR",
+            MessagePayload::create<DistributedAgentResponsePayload>(
+                payload->agentId,
+                MessagePayload::create<PlaceOrderLimitErrorResponsePayload>(
+                    subPayload,
+                    MessagePayload::create<ErrorResponsePayload>(OrderErrorCode2StrView(*ec).data()))));
     }
     if (simulation()->shouldAdjustLimitPrice(msg)) {
         const auto now = simulation()->currentTimestamp();
@@ -1310,7 +1367,7 @@ void MultiBookExchangeAgent::handleDistributedPlaceLimitOrder(const Message::Ptr
             Timestamp{},
             msg->source,
             name(),
-            "DISTRIBUTED_CANCEL_ORDERS",
+            "DISTRIBUTED_EXPIRE_ORDERS",
             MessagePayload::create<DistributedAgentResponsePayload>(
                 payload->agentId,
                 MessagePayload::create<CancelOrdersPayload>(
@@ -1344,6 +1401,13 @@ void MultiBookExchangeAgent::handleDistributedRetrieveOrders(const Message::Ptr&
 
 void MultiBookExchangeAgent::handleDistributedCancelOrders(const Message::Ptr& msg)
 {
+    // A GTT order's expiry is the exchange's own cancel at the order's deadline, scheduled when the order rests. It
+    // is answered as a cancel, so the owner learns of the expiry as before; an order already filled or cancelled by
+    // its deadline is dropped without a notice, since the owner has had its fill or its cancel,
+    // and a 'do not exist' notice for every order long gone would only flood it.
+    const bool expiry = msg->type == "DISTRIBUTED_EXPIRE_ORDERS";
+    if (expiry) msg->type = "DISTRIBUTED_CANCEL_ORDERS";
+
     const auto payload = std::static_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
     const auto subPayload = std::static_pointer_cast<CancelOrdersPayload>(payload->payload);
 
@@ -1401,7 +1465,7 @@ void MultiBookExchangeAgent::handleDistributedCancelOrders(const Message::Ptr& m
             );
     }
 
-    if (!failures.empty()) {
+    if (!failures.empty() && !expiry) {
         std::vector<OrderID> orderIds = failures
             | views::transform([](const auto& c) { return c.id; })
             | ranges::to<std::vector>();
@@ -1520,7 +1584,7 @@ void MultiBookExchangeAgent::handleLocalMessage(const Message::Ptr& msg)
     else if (msg->type == "RETRIEVE_ORDERS") {
         handleLocalRetrieveOrders(msg);
     }
-    else if (msg->type == "CANCEL_ORDERS") {
+    else if (msg->type == "CANCEL_ORDERS" || msg->type == "EXPIRE_ORDERS") {
         handleLocalCancelOrders(msg);
     }
     else if (msg->type == "CLOSE_POSITIONS") {
@@ -1560,6 +1624,54 @@ void MultiBookExchangeAgent::handleLocalMessage(const Message::Ptr& msg)
 
 //-------------------------------------------------------------------------
 
+std::optional<OrderErrorCode> MultiBookExchangeAgent::offGrid(const PlaceOrderLimitPayload& order) const noexcept
+{
+    const auto& params = m_config.parameters();
+    if (!params.refuseOffGrid) return std::nullopt;
+    if (taosim::util::round(order.price, params.priceIncrementDecimals) != order.price) {
+        return OrderErrorCode::PRICE_INCREMENT_VIOLATED;
+    }
+    const auto decimals = order.currency == Currency::BASE
+        ? params.volumeIncrementDecimals : params.quoteIncrementDecimals;
+    if (taosim::util::round(order.volume, decimals) != order.volume) {
+        return OrderErrorCode::VOLUME_INCREMENT_VIOLATED;
+    }
+    return std::nullopt;
+}
+
+std::optional<OrderErrorCode> MultiBookExchangeAgent::offGrid(const PlaceOrderMarketPayload& order) const noexcept
+{
+    const auto& params = m_config.parameters();
+    if (!params.refuseOffGrid) return std::nullopt;
+    const auto decimals = order.currency == Currency::BASE
+        ? params.volumeIncrementDecimals : params.quoteIncrementDecimals;
+    if (taosim::util::round(order.volume, decimals) != order.volume) {
+        return OrderErrorCode::VOLUME_INCREMENT_VIOLATED;
+    }
+    return std::nullopt;
+}
+
+void MultiBookExchangeAgent::roundOntoGrid(PlaceOrderLimitPayload& order) const noexcept
+{
+    const auto& params = m_config.parameters();
+    if (!params.refuseOffGrid) return;
+    order.price = taosim::util::roundNearest(order.price, params.priceIncrementDecimals);
+    order.volume = taosim::util::roundNearest(
+        order.volume,
+        order.currency == Currency::BASE ? params.volumeIncrementDecimals : params.quoteIncrementDecimals);
+}
+
+void MultiBookExchangeAgent::roundOntoGrid(PlaceOrderMarketPayload& order) const noexcept
+{
+    const auto& params = m_config.parameters();
+    if (!params.refuseOffGrid) return;
+    order.volume = taosim::util::roundNearest(
+        order.volume,
+        order.currency == Currency::BASE ? params.volumeIncrementDecimals : params.quoteIncrementDecimals);
+}
+
+//-------------------------------------------------------------------------
+
 void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr& msg)
 {
     const auto& payload = std::static_pointer_cast<PlaceOrderMarketPayload>(msg->payload);
@@ -1570,6 +1682,11 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(const Message::Ptr& msg
     }
     if (m_replayLog && !isMarginCall) {
         m_replayEventLoggers.at(payload->bookId)->log(msg);
+    }
+    // A background agent's size onto the nearest grid point; never a margin call's or a sweep's, which
+    // the engine sizes itself.
+    if (!isMarginCall && msg->source != "EXCHANGE") {
+        roundOntoGrid(*payload);
     }
 
     if (simulation()->debug()) {
@@ -1658,6 +1775,10 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(const Message::Ptr& msg)
             payload->price = payload->price / it->second * prevailingMidPrice;
         }
     }
+    // A background agent's price and size onto the nearest grid point, after the adjustment above.
+    if (msg->source != "EXCHANGE") {
+        roundOntoGrid(*payload);
+    }
 
     if (simulation()->debug()) {
         auto agentId = accounts().lookupLocalAgentId(msg->source);
@@ -1724,7 +1845,7 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(const Message::Ptr& msg)
             Timestamp{},
             msg->source,
             name(),
-            "CANCEL_ORDERS",
+            "EXPIRE_ORDERS",
             MessagePayload::create<CancelOrdersPayload>(
                 std::vector{taosim::event::Cancellation{order->id()}}, payload->bookId));
     }
@@ -1753,6 +1874,10 @@ void MultiBookExchangeAgent::handleLocalRetrieveOrders(const Message::Ptr& msg)
 
 void MultiBookExchangeAgent::handleLocalCancelOrders(const Message::Ptr& msg)
 {
+    // A GTT expiry, answered as a cancel and silent on an order already gone: see handleDistributedCancelOrders.
+    const bool expiry = msg->type == "EXPIRE_ORDERS";
+    if (expiry) msg->type = "CANCEL_ORDERS";
+
     const auto& payload = std::static_pointer_cast<CancelOrdersPayload>(msg->payload);
 
     if (m_replayLog) {
@@ -1801,7 +1926,7 @@ void MultiBookExchangeAgent::handleLocalCancelOrders(const Message::Ptr& msg)
             0);
     }
 
-    if (!failures.empty()) {
+    if (!failures.empty() && !expiry) {
         std::vector<OrderID> orderIds = failures
             | views::transform([](const auto& c) { return c.id; })
             | ranges::to<std::vector>();
@@ -2248,9 +2373,44 @@ void MultiBookExchangeAgent::notifyTradeSubscribersByOrderID(
 
 //-------------------------------------------------------------------------
 
+bool MultiBookExchangeAgent::accountInFull(AgentId agentId) const noexcept
+{
+    return !m_dirtyAccountsOnly
+        || m_fullAccountsRequested
+        || (m_fullAccountsEvery != 0
+            && (static_cast<uint64_t>(agentId) + m_accountsDeliveries) % m_fullAccountsEvery == 0);
+}
+
+//-------------------------------------------------------------------------
+
+void MultiBookExchangeAgent::markDirty(taosim::accounting::Account& account, BookId bookId) noexcept
+{
+    if (sharedQuoteBalances()) {
+        account.markAllDirty();
+    } else {
+        account.markDirty(bookId);
+    }
+}
+
+//-------------------------------------------------------------------------
+
+void MultiBookExchangeAgent::accountsDelivered()
+{
+    if (!m_dirtyAccountsOnly) return;
+    for ([[maybe_unused]] auto& [_, account] : accounts()) {
+        account.markClean();
+    }
+    ++m_accountsDeliveries;
+    m_fullAccountsRequested = false;
+}
+
+//-------------------------------------------------------------------------
+
 void MultiBookExchangeAgent::orderCallback(Order::Ptr order, OrderContext ctx)
 {
-    accounts()[ctx.agentId].activeOrders()[ctx.bookId].insert(order);
+    auto& account = accounts()[ctx.agentId];
+    account.activeOrders()[ctx.bookId].insert(order);
+    markDirty(account, ctx.bookId);
 
     // Snapshot SL/TP info into the container's side store at creation
     // time. This covers aggressing market / marketable-limit orders that
@@ -2421,7 +2581,9 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
     const OrderID orderId = limitOrder->id();
     const AgentId agentId = m_books[bookId]->orderToClientInfo().at(orderId).agentId;
 
-    taosim::accounting::Balances& balances = accounts().at(agentId).at(bookId);
+    auto& account = accounts().at(agentId);
+    markDirty(account, bookId);
+    taosim::accounting::Balances& balances = account.at(bookId);
     const auto freed = [&] -> taosim::accounting::ReservationAmounts {
         if (balances.canFree(orderId)){
             if (limitOrder->direction() == OrderDirection::BUY) {
@@ -2438,7 +2600,7 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
         return {};
     }();
 
-    accounts()[agentId].activeOrders()[bookId].erase(limitOrder);
+    account.activeOrders()[bookId].erase(limitOrder);
 
     if (limitOrder->volume() > 0_dec) {
         simulation()->logDebug(
@@ -2467,7 +2629,6 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
     // across the agent's books (multi-asset portfolio), so it is genuinely idle only when
     // the agent has NO active orders in ANY of its books — a per-book check would flag the
     // reserved amount that legitimately backs sibling-book orders. Base is always per-book.
-    auto& account = accounts()[agentId];
     const auto bookIdCanon = simulation()->bookIdCanon(bookId);
     const bool quoteIdle = sharedQuoteBalances()
         ? ranges::all_of(account.activeOrders(), [](const auto& orders) { return orders.empty(); })
@@ -2493,8 +2654,10 @@ void MultiBookExchangeAgent::unregisterLimitOrderCallback(LimitOrder::Ptr limitO
 void MultiBookExchangeAgent::marketOrderProcessedCallback(
     MarketOrder::Ptr marketOrder, OrderContext ctx)
 {
-    accounts()[ctx.agentId].activeOrders()[ctx.bookId].erase(marketOrder);
-    taosim::accounting::Balances& balances = accounts()[ctx.agentId][ctx.bookId];
+    auto& account = accounts()[ctx.agentId];
+    account.activeOrders()[ctx.bookId].erase(marketOrder);
+    markDirty(account, ctx.bookId);
+    taosim::accounting::Balances& balances = account[ctx.bookId];
 
     if (balances.canFree(marketOrder->id())){
         balances.freeReservation(marketOrder->id(), m_books[ctx.bookId]->bestAsk(),

@@ -149,11 +149,16 @@ std::unique_ptr<DynamicFeePolicy> DynamicFeePolicy::fromXML(pugi::xml_node node,
             "{}: Missing required argument '{}'", ctx, name)};
     };
 
+    // The dynamic part moves a rate between the sides and leaves their sum alone, so the configured pair bounds it.
+    const auto makerFee = checkFeeRate(getAttr(node, "makerFee").as_double());
+    const auto takerFee = checkFeeRate(getAttr(node, "takerFee").as_double());
+    checkFeeSum(makerFee, takerFee, ctx);
+
     return std::make_unique<DynamicFeePolicy>(DFPolicyDesc{
         .simulation = simulation,
         .historySlots = getAttr(node, "historySlots").as_int(),
-        .makerFee = checkFeeRate(getAttr(node, "makerFee").as_double()),
-        .takerFee = checkFeeRate(getAttr(node, "takerFee").as_double()),
+        .makerFee = makerFee,
+        .takerFee = takerFee,
         .maxMakerRate = util::double2decimal(getAttr(node, "maxMakerRate").as_double()),
         .maxTakerRate = util::double2decimal(getAttr(node, "maxTakerRate").as_double()),
         .targetMTR = util::double2decimal(getAttr(node, "targetMTR").as_double()),

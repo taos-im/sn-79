@@ -79,539 +79,539 @@ void packNotice(
 {
     using namespace std::string_literals;
 
-            if (msg->type == "EVENT_SIMULATION_START") {
-                o.pack_map(4);
-            } else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"
-                || msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
-                o.pack_map(13);
-            } else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"
-                || msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
-                o.pack_map(13);
-            } else if (msg->type == "EVENT_TRADE") {
-                o.pack_map(17);
-            } else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" 
-                || msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
-                o.pack_map(5);
-            } else if (msg->type == "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS"
-                || msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
-                o.pack_map(5);
-            } else if (msg->type == "RESPONSE_DISTRIBUTED_RESET_AGENT"
-                || msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT") {
-                o.pack_map(4);
-            } else if (msg->type == "EVENT_SIMULATION_END") {
-                o.pack_map(3);
-            } else {
-                o.pack_map(3);
-            }
+    if (msg->type == "EVENT_SIMULATION_START") {
+        o.pack_map(4);
+    } else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"
+        || msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
+        o.pack_map(13);
+    } else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"
+        || msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
+        o.pack_map(13);
+    } else if (msg->type == "EVENT_TRADE") {
+        o.pack_map(17);
+    } else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" 
+        || msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
+        o.pack_map(5);
+    } else if (msg->type == "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS"
+        || msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
+        o.pack_map(5);
+    } else if (msg->type == "RESPONSE_DISTRIBUTED_RESET_AGENT"
+        || msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT") {
+        o.pack_map(4);
+    } else if (msg->type == "EVENT_SIMULATION_END") {
+        o.pack_map(3);
+    } else {
+        o.pack_map(3);
+    }
 
-            auto abbreviate = [](const std::string& str) {
-                std::vector<std::string> parts;
-                boost::split(parts, str, boost::is_any_of("_"));
-                return fmt::format(
-                    "{}",
-                    fmt::join(
-                        parts
-                        | views::transform([](auto&& part) {
-                            return part.empty() ? ""s : std::string(1, part.front());
-                        }),
-                        ""));
-            };
+    auto abbreviate = [](const std::string& str) {
+        std::vector<std::string> parts;
+        boost::split(parts, str, boost::is_any_of("_"));
+        return fmt::format(
+            "{}",
+            fmt::join(
+                parts
+                | views::transform([](auto&& part) {
+                    return part.empty() ? ""s : std::string(1, part.front());
+                }),
+                ""));
+    };
 
-            o.pack("y"s);
-            o.pack(abbreviate(msg->type));
+    o.pack("y"s);
+    o.pack(abbreviate(msg->type));
+
+    o.pack("t"s);
+    // A SCHEDULED MESSAGE'S OCCURRENCE IS WHEN IT WAS QUEUED, NOT WHEN IT HAPPENS.
+    //
+    // Every ordinary notice is created at the moment it occurs (Book.cpp passes
+    // currentTimestamp as both occurrence and arrival), so for those the two are equal and
+    // this reads the same either way. The two lifecycle events are the exception: both are
+    // queued by Simulation::start() at the simulation's START, the end one with a delay of
+    // duration-1, so its occurrence is 0 and its arrival is when the simulation actually
+    // ends. Packing the occurrence gave an end event stamped with the start time, which then
+    // sorted to the FRONT of the agent's notice list -- an agent reading its final update saw
+    // "simulation ended" before the trades it had just done.
+    //
+    // Only the lifecycle pair is switched to arrival, deliberately: a fill notice's timestamp
+    // is a documented quantity and is not this change's business.
+    {
+        o.pack(isLifecycleNotice(msg) ? msg->arrival : msg->occurrence);
+    }
+
+    o.pack("a"s);
+    [&] {
+        if (isLifecycleNotice(msg)) {
+            o.pack_nil();
+            return;
+        }
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        if (pld == nullptr) {
+            throw std::runtime_error{fmt::format(
+                "{}: Failed to cast to DistributedAgentResponsePayload in 'packNotice'", ctx)};
+        }
+        if (pld->agentId > 0) {
+            o.pack(pld->agentId);
+        } else {
+            o.pack_nil();
+        }
+    }();
+
+    // An error notice whose payload is not the typed error its type names refuses an instruction
+    // that could not be decoded. It carries the reason, if it has one, and names no book, order,
+    // client order id or agent. The side, size, leverage and limit a placement refusal must carry
+    // are written as zero, and the settlement as unset; a cancel, close or reset refusal is one
+    // entry.
+    auto packUndecodedPlacementRefusal = [&] {
+        o.pack("b"s);
+        o.pack_nil();
+        o.pack("o"s);
+        o.pack_nil();
+        o.pack("c"s);
+        o.pack_nil();
+        o.pack("s"s);
+        o.pack(0);
+        o.pack("q"s);
+        o.pack(0.0);
+        o.pack("u"s);
+        o.pack(false);
+        o.pack("m"s);
+        o.pack(detail::refusalReason(msg));
+        o.pack("l"s);
+        o.pack(0.0);
+        o.pack("f"s);
+        o.pack(-2);
+    };
+    auto packUndecodedEntryRefusal = [&](const std::string& entriesKey) {
+        o.pack("b"s);
+        o.pack_nil();
+        o.pack(entriesKey);
+        o.pack_array(1);
+        o.pack_map(6);
+        o.pack("t"s);
+        o.pack(msg->occurrence);
+        o.pack("b"s);
+        o.pack_nil();
+        o.pack("o"s);
+        o.pack_nil();
+        o.pack("q"s);
+        o.pack_nil();
+        o.pack("u"s);
+        o.pack(false);
+        o.pack("m"s);
+        o.pack(detail::refusalReason(msg));
+    };
+
+    if (msg->type == "EVENT_SIMULATION_START") {
+        o.pack("l"s);
+        o.pack(logDir);
+    }
+    else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack(subPld->id);
+
+        o.pack("c"s);
+        o.pack(reqPld->clientOrderId);
+
+        o.pack("s"s);
+        o.pack(reqPld->direction);
+
+        o.pack("q"s);
+        o.pack(reqPld->volume);
+
+        o.pack("u"s);
+        o.pack(true);
+
+        o.pack("m"s);
+        o.pack(""s);
+
+        o.pack("l"s);
+        o.pack(reqPld->leverage);
+
+        o.pack("f"s);
+        o.pack(reqPld->settleFlag);
+
+        o.pack("p"s);
+        o.pack(reqPld->price);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"
+        && detail::typedError<PlaceOrderLimitErrorResponsePayload>(msg) == nullptr) {
+        packUndecodedPlacementRefusal();
+        o.pack("p"s);
+        o.pack(0.0);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+        const auto errPld = subPld->errorPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack_nil();
+
+        o.pack("c"s);
+        o.pack(reqPld->clientOrderId);
+
+        o.pack("s"s);
+        o.pack(reqPld->direction);
+
+        o.pack("q"s);
+        o.pack(reqPld->volume);
+
+        o.pack("u"s);
+        o.pack(false);
+
+        o.pack("m"s);
+        o.pack(errPld->message);
+
+        o.pack("l"s);
+        o.pack(reqPld->leverage);
+
+        o.pack("f"s);
+        o.pack(reqPld->settleFlag);
+
+        o.pack("p"s);
+        o.pack(reqPld->price);
+    }
+    else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack(subPld->id);
+
+        o.pack("c"s);
+        o.pack(reqPld->clientOrderId);
+
+        o.pack("s"s);
+        o.pack(reqPld->direction);
+
+        o.pack("q"s);
+        o.pack(reqPld->volume);
+
+        o.pack("u"s);
+        o.pack(true);
+
+        o.pack("m"s);
+        o.pack(""s);
+
+        o.pack("l"s);
+        o.pack(reqPld->leverage);
+
+        o.pack("f"s);
+        o.pack(reqPld->settleFlag);
+
+        o.pack("r"s);
+        o.pack(reqPld->currency);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"
+        && detail::typedError<PlaceOrderMarketErrorResponsePayload>(msg) == nullptr) {
+        packUndecodedPlacementRefusal();
+        o.pack("r"s);
+        o.pack(Currency::BASE);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+        const auto errPld = subPld->errorPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack_nil();
+
+        o.pack("c"s);
+        o.pack(reqPld->clientOrderId);
+
+        o.pack("s"s);
+        o.pack(reqPld->direction);
+
+        o.pack("q"s);
+        o.pack(reqPld->volume);
+
+        o.pack("u"s);
+        o.pack(false);
+
+        o.pack("m"s);
+        o.pack(errPld->message);
+
+        o.pack("l"s);
+        o.pack(reqPld->leverage);
+
+        o.pack("f"s);
+        o.pack(reqPld->settleFlag);
+
+        o.pack("r"s);
+        o.pack(reqPld->currency);
+    }
+    else if (msg->type == "EVENT_TRADE") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<EventTradePayload>(pld->payload);
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + subPld->bookId);
+
+        o.pack("i"s);
+        o.pack(subPld->trade.m_id);
+
+        o.pack("c"s);
+        o.pack(subPld->clientOrderId);
+
+        o.pack("Ta"s);
+        // The EFFECTIVE taker. A sweep order is placed under the exchange's own id (-1) once a
+        // miner's instruction has moved the pool through a resting price; packing that id
+        // leaves the validator with no settleable counterparty, so the fill reports
+        // executed=false, corrections unwind it, and the resting miner is never filled nor
+        // told. initiatorAgentId names the miner that caused it, and is nullopt otherwise.
+        o.pack(subPld->context.initiatorAgentId.value_or(subPld->context.aggressingAgentId));
+
+        o.pack("Ti"s);
+        o.pack(subPld->trade.m_aggressingOrderID);
+
+        o.pack("Tf"s);
+        o.pack(subPld->context.fees.taker);
+
+        o.pack("Ma"s);
+        o.pack(subPld->context.restingAgentId);
+
+        o.pack("Mi"s);
+        o.pack(subPld->trade.m_restingOrderID);
+
+        o.pack("Mf"s);
+        o.pack(subPld->context.fees.maker);
+
+        o.pack("s"s);
+        o.pack(subPld->trade.m_direction);
+
+        o.pack("p"s);
+        o.pack(subPld->trade.m_price);
+
+        o.pack("q"s);
+        o.pack(subPld->trade.m_volume);
+
+        o.pack("cr"s);
+        o.pack(subPld->context.aggressingCloseReason);
+
+        o.pack("Toi"s);
+        o.pack(subPld->context.aggressingOriginatingOrderId);
+    }
+    else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<CancelOrdersResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("c"s);
+        o.pack_array(reqPld->cancellations.size());
+        for (const auto& cancellation : reqPld->cancellations) {
+            o.pack_map(6);
 
             o.pack("t"s);
-            // A SCHEDULED MESSAGE'S OCCURRENCE IS WHEN IT WAS QUEUED, NOT WHEN IT HAPPENS.
-            //
-            // Every ordinary notice is created at the moment it occurs (Book.cpp passes
-            // currentTimestamp as both occurrence and arrival), so for those the two are equal and
-            // this reads the same either way. The two lifecycle events are the exception: both are
-            // queued by Simulation::start() at the simulation's START, the end one with a delay of
-            // duration-1, so its occurrence is 0 and its arrival is when the simulation actually
-            // ends. Packing the occurrence gave an end event stamped with the start time, which then
-            // sorted to the FRONT of the agent's notice list -- an agent reading its final update saw
-            // "simulation ended" before the trades it had just done.
-            //
-            // Only the lifecycle pair is switched to arrival, deliberately: a fill notice's timestamp
-            // is a documented quantity and is not this change's business.
-            {
-                o.pack(isLifecycleNotice(msg) ? msg->arrival : msg->occurrence);
-            }
+            o.pack(msg->occurrence);
+
+            o.pack("b"s);
+            o.pack(bookIdOffset + reqPld->bookId);
+
+            o.pack("o"s);
+            o.pack(cancellation.id);
+
+            o.pack("q"s);
+            o.pack(cancellation.volume);
+
+            o.pack("u"s);
+            o.pack(true);
+
+            o.pack("m"s);
+            o.pack(""s);
+        }
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS"
+        && detail::typedError<CancelOrdersErrorResponsePayload>(msg) == nullptr) {
+        packUndecodedEntryRefusal("c"s);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<CancelOrdersErrorResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+        const auto errPld = subPld->errorPayload;
+
+        o.pack("b"s);
+        o.pack(bookIdOffset + reqPld->bookId);
+
+        o.pack("c"s);
+        o.pack_array(reqPld->cancellations.size());
+        for (const auto& cancellation : reqPld->cancellations) {
+            o.pack_map(6);
+
+            o.pack("t"s);
+            o.pack(msg->occurrence);
+
+            o.pack("b"s);
+            o.pack(bookIdOffset + reqPld->bookId);
+
+            o.pack("o"s);
+            o.pack(cancellation.id);
+
+            o.pack("q"s);
+            o.pack(cancellation.volume);
+
+            o.pack("u"s);
+            o.pack(false);
+
+            o.pack("m"s);
+            o.pack(errPld->message);
+        }
+    }
+    // The close-positions book ids are written WITHOUT bookIdOffset: the retired
+    // in-place canonize never covered the close-positions response payloads, and
+    // this transfer preserves the wire behavior exactly.
+    else if (msg->type == "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<ClosePositionsResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+
+        o.pack("b"s);
+        o.pack(reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack_array(reqPld->closePositions.size());
+        for (const auto& close : reqPld->closePositions) {
+            o.pack_map(6);
+
+            o.pack("t"s);
+            o.pack(msg->occurrence);
+
+            o.pack("b"s);
+            o.pack(reqPld->bookId);
+
+            o.pack("o"s);
+            o.pack(close.id);
+
+            o.pack("q"s);
+            o.pack(close.volume);
+
+            o.pack("u"s);
+            o.pack(true);
+
+            o.pack("m"s);
+            o.pack(""s);
+        }
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS"
+        && detail::typedError<ClosePositionsErrorResponsePayload>(msg) == nullptr) {
+        packUndecodedEntryRefusal("o"s);
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<ClosePositionsErrorResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+        const auto errPld = subPld->errorPayload;
+
+        o.pack("b"s);
+        o.pack(reqPld->bookId);
+
+        o.pack("o"s);
+        o.pack_array(reqPld->closePositions.size());
+        for (const auto& close : reqPld->closePositions) {
+            o.pack_map(6);
+
+            o.pack("t"s);
+            o.pack(msg->occurrence);
+
+            o.pack("b"s);
+            o.pack(reqPld->bookId);
+
+            o.pack("o"s);
+            o.pack(close.id);
+
+            o.pack("q"s);
+            o.pack(close.volume);
+
+            o.pack("u"s);
+            o.pack(false);
+
+            o.pack("m"s);
+            o.pack(errPld->message);
+        }
+    }
+    else if (msg->type == "RESPONSE_DISTRIBUTED_RESET_AGENT") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<ResetAgentsResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+
+        o.pack("r"s);
+        o.pack_array(reqPld->agentIds.size());
+        for (auto agentId : reqPld->agentIds) {
+            o.pack_map(4);
 
             o.pack("a"s);
-            [&] {
-                if (isLifecycleNotice(msg)) {
-                    o.pack_nil();
-                    return;
-                }
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                if (pld == nullptr) {
-                    throw std::runtime_error{fmt::format(
-                        "{}: Failed to cast to DistributedAgentResponsePayload in 'packNotice'", ctx)};
-                }
-                if (pld->agentId > 0) {
-                    o.pack(pld->agentId);
-                } else {
-                    o.pack_nil();
-                }
-            }();
-
-            // An error notice whose payload is not the typed error its type names refuses an instruction
-            // that could not be decoded. It carries the reason, if it has one, and names no book, order,
-            // client order id or agent. The side, size, leverage and limit a placement refusal must carry
-            // are written as zero, and the settlement as unset; a cancel, close or reset refusal is one
-            // entry.
-            auto packUndecodedPlacementRefusal = [&] {
-                o.pack("b"s);
-                o.pack_nil();
-                o.pack("o"s);
-                o.pack_nil();
-                o.pack("c"s);
-                o.pack_nil();
-                o.pack("s"s);
-                o.pack(0);
-                o.pack("q"s);
-                o.pack(0.0);
-                o.pack("u"s);
-                o.pack(false);
-                o.pack("m"s);
-                o.pack(detail::refusalReason(msg));
-                o.pack("l"s);
-                o.pack(0.0);
-                o.pack("f"s);
-                o.pack(-2);
-            };
-            auto packUndecodedEntryRefusal = [&](const std::string& entriesKey) {
-                o.pack("b"s);
-                o.pack_nil();
-                o.pack(entriesKey);
-                o.pack_array(1);
-                o.pack_map(6);
-                o.pack("t"s);
-                o.pack(msg->occurrence);
-                o.pack("b"s);
-                o.pack_nil();
-                o.pack("o"s);
-                o.pack_nil();
-                o.pack("q"s);
-                o.pack_nil();
-                o.pack("u"s);
-                o.pack(false);
-                o.pack("m"s);
-                o.pack(detail::refusalReason(msg));
-            };
-
-            if (msg->type == "EVENT_SIMULATION_START") {
-                o.pack("l"s);
-                o.pack(logDir);
-            }
-            else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack(subPld->id);
-
-                o.pack("c"s);
-                o.pack(reqPld->clientOrderId);
-
-                o.pack("s"s);
-                o.pack(reqPld->direction);
-
-                o.pack("q"s);
-                o.pack(reqPld->volume);
-
-                o.pack("u"s);
-                o.pack(true);
-
-                o.pack("m"s);
-                o.pack(""s);
-
-                o.pack("l"s);
-                o.pack(reqPld->leverage);
-
-                o.pack("f"s);
-                o.pack(reqPld->settleFlag);
-
-                o.pack("p"s);
-                o.pack(reqPld->price);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"
-                && detail::typedError<PlaceOrderLimitErrorResponsePayload>(msg) == nullptr) {
-                packUndecodedPlacementRefusal();
-                o.pack("p"s);
-                o.pack(0.0);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-                const auto errPld = subPld->errorPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack_nil();
-
-                o.pack("c"s);
-                o.pack(reqPld->clientOrderId);
-
-                o.pack("s"s);
-                o.pack(reqPld->direction);
-
-                o.pack("q"s);
-                o.pack(reqPld->volume);
-
-                o.pack("u"s);
-                o.pack(false);
-
-                o.pack("m"s);
-                o.pack(errPld->message);
-
-                o.pack("l"s);
-                o.pack(reqPld->leverage);
-
-                o.pack("f"s);
-                o.pack(reqPld->settleFlag);
-
-                o.pack("p"s);
-                o.pack(reqPld->price);
-            }
-            else if (msg->type == "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack(subPld->id);
-
-                o.pack("c"s);
-                o.pack(reqPld->clientOrderId);
-
-                o.pack("s"s);
-                o.pack(reqPld->direction);
-
-                o.pack("q"s);
-                o.pack(reqPld->volume);
-
-                o.pack("u"s);
-                o.pack(true);
-
-                o.pack("m"s);
-                o.pack(""s);
-
-                o.pack("l"s);
-                o.pack(reqPld->leverage);
-
-                o.pack("f"s);
-                o.pack(reqPld->settleFlag);
-
-                o.pack("r"s);
-                o.pack(reqPld->currency);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"
-                && detail::typedError<PlaceOrderMarketErrorResponsePayload>(msg) == nullptr) {
-                packUndecodedPlacementRefusal();
-                o.pack("r"s);
-                o.pack(Currency::BASE);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-                const auto errPld = subPld->errorPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack_nil();
-
-                o.pack("c"s);
-                o.pack(reqPld->clientOrderId);
-
-                o.pack("s"s);
-                o.pack(reqPld->direction);
-
-                o.pack("q"s);
-                o.pack(reqPld->volume);
-
-                o.pack("u"s);
-                o.pack(false);
-
-                o.pack("m"s);
-                o.pack(errPld->message);
-
-                o.pack("l"s);
-                o.pack(reqPld->leverage);
-
-                o.pack("f"s);
-                o.pack(reqPld->settleFlag);
-
-                o.pack("r"s);
-                o.pack(reqPld->currency);
-            }
-            else if (msg->type == "EVENT_TRADE") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<EventTradePayload>(pld->payload);
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + subPld->bookId);
-
-                o.pack("i"s);
-                o.pack(subPld->trade.m_id);
-
-                o.pack("c"s);
-                o.pack(subPld->clientOrderId);
-
-                o.pack("Ta"s);
-                // The EFFECTIVE taker. A sweep order is placed under the exchange's own id (-1) once a
-                // miner's instruction has moved the pool through a resting price; packing that id
-                // leaves the validator with no settleable counterparty, so the fill reports
-                // executed=false, corrections unwind it, and the resting miner is never filled nor
-                // told. initiatorAgentId names the miner that caused it, and is nullopt otherwise.
-                o.pack(subPld->context.initiatorAgentId.value_or(subPld->context.aggressingAgentId));
-
-                o.pack("Ti"s);
-                o.pack(subPld->trade.m_aggressingOrderID);
-
-                o.pack("Tf"s);
-                o.pack(subPld->context.fees.taker);
-
-                o.pack("Ma"s);
-                o.pack(subPld->context.restingAgentId);
-
-                o.pack("Mi"s);
-                o.pack(subPld->trade.m_restingOrderID);
-
-                o.pack("Mf"s);
-                o.pack(subPld->context.fees.maker);
-
-                o.pack("s"s);
-                o.pack(subPld->trade.m_direction);
-
-                o.pack("p"s);
-                o.pack(subPld->trade.m_price);
-
-                o.pack("q"s);
-                o.pack(subPld->trade.m_volume);
-
-                o.pack("cr"s);
-                o.pack(subPld->context.aggressingCloseReason);
-
-                o.pack("Toi"s);
-                o.pack(subPld->context.aggressingOriginatingOrderId);
-            }
-            else if (msg->type == "RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<CancelOrdersResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("c"s);
-                o.pack_array(reqPld->cancellations.size());
-                for (const auto& cancellation : reqPld->cancellations) {
-                    o.pack_map(6);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("b"s);
-                    o.pack(bookIdOffset + reqPld->bookId);
-
-                    o.pack("o"s);
-                    o.pack(cancellation.id);
-
-                    o.pack("q"s);
-                    o.pack(cancellation.volume);
-
-                    o.pack("u"s);
-                    o.pack(true);
-
-                    o.pack("m"s);
-                    o.pack(""s);
-                }
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS"
-                && detail::typedError<CancelOrdersErrorResponsePayload>(msg) == nullptr) {
-                packUndecodedEntryRefusal("c"s);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<CancelOrdersErrorResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-                const auto errPld = subPld->errorPayload;
-
-                o.pack("b"s);
-                o.pack(bookIdOffset + reqPld->bookId);
-
-                o.pack("c"s);
-                o.pack_array(reqPld->cancellations.size());
-                for (const auto& cancellation : reqPld->cancellations) {
-                    o.pack_map(6);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("b"s);
-                    o.pack(bookIdOffset + reqPld->bookId);
-
-                    o.pack("o"s);
-                    o.pack(cancellation.id);
-
-                    o.pack("q"s);
-                    o.pack(cancellation.volume);
-
-                    o.pack("u"s);
-                    o.pack(false);
-
-                    o.pack("m"s);
-                    o.pack(errPld->message);
-                }
-            }
-            // The close-positions book ids are written WITHOUT bookIdOffset: the retired
-            // in-place canonize never covered the close-positions response payloads, and
-            // this transfer preserves the wire behavior exactly.
-            else if (msg->type == "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<ClosePositionsResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-
-                o.pack("b"s);
-                o.pack(reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack_array(reqPld->closePositions.size());
-                for (const auto& close : reqPld->closePositions) {
-                    o.pack_map(6);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("b"s);
-                    o.pack(reqPld->bookId);
-
-                    o.pack("o"s);
-                    o.pack(close.id);
-
-                    o.pack("q"s);
-                    o.pack(close.volume);
-
-                    o.pack("u"s);
-                    o.pack(true);
-
-                    o.pack("m"s);
-                    o.pack(""s);
-                }
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS"
-                && detail::typedError<ClosePositionsErrorResponsePayload>(msg) == nullptr) {
-                packUndecodedEntryRefusal("o"s);
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<ClosePositionsErrorResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-                const auto errPld = subPld->errorPayload;
-
-                o.pack("b"s);
-                o.pack(reqPld->bookId);
-
-                o.pack("o"s);
-                o.pack_array(reqPld->closePositions.size());
-                for (const auto& close : reqPld->closePositions) {
-                    o.pack_map(6);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("b"s);
-                    o.pack(reqPld->bookId);
-
-                    o.pack("o"s);
-                    o.pack(close.id);
-
-                    o.pack("q"s);
-                    o.pack(close.volume);
-
-                    o.pack("u"s);
-                    o.pack(false);
-
-                    o.pack("m"s);
-                    o.pack(errPld->message);
-                }
-            }
-            else if (msg->type == "RESPONSE_DISTRIBUTED_RESET_AGENT") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<ResetAgentsResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-
-                o.pack("r"s);
-                o.pack_array(reqPld->agentIds.size());
-                for (auto agentId : reqPld->agentIds) {
-                    o.pack_map(4);
-
-                    o.pack("a"s);
-                    o.pack(agentId);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("u"s);
-                    o.pack(true);
-
-                    o.pack("m"s);
-                    o.pack(""s);
-                }
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT"
-                && detail::typedError<ResetAgentsErrorResponsePayload>(msg) == nullptr) {
-                o.pack("r"s);
-                o.pack_array(1);
-                o.pack_map(4);
-                o.pack("a"s);
-                o.pack_nil();
-                o.pack("t"s);
-                o.pack(msg->occurrence);
-                o.pack("u"s);
-                o.pack(false);
-                o.pack("m"s);
-                o.pack(detail::refusalReason(msg));
-            }
-            else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT") {
-                const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
-                const auto subPld = std::dynamic_pointer_cast<ResetAgentsErrorResponsePayload>(pld->payload);
-                const auto reqPld = subPld->requestPayload;
-                const auto errPld = subPld->errorPayload;
-
-                o.pack("r"s);
-                o.pack_array(reqPld->agentIds.size());
-                for (auto agentId : reqPld->agentIds) {
-                    o.pack_map(4);
-
-                    o.pack("a"s);
-                    o.pack(agentId);
-
-                    o.pack("t"s);
-                    o.pack(msg->occurrence);
-
-                    o.pack("u"s);
-                    o.pack(false);
-
-                    o.pack("m"s);
-                    o.pack(errPld->message);
-                }
-            }
+            o.pack(agentId);
+
+            o.pack("t"s);
+            o.pack(msg->occurrence);
+
+            o.pack("u"s);
+            o.pack(true);
+
+            o.pack("m"s);
+            o.pack(""s);
+        }
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT"
+        && detail::typedError<ResetAgentsErrorResponsePayload>(msg) == nullptr) {
+        o.pack("r"s);
+        o.pack_array(1);
+        o.pack_map(4);
+        o.pack("a"s);
+        o.pack_nil();
+        o.pack("t"s);
+        o.pack(msg->occurrence);
+        o.pack("u"s);
+        o.pack(false);
+        o.pack("m"s);
+        o.pack(detail::refusalReason(msg));
+    }
+    else if (msg->type == "ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT") {
+        const auto pld = std::dynamic_pointer_cast<DistributedAgentResponsePayload>(msg->payload);
+        const auto subPld = std::dynamic_pointer_cast<ResetAgentsErrorResponsePayload>(pld->payload);
+        const auto reqPld = subPld->requestPayload;
+        const auto errPld = subPld->errorPayload;
+
+        o.pack("r"s);
+        o.pack_array(reqPld->agentIds.size());
+        for (auto agentId : reqPld->agentIds) {
+            o.pack_map(4);
+
+            o.pack("a"s);
+            o.pack(agentId);
+
+            o.pack("t"s);
+            o.pack(msg->occurrence);
+
+            o.pack("u"s);
+            o.pack(false);
+
+            o.pack("m"s);
+            o.pack(errPld->message);
+        }
+    }
 }
 
 //-------------------------------------------------------------------------

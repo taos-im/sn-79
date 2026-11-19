@@ -141,6 +141,8 @@ class FinanceEvent(SimulationEvent):
                 return SimulationEndEvent.from_json(json)
             case "ESE":
                 return SimulationEndEvent.model_construct(**json)
+            case "EPB":
+                return PriceBandEvent.model_construct(**json)
 
 class SimulationStartEvent(FinanceEvent):
     """
@@ -941,3 +943,70 @@ def parse_notices(raw):
         except Exception:
             pass
     return out
+
+
+class PriceBandEvent(FinanceEvent):
+    """
+    An order or a stop-loss/take-profit close cut at the pool's price band (exchange mode). A pool fill may not move
+    the pool's price past the band around its reference, so the part of the order that would have was not filled: a
+    market or immediate-or-cancel order's remainder is cancelled, a limit order's remainder rests at its limit, and a
+    close's remainder stays armed and fills as the band allows. Told once per order or close.
+
+    Attributes:
+        bookId (int | None): The book the order or close was on.
+        side (int): 0 for a buy, 1 for a sell.
+        clientOrderId (int | None): The agent's own identifier for the order, when it gave one.
+        orderId (int | None): The engine's id for the order, when it has one.
+        volumeCut (float): The volume not filled because of the band.
+        kind (str): 'order' or 'close'.
+        message (str): The reason, 'PRICE_BAND'.
+    """
+    y : Literal['EPB'] = Field(alias="type", default='EPB')
+    b : int | None = Field(alias="bookId", default=None)
+    s : int = Field(alias="side")
+    c : int | None = Field(alias="clientOrderId", default=None)
+    o : int | None = Field(alias="orderId", default=None)
+    v : float = Field(alias="volumeCut")
+    k : str = Field(alias="kind", default="order")
+    m : str = Field(alias="message", default="PRICE_BAND")
+
+    @property
+    def bookId(self) -> int | None:
+        """Readable accessor for wire field ``b``."""
+        return self.b
+
+    @property
+    def side(self) -> int:
+        """Readable accessor for wire field ``s``."""
+        return self.s
+
+    @property
+    def clientOrderId(self) -> int | None:
+        """Readable accessor for wire field ``c``."""
+        return self.c
+
+    @property
+    def orderId(self) -> int | None:
+        """Readable accessor for wire field ``o``."""
+        return self.o
+
+    @property
+    def volumeCut(self) -> float:
+        """Readable accessor for wire field ``v``."""
+        return self.v
+
+    @property
+    def kind(self) -> str:
+        """Readable accessor for wire field ``k``."""
+        return self.k
+
+    @property
+    def message(self) -> str:
+        """Readable accessor for wire field ``m``."""
+        return self.m
+
+    def __str__(self):
+        what = "CLOSE" if self.k == "close" else "ORDER"
+        ids = (f" #{self.o}" if self.o else "") + (f" (CLIENT ID {self.c})" if self.c is not None else "")
+        return (f"{'BUY ' if self.s == 0 else 'SELL'} {what}{ids} CUT AT THE PRICE BAND : {self.v} NOT FILLED "
+                f"({self.m})")

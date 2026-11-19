@@ -29,8 +29,10 @@ import bittensor as bt
 import numpy as np
 from typing import TYPE_CHECKING, Dict, Tuple
 
+from taos.im.validator.block_stats import dust_fill_shares, messages_per_fill
 from taos.im.validator.debeta import (markout_quality, absent_uids, book_alphas_by_book, book_alphas_by_subwindow,
-                                      book_alphas_held_by_book, hurdle_filter, hurdle_skill, kappa_floored, median_abs_floor,
+                                      book_alphas_held_by_book, book_alphas_split, book_alphas_held_split, seam_inside,
+                                      hurdle_filter, hurdle_skill, kappa_floored, median_abs_floor,
                                       presence_shares, skill_pool_factor, subwindow_skill, traded_book_alphas, balanced_reward_per_book,
                                       debeta_scores, shrunk_skill_eb, shrunk_skill_self)
 from taos.im.utils.kappa import kappa_3, batch_kappa_3, _get_pnl_fingerprint
@@ -941,7 +943,8 @@ def score_uid(validator_data: Dict, uid: int) -> Tuple[float, float]:
         # 0.6.2 skill-leg quantities, published whatever the dials say so a form can be read before it pays.
         for _k in ('skill_mark_alt', 'skill_net_alpha_mark_alt', 'maker_notional_two_sided', 'at_best_seconds', 'best_size', 'skill_books_kept', 'skill_pool_factor', 'notional',
                    'presence_share', 'skill_coverage_factor', 'coverage_books',
-                   'skill_p11_factor', 'skill_net_alpha', 'skill_shrunk_self', 'skill_shrunk_eb', 'conjunction'):
+                   'skill_p11_factor', 'skill_net_alpha', 'skill_shrunk_self', 'skill_shrunk_eb', 'conjunction',
+                   'dust_takes', 'dust_makes', 'dust_take_share'):
             uid_kappa[_k] = _d.get(_k) if _d else None
         uid_kappa['debeta_w_make'] = validator_data.get('debeta_w_make') if debeta_applied else None
         uid_kappa['debeta_floor'] = validator_data.get('debeta_floor') if debeta_applied else None
@@ -1589,6 +1592,34 @@ def smoothed_skill_share(dcfg, detail, all_uids, class_shares, pool_ema, deregs,
     return smoothed
 
 
+def paid_skill_share(pool_mode, pool, detail, all_uids, skill_min_books, class_shares=None, skill_share=None):
+    """The skill share pool_pay_vector pays, the rule stated once: None unless the pool pays skill apart
+    ('proportional_both' with a pool); else the caller's smoothed share (smoothed_skill_share), else the class-mixed
+    share at the dial (class_pool_shares), else the flat share on all books (skill_pool_share)."""
+    if pool_mode != "proportional_both" or not pool > 0.0:
+        return None
+    if skill_share is not None:
+        return skill_share
+    if class_shares:
+        return {uid: float(class_shares[1].get(uid, 0.0)) for uid in all_uids}
+    return skill_pool_share(detail or {}, all_uids, int(skill_min_books or 4))
+
+
+def note_skill_share(kappa_values, skill_share, all_uids) -> None:
+    """Each uid's paid skill share, normalized, on its kappa_values row as 'skill_share', beside 'making_share', for
+    the report's debeta_skill_share gauge (0.6.8: the board counts the paid skill, not the flat rank); None when the
+    pool pays no skill apart."""
+    tot = sum(max(0.0, float(v)) for v in (skill_share or {}).values()) if skill_share is not None else 0.0
+    for uid in all_uids:
+        kv = (kappa_values or {}).get(uid)
+        if kv is None:
+            continue
+        if skill_share is None:
+            kv['skill_share'] = None
+        else:
+            kv['skill_share'] = (max(0.0, float(skill_share.get(uid, 0.0))) / tot) if tot > 0 else 0.0
+
+
 def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_scores, making_share, config,
                     skill_min_books, class_shares=None, skill_share=None) -> torch.FloatTensor:
     """The trading emission vector for a making_pool setting. ONE implementation for main (get_rewards) and the
@@ -1610,14 +1641,7 @@ def pool_pay_vector(pool_mode, pool, detail, all_uids, ladder_scores, trading_sc
             smoothed and passes as ``making_share``; the skill half is taken from here.
     """
     if pool_mode in ("proportional", "proportional_blended", "proportional_both") and pool > 0.0:
-        if pool_mode != "proportional_both":
-            skill_share = None
-        elif skill_share is not None:
-            pass   # already smoothed by the caller (smoothed_skill_share)
-        elif class_shares:
-            skill_share = {uid: float(class_shares[1].get(uid, 0.0)) for uid in all_uids}
-        else:
-            skill_share = skill_pool_share(detail or {}, all_uids, int(skill_min_books or 4))
+        skill_share = paid_skill_share(pool_mode, pool, detail, all_uids, skill_min_books, class_shares, skill_share)
         return allocate_trading(pool_ladder_input(pool_mode, ladder_scores, trading_scores, all_uids),
                                 making_share, pool, all_uids, config, skill_share=skill_share)
     floored = apply_reward_floor([trading_scores[uid] for uid in all_uids], config)
@@ -1711,6 +1735,7 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
     self._debeta_class_shares = None
     self._debeta_class_summary = None
     self._debeta_class_details = None
+    self._debeta_carry = {}
     try:
         # Windowed finalizer: drift = telescoped sum(dp) over the kappa window (debeta_drift), NOT the
         # full-run p_last-p_first. Equals book_alphas_from_mtm over a non-pruned run (asserted in tests).
@@ -1722,8 +1747,15 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
         _caps_b = getattr(self, 'capture_buy_sums', {}) or {}
         _caps_s = getattr(self, 'capture_sell_sums', {}) or {}
         _traded = {u: set(_caps_b.get(u) or {}) | set(_caps_s.get(u) or {}) for u in set(_caps_b) | set(_caps_s)}
+        # The seam (0.6.8, scoring.debeta.seam_split): while the window still holds the old run's entries, each run
+        # is stripped on its own from the histories, so the old run's mean inventory never meets the new run's move.
+        _seam = getattr(self, 'debeta_seam_ts', None)
+        _split = int(debeta_dial(dcfg, 'seam_split')) and seam_inside(getattr(self, 'debeta_drift_hist', None), _seam)
         self.debeta_alphas_by_book = traded_book_alphas(
-            book_alphas_by_book(
+            book_alphas_split(
+                getattr(self, 'debeta_mtm_hist', {}) or {}, getattr(self, 'debeta_invsum_hist', {}) or {},
+                getattr(self, 'debeta_invn_hist', {}) or {}, getattr(self, 'debeta_drift_hist', {}) or {}, _seam, only=_traded,
+            ) if _split else book_alphas_by_book(
                 getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_invsum', {}),
                 getattr(self, 'debeta_invn', {}), getattr(self, 'debeta_drift', {}), only=_traded,
             ),
@@ -1733,6 +1765,10 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
         # pays it; an unpaid form is not computed; set its dial to compute it.
         _variant = str(debeta_dial(dcfg, 'skill_variant'))
         pool_by_book = (traded_book_alphas(
+            book_alphas_held_split(getattr(self, 'debeta_mtm_hist', {}) or {}, getattr(self, 'debeta_heldinv_hist', {}) or {},
+                                   getattr(self, 'debeta_heldn_hist', {}) or {}, getattr(self, 'debeta_helddrift_hist', {}) or {},
+                                   _seam, only=_traded)
+            if _split else
             book_alphas_held_by_book(getattr(self, 'debeta_mtm', {}), getattr(self, 'debeta_heldinv', {}),
                                      getattr(self, 'debeta_heldn', {}), getattr(self, 'debeta_helddrift', {}),
                                      only=_traded),
@@ -1742,9 +1778,13 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
         # the alternative mark's skill (scoring.debeta.mark_mode_alt): the paid leg's floor rule and bar on its own
         # accumulators, published per uid so a change of mark is judged on live data; never paid
         _alt_mtm = getattr(self, 'debeta_mtm_alt', None) or {}
-        _alt_by_book = (book_alphas_by_book(_alt_mtm, getattr(self, 'debeta_invsum_alt', {}) or {},
-                                            getattr(self, 'debeta_invn_alt', {}) or {}, getattr(self, 'debeta_drift_alt', {}) or {},
-                                            only=_traded)
+        _alt_by_book = ((book_alphas_split(getattr(self, 'debeta_mtm_alt_hist', {}) or {}, getattr(self, 'debeta_invsum_alt_hist', {}) or {},
+                                           getattr(self, 'debeta_invn_alt_hist', {}) or {}, getattr(self, 'debeta_drift_alt_hist', {}) or {},
+                                           _seam, only=_traded)
+                         if _split else
+                         book_alphas_by_book(_alt_mtm, getattr(self, 'debeta_invsum_alt', {}) or {},
+                                             getattr(self, 'debeta_invn_alt', {}) or {}, getattr(self, 'debeta_drift_alt', {}) or {},
+                                             only=_traded))
                         if _alt_mtm else {})
         _alt_floor = median_abs_floor({u: list(b.values()) for u, b in _alt_by_book.items()}, scale=float(dcfg.floor_scale))
         alt_skill = {u: kappa_floored(list(b.values()), _alt_floor, _bar) for u, b in _alt_by_book.items()}
@@ -1777,6 +1817,11 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
         skill_p11_strength = float(debeta_dial(dcfg, 'skill_p11_strength'))
         p11_topk = int(debeta_dial(dcfg, 'p11_topk'))
         s3_k = float(debeta_dial(dcfg, 's3_k'))
+        # The order-to-trade discount: the reading is built only when the dial pays, so the shipped
+        # default (0, off) computes and publishes nothing new.
+        _otr_threshold = float(debeta_dial(dcfg, 'making_otr_threshold'))
+        _otr_power = float(debeta_dial(dcfg, 'making_otr_power'))
+        _otr = messages_per_fill(self) if _otr_threshold > 0 else None
         # The counterparty map feeds BOTH discounts: built for the making one only, the skill-leg factor
         # would receive no map with p11_strength 0 and stay at 1.0, against the dial's own help text.
         # debeta_cp is the making-window sum of the counterparty history, so the factor the skill leg
@@ -1807,6 +1852,9 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
             skill_p11_strength=skill_p11_strength,
             p11_topk=p11_topk,
             s3_k=s3_k,
+            otr=_otr,
+            otr_threshold=_otr_threshold,
+            otr_power=_otr_power,
         )
         # Both making bases per uid, two-sided per book as the pool reads them, and which one pays (1.0 = realized),
         # so a board shows what the other basis would pay before any dial moves.
@@ -1824,7 +1872,14 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
         _notional = getattr(self, 'debeta_notional', {}) or {}
         # both shrinkage forms of the per-book alphas the present skill reads (0.6.6), published beside it; never paid
         _shrunk_self, _shrunk_eb = _shrunk_skills(skill_pool)
+        # the dust-fill reading, measured and not paid: the fills each uid took and made under the floor over
+        # the making window and the takes' share of its fills, published whatever the dials say, paid by nothing
+        _dust = dust_fill_shares(self)
         for _u, _dd in _detail.items():
+            _du = _dust.get(_u) or {}
+            _dd["dust_takes"] = int(_du.get("takes", 0))
+            _dd["dust_makes"] = int(_du.get("makes", 0))
+            _dd["dust_take_share"] = float(_du.get("take_share", 0.0))
             # under the hurdle a qualifying book is one it kept; the pool's bar reads this count
             if _hurdle_books_by_uid is not None:
                 _dd['skill_books'] = int(_hurdle_books_by_uid.get(_u, 0))
@@ -1939,6 +1994,9 @@ def compute_debeta_scores(self: 'Validator', absent=None, presence=None, now=Non
                 bt.logging.info(handover_log_line(_handover, _cw, _names))
             self._debeta_class_vectors = {(_names[c] if 0 <= int(c) < len(_names) else str(c)): v
                                           for c, v in _vectors.items()}
+            # what the board's carry line reads while a class that lost books carries its standing (0.6.8)
+            self._debeta_carry = carry_report(getattr(self, '_debeta_handover', None), self._debeta_class_vectors,
+                                              _handover, _names)
             self._debeta_class_summary = class_summary(_details, _cw, _bars, {c: p['n_books'] for c, p in _by_class.items()})
             # the conjunction per class (0.6.6), after the pools and the summary are built from the scored uids: a uid
             # resting two-sided with no credit in the class still gets its row, and each class its farm reference
@@ -1981,6 +2039,39 @@ def debeta_for_report(self: 'Validator', report_ts: int):
     scores = compute_debeta_scores(self, end_handover=False)
     return (scores, getattr(self, '_debeta_class_summary', None) or {},
             getattr(self, '_debeta_class_details', None) or {})
+
+
+def carry_report(handover, vectors, handover_now, names) -> dict:
+    """``{class name: {'w', 'carried', 'paid'}}`` for each class the live run-boundary handover carries: the weight
+    this scoring paid the carried shares at (``handover_now``, class_handover_now's), the carried making and skill
+    shares (``handover``, the raw _debeta_handover keyed by name) and the shares paid (``vectors``, by name); {} with no
+    live handover or nothing carried. The board's carry line bounds the paid by the carried within 1 - w."""
+    if not handover_now:
+        return {}
+    w = float(handover_now.get('w') or 0.0)
+    live = {names[int(i)] for i in (handover_now.get('carried') or {}) if 0 <= int(i) < len(names)}
+    out = {}
+    for name, legs in ((handover or {}).get('carried') or {}).items():
+        if name not in live:
+            continue
+        paid = (vectors or {}).get(name) or {}
+        out[name] = {'w': w,
+                     'carried': {leg: {int(u): float(x) for u, x in ((legs or {}).get(leg) or {}).items()}
+                                 for leg in ('making', 'skill')},
+                     'paid': {leg: {int(u): float(x) for u, x in (paid.get(leg) or {}).items()}
+                              for leg in ('making', 'skill')}}
+    return out
+
+
+def carry_for_report(self: 'Validator', report_ts: int) -> dict:
+    """The carry (carry_report) of the boundary the report's state belongs to: the scoring service's, as main kept it
+    on adopting its result, else main's own scoring's (a fallback cycle, a missed reply), as debeta_for_report reads."""
+    interval = int(self.config.scoring.interval)
+    boundary = (int(report_ts) // interval) * interval
+    scored = getattr(self, '_scored_debeta', None)
+    if scored is not None and scored.get('ts') == boundary:
+        return scored.get('carry') or {}
+    return getattr(self, '_debeta_carry', None) or {}
 
 
 # How long a de-beta map may be carried at the (0, 0, 1) rung when the current cycle produced none.
@@ -2067,6 +2158,8 @@ def build_scoring_config(self: 'Validator') -> Dict:
                 'mark_mode': str(debeta_dial(_dcfg, 'mark_mode')),
                 'mark_window': int(debeta_dial(_dcfg, 'mark_window')),
                 'fill_charge': str(debeta_dial(_dcfg, 'fill_charge')),
+                'seam_split': int(debeta_dial(_dcfg, 'seam_split')),
+                'charge_ref': str(debeta_dial(_dcfg, 'charge_ref')),
                 'making_pool': str(debeta_dial(_dcfg, 'making_pool')),
                 # resolved here so the scoring child and the pool read the same count as the legs
                 'skill_min_books': skill_bar(self),
@@ -2412,10 +2505,14 @@ def get_rewards(self: 'Validator', pinned_inputs: Dict = None) -> Tuple[torch.Fl
                                          _last_snap, _scorable, skill_min_books=skill_bar(self))
         if not (_pin and 'trading_ema' in _pin):
             self._debeta_pool_ema = _pool_ema
+    # the skill share the pool pays, noted per uid beside the making share for the report (0.6.8)
+    _skill_paid = paid_skill_share(_pool_mode, _pool, validator_data.get('debeta_detail') or {}, all_uids,
+                                   skill_bar(self), _class_shares, _skill_sm)
+    note_skill_share(validator_data['kappa_values'], _skill_paid, all_uids)
     distributed_trading = pool_pay_vector(
         _pool_mode, _pool, validator_data.get('debeta_detail') or {}, all_uids, _ladder_scores,
         trading_uid_scores, _make_share, validator_data['config'], skill_bar(self),
-        class_shares=_class_shares, skill_share=_skill_sm,
+        class_shares=_class_shares, skill_share=_skill_paid,
     ).to(self.device)
     _prof_pareto = time.perf_counter()
     # INFO (not debug): one line per scoring round, so the reward calculation's

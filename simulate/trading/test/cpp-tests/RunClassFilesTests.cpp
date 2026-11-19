@@ -10,6 +10,7 @@
 
 #include "MultiAssetRunFixture.hpp"
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 #include <pugixml.hpp>
 
@@ -18,6 +19,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace
 {
@@ -114,3 +117,49 @@ TEST(RunClassFiles, ARunAnOlderEngineStartedResumesOnTheFilesItsConfigNames)
     EXPECT_EQ(backgroundPaths(run.root() / "config.xml"), std::vector<std::string>{source.string()});
     EXPECT_FALSE(fs::exists(run.root() / "class_files")) << "a restore copied the files an older run names";
 }
+
+// THE PUBLISHED CLASSES LOAD IN THE ENGINE: the four-class acceptance layout names every class's
+// acceptance copy, which differs from the published class file only in its debug switches, so the engine building it
+// reads all four markets, simulation_3 included. Skipped where run/config/ is reduced (the public tree).
+//
+// OFF THE LIVE QUEUES. An orchestrator built from a message-pack layout opens the validator queues under their default
+// names (/taosim-req, /taosim-res) and unlinks them on teardown: built from the shipped files as they are, this test
+// removed a running local simulator's queues and stalled its validator. It builds from copies with
+// useMessagePack="0", so it opens none, and checks that the queues on this machine are as it found them.
+TEST(RunClassFiles, TheFourClassAcceptanceLayoutLoadsEveryClass)
+{
+    const auto configDir = fs::path{__FILE__}.parent_path().parent_path().parent_path() / "run" / "config";
+    const auto layout = configDir / "multiasset_acceptance_64_4.xml";
+    if (!fs::exists(layout)) GTEST_SKIP() << "run/config/ is reduced here; the acceptance layouts are not distributed";
+    const auto base = fs::temp_directory_path() / fmt::format("taosim-four-class-layout-{}", ::getpid());
+    fs::remove_all(base);
+    fs::create_directories(base);
+    const auto offTheQueues = [](const fs::path& from, const fs::path& to) {
+        pugi::xml_document doc;
+        ASSERT_TRUE(doc.load_file(from.c_str())) << from;
+        for (auto node = doc.first_child(); node; node = node.next_sibling()) {
+            if (node.type() == pugi::node_element && node.attribute("useMessagePack")) {
+                node.attribute("useMessagePack").set_value("0");
+            }
+        }
+        ASSERT_TRUE(doc.save_file(to.c_str())) << to;
+    };
+    pugi::xml_document wrapper;
+    ASSERT_TRUE(wrapper.load_file(layout.c_str()));
+    offTheQueues(layout, base / layout.filename());
+    for (const auto& bg : wrapper.document_element().children("Background")) {
+        offTheQueues(configDir / bg.attribute("path").value(), base / bg.attribute("path").value());
+    }
+    const auto queues = [] {
+        return std::vector<bool>{fs::exists("/dev/mqueue/taosim-req"), fs::exists("/dev/mqueue/taosim-res")};
+    };
+    const auto before = queues();
+    std::unique_ptr<Orchestrator> orchestrator;
+    ASSERT_NO_THROW(orchestrator = Orchestrator::fromConfig(base / layout.filename(), base))
+        << "the engine could not build the four-class layout from its class files";
+    ASSERT_NE(orchestrator, nullptr);
+    orchestrator.reset();
+    EXPECT_EQ(queues(), before) << "the test created or removed this machine's validator queues";
+    fs::remove_all(base);
+}
+

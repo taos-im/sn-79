@@ -675,3 +675,76 @@ TEST(DynamicFeePolicyHistory, aCheckpointKeepsEachBooksTimeAndAPolicyWideOneStil
     EXPECT_EQ(resumed->volumes().at(1).size(), 2u);
     EXPECT_TRUE(resumed->totalVolumes().at(1).aggressive == 4_dec);
 }
+
+//-------------------------------------------------------------------------
+// A REBATE NEVER EXCEEDS THE FEE THAT PAYS IT. The exchange pays a maker's rebate out of the taker's fee,
+// so a configuration whose rates could sum below zero is refused, and a fill whose two agents' policies would still
+// pair such rates has its rebate cut to the taker's fee.
+
+namespace
+{
+
+[[nodiscard]] pugi::xml_node feeNode(pugi::xml_document& doc, const char* xml)
+{
+    EXPECT_TRUE(doc.load_string(xml));
+    return doc.first_child();
+}
+
+// Rates by agent: agent 1 rests with a large rebate, agent 2 takes with a small fee.
+struct PairedRatesPolicy : FeePolicy
+{
+    Fees calculateFees(const TradeDesc&) const override { return {}; }
+    void updateHistory(Timestamp, BookId, AgentId, decimal_t, std::optional<bool>) override {}
+    void resetHistory() noexcept override {}
+    void resetHistory(const std::unordered_set<AgentId>&) noexcept override {}
+    Fees getRates(BookId, AgentId agentId) const override
+    {
+        return agentId == 1 ? Fees{.maker = -DEC(0.003), .taker = DEC(0.003)} : Fees{.maker = DEC(0.0), .taker = DEC(0.001)};
+    }
+};
+
+}  // namespace
+
+TEST(FeeSumGuard, ADynamicPolicyWhoseRatesSumBelowZeroIsRefused)
+{
+    pugi::xml_document doc;
+    const auto node = feeNode(doc,
+        R"(<FeePolicy type="dynamic" historySlots="2" makerFee="-0.0003" takerFee="0.0002" maxMakerRate="0.0001" )"
+        R"(maxTakerRate="0.0001" targetMTR="0.5" shapeMakerFee="1" shapeMakerRebate="1"/>)");
+    EXPECT_THROW({ [[maybe_unused]] auto p = DynamicFeePolicy::fromXML(node, nullptr); }, std::invalid_argument);
+}
+
+TEST(FeeSumGuard, ADynamicPolicyWhoseRatesSumToZeroOrMoreIsRead)
+{
+    pugi::xml_document doc;
+    const auto node = feeNode(doc,
+        R"(<FeePolicy type="dynamic" historySlots="2" makerFee="-0.0002" takerFee="0.0002" maxMakerRate="0.0001" )"
+        R"(maxTakerRate="0.0001" targetMTR="0.5" shapeMakerFee="1" shapeMakerRebate="1"/>)");
+    EXPECT_NO_THROW({ [[maybe_unused]] auto p = DynamicFeePolicy::fromXML(node, nullptr); });
+}
+
+TEST(FeeSumGuard, TiersWhoseLowestMakerAndTakerRatesSumBelowZeroAreRefused)
+{
+    pugi::xml_document doc;
+    const auto node = feeNode(doc,
+        R"(<FeePolicy type="tiered" historySlots="2" slotPeriod="10">)"
+        R"(<Tier volumeRequired="0" makerFee="0.001" takerFee="0.001"/>)"
+        R"(<Tier volumeRequired="100" makerFee="-0.002" takerFee="0.003"/>)"
+        R"(</FeePolicy>)");
+    EXPECT_THROW({ [[maybe_unused]] auto p = TieredFeePolicy::fromXML(node, nullptr); }, std::invalid_argument)
+        << "a maker in the second tier (-0.002) can trade with a taker in the first (0.001)";
+}
+
+TEST(FeeSumGuard, AFillWhoseTwoAgentsRatesSumBelowZeroHasItsRebateCutToTheFee)
+{
+    accounting::AccountRegistry registry;
+    FeePolicyWrapper wrapper{std::make_unique<PairedRatesPolicy>(), &registry};
+    const auto trade = Trade::create(1, Timestamp{1}, OrderDirection::BUY, 2, 3, 2_dec, 100_dec);
+    const auto fees = wrapper.calculateFees(TradeDesc{.bookId = 0, .restingAgentId = 1, .aggressingAgentId = 2, .trade = trade});
+    EXPECT_EQ(fees.taker, DEC(0.2)) << "the taker pays its own rate";
+    EXPECT_EQ(fees.maker, -DEC(0.2)) << "the rebate is cut to the fee that pays it, so the fill sums to zero";
+    const auto even = wrapper.calculateFees(TradeDesc{.bookId = 0, .restingAgentId = 2, .aggressingAgentId = 1, .trade = trade});
+    EXPECT_EQ(even.maker, DEC(0.0));
+    EXPECT_EQ(even.taker, DEC(0.6)) << "a fill whose rates sum to zero or more is unchanged";
+}
+

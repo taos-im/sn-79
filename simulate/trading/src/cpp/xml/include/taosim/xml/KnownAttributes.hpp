@@ -29,7 +29,7 @@
 namespace taosim::xml
 {
 
-inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
+inline constexpr std::array<std::string_view, 221> kKnownAttributes{{
     "GBM_X0",
     "GBM_mu",
     "GBM_seed",
@@ -75,6 +75,7 @@ inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
     "departure",
     "depth",
     "detailedDepth",
+    "dirtyAccountsOnly",
     "dt",
     "duration",
     "edge",
@@ -86,6 +87,7 @@ inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
     "feeReserveFrac",
     "file",
     "forecastVar",
+    "fullAccountsEvery",
     "gHFT",
     "gHFTstd",
     "gammaX",
@@ -138,6 +140,7 @@ inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
     "noiseRay",
     "numLevels",
     "numRows",
+    "offGridOrders",
     "omega",
     "opLatencyScaleRay",
     "orderMean",
@@ -147,6 +150,8 @@ inline constexpr std::array<std::string_view, 216> kKnownAttributes{{
     "pO_alpha",
     "parentOrderAdvFraction",
     "path",
+    "poolPriceBand",
+    "poolPriceBandBooks",
     "port",
     "price",
     "priceDecimals",

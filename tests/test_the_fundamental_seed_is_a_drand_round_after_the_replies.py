@@ -147,6 +147,7 @@ def test_the_sources_reach_the_validator_gauges():
     assert out == {"fundamental_seed_drand": 3.0, "fundamental_seed_chain": 0.0, "fundamental_seed_random": 1.0,
                    "fundamental_seed_drand_disagree": 2.0, "fundamental_seed_drand_one_operator": 0.0,
                    "fundamental_seed_commit": 0.0, "fundamental_seed_reveal": 0.0,
+                   "fundamental_seed_drand_bad_signature": 0.0, "fundamental_seed_drand_unverified": 0.0,
                    "fundamental_seed_clock_skew_s": 0.0}
 
 

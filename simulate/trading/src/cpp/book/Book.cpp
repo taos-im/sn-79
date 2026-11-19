@@ -304,6 +304,7 @@ void Book::placeOrder(const LimitOrder::Ptr& order)
 void Book::placeLimitBuy(const LimitOrder::Ptr& order)
 {
     if (!m_sellQueue.hasActiveOrders() || order->price() < bestAsk()) {
+        if (cancelImmediateRemainder(order)) return;
         auto firstLessThan = std::find_if(
             m_buyQueue.rbegin(),
             m_buyQueue.rend(),
@@ -327,6 +328,7 @@ void Book::placeLimitBuy(const LimitOrder::Ptr& order)
 
         if (order->volume() > 0_dec) {
             if (order->volume() == volBefore) {
+                if (cancelImmediateRemainder(order)) return;
                 // No progress was made — place as passive to avoid infinite recursion
                 // A CROSSING ORDER THAT CANNOT MATCH MUST NOT REST, OR IT WOULD LEAVE THE BOOK CROSSED
                 // PERMANENTLY. Reaching here means the order is marketable but processAgainst* moved none of
@@ -383,6 +385,7 @@ void Book::placeLimitBuy(const LimitOrder::Ptr& order)
 void Book::placeLimitSell(const LimitOrder::Ptr& order)
 {
     if (!m_buyQueue.hasActiveOrders() || order->price() > bestBid()) {
+        if (cancelImmediateRemainder(order)) return;
         auto firstGreaterThan = std::find_if(
             m_sellQueue.begin(),
             m_sellQueue.end(),
@@ -406,6 +409,7 @@ void Book::placeLimitSell(const LimitOrder::Ptr& order)
 
         if (order->volume() > 0_dec) {
             if (order->volume() == volBefore) {
+                if (cancelImmediateRemainder(order)) return;
                 // No progress was made — place as passive to avoid infinite recursion
                 // A CROSSING ORDER THAT CANNOT MATCH MUST NOT REST, OR IT WOULD LEAVE THE BOOK CROSSED
                 // PERMANENTLY. Reaching here means the order is marketable but processAgainst* moved none of
@@ -455,6 +459,55 @@ void Book::placeLimitSell(const LimitOrder::Ptr& order)
             unregisterLimitOrder(order);
         }
     }
+}
+
+//-------------------------------------------------------------------------
+
+// AN IOC OR FOK NEVER RESTS. The placement check sizes one to what the book holds at that moment, and
+// that size funds its reservation, but the book can hold less by the time the order matches. Whatever
+// matching leaves is cancelled here instead of resting as a maker order its owner never placed: the
+// order leaves the book as a fully cancelled one does (the cancellation's details, which record the
+// cancellation in the L3 record and release what was reserved for the rest, then the unregistering), and
+// the owner is told as for any cancellation of its order. It never rested, so no level changes.
+bool Book::cancelImmediateRemainder(const LimitOrder::Ptr& order)
+{
+    const auto timeInForce = order->timeInForce();
+    if (timeInForce != taosim::TimeInForce::IOC && timeInForce != taosim::TimeInForce::FOK) {
+        return false;
+    }
+    const auto remainder = order->volume();
+    const auto ownerId = m_order2clientCtx.at(order->id()).agentId;
+    m_signals.cancelOrderDetails(order, remainder, m_id);
+    order->removeVolume(remainder);
+    m_simulation->logDebug("{} | AGENT #{} BOOK {} : {} ORDER {} CANCELLED {} LEFT AFTER MATCHING",
+        m_simulation->currentTimestamp(), ownerId, m_id,
+        timeInForce == taosim::TimeInForce::IOC ? "IOC" : "FOK", order->id(), remainder);
+    announceCancellation(order->id(), ownerId, remainder);
+    unregisterLimitOrder(order);
+    return true;
+}
+
+//-------------------------------------------------------------------------
+
+// The notice a miner's own cancel is answered with, for a cancellation no instruction asked for. Only
+// a remote agent is reached through the proxy. Pushed directly, because a message dispatched from
+// inside matching is never delivered (DistributedProxyAgent::pushNotice).
+void Book::announceCancellation(OrderID orderId, AgentId ownerId, taosim::decimal_t volume)
+{
+    auto* proxy = m_simulation->proxy();
+    if (ownerId < 0 || proxy == nullptr) return;
+    proxy->pushNotice(Message::create(
+        m_simulation->currentTimestamp(),
+        m_simulation->currentTimestamp(),
+        m_simulation->exchange()->name(),
+        proxy->name(),
+        "RESPONSE_DISTRIBUTED_CANCEL_ORDERS",
+        MessagePayload::create<DistributedAgentResponsePayload>(
+            ownerId,
+            MessagePayload::create<CancelOrdersResponsePayload>(
+                std::vector<OrderID>{orderId},
+                MessagePayload::create<CancelOrdersPayload>(
+                    std::vector{taosim::event::Cancellation{orderId, volume}}, m_id)))));
 }
 
 //-------------------------------------------------------------------------

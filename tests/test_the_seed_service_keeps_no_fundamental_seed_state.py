@@ -3,9 +3,9 @@
 """The seed service records the external market's price only, and keeps no state for a fundamental seed.
 
 The fundamental's step seed is a drand round the validator attaches to its batch (fundamental_seed.py). The seed
-service still subscribes to the fundamental symbol, whose options the launchers pass, and records none of its trades,
-so it holds no seed file, count or last seed, and has no watchdog on a seed that never arrives. Both the service's
-process and the proxy's seed thread follow that, and the options' help says what they do."""
+service no longer subscribes to the fundamental symbol, so it holds no seed file, count or last seed, and has no
+watchdog on a seed that never arrives. Both the service's process and the proxy's seed thread follow that, and the
+validator's options for the symbol say they are ignored."""
 import inspect
 
 from taos.im.validator import seed
@@ -23,7 +23,7 @@ def test_the_external_price_is_still_recorded_and_watched():
         assert '"external_seed.csv"' in src and "No new external price" in src, fn.__name__
 
 
-def test_the_fundamental_options_say_their_trades_are_not_recorded():
+def test_the_fundamental_options_say_they_are_ignored():
     import argparse
     from taos.im.config.simulation import add_simulation_args
     parser = argparse.ArgumentParser()
@@ -31,4 +31,4 @@ def test_the_fundamental_options_say_their_trades_are_not_recorded():
     helps = {a.dest: a.help for a in parser._actions}
     for venue in ("coinbase", "binance"):
         text = helps[f"simulation.seeding.fundamental.symbol.{venue}"]
-        assert "seed simulation price" not in text and "not recorded" in text, text
+        assert "seed simulation price" not in text and text.startswith("Ignored"), text

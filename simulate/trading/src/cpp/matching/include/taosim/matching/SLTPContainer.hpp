@@ -16,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 #include <utility>
 #include <vector>
 
@@ -79,6 +80,9 @@ struct SLTPEntry
     decimal_t baseSl;
     decimal_t baseTp;
     bool isSL{false};
+    // Set once a price band has cut this close and its owner was told, so an armed close fired again is
+    // not told again. Not checkpointed.
+    bool bandTold{false};
 };
 
 //-------------------------------------------------------------------------
@@ -125,6 +129,9 @@ struct SLTPPerBook
     // hot paths short-circuit when the book has no SL/TP activity without
     // having to enumerate `openSlots`.
     size_t activeSlotCount{};
+    // Closes a price band cut, holding what they did not close. Not checkpointed: a restart drops them
+    // as it drops other in-flight state.
+    std::vector<SLTPEntry> armed;
 };
 
 //-------------------------------------------------------------------------
@@ -203,6 +210,14 @@ public:
     // Drain all entries that the price transition `lastPrice -> price`
     // crossed and dispatch a closing market order for each.
     void onPriceUpdate(BookId bookId, decimal_t price);
+
+    // AN SL/TP CLOSE A PRICE BAND CUT STAYS ARMED. `entry` carries what is left of the close; it fires
+    // again from fireArmed, as a margin call is placed again each step while the price stays past it.
+    void rearm(SLTPEntry entry);
+
+    // Dispatch every armed close on the book whose trigger `price` is still past, each at most once per call: a close
+    // the band cuts again re-arms for the next call. A close whose price has come back inside stays armed.
+    void fireArmed(BookId bookId, decimal_t price);
 
     // Replace the dispatch callback used to spawn closing market orders.
     // Default-constructed containers have no dispatch; calling

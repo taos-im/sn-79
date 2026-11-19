@@ -105,7 +105,8 @@ def test_the_accumulators_are_wired_into_the_state_update():
     assert "conjunction_book_refs(self, bookId, book, trades, ts=timestamp)" in src
     assert "accumulate_conjunction_farm(self, books, dt=_conj_dt, ts=sampled_timestamp)" in src
     assert "_conj_dt = conjunction_interval(self, timestamp)" in src
-    assert "accumulate_conjunction(self, uid_item, books, accounts_uid, dt=self._conj_dt, ts=sampled_timestamp, bands=bands)" \
+    # the conjunction runs in the one pass over each account's orders it shares with the at-best leg
+    assert "accumulate_order_legs(self, uid_item, books, accounts_uid, self._conj_dt if _cj else 0.0," \
         in inspect.getsource(trade._process_uid_trade_volumes)
 
 

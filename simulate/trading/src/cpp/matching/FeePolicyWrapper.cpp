@@ -30,9 +30,21 @@ Fees FeePolicyWrapper::calculateFees(const TradeDesc& tradeDesc)
 {
     const auto [bookId, restingAgentId, aggressingAgentId, trade] = tradeDesc;
     const auto volumeWeightedPrice = trade->volume() * trade->price();
+    auto makerRate = getRates(bookId, restingAgentId).maker;
+    const auto takerRate = getRates(bookId, aggressingAgentId).taker;
+    // Each policy's own rates are checked when it is read; two agents on different policies can still pair a rebate
+    // larger than the fee that pays it. The rebate is then cut to that fee, so the fill sums to zero.
+    if (makerRate + takerRate < 0_dec) {
+        static std::once_flag s_warned;
+        std::call_once(s_warned, [&] {
+            fmt::println(stderr, "FeePolicyWrapper: maker rate {} with taker rate {} on book {} sums below zero; "
+                "the rebate is cut to the taker's fee (reported once)", makerRate, takerRate, bookId);
+        });
+        makerRate = -takerRate;
+    }
     return {
-        .maker = getRates(bookId, restingAgentId).maker * volumeWeightedPrice,
-        .taker = getRates(bookId, aggressingAgentId).taker * volumeWeightedPrice
+        .maker = makerRate * volumeWeightedPrice,
+        .taker = takerRate * volumeWeightedPrice
     };
 }
 

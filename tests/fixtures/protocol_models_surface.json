@@ -1781,6 +1781,16 @@
     "annotation": "float | None",
     "required": false
    },
+   "Mfb": {
+    "alias": "maker_fee_base",
+    "annotation": "float | None",
+    "required": false
+   },
+   "Mfr": {
+    "alias": "maker_fee_refund",
+    "annotation": "float | None",
+    "required": false
+   },
    "Mi": {
     "alias": "maker_id",
     "annotation": "int | None",
@@ -1793,6 +1803,16 @@
    },
    "Tf": {
     "alias": "taker_fee",
+    "annotation": "float | None",
+    "required": false
+   },
+   "Tfb": {
+    "alias": "taker_fee_base",
+    "annotation": "float | None",
+    "required": false
+   },
+   "Tfr": {
+    "alias": "taker_fee_refund",
     "annotation": "float | None",
     "required": false
    },
@@ -1815,6 +1835,11 @@
     "alias": "quantity",
     "annotation": "<class 'float'>",
     "required": true
+   },
+   "qs": {
+    "alias": "quote_settled",
+    "annotation": "float | None",
+    "required": false
    },
    "s": {
     "alias": "side",

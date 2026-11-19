@@ -6,6 +6,11 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::config
@@ -196,6 +201,47 @@ void ExchangeAgentConfig::setPriceBand(pugi::xml_node node)
                 "Value of attribute 'bandReleaseMax' should be in (0,1] and at least maxPriceBand, was {}", value)};
         }
         m_parameters.bandReleaseMax = value;
+    }
+    const auto checkWidth = [](std::string_view name, double value) {
+        if (value < 0.0 || value >= 1.0) {
+            throw ExchangeAgentConfigException{fmt::format(
+                "A width in attribute '{}' should be in [0,1), was {}", name, value)};
+        }
+        return value;
+    };
+    if (pugi::xml_attribute attr = node.attribute("offGridOrders"); !attr.empty()) {
+        const std::string_view value = attr.as_string();
+        if (value != "cut" && value != "refuse") {
+            throw ExchangeAgentConfigException{fmt::format(
+                "Value of attribute 'offGridOrders' should be 'cut' or 'refuse', was '{}'", value)};
+        }
+        m_parameters.refuseOffGrid = value == "refuse";
+    }
+    if (pugi::xml_attribute attr = node.attribute("poolPriceBand"); !attr.empty()) {
+        m_parameters.poolPriceBand = checkWidth("poolPriceBand", attr.as_double());
+    }
+    if (pugi::xml_attribute attr = node.attribute("poolPriceBandBooks"); !attr.empty()) {
+        // "book:width,book:width"; a malformed entry stops the load rather than leaving a book unbanded unseen.
+        const std::string text = attr.as_string();
+        size_t pos = 0;
+        while (pos < text.size()) {
+            const auto end = std::min(text.find(',', pos), text.size());
+            const auto entry = text.substr(pos, end - pos);
+            const auto colon = entry.find(':');
+            if (colon == std::string::npos) {
+                throw ExchangeAgentConfigException{fmt::format(
+                    "Entry '{}' of attribute 'poolPriceBandBooks' should read book:width", entry)};
+            }
+            try {
+                const auto book = static_cast<uint32_t>(std::stoul(entry.substr(0, colon)));
+                m_parameters.poolPriceBandBooks[book] =
+                    checkWidth("poolPriceBandBooks", std::stod(entry.substr(colon + 1)));
+            } catch (const std::logic_error&) {
+                throw ExchangeAgentConfigException{fmt::format(
+                    "Entry '{}' of attribute 'poolPriceBandBooks' should read book:width", entry)};
+            }
+            pos = end + 1;
+        }
     }
 }
 

@@ -10,6 +10,7 @@
 
 #include <msgpack.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -66,7 +67,15 @@ struct pack<taosim::simulation::multiasset::serialization::MultiAssetValidatorRe
         using namespace std::string_literals;
         namespace single = taosim::simulation::serialization;
 
-        o.pack_map(4);
+        // As in the single-background request: present only when a realization's exchange is under
+        // dirtyAccountsOnly, so the validator knows to fill in the account entries left out.
+        const bool dirtyAccountsOnly = std::ranges::any_of(
+            v.simulations, [](const auto& simulation) { return simulation->exchange()->dirtyAccountsOnly(); });
+        o.pack_map(dirtyAccountsOnly ? 5 : 4);
+        if (dirtyAccountsOnly) {
+            o.pack("dirtyAccountsOnly"s);
+            o.pack(true);
+        }
 
         // Run root (each realization additionally carries its own log directory).
         o.pack("logDir"s);

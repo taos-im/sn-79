@@ -1,0 +1,27 @@
+<!--
+  THE PUBLISHED LAYOUT OF 0.6.7, three classes: eight realizations of simulation_0 (books 0-127), four of simulation_1
+  (128-191) and four of simulation_2 (192-255), sixteen books each, 256 in all. Kept so that the change to
+  multiasset_simulation_0.xml's four classes of 64 books can be tested from it.
+-->
+<MultiAssetSimulation
+    traceTime="1"
+    measureStepWallClockTime="1"
+    useMessagePack="1"
+    host="localhost"
+    port="8000"
+    generalMsgEndpoint="/account"
+    threads="8"
+    start="0"
+    step="1000000000"
+    duration="86400000000000"
+    gracePeriod="600000000000"
+    ckptIntervalInSteps="600"
+    ckptNumLastFilesToKeep="3"
+    ckptNumWorkers="4"
+    ckptMeasureWallClockTime="1">
+
+    <Background name="simulation_0" path="simulation_0.xml" instanceCount="8"/>
+    <Background name="simulation_1" path="simulation_1.xml" instanceCount="4"/>
+    <Background name="simulation_2" path="simulation_2.xml" instanceCount="4"/>
+
+</MultiAssetSimulation>

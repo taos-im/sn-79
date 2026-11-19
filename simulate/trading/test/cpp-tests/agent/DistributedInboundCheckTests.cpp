@@ -57,6 +57,7 @@ protected:
     void SetUp() override
     {
         nodes = taosim::util::parseSimulationFile(kTestDataPath / "MultiAgentFees.xml");
+        configure(nodes);
         simulation = std::make_unique<Simulation>();
         simulation->setDebug(false);
         simulation->configure(nodes.simulation);
@@ -64,6 +65,9 @@ protected:
         ASSERT_NE(exchange, nullptr);
         book = exchange->books().at(kBookId);
     }
+
+    // A derived fixture's change to the configuration, before the simulation is built from it.
+    virtual void configure(taosim::util::Nodes&) {}
 
     [[nodiscard]] BookId missingBook() const { return static_cast<BookId>(exchange->books().size()); }
 
@@ -200,6 +204,64 @@ TEST_F(DistributedInboundCheckTest, ACancelCancelsTheAgentsOrder)
 
     EXPECT_EQ(answerCount("RESPONSE_DISTRIBUTED_CANCEL_ORDERS"), 1);
     EXPECT_EQ(restingVolume(OrderDirection::BUY), 0_dec);
+}
+
+// A GTT order's expiry. The exchange schedules it at the order's deadline as its own message, and it
+// fires whether or not the order is still there: on a resting order it is answered as the owner's cancel, and on an
+// order already filled or cancelled it says nothing. It answered 'Order IDs ... do not exist', 66k to 140k notices
+// in 600 rounds of the load runs.
+namespace
+{
+
+[[nodiscard]] Message::Ptr scheduledExpiry(Simulation& simulation)
+{
+    for (const auto& entry : simulation.messageQueue().queue().underlying()) {
+        if (entry.pmsg.msg->type == "DISTRIBUTED_EXPIRE_ORDERS") return entry.pmsg.msg;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] MessagePayload::Ptr gttLimit(OrderDirection direction, taosim::decimal_t volume, taosim::decimal_t price)
+{
+    return MessagePayload::create<PlaceOrderLimitPayload>(
+        direction, volume, price, kBookId, Currency::BASE, std::nullopt, false, taosim::TimeInForce::GTT,
+        std::optional<Timestamp>{60'000'000'000});
+}
+
+}  // namespace
+
+TEST_F(DistributedInboundCheckTest, AGttExpiryOfARestingOrderIsAnsweredAsItsCancel)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, gttLimit(OrderDirection::BUY, 1_dec, 100_dec));
+    const auto expiry = scheduledExpiry(*simulation);
+    ASSERT_NE(expiry, nullptr) << "a resting GTT order schedules its expiry as its own message";
+    simulation->messageQueue() = taosim::message::MessageQueue{};
+
+    exchange->receiveMessage(expiry);
+
+    EXPECT_EQ(restingVolume(OrderDirection::BUY), 0_dec) << "the expired order is still on the book";
+    EXPECT_EQ(answerCount("RESPONSE_DISTRIBUTED_CANCEL_ORDERS"), 1) << "the owner is told as for its own cancel";
+    EXPECT_EQ(answerCount("ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS"), 0);
+}
+
+TEST_F(DistributedInboundCheckTest, AGttExpiryOfAnOrderAlreadyGoneSaysNothing)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, gttLimit(OrderDirection::BUY, 1_dec, 100_dec));
+    const auto ack = answer<PlaceOrderLimitResponsePayload>("RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT");
+    ASSERT_NE(ack, nullptr);
+    const auto expiry = scheduledExpiry(*simulation);
+    ASSERT_NE(expiry, nullptr);
+    simulation->messageQueue() = taosim::message::MessageQueue{};
+    send(
+        "DISTRIBUTED_CANCEL_ORDERS",
+        kTrader,
+        MessagePayload::create<CancelOrdersPayload>(std::vector{taosim::event::Cancellation{ack->id}}, kBookId));
+    ASSERT_EQ(answerCount("RESPONSE_DISTRIBUTED_CANCEL_ORDERS"), 1) << "the owner cancels it first";
+    simulation->messageQueue() = taosim::message::MessageQueue{};
+
+    exchange->receiveMessage(expiry);
+
+    EXPECT_TRUE(answers().empty()) << "the expiry of an order already cancelled answered " << answers().front()->type;
 }
 
 TEST_F(DistributedInboundCheckTest, ARetrieveReturnsTheOrder)
@@ -476,3 +538,132 @@ TEST_F(DistributedInboundCheckTest, ARefusedOrDroppedMessageLeavesTheRestOfTheSt
 }
 
 //-------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------
+// OFF-GRID ORDERS. Under offGridOrders="refuse" a miner's price or size off the book's grid (here two
+// price places, four volume places) is refused with its reason where it was cut, judged on what the miner sent; the
+// background agents' orders are rounded to the nearest grid point at entry; orders the engine sizes itself, a margin
+// call or an SL/TP close, are neither. The default, "cut", truncates as before.
+
+namespace
+{
+
+constexpr std::string_view kLocalAgent = "OFF_GRID_TEST_AGENT";
+
+class OffGridRefusedTest : public DistributedInboundCheckTest
+{
+protected:
+    void configure(taosim::util::Nodes& n) override { n.exchange.append_attribute("offGridOrders") = "refuse"; }
+
+    // A background agent's limit order, answered to that agent.
+    std::shared_ptr<PlaceOrderLimitResponsePayload> placeLocal(taosim::decimal_t volume, taosim::decimal_t price)
+    {
+        exchange->accounts().registerLocal(std::string{kLocalAgent});
+        const auto now = simulation->currentTimestamp();
+        exchange->receiveMessage(Message::create(now, now, std::string{kLocalAgent}, exchange->name(),
+            "PLACE_ORDER_LIMIT", MessagePayload::create<PlaceOrderLimitPayload>(OrderDirection::BUY, volume, price,
+                kBookId)));
+        for (const auto& entry : simulation->messageQueue().queue().underlying()) {
+            if (entry.pmsg.msg->type != "RESPONSE_PLACE_ORDER_LIMIT") continue;
+            if (auto pld = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(entry.pmsg.msg->payload)) {
+                return pld;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] taosim::decimal_t restingPrice(OrderDirection side) const
+    {
+        const auto& queue = side == OrderDirection::BUY ? book->buyQueue() : book->sellQueue();
+        return queue.empty() ? taosim::decimal_t{} : queue.begin()->price();
+    }
+};
+
+}  // namespace
+
+TEST_F(OffGridRefusedTest, AMinersPriceOffTheGridIsRefusedNotCut)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, limit(OrderDirection::BUY, 1_dec, DEC(100.005)));
+
+    const auto refusal = answer<PlaceOrderLimitErrorResponsePayload>("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT");
+    ASSERT_NE(refusal, nullptr) << "the off-grid price was not refused";
+    EXPECT_EQ(refusal->errorPayload->message, "PRICE_INCREMENT_VIOLATED");
+    EXPECT_EQ(restingVolume(OrderDirection::BUY), 0_dec) << "the order rested, cut onto the grid";
+}
+
+TEST_F(OffGridRefusedTest, AMinersSizeOffTheGridIsRefusedOnALimitAndOnAMarketOrder)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, limit(OrderDirection::BUY, DEC(1.00005), 100_dec));
+    const auto refusal = answer<PlaceOrderLimitErrorResponsePayload>("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT");
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_EQ(refusal->errorPayload->message, "VOLUME_INCREMENT_VIOLATED");
+    EXPECT_EQ(restingVolume(OrderDirection::BUY), 0_dec);
+
+    restLimit(kCounterparty, OrderDirection::SELL, 10_dec, 300_dec);
+    send("DISTRIBUTED_PLACE_ORDER_MARKET", kTrader, market(OrderDirection::BUY, DEC(1.00005)));
+    const auto marketRefusal =
+        answer<PlaceOrderMarketErrorResponsePayload>("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET");
+    ASSERT_NE(marketRefusal, nullptr) << "the off-grid size was not refused";
+    EXPECT_EQ(marketRefusal->errorPayload->message, "VOLUME_INCREMENT_VIOLATED");
+    EXPECT_EQ(restingVolume(OrderDirection::SELL), 10_dec) << "the refused market order traded";
+}
+
+TEST_F(OffGridRefusedTest, AnOrderOnTheGridIsPlacedAsBefore)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, limit(OrderDirection::BUY, DEC(1.0001), DEC(100.01)));
+
+    EXPECT_EQ(answerCount("RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"), 1);
+    EXPECT_EQ(restingVolume(OrderDirection::BUY), DEC(1.0001));
+}
+
+TEST_F(OffGridRefusedTest, AMarginCallOffTheGridIsNotRefused)
+{
+    restLimit(kCounterparty, OrderDirection::SELL, 10_dec, 300_dec);
+
+    send("DISTRIBUTED_PLACE_ORDER_MARKET_MC", kTrader, market(OrderDirection::BUY, DEC(1.00005)));
+
+    EXPECT_EQ(answerCount("RESPONSE_DISTRIBUTED_PLACE_MARKET_ORDER"), 1) << "the engine's own close was refused";
+    EXPECT_EQ(restingVolume(OrderDirection::SELL), 9_dec) << "the margin call's size was not cut onto the grid";
+}
+
+TEST_F(OffGridRefusedTest, AnSltpCloseOffTheGridIsNotRefused)
+{
+    restLimit(kCounterparty, OrderDirection::SELL, 10_dec, 300_dec);
+    auto close = std::static_pointer_cast<PlaceOrderMarketPayload>(market(OrderDirection::BUY, DEC(1.00005)));
+    close->closeReason = 1;
+
+    send("DISTRIBUTED_PLACE_ORDER_MARKET", kTrader, close);
+
+    EXPECT_EQ(answerCount("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET"), 0) << "the engine's own close was refused";
+    EXPECT_EQ(restingVolume(OrderDirection::SELL), 9_dec);
+}
+
+TEST_F(OffGridRefusedTest, ABackgroundAgentsPriceIsRoundedToTheNearestGridPointNotCutATickLow)
+{
+    // A float 100.0 written through double2decimal can arrive as 99.99999999: cut, 99.99; rounded, 100.00.
+    const auto placed = placeLocal(1_dec, DEC(99.99999999));
+
+    ASSERT_NE(placed, nullptr) << "the background agent's order was refused";
+    EXPECT_EQ(restingPrice(OrderDirection::BUY), DEC(100.00)) << "the price was cut a tick low";
+}
+
+TEST_F(DistributedInboundCheckTest, ByDefaultAMinersPriceOffTheGridIsCutAsBefore)
+{
+    send("DISTRIBUTED_PLACE_ORDER_LIMIT", kTrader, limit(OrderDirection::BUY, 1_dec, DEC(100.005)));
+
+    EXPECT_EQ(answerCount("RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"), 1);
+    EXPECT_EQ(answerCount("ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT"), 0);
+    const auto& queue = book->buyQueue();
+    ASSERT_FALSE(queue.empty());
+    EXPECT_EQ(queue.begin()->price(), DEC(100.00)) << "the default no longer cuts onto the grid";
+}
+
+TEST(OffGridOrdersConfig, OnlyCutAndRefuseAreAccepted)
+{
+    pugi::xml_document doc;
+    auto node = doc.append_child("MultiBookExchangeAgent");
+    node.append_attribute("offGridOrders") = "round";
+    taosim::config::ExchangeAgentConfig cfg;
+    EXPECT_THROW(cfg.configure(node), taosim::config::ExchangeAgentConfigException);
+    EXPECT_FALSE(taosim::config::ExchangeAgentConfig{}.parameters().refuseOffGrid) << "refusal is off by default";
+}

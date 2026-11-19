@@ -59,6 +59,9 @@ from taos.im.validator.engines import (
 from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.simulator import PackedOrders, pack_batch
 from taos.im.validator.fundamental import stamp as stamp_fundamental
+from taos.im.validator.kept_accounts import fill_accounts
+from taos.im.validator import levers
+from taos.im.validator import queued_orders
 from taos.im.validator.multiasset_state import flatten_multiasset_state
 
 if TYPE_CHECKING:
@@ -199,6 +202,14 @@ class SimulationEngine(MarketEngine):
 
     Counterpart of the exchange engine, behind the same MarketEngine interface.
     """
+    # The engine leaves unchanged account entries out (it says so with "dirtyAccountsOnly" in the state): set on the
+    # first such state, and read by the validator to give the scoring process's INIT the last complete accounts.
+    dirty_accounts_only = False
+    # The next answer asks the engine for every account in full (a state could not be completed).
+    _ask_full_accounts = False
+    # Called with each state's size as soon as its bytes are read (the validator's offmain_build hook); None, nothing.
+    _on_state_bytes = None
+
     def __init__(self, config: Any, validator: "Validator") -> None:
         self.config    = config
         self.validator = validator
@@ -318,6 +329,12 @@ class SimulationEngine(MarketEngine):
         """
         receive_start = time.time()
         raw_bytes = await self._recv_bytes()
+        _hook = self._on_state_bytes
+        if _hook is not None:
+            try:
+                _hook(len(raw_bytes))
+            except Exception:
+                logger.debug("the state-bytes hook failed; main builds this state's requests", exc_info=True)
         _q4_t_recv = time.time()
         # Retry unpack: SHM data may be partially written even after the size
         # poll passes (simulator signals MQ before completing the write), or the
@@ -341,6 +358,8 @@ class SimulationEngine(MarketEngine):
         # keep the per-realization metadata for log-dir-scoped consumers.
         raw_dict, instance_metas = flatten_multiasset_state(raw_dict)
         self._instance_metas = instance_metas
+        if not self._complete_accounts(raw_dict):
+            return raw_bytes, None, receive_start
         state = self._parse_state(raw_dict)
         _q4_t_parse = time.time()
         normalized = self._normalize(state)
@@ -350,6 +369,7 @@ class SimulationEngine(MarketEngine):
         # no await so the data-service fetch never sits on the round path.
         self._ensure_external_poller()
         self._external_instructions = self._drain_external_orders()
+        queued_orders.tally(self)
         # [Q4-PROFILE] splits recv_norm into recv (shm read), unpack
         # (msgpack.unpackb), parse (_parse_state; pydantic construction, the
         # suspected model_construct hotspot), norm (_normalize) and ext (fetch
@@ -586,6 +606,10 @@ class SimulationEngine(MarketEngine):
         """
         try:
             self.validator.last_response = response
+            deltas_off = getattr(self, "dirty_accounts_only", False) and not levers.enabled("account_deltas")
+            if self._ask_full_accounts or deltas_off:
+                response = {**response, "fullAccounts": True}
+                self._ask_full_accounts = False
             if any(isinstance(item, PackedOrders) for item in response.get("responses", ())):  # neuron.orders_packed
                 packed, dropped = pack_batch(response)
                 if dropped:
@@ -1840,10 +1864,6 @@ class SimulationEngine(MarketEngine):
         logger.info("Starting seed service from: ../validator/seed.py")
         cmd = [
             sys.executable, '-u', '../validator/seed.py',
-            '--seed.fundamental.symbol.coinbase',
-            v.config.simulation.seeding.fundamental.symbol.coinbase,
-            '--seed.fundamental.symbol.binance',
-            v.config.simulation.seeding.fundamental.symbol.binance,
             '--seed.external.symbol.coinbase',
             v.config.simulation.seeding.external.symbol.coinbase,
             '--seed.external.symbol.binance',
@@ -2161,6 +2181,34 @@ class SimulationEngine(MarketEngine):
             mm.write(data)
         mq_res.send(byte_size.to_bytes(8, byteorder="little"))
         mq_res.close()
+
+    def ask_full_accounts(self) -> None:
+        """The engine counts any answer as delivered and stops listing what that state carried, so a state the listener
+        answered without reading would leave the kept copy short of its changes for good: the next answer asks for
+        every account in full. Nothing to ask of an engine that sends every account."""
+        if self.dirty_accounts_only:
+            self._ask_full_accounts = True
+
+    def _complete_accounts(self, raw_dict: dict) -> bool:
+        """Fill in the account entries an engine under dirtyAccountsOnly left out, from the last full copy of each
+        (kept_accounts). False when some could not be filled, as for a validator that has just started: the state is
+        then skipped (answered with no instructions, like any state the listener does not handle) and the answer asks
+        the engine for every account in full, so the next state is complete."""
+        if not raw_dict.get("dirtyAccountsOnly"):
+            return True
+        self.dirty_accounts_only = True
+        if getattr(self, "_kept_accounts", None) is None:
+            self._kept_accounts = {}
+        missing = fill_accounts(self._kept_accounts, raw_dict.get("accounts") or {}, raw_dict.get("books"),
+                                raw_dict.get("bookFees"))
+        if missing:
+            self._ask_full_accounts = True
+            import bittensor as bt
+            bt.logging.warning(
+                f"[ACCOUNTS] {missing} account entries left out with no full copy yet: state skipped, "
+                f"every account asked for in full")
+            return False
+        return True
 
     def _parse_state(self, raw_dict: dict) -> Any:
         """

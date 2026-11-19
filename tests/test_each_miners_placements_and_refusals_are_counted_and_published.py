@@ -66,4 +66,4 @@ def test_the_validator_counts_each_state_once():
     from taos.im.neurons import validator as vmod
     src = inspect.getsource(vmod)
     i = src.index("self.process_resets(state)")
-    assert "update_placement_stats(self, state.notices)" in src[i:i + 400]
+    assert "update_placement_stats(self, state.notices, ts=state.timestamp)" in src[i:i + 400]

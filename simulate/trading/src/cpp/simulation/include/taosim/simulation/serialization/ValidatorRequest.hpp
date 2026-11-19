@@ -9,6 +9,7 @@
 #include <taosim/event/serialization/OrderEvent.hpp>
 #include <taosim/event/serialization/TradeEvent.hpp>
 #include <taosim/simulation/util.hpp>
+#include <taosim/simulation/serialization/AccountPack.hpp>
 #include <taosim/simulation/serialization/LimitOrder.hpp>
 #include <taosim/simulation/serialization/NoticePack.hpp>
 #include <common.hpp>
@@ -78,7 +79,15 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 return agentId >= 0; 
             });
 
-        o.pack_map(6);
+        // An exchange under dirtyAccountsOnly says so and lists each book's shared fee rates: the validator then
+        // fills in the account entries it leaves out and may ask for every account in full. Without it the state
+        // is exactly as before.
+        const bool dirtyAccountsOnly = representativeSimulation->exchange()->dirtyAccountsOnly();
+        o.pack_map(dirtyAccountsOnly ? 8 : 6);
+        if (dirtyAccountsOnly) {
+            o.pack("dirtyAccountsOnly"s);
+            o.pack(true);
+        }
 
         // Log directory.
         o.pack("logDir"s);
@@ -230,139 +239,19 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
             o.pack(agentId);
 
-            o.pack_map(bookCount);
-
+            uint32_t entries{};
             for (const auto& simulation : v.simulations) {
-                const auto exchange = simulation->exchange();
-                const auto& account = exchange->accounts().at(agentId);
-                const auto feePolicy = exchange->clearingManager().feePolicy();
-                for (const auto& book : exchange->books()) {
-                    const BookId bookIdCanon = simulation->bookIdCanon(book->id());
-
-                    o.pack(bookIdCanon);
-
-                    o.pack_map(11);
-
-                    o.pack("i"s);
-                    o.pack(agentId);
-
-                    o.pack("b"s);
-                    o.pack(bookIdCanon);
-
-                    const auto& balances = account.at(book->id());
-
-                    auto packBalance = [](auto& o, const taosim::accounting::Balance& balance, std::string_view currency) {
-                        o.pack_map(5);
-
-                        o.pack("c"s);
-                        o.pack(currency);
-
-                        o.pack("t"s);
-                        o.pack(balance.getTotal());
-
-                        o.pack("f"s);
-                        o.pack(balance.getFree());
-
-                        o.pack("r"s);
-                        o.pack(balance.getReserved());
-
-                        o.pack("i"s);
-                        o.pack(balance.getInitial());
-                    };
-
-                    o.pack("bb"s);
-                    packBalance(o, balances.base, "BASE");
-
-                    o.pack("qb"s);
-                    packBalance(o, *balances.quote, "QUOTE");
-
-                    o.pack("bl"s);
-                    o.pack(balances.m_baseLoan);
-
-                    o.pack("ql"s);
-                    o.pack(balances.m_quoteLoan);
-
-                    o.pack("bc"s);
-                    o.pack(balances.m_baseCollateral);
-
-                    o.pack("qc"s);
-                    o.pack(balances.m_quoteCollateral);
-
-                    o.pack("o"s);
-                    const auto limitOrders = [&] {
-                        std::vector<taosim::simulation::serialization::LimitOrder> limitOrders;
-                        const auto& activeOrders = account.activeOrders().at(book->id());
-                        for (const auto& order : activeOrders) {
-                            const auto limitOrder =
-                                std::dynamic_pointer_cast<::LimitOrder>(order);
-                            if (limitOrder == nullptr) continue;
-                            limitOrders.push_back(taosim::simulation::serialization::LimitOrder{
-                                .limitOrder = limitOrder,
-                                .clientOrderId = book->orderToClientInfo().at(order->id()).clientOrderId
-                            });
-                        }
-                        return limitOrders;
-                    }();
-                    o.pack_array(limitOrders.size());
-                    for (const auto& limitOrder : limitOrders) {
-                        o.pack(limitOrder);
-                    }
-
-                    auto packLoan = [](auto& o, const taosim::accounting::Loan& loan, OrderID id) {
-                        o.pack_map(5);
-
-                        o.pack("i"s);
-                        o.pack(id);
-
-                        o.pack("a"s);
-                        o.pack(loan.amount());
-
-                        o.pack("c"s);
-                        o.pack(
-                            std::to_underlying(
-                                loan.direction() == OrderDirection::BUY ? Currency::QUOTE : Currency::BASE));
-
-                        o.pack("bc"s);
-                        o.pack(loan.collateral().base());
-
-                        o.pack("qc"s);
-                        o.pack(loan.collateral().quote());
-                    };
-
-                    o.pack("l"s);
-                    o.pack_map(balances.m_loans.size());
-                    for (const auto& [id, loan] : balances.m_loans) {
-                        o.pack(id);
-                        packLoan(o, loan, id);
-                    }
-
-                    o.pack("f"s);
-
-                    o.pack_map(3);
-
-                    o.pack("v"s);
-                    if (feePolicy->isTiered()) {
-                        o.pack(feePolicy->agentVolume(book->id(), agentId));
-                    } else {
-                        o.pack_nil();
-                    }
-
-                    const auto rates = [&] {
-                        if (feePolicy->isTiered() || feePolicy->hasOwnPolicy(agentId)) {
-                            return feePolicy->getRates(book->id(), agentId);
-                        }
-                        const auto [it, fresh] = bookRates.try_emplace(bookIdCanon);
-                        if (fresh) it->second = feePolicy->getRates(book->id(), agentId);
-                        return it->second;
-                    }();
-
-                    o.pack("m"s);
-                    o.pack(rates.maker);
-
-                    o.pack("t"s);
-                    o.pack(rates.taker);
-                }
+                entries += taosim::simulation::serialization::entriesPacked(*simulation, agentId);
             }
+            o.pack_map(entries);
+            for (const auto& simulation : v.simulations) {
+                taosim::simulation::serialization::packAccount(o, *simulation, agentId, bookRates);
+            }
+        }
+
+        if (dirtyAccountsOnly) {
+            o.pack("bookFees"s);
+            taosim::simulation::serialization::packBookFees(o, v.simulations, bookRates);
         }
 
         // Notices.

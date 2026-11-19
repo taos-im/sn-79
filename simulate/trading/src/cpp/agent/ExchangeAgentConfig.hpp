@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <source_location>
 #include <string>
 
@@ -55,6 +56,24 @@ public:
         int64_t bandReleaseAfter = 300'000'000'000;  // 5 sim minutes without a print
         int64_t bandReleaseStep = 30'000'000'000;    // one more band-width every 30 sim seconds
         double bandReleaseMax = 0.5;                 // the widened band never exceeds this
+        // A SECOND PRICE BAND, read only by the exchange service and kept apart from maxPriceBand.
+        // poolPriceBand is every book's width, poolPriceBandBooks a per-book override ("5:0.1,9:0.2"); 0 is off. Its
+        // reference is the median of per-block prices over bandRefWindow.
+        double poolPriceBand = 0.0;
+        std::map<uint32_t, double> poolPriceBandBooks;
+
+        // OFF-GRID ORDERS. "cut", the default, truncates a price or a size off the book's grid, as
+        // always. "refuse" refuses a miner's off-grid price (PRICE_INCREMENT_VIOLATED) or size
+        // (VOLUME_INCREMENT_VIOLATED) instead, checked on the price the miner sent, and rounds the background agents'
+        // orders to the nearest grid point at entry, where truncation put a third of their prices a tick low. Orders
+        // the engine makes itself (margin calls, SL/TP closes) are neither refused nor rounded.
+        bool refuseOffGrid = false;
+
+        [[nodiscard]] double poolPriceBandFor(uint32_t bookId) const noexcept
+        {
+            const auto it = poolPriceBandBooks.find(bookId);
+            return it != poolPriceBandBooks.end() ? it->second : poolPriceBand;
+        }
         // ...
     };
 

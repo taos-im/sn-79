@@ -95,7 +95,7 @@ def seed(config):
 
     Opens a WebSocket connection to Coinbase (Binance when Coinbase is unavailable), writes the external symbol's
     trades to CSV files in the run's directory, and follows the run directory through the handoff file (SIGUSR1
-    makes a change seen at once). The fundamental symbol is subscribed too; its trades are not recorded.
+    makes a change seen at once). Only the external symbol is subscribed.
 
     Args:
         config: Configuration object with seed symbols and data directory path.
@@ -282,14 +282,14 @@ def seed(config):
             attempts += 1
             seed_exchange = 'coinbase'
             seed_client, ex = connect_coinbase(
-                [config.seed.fundamental.symbol.coinbase, config.seed.external.symbol.coinbase],
+                [config.seed.external.symbol.coinbase],
                 on_coinbase_trade
             )
             if not seed_client:
                 bt.logging.warning(f"Unable to connect to Coinbase Trades Stream! {ex}. Trying Binance.")
                 seed_exchange = 'binance'
                 seed_client, ex = connect_binance(
-                    [config.seed.fundamental.symbol.binance, config.seed.external.symbol.binance],
+                    [config.seed.external.symbol.binance],
                     on_binance_trade
                 )
                 if not seed_client:
@@ -366,9 +366,8 @@ def seed(config):
             
 def seed_thread(self) -> None:
         """
-        Record the external market's price to the simulation's log directory, where the simulator reads it; the
-        fundamental symbol is subscribed too and its trades are not recorded. Runs in a thread beside the FastAPI
-        server and restarts on any failure.
+        Record the external market's price to the simulation's log directory, where the simulator reads it; only
+        the external symbol is subscribed. Runs in a thread beside the FastAPI server and restarts on any failure.
         """
         while True:
             try:
@@ -454,11 +453,11 @@ def seed_thread(self) -> None:
                     while True:
                         attempts += 1
                         self.seed_exchange='coinbase'
-                        self.seed_client, ex = connect_coinbase([self.config.simulation.seeding.fundamental.symbol.coinbase, self.config.simulation.seeding.external.symbol.coinbase], on_coinbase_trade)
+                        self.seed_client, ex = connect_coinbase([self.config.simulation.seeding.external.symbol.coinbase], on_coinbase_trade)
                         if not self.seed_client:
                             bt.logging.warning(f"Unable to connect to Coinbase Trades Stream! {ex}. Trying Binance.")
                             self.seed_exchange='binance'
-                            self.seed_client, ex = connect_binance([self.config.simulation.seeding.fundamental.symbol.binance,self.config.simulation.seeding.external.symbol.binance], on_binance_trade)
+                            self.seed_client, ex = connect_binance([self.config.simulation.seeding.external.symbol.binance], on_binance_trade)
                             if not self.seed_client:
                                 bt.logging.error(f"Unable to connect to Binance Trades Stream : {ex}.")
                                 if attempts >= 3:
@@ -527,16 +526,22 @@ def seed_thread(self) -> None:
                 time.sleep(10)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    bt.logging.add_args(parser)
-    bt.logging.set_info()
-    parser.add_argument('--seed.fundamental.symbol.coinbase', type=str, required=True)
-    parser.add_argument('--seed.fundamental.symbol.binance', type=str, required=True)
+def add_seed_service_args(parser) -> None:
+    """The seed service's own options. The fundamental symbol's are accepted and ignored: the service subscribes to
+    the external symbol only, and a validator started before that still passes them when it starts the service."""
+    parser.add_argument('--seed.fundamental.symbol.coinbase', type=str, default=None, help='Ignored.')
+    parser.add_argument('--seed.fundamental.symbol.binance', type=str, default=None, help='Ignored.')
     parser.add_argument('--seed.external.symbol.coinbase', type=str, required=True)
     parser.add_argument('--seed.external.symbol.binance', type=str, required=True)
     parser.add_argument('--seed.external.sampling_seconds', type=int, required=True)
     parser.add_argument('--logging.level', type=str, default='INFO')
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    bt.logging.add_args(parser)
+    bt.logging.set_info()
+    add_seed_service_args(parser)
 
     config = bt.Config(parser)
     bt.logging(config=config)

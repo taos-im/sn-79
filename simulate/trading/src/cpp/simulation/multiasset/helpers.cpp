@@ -123,7 +123,7 @@ pugi::xml_document adjustedBackgroundDoc(
     doc.append_copy(backgroundNode);
 
     const auto simuNode = doc.child("Simulation");
-    xml::setAttribute(simuNode, "id", std::string{id}.c_str());
+    xml::setAttribute(simuNode, "id", id.data());
     if (seed) {
         xml::setAttribute(simuNode, "rngSeed", *seed);
     }

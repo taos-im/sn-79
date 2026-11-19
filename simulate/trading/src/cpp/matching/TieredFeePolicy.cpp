@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
  * SPDX-License-Identifier: MIT
  */
+#include <algorithm>
 #include "Simulation.hpp"
 #include <taosim/matching/TieredFeePolicy.hpp>
 
@@ -157,6 +158,14 @@ std::unique_ptr<TieredFeePolicy> TieredFeePolicy::fromXML(pugi::xml_node node, S
             .makerFeeRate = checkFeeRate(getAttr(tierNode, "makerFee").as_double()),
             .takerFeeRate = checkFeeRate(getAttr(tierNode, "takerFee").as_double())
         });
+    }
+
+    // A maker in one tier trades with a taker in any other, so the lowest maker rate meets the lowest taker rate.
+    if (!parsedTiers.empty()) {
+        checkFeeSum(
+            std::ranges::min(parsedTiers, {}, &Tier::makerFeeRate).makerFeeRate,
+            std::ranges::min(parsedTiers, {}, &Tier::takerFeeRate).takerFeeRate,
+            ctx);
     }
 
     return std::make_unique<TieredFeePolicy>(TFPolicyDesc{

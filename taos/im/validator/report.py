@@ -31,6 +31,9 @@ from taos.im.utils import duration_from_timestamp
 from taos.im.config import debeta_dial
 from taos.im.validator.ingest_payload import kappa_maps, debeta_maps, scoring_params
 from taos.im.validator import order_stats
+from taos.im.validator import price_band
+from taos.im.validator import exchange_phases
+from taos.im.validator import queued_orders
 # a report cycle allocates millions of tuples and dicts; the cyclic collector is paused around it (gc_pause)
 from taos.im.validator.gc_pause import cyclic_gc_paused
 from prometheus_client import Counter, Gauge, Info, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
@@ -405,7 +408,7 @@ class ReportingService:
             'debeta_score', 'debeta_making_rank', 'debeta_skill_rank', 'debeta_p11_factor',
             'debeta_s3_factor', 'debeta_bg_share',
             'debeta_making_realized', 'debeta_making_captured', 'debeta_making_basis',
-            'debeta_making_share', 'debeta_ladder_input',
+            'debeta_making_share', 'debeta_skill_share', 'debeta_ladder_input',
             'debeta_present', 'debeta_coverage_books', 'debeta_skill_coverage_factor',
             'num_scored_books', 'scorable',
             # resting orders and open loans, summed over the books (order_stats)
@@ -727,6 +730,8 @@ class ReportingService:
         self.round_gaps = list(data.get('round_gaps') or [])
         self.query_waits = list(data.get('query_waits') or [])
         self.reward_gate_waits = list(data.get('reward_gate_waits') or [])
+        self.accounting_times = list(data.get('accounting_times') or [])
+        self.service_accounting_times = list(data.get('service_accounting_times') or [])
         self.fundamental_seed_sources = dict(data.get('fundamental_seed_sources') or {})
         for _key in ('fundamental_seed_commit', 'fundamental_seed_reveal'):
             setattr(self, _key, dict(data[_key]) if isinstance(data.get(_key), dict) else None)
@@ -736,11 +741,15 @@ class ReportingService:
         self.debeta_class_summary = {int(c): dict(v) for c, v in (data.get('debeta_class_summary') or {}).items()}
         self.debeta_class_details = {int(c): {int(u): dict(d) for u, d in (v or {}).items()}
                                      for c, v in (data.get('debeta_class_details') or {}).items()}
+        self.debeta_carry = dict(data.get('debeta_carry') or {})
         self.capture_floor_stats = {int(b): dict(v) for b, v in (data.get('capture_floor_stats') or {}).items()}
         self.capture_settle_by_class = {int(c): dict(v) for c, v in (data.get('capture_settle_by_class') or {}).items()}
         self.scoring_shadow_health = data.get('scoring_shadow')
         self.history_clock = data.get('history_clock')
         self.exchange_settlement = data.get('exchange_settlement')
+        self.queued_orders = data.get('queued_orders')
+        self.price_band = data.get('price_band')
+        self.exchange_phases = data.get('exchange_phases')
 
         def _int_keyed_books(d):
             """IPC serialization stringifies keys; the book-gauge block indexes by int uid/book."""
@@ -963,6 +972,7 @@ def class_names(simulation) -> dict:
 CLASS_DETAIL_GAUGES = (
     ('making_raw', 'making'), ('making_rank', 'making_rank'), ('skill_raw', 'skill'), ('skill_rank', 'skill_rank'),
     ('p11_factor', 'p11_factor'), ('making_s3_factor', 's3_factor'), ('bg_share', 'bg_share'),
+    ('making_otr_factor', 'otr_factor'), ('messages_per_fill', 'messages_per_fill'),
     ('skill_coverage_factor', 'coverage_factor'), ('skill_net_alpha', 'net_alpha'), ('skill_books', 'skill_books'),
     ('coverage_books', 'coverage_books'), ('present', 'present'), ('notional', 'notional'),
     # both shrinkage forms of the class's skill pool (0.6.6), the empirical Bayes one shrunk within the class
@@ -996,6 +1006,29 @@ def publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid):
                 if _v is None:
                     continue
                 updates.append((coll, float(_v), wallet_addr, netuid, simid, label, int(_uid), _gauge))
+
+
+# a carried class's per-uid legs (0.6.8): the leg, its paid gauge, its carried gauge
+CARRY_GAUGES = (('making', 'paid_making', 'carried_making'), ('skill', 'paid_skill', 'carried_skill'))
+
+
+def publish_carry_gauges(self, updates, wallet_addr, netuid, simid):
+    """While a class that lost books carries its standing through the run-boundary handover (0.6.8): the weight w
+    this scoring paid the carried shares at, as class gauge handover_w, and per uid the shares paid and the shares
+    carried (agent_class_gauges paid_* and carried_*, zeros left out), so the board's carry line
+    reads the carry bound live. Nothing outside a carry, so the scrape grows
+    only for the lookback one runs."""
+    coll = getattr(self, 'prometheus_agent_class_gauges', None)
+    for name, c in (getattr(self, 'debeta_carry', None) or {}).items():
+        updates.append((self.prometheus_class_gauges, float((c or {}).get('w') or 0.0), wallet_addr, netuid, simid,
+                        str(name), 'handover_w'))
+        if coll is None:
+            continue
+        for leg, paid_gauge, carried_gauge in CARRY_GAUGES:
+            for key, gauge in (('paid', paid_gauge), ('carried', carried_gauge)):
+                for uid, v in (((c or {}).get(key) or {}).get(leg) or {}).items():
+                    if float(v) != 0.0:
+                        updates.append((coll, float(v), wallet_addr, netuid, simid, str(name), int(uid), gauge))
 
 
 def publish_capture_floor_gauges(self, updates, wallet_addr, netuid, simid):
@@ -1114,7 +1147,8 @@ def fundamental_seed_gauges(self) -> list:
     slow), 0 before the first sample."""
     src = dict(getattr(self, 'fundamental_seed_sources', None) or {})
     out = [(f"fundamental_seed_{k}", float(src.get(k, 0)))
-           for k in ("drand", "chain", "random", "drand_disagree", "drand_one_operator", "commit", "reveal")]
+           for k in ("drand", "chain", "random", "drand_disagree", "drand_one_operator", "commit", "reveal",
+                     "drand_bad_signature", "drand_unverified")]
     samples = [float(x) for x in (getattr(self, 'fundamental_seed_clock', None) or [])]
     out.append(("fundamental_seed_clock_skew_s", min(samples) if samples else 0.0))
     return out
@@ -1134,6 +1168,23 @@ def fundamental_seed_info(self) -> list:
     return out
 
 
+def accounting_gauges(main_times, service_times) -> list:
+    """Each state's accounting over the last published states, as (gauge, value): main's wall time
+    (median and 95th percentile) and thread CPU (median), and the scoring service's wall time (mean, which says whether
+    it keeps up with the states, and 95th percentile, the states that run the per-entry legs)."""
+    out = []
+    main = [t for t in (main_times or []) if len(t) >= 2]
+    if main:
+        walls, cpus = [float(t[0]) for t in main], [float(t[1]) for t in main]
+        out += [("accounting_wall_median", round_quantile(walls, 0.5)), ("accounting_wall_p95", round_quantile(walls, 0.95)),
+                ("accounting_cpu_median", round_quantile(cpus, 0.5))]
+    service = [float(t[0]) for t in (service_times or []) if len(t) >= 1]
+    if service:
+        out += [("service_accounting_wall_mean", sum(service) / len(service)),
+                ("service_accounting_wall_p95", round_quantile(service, 0.95))]
+    return out
+
+
 def round_timing_gauges(self) -> list:
     """The validator's round timing over its last published rounds, as (gauge, value): the round period's 5th
     percentile, median and 95th percentile (wall seconds between consecutive states), the query wait's median and 95th
@@ -1150,6 +1201,7 @@ def round_timing_gauges(self) -> list:
     gate = list(getattr(self, 'reward_gate_waits', None) or [])
     if gate:
         out.append(("reward_gate_wait_max", max(gate)))
+    out += accounting_gauges(getattr(self, 'accounting_times', None), getattr(self, 'service_accounting_times', None))
     out.append(("reward_tasks_pending", int(getattr(self, 'pending_reward_tasks', 0) or 0)))
     return out
 
@@ -1187,6 +1239,11 @@ def publish_validator_gauges(self: ReportingService):
         self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
     for _name, _value in fundamental_seed_gauges(self):
         self.prometheus_validator_gauges.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
+    # booked fill sides whose uid's notice carries another fee, or no notice (trade.capture_fee_disagreements)
+    _fee_check = getattr(self, "capture_fee_check", None) or {}
+    for _name, _value in (("capture_fee_disagreements", _fee_check.get("total", 0)),
+                          ("capture_fee_disagreements_state", _fee_check.get("state", 0))):
+        self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, validator_gauge_name=_name).set(float(_value))
     for _kind, _fields in fundamental_seed_info(self):
         self.prometheus_seed_info.labels(wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, sim_id=self.simulation.simulation_id, kind=_kind).info(_fields)
     cpu_usage = psutil.cpu_percent()
@@ -1210,6 +1267,9 @@ def publish_validator_gauges(self: ReportingService):
             ("scoring_shadow_suspended", "cutover_suspended"),
             ("scoring_shadow_initialized", "initialized"),
             ("scoring_shadow_child_lag", "child_lag"),
+            # 0.6.8 D3: the per-entry legs run in the service alone; their age says when they stopped
+            ("scoring_shadow_legs_in_service", "legs_in_service"),
+            ("scoring_shadow_legs_age_s", "legs_age_s"),
         ):
             self.prometheus_validator_gauges.labels(
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
@@ -1235,7 +1295,42 @@ def publish_validator_gauges(self: ReportingService):
                 wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
                 sim_id=self.simulation.simulation_id, validator_gauge_name=f"settlement_{_key}",
             ).set(float(_value or 0))
+    publish_queued_order_gauges(self)
+    publish_price_band_gauges(self)
+    publish_exchange_phase_gauges(self)
     bt.logging.debug(f"Validator metrics published ({time.time()-start:.4f}s).")
+
+
+def publish_queued_order_gauges(self: ReportingService) -> None:
+    """The queued orders drained, as totals of every drain (queued_orders.py): queued_orders,
+    queued_orders_unstamped (each went in at delay 0, ahead of every miner), queued_order_delay_max_ns (the largest
+    over the last hour of drains) and queued_order_delay_last_ns (the latest drain's), with any further count the
+    drain carries. Nothing before the first counted drain."""
+    for _key, _value in (getattr(self, 'queued_orders', None) or {}).items():
+        self.prometheus_validator_gauges.labels(
+            wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+            sim_id=self.simulation.simulation_id, validator_gauge_name=queued_orders.gauge_name(_key),
+        ).set(float(_value or 0))
+
+def publish_price_band_gauges(self: ReportingService) -> None:
+    """What the price band cut and refused, as totals since the process started (price_band.py):
+    price_band_cuts, price_band_cut_closes and price_band_refusals. Nothing before the first response with a band list."""
+    for _key, _value in (getattr(self, 'price_band', None) or {}).items():
+        self.prometheus_validator_gauges.labels(
+            wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+            sim_id=self.simulation.simulation_id, validator_gauge_name=price_band.gauge_name(_key),
+        ).set(float(_value or 0))
+
+def publish_exchange_phase_gauges(self: ReportingService) -> None:
+    """The exchange engine's round timed by phase per chain block (exchange_phases.py): the last completed
+    block's exchange_phase_<phase>_ms, exchange_engine_round_ms, exchange_ipc_ms, exchange_rounds_per_block and
+    exchange_block_instructions, and the largest a block took since the previous report as <name>_max_ms. Nothing
+    from an engine without phases."""
+    for _key, _value in (getattr(self, 'exchange_phases', None) or {}).items():
+        self.prometheus_validator_gauges.labels(
+            wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid,
+            sim_id=self.simulation.simulation_id, validator_gauge_name=exchange_phases.gauge_name(_key),
+        ).set(float(_value or 0))
 
 def publish_gentrx_gauges(self: ReportingService) -> None:
     """
@@ -1829,6 +1924,8 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             # proportional pool, and what the ladder would rank, so the alternative is visible
             # on the dashboards before the dial is turned
             'making_share': kappa_values.get('making_share') if kappa_values else None,
+            # the skill share the pool pays (0.6.8), beside the making share
+            'skill_share': kappa_values.get('skill_share') if kappa_values else None,
             'ladder_input': kappa_values.get('ladder_input') if kappa_values else None,
                 'making_rank': kappa_values.get('making_rank') if kappa_values else None,
                 # both making bases and which one pays (0.6.3): reward.py stores them on uid_kappa with the
@@ -1858,6 +1955,11 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                 'skill_coverage_factor': kappa_values.get('skill_coverage_factor') if kappa_values else None,
                 'coverage_books': kappa_values.get('coverage_books') if kappa_values else None,
                 'skill_p11_factor': kappa_values.get('skill_p11_factor') if kappa_values else None,
+                'making_otr_factor': kappa_values.get('making_otr_factor') if kappa_values else None,
+                'messages_per_fill': kappa_values.get('messages_per_fill') if kappa_values else None,
+                'dust_takes': kappa_values.get('dust_takes') if kappa_values else None,
+                'dust_makes': kappa_values.get('dust_makes') if kappa_values else None,
+                'dust_take_share': kappa_values.get('dust_take_share') if kappa_values else None,
                 'skill_net_alpha': kappa_values.get('skill_net_alpha') if kappa_values else None,
                 'notional': kappa_values.get('notional') if kappa_values else None,
                 'presence_share': kappa_values.get('presence_share') if kappa_values else None,
@@ -1929,6 +2031,7 @@ async def report(self: ReportingService) -> None:
         publish_class_gauges(self, updates, wallet_addr, netuid, simid)
         publish_capture_settle_gauges(self, updates, wallet_addr, netuid, simid)
         publish_agent_class_gauges(self, updates, wallet_addr, netuid, simid)
+        publish_carry_gauges(self, updates, wallet_addr, netuid, simid)
         bt.logging.debug(f"Simulation metrics collected ({time.time()-start:.4f}s).")
 
         has_new_trades = False
@@ -2421,6 +2524,7 @@ async def report(self: ReportingService) -> None:
             # implying de-beta still drives the score.
             for _k, _g in (('debeta_score', 'debeta_score'),
                            ('making_share', 'debeta_making_share'),
+                           ('skill_share', 'debeta_skill_share'),
                            ('ladder_input', 'debeta_ladder_input'),
                            ('making_raw', 'debeta_making'),
                            ('making_rank', 'debeta_making_rank'),
@@ -2455,6 +2559,10 @@ async def report(self: ReportingService) -> None:
                            ('skill_coverage_factor', 'debeta_skill_coverage_factor'),
                            ('coverage_books', 'debeta_coverage_books'),
                            ('skill_p11_factor', 'debeta_skill_p11_factor'),
+                           ('making_otr_factor', 'debeta_making_otr_factor'),
+                           ('messages_per_fill', 'debeta_messages_per_fill'),
+                           ('dust_takes', 'debeta_dust_takes'), ('dust_makes', 'debeta_dust_makes'),
+                           ('dust_take_share', 'debeta_dust_take_share'),
                            ('skill_net_alpha', 'debeta_skill_net_alpha'),
                            ('notional', 'debeta_notional'),
                            ('presence_share', 'debeta_presence_share'),
@@ -2555,6 +2663,7 @@ async def report(self: ReportingService) -> None:
                 # without a matching argument here stops the entire miner gauge publishing, not just
                 # its own series.
                 debeta_making_share=(m['making_share'] if m.get('making_share') is not None else 0.0),
+                debeta_skill_share=(m['skill_share'] if m.get('skill_share') is not None else 0.0),
                 debeta_ladder_input=(m['ladder_input'] if m.get('ladder_input') is not None else 0.0),
                 # Presence and the two coverage counts belong on the summary row, so the per-miner
                 # de-beta table does not duplicate its columns from here.

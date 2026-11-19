@@ -37,7 +37,7 @@ from taos.im.neurons.validator import Validator
 from taos.im.protocol import FinanceAgentResponse, FinanceEventNotification, MarketSimulationStateUpdate
 from taos.im.protocol.instructions import *
 from taos.im.validator.delays import latency_profile, max_instruction_delay_ns, set_delays
-from taos.im.validator.block_stats import block_row, bump, sent_counts
+from taos.im.validator.block_stats import block_row, bump, sent_counts, note_otr, messages_per_fill  # noqa: F401
 from taos.im.utils import duration_from_timestamp
 
 
@@ -81,7 +81,7 @@ def _remember(keys: dict, key, cap: int) -> None:
     keys[key] = True
 
 
-def _count_cancel_answer(self: Validator, st: dict, uid, notice, seen) -> None:
+def _count_cancel_answer(self: Validator, st: dict, uid, notice, seen, ts=None) -> None:
     """One answer's orders by outcome. An order a cancel instruction named is cancelled or not found; a success for an
     order no instruction named is a self-trade-prevention cancel. Until the first round is sent (after a restart) the
     answers belong to cancels sent before it, so an unmatched success is counted as a cancel."""
@@ -103,9 +103,11 @@ def _count_cancel_answer(self: Validator, st: dict, uid, notice, seen) -> None:
         else:
             name = 'stp_cancels'
         st[name] = st.get(name, 0) + 1
+        if name == 'orders_cancelled':
+            note_otr(self, uid, 'msg', ts)
 
 
-def update_placement_stats(self: Validator, notices: dict | None) -> None:
+def update_placement_stats(self: Validator, notices: dict | None, ts=None) -> None:
     """Counts, into each miner's request stats so they publish and reset with them per block: its limit and market
     placements the engine answered in a state, accepted and refused (a refusal for CONTRACT_VIOLATION, post-only or
     time in force, also apart), the orders its cancels named by outcome, and the fills it took part in. The exchange
@@ -127,9 +129,10 @@ def update_placement_stats(self: Validator, notices: dict | None) -> None:
                             continue
                         _remember(seen, key, _FILL_SEEN_CAP)
                 st['fills'] = st.get('fills', 0) + 1
+                note_otr(self, uid, 'fill', ts)
                 continue
             if y in _CANCEL_ANSWERS:
-                _count_cancel_answer(self, st, uid, n, seen)
+                _count_cancel_answer(self, st, uid, n, seen, ts)
                 continue
             if y not in _PLACEMENT_ANSWERS:
                 continue
@@ -140,6 +143,7 @@ def update_placement_stats(self: Validator, notices: dict | None) -> None:
                     st['refused_contract'] = st.get('refused_contract', 0) + 1
             else:
                 st['placed'] = st.get('placed', 0) + 1
+                note_otr(self, uid, 'msg', ts)
 
 
 def update_sent_stats(self: Validator, responses) -> None:
@@ -196,6 +200,7 @@ def delay_settings(self: Validator) -> SimpleNamespace:
             min_delay=scoring.min_delay, max_delay=scoring.max_delay,
             min_instruction_delay=scoring.min_instruction_delay, max_instruction_delay=scoring.max_instruction_delay,
             delay_policy=getattr(scoring, 'delay_policy', None), delay_jitter=getattr(scoring, 'delay_jitter', None),
+            engine_mode=getattr(getattr(self, 'engine', None), 'mode', None),
             delay_prompt_cutoff=getattr(scoring, 'delay_prompt_cutoff', None))),
         simulation=SimpleNamespace(time_unit=getattr(self.simulation, 'time_unit', 'ns')),
         # main's loaded profile, so the query process applies it without reading the file each round
@@ -391,12 +396,20 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
 
             write_start = time.time()
             if getattr(self.config.neuron, 'query_prepayload', False) and request_data['engine_mode'] != 'exchange':
-                # The miners' requests built here, so the query process unpickles strings, not the decoded state.
-                from taos.im.validator.query import prebuild_request
-                compression = self.config.compression
-                request_data = prebuild_request(request_data, self.wallet.hotkey.ss58_address, compression.level,
-                                                compression.engine, compression.parallel_workers)
-                bt.logging.info(f"Prebuilt miner payloads ({time.time()-write_start:.4f}s).")
+                # The miners' requests built here, so the query process unpickles strings, not the decoded state;
+                # or, with the lever offmain_build on and the query process holding this state, built there.
+                from taos.im.validator import offmain_build
+                handed = offmain_build.hand_over(self, request_data)
+                if handed is not None:
+                    request_data = handed
+                    bt.logging.info(f"Handed the miners' requests to the query process "
+                                    f"({time.time()-write_start:.4f}s).")
+                else:
+                    from taos.im.validator.query import prebuild_request
+                    compression = self.config.compression
+                    request_data = prebuild_request(request_data, self.wallet.hotkey.ss58_address, compression.level,
+                                                    compression.engine, compression.parallel_workers)
+                    bt.logging.info(f"Prebuilt miner payloads ({time.time()-write_start:.4f}s).")
                 write_start = time.time()
             data_bytes = pickle.dumps(request_data, protocol=5)
             bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")

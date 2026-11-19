@@ -5,7 +5,7 @@
 run_validator.sh defaults SIMULATION_CONFIG to multiasset_simulation_0, so this is the configuration a
 miner actually trades unless they pass -g. This test reads the layout that ships, so it fails in a miner's
 tree if the tree stops shipping a piece of it (the wrapper or a per-class config it references), and it
-states the properties an agent is entitled to rely on: contiguous ids from zero, three named classes, and
+states the properties an agent is entitled to rely on: contiguous ids from zero, four named classes, and
 a grid per book rather than one top-level priceDecimals.
 """
 import xml.etree.ElementTree as ET
@@ -35,11 +35,11 @@ def test_every_class_the_default_layout_names_is_present():
     assert not missing, f"the default layout references {missing}, which this tree does not contain"
 
 
-def test_the_default_layout_loads_as_three_named_classes():
+def test_the_default_layout_loads_as_four_named_classes():
     classes = _layout().asset_classes()
-    assert [c.name for c in classes] == ["simulation_0", "simulation_1", "simulation_2"], (
+    assert [c.name for c in classes] == ["simulation_0", "simulation_1", "simulation_2", "simulation_3"], (
         "the published layout's classes are the names the migration note and the announcement use")
-    assert [len(c.books) for c in classes] == [128, 64, 64], "the published 128/64/64"
+    assert [len(c.books) for c in classes] == [64, 64, 64, 64], "the published 64/64/64/64 of 0.6.8"
 
 
 def test_book_ids_run_contiguously_from_zero_across_the_whole_layout():

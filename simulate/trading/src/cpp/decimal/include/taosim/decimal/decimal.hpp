@@ -55,6 +55,14 @@ inline constexpr uint32_t kDefaultDecimalPlaces = 8;
     return DecimalUtil::ceil(val * factor) / factor;
 }
 
+// To the nearest multiple of 10^-decimalPlaces, a half away from zero; round() truncates instead.
+[[nodiscard]] inline decimal_t roundNearest(decimal_t val, uint32_t decimalPlaces)
+{
+    using namespace BloombergLP::bdldfp;
+    const auto factor = DecimalUtil::multiplyByPowerOf10(decimal_t{1}, decimalPlaces);
+    return DecimalUtil::round(val * factor) / factor;
+}
+
 [[nodiscard]] inline double decimal2double(decimal_t val)
 {
     return BloombergLP::bdldfp::DecimalConvertUtil::decimalToDouble(val);

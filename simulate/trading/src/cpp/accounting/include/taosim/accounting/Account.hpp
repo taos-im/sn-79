@@ -46,6 +46,12 @@ public:
 
     [[nodiscard]] auto&& holdings(this auto&& self) noexcept { return self.m_holdings; }
     [[nodiscard]] auto&& activeOrders(this auto&& self) noexcept { return self.m_activeOrders; }
+    // Changed on a book since its state was last delivered to the validator; read and cleared only by the
+    // state publisher. No marks yet (a new, reset or restored account) means changed on every book.
+    [[nodiscard]] bool dirty(BookId bookId) const noexcept { return m_clean.empty() || !m_clean[bookId]; }
+    void markDirty(BookId bookId) noexcept { if (!m_clean.empty()) m_clean[bookId] = false; }
+    void markAllDirty() noexcept { m_clean.clear(); }
+    void markClean() { m_clean.assign(m_holdings.size(), true); }
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
@@ -59,6 +65,7 @@ private:
 
     Holdings m_holdings;
     ActiveOrders m_activeOrders;
+    std::vector<bool> m_clean;
 };
 
 //-------------------------------------------------------------------------

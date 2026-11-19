@@ -48,6 +48,18 @@ public:
     // [[nodiscard]] static std::unique_ptr<FeePolicy> fromXML(
     //     pugi::xml_node node, Simulation* simulation);
 
+    // A REBATE NEVER EXCEEDS THE FEE THAT PAYS IT. The exchange pays a maker's rebate out of the
+    // taker's fee, so the rates of a fill sum to zero or more. Checked on the configured rates when a policy is read
+    // and on every fill (FeePolicyWrapper::calculateFees, for two agents on different policies).
+    static void checkFeeSum(decimal_t makerFee, decimal_t takerFee, std::string_view where)
+    {
+        if (makerFee + takerFee < decimal_t{0}) {
+            throw std::invalid_argument{fmt::format(
+                "{}: maker fee {} and taker fee {} sum below zero, so a rebate would exceed the fee that pays it",
+                where, makerFee, takerFee)};
+        }
+    }
+
     static decimal_t checkFeeRate(double feeRate)
     {
         static constexpr double feeRateMin{-1.0}, feeRateMax{1.0};

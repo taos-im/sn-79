@@ -578,7 +578,7 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
                             mid_state=None, flush_ns=CAPTURE_FLUSH_NS,
                             real_buy_sums=None, real_sell_sums=None, real_buy_hist=None, real_sell_hist=None,
                             horizon_ns=None, now_ns=None, min_size=0.0, fee_weight=0.0, market_votes=False,
-                            taker=None):
+                            taker=None, dust_out=None):
     """Accumulate per-uid two-sided spread capture for ONE book's ordered trade batch into
     buy_sums / sell_sums ({uid: {book: cap}}), in place. Each `trade` is dict-like with keys
     p (price), q (quantity), s (side), Ma (maker uid), Ta (taker uid). side==0 => taker buys /
@@ -666,6 +666,12 @@ def accumulate_book_capture(buy_sums, sell_sums, book_id, trades, W, *,
         sizes.append(float(t.get("q") or 0.0))
         bgs.append(_background_sided(t))
         floors.append(_push_floor_reference(ref_sorted, ref_fifo, sizes[-1], bgs[-1], st["min_size"]))
+        if dust_out is not None and sizes[-1] < floors[-1]:
+            # a print under its floor, by its miner sides: the taker's take, the maker's make; a
+            # background side is nobody's reading
+            for side, uid in (("takes", t.get("Ta")), ("makes", t.get("Ma"))):
+                if uid is not None and int(uid) >= 0:
+                    dust_out.setdefault(int(uid), {"takes": 0, "makes": 0})[side] += 1
         if t.get("Ma", -1) != t.get("Ta", -1):
             st["pend"].append((st["n"], pt, t))
             # only fills with a miner on either side can earn or pay realized spread; background-on-background
@@ -1018,6 +1024,25 @@ def counterparty_ec(cp, maker, topk=2):
     return my_share - mkt_share
 
 
+def otr_discount(own, otr, uids, threshold, power=1.0):
+    """The order-to-trade discount on the making leg: a uid whose messages per fill over the making
+    window exceed `threshold` keeps min(1, (threshold / messages_per_fill) ** power) of its making credit. `otr` maps
+    uid to messages per fill (placements and cancels the engine applied, over fills); a uid without a reading keeps
+    its credit, one with messages and no fills (inf) keeps none. The real-market mirror is the order-to-trade ratio
+    limit a venue sets (MiFID II RTS 9) and the excessive-messaging fee: noise that never trades is not liquidity."""
+    out = {}
+    for u in uids:
+        v = own.get(u, 0.0)
+        r = (otr or {}).get(u)
+        if r is None or threshold <= 0 or r <= threshold:
+            out[u] = v
+        elif r == float("inf"):
+            out[u] = 0.0
+        else:
+            out[u] = v * min(1.0, (float(threshold) / float(r)) ** float(power))
+    return out
+
+
 def p11_discount(own, cp, uids, strength, topk=2, ec=None):
     """Apply the P11 counterparty-diversity discount to the making leg: making *= (1 - strength*EC+),
     EC+ = max(0, excess concentration). strength 0 disables. A feeder-fed maker (EC~1) loses ~strength
@@ -1297,7 +1322,7 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
                   skill_rank_scope="positives", making_rank_scope="positives",
                   skill_values=None, skill_rank_scale=1.0, skill_max_inactive_books=0.0,
                   skill_min_books=MIN_SKILL_BOOKS_DEFAULT, skill_p11_strength=0.0, p11_topk=2, s3_k=0.0,
-                  cp_tether=None):
+                  cp_tether=None, otr=None, otr_threshold=0.0, otr_power=1.0):
     """Full per-uid de-beta score. making = per-uid two-sided spread capture, combined by RANK. Rank
     rather than magnitude-proportional, because proportional combining re-concentrates reward on the
     largest flow; and per-uid rather than netted across linked accounts, because grouping by identity is
@@ -1369,6 +1394,11 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
     _cp_t = cp_tether if cp_tether is not None else cp
     if _cp_t is not None and s3_k > 0:
         own = tether_miner_sourced(own, _cp_t, uids, float(s3_k))
+    pre_otr = dict(own)
+    # The order-to-trade discount last, on the credit the tether left: messages that never trade are not liquidity
+    # (otr_discount). Off at threshold 0.
+    if otr is not None and otr_threshold > 0:
+        own = otr_discount(own, otr, uids, float(otr_threshold), float(otr_power))
     making = [own.get(u, 0.0) for u in uids]
     if skill_values is None:
         skill = [kappa_floored(book_alphas_by_uid.get(u, []), floor, skill_min_books) for u in uids]
@@ -1442,7 +1472,12 @@ def debeta_scores(capture_buy_sums, capture_sell_sums, book_alphas_by_uid, floor
                 "skill_net_alpha": net_alpha[i],
                 "skill_rank": rs[i],
                 "p11_factor": (pre_s3.get(u, 0.0) / base) if base else 1.0,
-                "making_s3_factor": (making[i] / pre_s3.get(u, 0.0)) if pre_s3.get(u, 0.0) else 1.0,
+                "making_s3_factor": (pre_otr.get(u, 0.0) / pre_s3.get(u, 0.0)) if pre_s3.get(u, 0.0) else 1.0,
+                # The order-to-trade discount applied (1.0 when the dial is off or the uid is under the threshold),
+                # the credit before it, and the reading it was judged on (None without one).
+                "making_otr_factor": (making[i] / pre_otr.get(u, 0.0)) if pre_otr.get(u, 0.0) else 1.0,
+                "making_pre_otr": pre_otr.get(u, 0.0),
+                "messages_per_fill": (None if otr is None or otr.get(u) is None else float(otr.get(u))),
                 # The maker's background share of fill volume on the rows the tether read: what the tether
                 # keys on, and what tells a griefed honest maker (high share, low P11 factor) from a fed one.
                 "bg_share": _bg_share_of(_cp_t, u),
@@ -1483,6 +1518,7 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
                         mtm_hist=None, invsum_hist=None, invn_hist=None,
                         drift=None, drift_hist=None, ts=None,
                         mark_state=None, mark_mode="last", mark_window=0, mark_mid=None, fill_charge="none",
+                        charge_ref="mark",
                         heldn=None, heldinv=None, helddrift=None, notional=None,
                         heldn_hist=None, heldinv_hist=None, helddrift_hist=None, notional_hist=None):
     """Accumulate the drift-strip inputs for kappa-of-alpha over ONE book's ordered trade batch,
@@ -1553,6 +1589,9 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
         prev = st["prev"]
     else:
         prev = p_last.get(book_id)
+    # the book's mark as it stood before this batch: under charge_ref "prev" the taker fill is charged against it,
+    # the quote the taker crossed, rather than the mark after the batch
+    ref_prev = prev
     for t in trades:
         p = float(t["p"])
         fill_p = p
@@ -1608,9 +1647,10 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
         ma = _uid(t.get("Ma", -1))
         ta = _uid(t.get("Ta", -1))
         buyer, seller = (ta, ma) if int(t["s"]) == 0 else (ma, ta)
-        if fill_charge != "none" and p != fill_p:
-            # the fill at its price against the mark: what a sweep pays over the mark is its own cost, not a move
-            for u, c in ((buyer, (p - fill_p) * q), (seller, (fill_p - p) * q)):
+        ref = ref_prev if (charge_ref == "prev" and ref_prev is not None) else p
+        if fill_charge != "none" and ref != fill_p:
+            # the fill at its price against the reference: what a sweep pays over it is its own cost, not a move
+            for u, c in ((buyer, (ref - fill_p) * q), (seller, (fill_p - ref) * q)):
                 if u < 0 or (fill_charge == "taker" and u != ta):
                     continue
                 mtm[u][book_id] = mtm[u].get(book_id, 0.0) + c
@@ -1714,6 +1754,82 @@ def book_alphas_by_book(mtm, invsum, invn, drift, only=None):
             by_book[b] = tb - mi * drift.get(b, 0.0)
         out[uid] = by_book
     return out
+
+
+def _strip_sides(entries_2, entries_n, entries_d, seam_ts):
+    """alpha = sum over the sides of (M - (I / n) x D), each side's sums over its own entries: before the seam the
+    old run's (shifted onto the new clock at the run change), at or after it the new run's. seam_ts None: one side."""
+    sides = ((lambda ts: ts < seam_ts), (lambda ts: ts >= seam_ts)) if seam_ts is not None else ((lambda ts: True),)
+    out = 0.0
+    for side in sides:
+        n = sum(v for ts, v in entries_n.items() if side(ts))
+        if n <= 0:
+            continue
+        m = sum(v for ts, v in entries_2[0].items() if side(ts))
+        i = sum(v for ts, v in entries_2[1].items() if side(ts))
+        d = sum(v for ts, v in entries_d.items() if side(ts))
+        out += m - (i / n) * d
+    return out
+
+
+def book_alphas_split(mtm_hist, invsum_hist, invn_hist, drift_hist, seam_ts, only=None):
+    """book_alphas_by_book from the histories, each side of a run change stripped on its own: {uid: {book: alpha}}.
+
+    At a run change the histories are shifted onto the new clock so the window spans the boundary, and every inventory
+    starts flat; one strip over the whole window then multiplies the old run's mean inventory by the new run's drift,
+    a term from no trade that lasts until the old entries leave the window (a uid with no fill in the new run can
+    carry a large published net alpha from it). The old
+    run's entries sit before `seam_ts` on the new clock (the shift moves one landing exactly on it just before it), the
+    new run's at or after it; each side is stripped with its own mean inventory and drift and the two are summed. With
+    no entry on one side this equals the one-strip finalizer, by the invariant running == sum(history in window).
+
+    Args:
+        mtm_hist, invsum_hist: ``{uid: {book: {ts: incr}}}``.
+        invn_hist, drift_hist: ``{book: {ts: incr}}``.
+        seam_ts: The run change on the new clock (the validator's ``debeta_seam_ts``), or None for one side.
+        only: ``{uid: books}`` to compute, as in book_alphas_by_book.
+    """
+    out = {}
+    for uid in set(mtm_hist) | set(invsum_hist):
+        by_book = {}
+        keep = None if only is None else only.get(uid, ())
+        for b in set(mtm_hist.get(uid, {})) | set(invsum_hist.get(uid, {})):
+            if keep is not None and b not in keep:
+                continue
+            n_entries = invn_hist.get(b) or {}
+            if not n_entries:
+                continue
+            by_book[b] = _strip_sides((mtm_hist.get(uid, {}).get(b) or {}, invsum_hist.get(uid, {}).get(b) or {}),
+                                      n_entries, drift_hist.get(b) or {}, seam_ts)
+        out[uid] = by_book
+    return out
+
+
+def book_alphas_held_split(mtm_hist, heldinv_hist, heldn_hist, helddrift_hist, seam_ts, only=None):
+    """book_alphas_held_by_book from the histories with each side of a run change stripped on its own; the held
+    variant's count and drift are per uid and book, so every history here is ``{uid: {book: {ts: incr}}}``."""
+    out = {}
+    for uid in set(mtm_hist) | set(heldn_hist):
+        by_book = {}
+        keep = None if only is None else only.get(uid, ())
+        for b in set(mtm_hist.get(uid, {})) | set(heldn_hist.get(uid, {})):
+            if keep is not None and b not in keep:
+                continue
+            n_entries = heldn_hist.get(uid, {}).get(b) or {}
+            if not n_entries:
+                continue
+            by_book[b] = _strip_sides((mtm_hist.get(uid, {}).get(b) or {}, heldinv_hist.get(uid, {}).get(b) or {}),
+                                      n_entries, helddrift_hist.get(uid, {}).get(b) or {}, seam_ts)
+        out[uid] = by_book
+    return out
+
+
+def seam_inside(drift_hist, seam_ts):
+    """Whether any history entry still sits before the seam: once the old run's entries have left the window the
+    one-strip and the split finalizers agree and the seam is spent."""
+    if seam_ts is None:
+        return False
+    return any(ts < seam_ts for tsd in (drift_hist or {}).values() for ts in tsd)
 
 
 def traded_book_alphas(alphas_by_book, capture_buy_sums, capture_sell_sums):

@@ -11,12 +11,54 @@
 
 #include <range/v3/algorithm/all_of.hpp>
 
+#include <algorithm>
 #include <bit>
 
 //-------------------------------------------------------------------------
 
 namespace taosim::matching
 {
+
+namespace
+{
+
+//-------------------------------------------------------------------------
+
+// What the fill that completes a buy limit moves from the buyer to the seller.
+//
+// The fill commits the order's remaining reservation, so that nothing reserved for the order
+// outlives it. That is the fill's own notional only while the reservation was sized from the
+// fills. With a price band configured the placement check reserves limit x size instead, and the
+// remainder then also holds what the order saved by filling below its limit. That part is the
+// buyer's: the fill moves its notional, and the rest is released when the order is unregistered.
+[[nodiscard]] decimal_t completingBuyAmount(
+    bool banded, decimal_t reservation, decimal_t notional) noexcept
+{
+    return banded ? std::min(reservation, notional) : reservation;
+}
+
+//-------------------------------------------------------------------------
+
+}  // namespace
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+// A limit that meets the opposite best price on arrival can take liquidity whatever the placement check predicted.
+[[nodiscard]] bool crossesOnArrival(const OrderDesc& orderDesc, const book::Book::Ptr& book)
+{
+    const auto* limit = std::get_if<LimitOrderDesc>(&orderDesc);
+    if (limit == nullptr) return false;
+    const auto& payload = limit->payload;
+    if (payload->direction == OrderDirection::BUY) {
+        return book->sellQueue().hasActiveOrders() && payload->price >= book->bestAsk();
+    }
+    return book->buyQueue().hasActiveOrders() && payload->price <= book->bestBid();
+}
+
+}  // namespace
 
 //-------------------------------------------------------------------------
 
@@ -99,10 +141,16 @@ OrderResult ClearingManager::handleOrder(const OrderDesc& orderDesc)
     }
     const auto& validationResult = expectedValidationResult.value();
 
-    auto& balances = accounts().at(agentId).at(bookId);
+    auto& account = accounts().at(agentId);
+    m_exchange->markDirty(account, bookId);
+    auto& balances = account.at(bookId);
     const OrderID orderId = *m_exchange->books()[bookId]->orderIdCounter();
 
-    if (validationResult.instantTrade) {
+    // THE INSTRUCTION LOG CARRIES EVERY ORDER THAT CAN TAKE LIQUIDITY ON ARRIVAL. instantTrade is the
+    // check's reservation prediction, and under an active band a buy predicts no sweep (sweepCap: it reserves its
+    // whole volume at its limit), so a banded buy that crossed the asks traded with no instruction line and, filled
+    // whole, left no line at all. A limit crossing the opposite best price on arrival is logged too.
+    if (validationResult.instantTrade || crossesOnArrival(orderDesc, m_exchange->books()[bookId])) {
         m_exchange->instructionLogCallback(orderDesc, orderId);
     }
 
@@ -251,6 +299,7 @@ void ClearingManager::handleCancelOrder(const CancelOrderDesc& cancelDesc)
     const AgentId agentId = m_exchange->books()[bookId]->orderToClientInfo().at(orderId).agentId;
 
     accounting::Account& account = accounts()[agentId];
+    m_exchange->markDirty(account, bookId);
     accounting::Balances& balances = account[bookId];
 
     const auto freed = [&] -> accounting::ReservationAmounts {
@@ -374,10 +423,13 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
     const OrderID restingOrderId = trade->restingOrderID();
     const OrderID aggressingOrderId = trade->aggressingOrderID();
 
-    const auto& restingAgentActiveOrders =
-        accounts()[restingAgentId].activeOrders()[bookId];
-    const auto& aggressingAgentActiveOrders =
-        accounts()[aggressingAgentId].activeOrders()[bookId];
+    accounting::Account& restingAccount = accounts()[restingAgentId];
+    accounting::Account& aggressingAccount = accounts()[aggressingAgentId];
+    m_exchange->markDirty(restingAccount, bookId);
+    m_exchange->markDirty(aggressingAccount, bookId);
+
+    const auto& restingAgentActiveOrders = restingAccount.activeOrders()[bookId];
+    const auto& aggressingAgentActiveOrders = aggressingAccount.activeOrders()[bookId];
 
     auto restingOrderIt = std::find_if(
         restingAgentActiveOrders.begin(),
@@ -428,8 +480,8 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
     fees.maker = util::round(fees.maker, m_exchange->config().parameters().quoteIncrementDecimals);
     fees.taker = util::round(fees.taker, m_exchange->config().parameters().quoteIncrementDecimals);
     
-    accounting::Balances& restingBalance = accounts()[restingAgentId][bookId];
-    accounting::Balances& aggressingBalance = accounts()[aggressingAgentId][bookId];
+    accounting::Balances& restingBalance = restingAccount[bookId];
+    accounting::Balances& aggressingBalance = aggressingAccount[bookId];
 
     // A side without active quotes reports 0, which is not a price: reservations would be valued
     // at nothing and loan settlement would divide by it. The trade that just printed is the best
@@ -437,6 +489,7 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
     auto markPrice = [&](decimal_t best) { return best > 0_dec ? best : trade->price(); };
     const decimal_t bestBid = markPrice(m_exchange->books()[bookId]->bestBid());
     const decimal_t bestAsk = markPrice(m_exchange->books()[bookId]->bestAsk());
+    const bool banded = m_exchange->config().parameters().maxPriceBand > 0.0;
 
     // Policy: The direction of the trade is that of the aggressing order.
     if (trade->direction() == OrderDirection::BUY) {
@@ -459,6 +512,9 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
         
 
         const auto totalPrice = [&] {
+            const auto notional =
+                util::round(trade->price(), m_exchange->config().parameters().priceIncrementDecimals) *
+                util::round(trade->volume(), m_exchange->config().parameters().volumeIncrementDecimals);
             if (auto limitOrder = std::dynamic_pointer_cast<LimitOrder>(aggressingOrder)) {
                 if (reservation == 0_dec) {
                     
@@ -482,17 +538,17 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
                         aggressingOrder->direction(), aggressingOrderId)};
                 }
                 if (aggressingOrder->totalVolume() == trade->volume()) {
+                    const auto committed = completingBuyAmount(banded, reservation, notional);
                     m_exchange->simulation()->logDebug(
                         "{} | AGENT #{} BOOK {} : Committing reservation amount {} for trade volume {} in {} order #{}.",
                         m_exchange->simulation()->currentTimestamp(),
                         aggressingAgentId, m_exchange->simulation()->bookIdCanon(bookId),
-                        util::round(reservation / util::dec1p(aggressingBalance.getLeverage(aggressingOrderId, aggressingOrder->direction())), m_exchange->config().parameters().quoteIncrementDecimals),
+                        util::round(committed / util::dec1p(aggressingBalance.getLeverage(aggressingOrderId, aggressingOrder->direction())), m_exchange->config().parameters().quoteIncrementDecimals),
                         trade->volume(), aggressingOrder->direction(), aggressingOrderId);
-                    return reservation;
+                    return committed;
                 }
             }
-            return util::round(trade->price(), m_exchange->config().parameters().priceIncrementDecimals) * 
-                    util::round(trade->volume(), m_exchange->config().parameters().volumeIncrementDecimals);
+            return notional;
         }();
 
         decimal_t aggressingMarginCall = {}, restingMarginCall = {};
@@ -589,6 +645,10 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
                 m_exchange->config().parameters().quoteIncrementDecimals);
         }
 
+        const auto tradeQuote = util::round(trade->volume() * trade->price(), m_exchange->config().parameters().quoteIncrementDecimals);
+        const auto restingVolume = restingOrder->totalVolume() == trade->volume() && reservation > 0_dec
+            ? completingBuyAmount(banded, reservation, tradeQuote) : tradeQuote;
+
         if (reservation == 0_dec) {
             
             m_exchange->simulation()->logError(
@@ -618,7 +678,7 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
                 "{} | AGENT #{} BOOK {} : Committing reservation amount {} for trade volume {} in {} order #{}.",
                 m_exchange->simulation()->currentTimestamp(),
                 restingAgentId, m_exchange->simulation()->bookIdCanon(bookId),
-                util::round(reservation / util::dec1p(restingBalance.getLeverage(restingOrderId, restingOrder->direction())), m_exchange->config().parameters().quoteIncrementDecimals), 
+                util::round(restingVolume / util::dec1p(restingBalance.getLeverage(restingOrderId, restingOrder->direction())), m_exchange->config().parameters().quoteIncrementDecimals),
                 trade->volume(), restingOrder->direction(), restingOrderId);
         }
 
@@ -639,9 +699,6 @@ Fees ClearingManager::handleTrade(const TradeDesc& tradeDesc)
         }
 
         const auto aggressingVolume = util::round(trade->volume(), m_exchange->config().parameters().baseIncrementDecimals);
-        const auto restingVolume = restingOrder->totalVolume() == trade->volume() && reservation > 0_dec ?
-            reservation : util::round(trade->price() * trade->volume(), m_exchange->config().parameters().quoteIncrementDecimals);
-        const auto tradeQuote = util::round(trade->volume() * trade->price(), m_exchange->config().parameters().quoteIncrementDecimals);
 
         
         

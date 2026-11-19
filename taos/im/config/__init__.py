@@ -393,6 +393,25 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.debeta.making_otr_threshold",
+        type=float,
+        help="Order-to-trade discount on the MAKING leg: a uid whose messages per fill over the making window "
+             "(placements and cancels the engine applied, over its fills) exceed this threshold keeps "
+             "min(1, (threshold / messages_per_fill) ** making_otr_power) of its making credit before ranking, "
+             "the order-to-trade ratio limit a venue sets. 200, the default, sits well above the messages per maker "
+             "fill most makers send and below the noisiest slots'; 0 disables it.",
+        default=200.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.making_otr_power",
+        type=float,
+        help="The exponent of the order-to-trade discount: 1 scales the making credit by threshold over messages per "
+             "fill, 0.5 by its square root. Read only when making_otr_threshold is above 0.",
+        default=1.0,
+    )
+
+    parser.add_argument(
         "--scoring.debeta.skill_rank_scope",
         type=str,
         choices=["positives", "whole"],
@@ -655,6 +674,32 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.debeta.seam_split",
+        type=int,
+        choices=[0, 1],
+        help="1 (the default): while the skill window still holds the previous run's entries after a run "
+             "change, the drift strip runs on each run's own entries and sums the two, so the old run's mean "
+             "inventory never meets the new run's price move (one strip over the seam pays a position held in the "
+             "old run the new run's first move, from no trade, until the old entries leave the window). 0: one "
+             "strip over the window.",
+        default=1,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.charge_ref",
+        type=str,
+        choices=["mark", "prev"],
+        help="The reference a taker fill is charged against under fill_charge: 'mark', the state's mark at the fill "
+             "(under mark_mode mid, the book's mid after the interval's trades, so a taker's own batch's move is "
+             "credited to it inside the interval); 'prev', the book's mid as it stood at the end of the previous state, "
+             "before any of the interval's trades, the quote the taker crossed, so its own move is charged to it in "
+             "full. 'mark' is the default: with the inventory marked from the state's mark, 'prev' leaves the "
+             "interval's move after the fill out of the taker's result, which pays momentum takers the move and takes "
+             "from the makers' share of the skill half; the dial stays for a pre-trade quote the engine may carry.",
+        default="mark",
+    )
+
+    parser.add_argument(
         "--scoring.debeta.conjunction_bounds",
         type=str,
         help="The conjunction's band per asset class as name:bound pairs: a miner's resting volume counts within "
@@ -861,13 +906,16 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.delay_policy",
         type=str,
-        choices=["curve", "flat", "jitter"],
-        help="How a response's process time maps to its base delay. curve: the exponential mapping from min_delay to "
+        choices=["curve", "flat", "jitter", "measured"],
+        help="How a response's process time maps to its base delay; unset, the simulation runs the curve and the "
+             "exchange the measured time (delays.resolve_delay_policy), an explicit choice winning. curve: the exponential mapping from min_delay to "
              "max_delay over the timeout. flat: min_delay for every response within the timeout, the responses "
              "submitted in a random order (the engine keeps insertion order among equal timestamps). jitter: min_delay "
              "plus a uniform draw up to delay_jitter for a response within delay_prompt_cutoff seconds, the curve "
-             "beyond it. A response at or over the timeout follows the curve under every policy.",
-        default="curve",
+             "beyond it. measured: the response's own process time, every instruction at that delay with the "
+             "response's cancels before its placements and no random per-instruction spread (the venue's time, "
+             "exchange mode). A response at or over the timeout follows the curve under every policy.",
+        default=None,
     )
 
     parser.add_argument(
