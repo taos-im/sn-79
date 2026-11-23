@@ -1046,6 +1046,12 @@ async def save_state_async(self: Validator) -> bool:
         bt.logging.debug(f"Released save lock for step {save_step}")
 
 
+def seam_ts_or_none(value):
+    """The saved seam as an integer timestamp, or None: a state written by a validator that started with no seam
+    carries an empty map where the scalar should be, and loads as no seam."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def schedule_save(self: Validator) -> None:
     """
     Schedules the asynchronous state-saving coroutine on the main event loop.
@@ -1060,10 +1066,12 @@ def schedule_save(self: Validator) -> None:
     """
     if not self.last_state:
         return
-    # the first state of each save period, counted from 4 s past it: a state stepping each second lands there itself,
-    # one stepping in 12 s blocks never does, so the period is crossed rather than matched; the first state after a
-    # start only records its period
-    period = (self.last_state.timestamp - 4_000_000_000) // (_SAVE_EVERY_INTERVALS * self.config.scoring.interval)
+    # the first state of each save period, a scoring boundary for a state stepping each second: the boundary's state
+    # and score inputs are teed on receipt, before this asks for the save, so the scoring service scores the boundary
+    # and then writes, and the save's snapshot is the boundary the light fields describe (asked on the state before a
+    # boundary, the boundary's score would wait the whole write). The period is crossed rather than matched, so 12 s
+    # blocks save once a period too; the first state after a start only records its period
+    period = self.last_state.timestamp // (_SAVE_EVERY_INTERVALS * self.config.scoring.interval)
     last = getattr(self, '_last_save_period', None)
     if last is None or period < last:
         self._last_save_period = period
@@ -1883,7 +1891,7 @@ def _load_validator_state(self):
 
             fundamental_seed.restore_state(self, validator_state)
             # the run change on the new clock: None when the state predates the seam or no roll is inside the window
-            self.debeta_seam_ts = validator_state.get('debeta_seam_ts')
+            self.debeta_seam_ts = seam_ts_or_none(validator_state.get('debeta_seam_ts'))
             bt.logging.info("Processing kappa values...")
             if 'kappa_values' in validator_state:
                 loaded_kappa = validator_state['kappa_values']

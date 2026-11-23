@@ -56,6 +56,6 @@ def test_a_lambda_factory_defaultdict_pickles_through_the_override_where_plain_p
 def test_send_init_uses_the_one_pass_dump():
     import inspect
     src = inspect.getsource(ss.ScoringShadow.send_init)
-    assert "blob = dump_plain(getattr(validator, name, {}))" in src
+    assert "blob = dump_plain(getattr(validator, name, init_default(name)))" in src
     assert "_plainify(getattr(validator, name" not in src
     assert '"plainify_s": 0.0' in src

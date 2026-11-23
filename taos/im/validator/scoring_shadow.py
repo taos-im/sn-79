@@ -124,6 +124,14 @@ _DEBETA_PLAIN = [
     "debeta_conj_samples", "_debeta_class_vectors", "_debeta_handover", "_debeta_young_books",
 ]
 
+_SCALAR_NAMES = ("debeta_seam_ts",)   # scalars among the structures: a missing one is None, not an empty map
+
+
+def init_default(name: str):
+    """What the INIT ships for a structure the validator does not hold yet: None for a scalar, an empty map else."""
+    return None if name in _SCALAR_NAMES else {}
+
+
 _STRUCT_NAMES = [
     "trade_volumes", "volume_sums", "maker_volume_sums", "taker_volume_sums",
     "self_volume_sums", "fee_sums", "roundtrip_volumes", "roundtrip_volume_sums",
@@ -1659,7 +1667,7 @@ class ScoringShadow:
                 for name in _STRUCT_NAMES:
                     t1 = time.time()
                     # one pass: the structure is pickled as its plain copy would be, without making the copy
-                    blob = dump_plain(getattr(validator, name, {}))
+                    blob = dump_plain(getattr(validator, name, init_default(name)))
                     t3 = time.time()
                     _send_frame(self._sock, ("init_part", (name, blob)))
                     timings[name] = {"plainify_s": 0.0, "pickle_s": t3 - t1, "send_s": time.time() - t3, "bytes": len(blob)}

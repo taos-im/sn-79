@@ -40,14 +40,14 @@ def test_offmain_build_is_an_opt_in_lever_off_by_default(levers):
     mod, _, _ = levers
     assert "offmain_build" in mod.OPT_IN and "offmain_build" not in mod.LEVERS
     assert not mod.enabled("offmain_build")
-    assert mod.opt_in_states() == {"offmain_build": False}
+    assert mod.opt_in_states() == {"offmain_build": False, "reward_in_wait": False}
     assert mod.states() == {n: True for n in mod.LEVERS}, "the round-time levers keep their default, on"
 
 
 def test_naming_it_in_the_on_file_turns_it_on_and_removing_the_line_turns_it_off(levers):
     mod, _, on = levers
     _write(on, "offmain_build  # testnet hour on\n", 1_000_000_000)
-    assert mod.enabled("offmain_build") and mod.opt_in_states() == {"offmain_build": True}
+    assert mod.enabled("offmain_build") and mod.opt_in_states() == {"offmain_build": True, "reward_in_wait": False}
     _write(on, "# off again\n", 2_000_000_000)
     assert not mod.enabled("offmain_build")
 

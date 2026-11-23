@@ -1165,7 +1165,8 @@ def absent_uids(presence, window=PRESENCE_WINDOW_DEFAULT):
     """
     n = max(int(window or PRESENCE_WINDOW_DEFAULT), 1)
     out = set()
-    for u, outcomes in (presence or {}).items():
+    # a snapshot: the metagraph resync pops a departed uid from the live mapping on another thread
+    for u, outcomes in list((presence or {}).items()):
         seq = list(outcomes)
         if len(seq) >= n and not any(bool(x) for x in seq[-n:]):
             out.add(int(u))
@@ -1827,7 +1828,9 @@ def book_alphas_held_split(mtm_hist, heldinv_hist, heldn_hist, helddrift_hist, s
 def seam_inside(drift_hist, seam_ts):
     """Whether any history entry still sits before the seam: once the old run's entries have left the window the
     one-strip and the split finalizers agree and the seam is spent."""
-    if seam_ts is None:
+    if not isinstance(seam_ts, int) or isinstance(seam_ts, bool):
+        # None without a run change inside the window; anything else that is not a timestamp (a validator started
+        # with no saved state ships none, a map stands in for a missing scalar) is no seam either
         return False
     return any(ts < seam_ts for tsd in (drift_hist or {}).values() for ts in tsd)
 
@@ -2062,7 +2065,8 @@ def presence_shares(presence, window=PRESENCE_WINDOW_DEFAULT):
     companion of absent_uids: {uid: share}. A uid with no outcomes has no entry."""
     n = max(int(window or PRESENCE_WINDOW_DEFAULT), 1)
     out = {}
-    for u, outcomes in (presence or {}).items():
+    # a snapshot, as absent_uids: the resync pops from the live mapping on another thread
+    for u, outcomes in list((presence or {}).items()):
         seq = list(outcomes)[-n:]
         if seq:
             out[int(u)] = sum(1 for x in seq if bool(x)) / len(seq)

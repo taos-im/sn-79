@@ -1143,6 +1143,8 @@ if __name__ != "__mp_main__":
             self.round_gaps = []
             self.query_waits = []
             self.reward_gate_waits = []
+            # the run change on the new clock (de-beta's seam): none until a run rolls
+            self.debeta_seam_ts = None
             # each state's accounting, main's and the scoring service's: (wall, thread CPU[, legs ran]) seconds
             self.accounting_times = []
             self.service_accounting_times = []
@@ -3233,18 +3235,29 @@ if __name__ != "__mp_main__":
                     self._sim_push_ts = state.timestamp
                     _spawn_push(self._push_sim_state_bg(state, url))
             if levers.enabled('prereq_in_wait'):
+                # the work writes the accounting's structures (the reset stash, the placement counts, the
+                # order-to-trade histories) that _reward prunes and reads on the main loop, so it runs there too,
+                # handed over from this thread: the loop is idle during the miners' wait, the work still overlaps
+                # it, and one thread touches each dict. The accounting, when it runs in the wait as well, starts
+                # from the same callback once the work is done: it reads the state and the accumulators, nothing
+                # of the answers; a boundary state's scoring waits for the forward's end (_forward_done_wait); a
+                # failed work leaves the reward to its place after the forward.
+                def _prereq_on_loop(state=state):
+                    try:
+                        self._pre_request_work(state)
+                        state._pre_request_ok = True
+                    except Exception:
+                        bt.logging.exception("pre-request work in the miners' wait failed")
+                        return
+                    if levers.enabled('reward_in_wait'):
+                        state._forward_done = asyncio.Event()
+                        self.reward(state)
                 try:
-                    self._pre_request_work(state)
-                    state._pre_request_ok = True
+                    self.main_loop.call_soon_threadsafe(_prereq_on_loop)
                 except Exception:
+                    # on_query_sent runs between the query's send and the wait for the answers: nothing raises
+                    # into the forward from here; a hand-over that fails leaves the work to its place after it
                     bt.logging.exception("pre-request work in the miners' wait failed")
-            # the accounting reads the state and the accumulators, nothing of the answers: it runs in the wait too,
-            # once this state's pre-request work has run there and stashed the resets it applies (a failed one leaves
-            # the reward to its place after the forward); a boundary state's scoring waits for the forward's end
-            # (_forward_done_wait)
-            if levers.enabled('reward_in_wait') and getattr(state, '_pre_request_ok', False):
-                state._forward_done = asyncio.Event()
-                self.reward(state)
 
         # How long a boundary state's scoring waits for its forward's end past the query timeout before it scores
         # without it; reached only when nothing signalled the end (a path that left handle_state unseen).

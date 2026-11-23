@@ -55,13 +55,16 @@ def _fired(monkeypatch, step_s, seconds=600, busy=()):
 
 
 def test_a_save_is_scheduled_once_a_simulated_minute_at_the_five_second_interval(monkeypatch):
-    assert _fired(monkeypatch, 1) == [4 + 60 * k for k in range(10)]
+    # the first state after a start only records its period, so the first save is at the next minute
+    assert _fired(monkeypatch, 1) == [60 * k for k in range(1, 10)]
 
 
 def test_twelve_second_blocks_save_once_a_simulated_minute_too(monkeypatch):
-    # a source stepping one 12 s block at a time never sits 4 s past a minute
-    assert _fired(monkeypatch, 12) == [12 + 60 * k for k in range(10)]
+    # the period is crossed rather than matched: a 12 s block lands on each minute here, and one that did not would
+    # still save at the first block past it
+    assert _fired(monkeypatch, 12) == [60 * k for k in range(1, 10)]
+    assert _fired(monkeypatch, 7, seconds=300) == [63, 126, 182, 245]
 
 
 def test_a_save_skipped_while_one_runs_is_taken_at_the_next_state(monkeypatch):
-    assert _fired(monkeypatch, 12, seconds=180, busy={12})[:2] == [24, 72]
+    assert _fired(monkeypatch, 12, seconds=180, busy={60})[:2] == [72, 120]

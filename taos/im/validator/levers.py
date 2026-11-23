@@ -20,8 +20,6 @@ publishes each lever's state as validator_gauges lever_<name>. A lever turned of
 - prereq_in_wait: the pre-request work that feeds nothing the request carries (the reset notices, the placement
   counts and the GenTRX push) runs once the query is sent, in the miners' wait (validator._pre_request_work); off, it
   runs after the forward.
-- reward_in_wait: a state's accounting starts once the query is sent, only after its pre-request work ran there, and
-  its boundary scoring waits for the forward's end; off, the reward starts after the forward.
 
 An opt-in lever (OPT_IN) is off until it is named on: in TAOS_LEVERS_ON (comma-separated, read once at start) or in the
 levers-on file (TAOS_LEVERS_ON_FILE, default ~/.taos/levers_on), read like the off file, so it goes on with
@@ -29,12 +27,15 @@ levers-on file (TAOS_LEVERS_ON_FILE, default ~/.taos/levers_on), read like the o
 publishes its state beside the others.
 
 - offmain_build: the query process builds the miners' requests from the state it reads itself, and main hands over
-  only what it adds (offmain_build.py); off, main builds them, as before."""
+  only what it adds (offmain_build.py); off, main builds them, as before.
+- reward_in_wait: a state's accounting starts once the query is sent, only after its pre-request work ran there, and
+  its boundary scoring waits for the forward's end; off, the reward starts after the forward. It goes on with
+  `echo reward_in_wait >> ~/.taos/levers_on` and needs prereq_in_wait on."""
 import os
 import time
 
-LEVERS = ("push_in_wait", "pack_shared", "account_deltas", "prereq_in_wait", "reward_in_wait")
-OPT_IN = ("offmain_build",)
+LEVERS = ("push_in_wait", "pack_shared", "account_deltas", "prereq_in_wait")
+OPT_IN = ("offmain_build", "reward_in_wait")
 CHECK_S = 2.0
 FILE = os.path.expanduser(os.environ.get("TAOS_LEVERS_FILE") or "~/.taos/levers_off")
 ON_FILE = os.path.expanduser(os.environ.get("TAOS_LEVERS_ON_FILE") or "~/.taos/levers_on")
@@ -59,8 +60,10 @@ def _read(path: str) -> frozenset:
 
 
 def _names(off_now: frozenset) -> str:
-    unknown = sorted(off_now - set(LEVERS))
+    named_off = sorted(off_now & set(OPT_IN))
+    unknown = sorted(off_now - set(LEVERS) - set(OPT_IN))
     return (", ".join(f"{n} {'off' if n in off_now else 'on'}" for n in LEVERS)
+            + (f", {', '.join(f'{n} off' for n in named_off)}" if named_off else "")
             + (f"; not a lever, ignored: {', '.join(unknown)}" if unknown else ""))
 
 
