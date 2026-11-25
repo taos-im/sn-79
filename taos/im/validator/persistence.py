@@ -165,6 +165,8 @@ def build_debeta_state(self) -> dict:
     out["debeta_cpc_hist"] = {int(c): _snap_hist3(h) for c, h in (getattr(self, "debeta_cpc_hist", {}) or {}).items()}
     out.update({name: _snap_hist2(getattr(self, name, {})) for name in _DEBETA_HIST2})
     out["debeta_inv"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv', {}) or {}).items()}
+    out["debeta_pending_inv"] = {int(b): [[int(r), int(u), float(q)] for r, u, q in rows]
+                                 for b, rows in (getattr(self, 'debeta_pending_inv', {}) or {}).items() if rows}
     out["debeta_plast"] = dict(getattr(self, 'debeta_plast', {}) or {})
     # the alternative mark's leg (0.6.5): its own inventory and last mark, so its path continues after a restart
     out["debeta_inv_alt"] = {b: dict(u) for b, u in (getattr(self, 'debeta_inv_alt', {}) or {}).items()}
@@ -1560,6 +1562,8 @@ def _restore_trade_volumes(self, validator_state, book_ids, book_ids_set):
         int(b): defaultdict(float, {int(u): float(v) for u, v in (us or {}).items()})
         for b, us in (validator_state.get("debeta_inv") or {}).items()
     })
+    self.debeta_pending_inv = {int(b): [(int(r), int(u), float(q)) for r, u, q in rows]
+                               for b, rows in (validator_state.get("debeta_pending_inv") or {}).items() if rows}
     self.debeta_plast_alt = {int(b): float(v) for b, v in (validator_state.get("debeta_plast_alt") or {}).items()}
     self._debeta_class_vectors = _load_class_vectors(validator_state.get("debeta_class_vectors"))
     self._debeta_young_books = load_young_books(validator_state.get("debeta_young_books"))

@@ -76,7 +76,7 @@ def test_the_flat_layout_archives_exactly_as_before(tmp_path):
 
 
 def test_at_start_a_superseded_per_instance_run_is_archived_whole(tmp_path):
-    old = _run(tmp_path, "20261006_160323", {"simulation_0-0": [f"L3-0.{CLOSED}.log", f"L3-0.{OPEN}.log"]})
+    old = _run(tmp_path, "20261006_120000", {"simulation_0-0": [f"L3-0.{CLOSED}.log", f"L3-0.{OPEN}.log"]})
     active = _run(tmp_path, "20261008_120000", {"simulation_0-0": [f"L3-0.{OPEN}.log"]})
     _compress(active, now=HOUR + 1, start=True)
     assert _members(old / f"L3_{CLOSED}.zip") == [f"L3-0.{CLOSED}.log"]

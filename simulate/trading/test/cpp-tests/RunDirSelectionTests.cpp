@@ -40,8 +40,8 @@ struct TempDir
 TEST(RunDirSelection, TheNewestRunByNameWinsOverAnOlderRunTouchedLater)
 {
     TempDir tmp;
-    const auto older = makeRun(tmp.path, "20261002_183801");
-    const auto newer = makeRun(tmp.path, "20261006_160323");
+    const auto older = makeRun(tmp.path, "20261002_120000");
+    const auto newer = makeRun(tmp.path, "20261006_120000");
     const auto now = fs::file_time_type::clock::now();
     fs::last_write_time(newer, now - std::chrono::hours{48});
     fs::last_write_time(older, now);
@@ -52,7 +52,7 @@ TEST(RunDirSelection, TheNewestRunByNameWinsOverAnOlderRunTouchedLater)
 TEST(RunDirSelection, AnExchangeStateDirectoryIsNeverChosen)
 {
     TempDir tmp;
-    const auto run = makeRun(tmp.path, "20261006_160323");
+    const auto run = makeRun(tmp.path, "20261006_120000");
     fs::create_directories(tmp.path / "20261007_000000" / "ckpt");
     std::ofstream{tmp.path / "20261007_000000" / "ckpt" / "state.ckpt"} << "x";
 

@@ -21,7 +21,7 @@ from taos.im.validator.trade import history_clock_health  # noqa: E402
 
 S = 1_000_000_000
 H = 3600 * S
-RUN = "20261006_1603"
+RUN = "20261006_1200"
 DEV = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -31,7 +31,7 @@ def _engine(tmp_path, locked=RUN, held=20 * H):
                                neuron=SimpleNamespace(full_path=str(tmp_path / "validator")))
     os.makedirs(v.config.neuron.full_path, exist_ok=True)
     v.simulation_timestamp = held
-    logdir = str(tmp_path / "logs" / "20261006_160323")
+    logdir = str(tmp_path / "logs" / "20261006_120000")
     v.simulation = SimpleNamespace(logDir=logdir, simulation_id=locked, log_window=H, publish_interval=S)
     v.effective_max_uids = 4
     v.update_repo = lambda end=False: None

@@ -62,6 +62,8 @@ CLEARED = {
 CLEARED_BOOK_FIRST = {"debeta_inv", "debeta_inv_alt"}
 # class-first per-uid state ({asset class: {maker uid: {taker uid: ...}}}): the counterparty rows kept per class
 CLEARED_CLASS_FIRST = {"debeta_cpc", "debeta_cpc_hist"}
+# rows under each book carrying the uid at index 1: a block's fills waiting out the impact window (0.6.8.1)
+CLEARED_ROWS_BY_UID = {"debeta_pending_inv"}
 EXEMPT = {
     # the conjunction's book-keyed state (0.6.6): the farm reference and the per-book references are per book, not
     # per uid, and the interval is the state's, set at the start of every update
@@ -116,6 +118,7 @@ EXEMPT = {
     "debeta_drift_alt_hist": "book-keyed", "debeta_pfirst_alt": "book-keyed", "debeta_plast_alt": "book-keyed",
     "debeta_mark_state_alt": "book-keyed",
     "_debeta_seen_tids": "trade-id ledger", "_volume_seen_tids": "trade-id ledger",
+    "uid_coldkeys": "the metagraph's coldkey per uid (the block rule's read), rewritten whole at every sync, not a uid's scoring state",
     "fee_sums": "not read by the pay path's scoring", "recent_trades": "book-keyed trade tape",
     "_gentrx": "object; its _scores are cleared by handle_deregistration",
     # runtime handles and flags of the query service, the reporter and load bookkeeping
@@ -167,7 +170,13 @@ def _class_first():
     return {0: _filled(True), 1: _filled(True)}
 
 
+def _rows_by_uid():
+    return {b: [[1, GONE, S], [2, KEPT, S]] for b in BOOKS}
+
+
 def _has(name, o, uid):
+    if name in CLEARED_ROWS_BY_UID:
+        return isinstance(o, dict) and any(any(len(r) > 2 and r[1] == uid and _has_sentinel(r[2]) for r in rows) for rows in o.values())
     if isinstance(o, tuple):
         return any(_has(name, x, uid) for x in o if isinstance(x, dict))
     if not isinstance(o, dict):
@@ -203,6 +212,8 @@ def _validator():
         setattr(v, n, _book_first())
     for n in CLEARED_CLASS_FIRST:
         setattr(v, n, _class_first())
+    for n in CLEARED_ROWS_BY_UID:
+        setattr(v, n, _rows_by_uid())
     v._debeta_pool_ema = {"term": _filled(), "share": _filled()}
     v.miner_presence = {GONE: collections.deque([S, S]), KEPT: collections.deque([S, S])}
     v._trading_score_ema_pre = (dict(_filled()), dict(_filled()), None)
@@ -212,7 +223,7 @@ def _validator():
 
 
 def test_every_attribute_the_pay_path_touches_is_classified():
-    unclassified = sorted(_discovered() - CLEARED - CLEARED_BOOK_FIRST - CLEARED_CLASS_FIRST - set(EXEMPT))
+    unclassified = sorted(_discovered() - CLEARED - CLEARED_BOOK_FIRST - CLEARED_CLASS_FIRST - CLEARED_ROWS_BY_UID - set(EXEMPT))
     unclassified = [n for n in unclassified if not n.startswith("__") and n not in {"prometheus", "logger"}]
     assert not unclassified, (
         f"pay-path attributes with no reset classification: {unclassified}. Add each to CLEARED (a reset must "
@@ -223,7 +234,7 @@ def test_the_reset_path_leaves_nothing_of_the_departed_uid():
     v = _validator()
     vmod.Validator.handle_deregistration(v, GONE)
     trade.reset_agent_histories(v, GONE, BOOKS)
-    survived = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST if _has(n, getattr(v, n), GONE))
+    survived = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST | CLEARED_ROWS_BY_UID if _has(n, getattr(v, n), GONE))
     assert not survived, f"the departed uid survives a reset in: {survived}"
 
 
@@ -231,5 +242,5 @@ def test_the_reset_leaves_other_uids_alone():
     v = _validator()
     vmod.Validator.handle_deregistration(v, GONE)
     trade.reset_agent_histories(v, GONE, BOOKS)
-    lost = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST if not _has(n, getattr(v, n), KEPT))
+    lost = sorted(n for n in CLEARED | CLEARED_BOOK_FIRST | CLEARED_CLASS_FIRST | CLEARED_ROWS_BY_UID if not _has(n, getattr(v, n), KEPT))
     assert not lost, f"a reset of one uid cleared another uid's state in: {lost}"

@@ -122,6 +122,7 @@ _DEBETA_PLAIN = [
     "debeta_maker_buy_notional_hist", "debeta_maker_sell_notional_hist", "debeta_at_best_hist", "debeta_best_size_hist",
     "debeta_conj_hist", "debeta_conj_farm", "debeta_conj_farm_hist", "debeta_conj_ref", "debeta_conj_clock",
     "debeta_conj_samples", "_debeta_class_vectors", "_debeta_handover", "_debeta_young_books",
+    "debeta_pending_inv", "uid_coldkeys",
 ]
 
 _SCALAR_NAMES = ("debeta_seam_ts",)   # scalars among the structures: a missing one is None, not an empty map

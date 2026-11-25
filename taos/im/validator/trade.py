@@ -21,7 +21,7 @@ from taos.im.protocol.config import RUN_BOOKKEEPING_FIELDS
 from taos.im.config import debeta_dial
 from taos.im.validator.block_stats import note_otr
 from taos.im.validator.debeta import (
-    _hadd1, _hadd2, accumulate_book_capture, accumulate_book_mtm, accumulate_counterparties, et_book_batches,
+    _hadd1, _hadd2, accumulate_book_capture, accumulate_book_mtm, block_uids_in, accumulate_counterparties, et_book_batches,
     drop_uid_from_pending, flush_capture_state,
     prune_hist_2level, prune_hist_1level, shift_hist_2level, shift_hist_1level,
 )
@@ -1218,6 +1218,8 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                 setattr(self, _name, defaultdict(lambda: defaultdict(float)))
         if not hasattr(self, 'debeta_inv'):
             self.debeta_inv = defaultdict(lambda: defaultdict(float))  # STATE (carried, re-based at boundary)
+        if not hasattr(self, 'debeta_pending_inv'):
+            self.debeta_pending_inv = {}  # STATE {book: [(release_ts, uid, signed_qty)]}: block fills not yet marked
         for _name in ('debeta_invn', 'debeta_pfirst', 'debeta_plast', 'debeta_drift'):
             if not hasattr(self, _name):
                 setattr(self, _name, {})  # invn/drift running (per book); pfirst/plast STATE
@@ -1276,6 +1278,23 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
             self._debeta_seen_tids = {}  # {trade_id: ts} carried + windowed-pruned; redelivery dedupe
         _et_batches = et_book_batches(notices, self._debeta_seen_tids, sampled_timestamp)
 
+    # the synchronous-block rule (0.6.9): the block is read over every book's fills of this state before the books
+    # are accumulated, so a member's fills in every book defer together
+    _block_uids = {}
+    _block_window_ns = 0
+    if _debeta_on and int(debeta_dial(_debeta_cfg, 'block_min_uids') or 0) > 0:
+        # the uid to coldkey list main sets at each metagraph sync and the INIT ships to the scoring service
+        _ck_list = getattr(self, 'uid_coldkeys', None)
+        if isinstance(_ck_list, (list, tuple)) and _ck_list:
+            _de_pre = {}
+            for _b, _bk in books.items():
+                _raw = _et_batches.get(_b, []) if _debeta_exchange else [e for e in _bk.get('e', []) if e['y'] == 't']
+                _de_pre[_b] = [x for x in map(fee_complete_sides, _raw) if x is not None]
+            _block_uids = block_uids_in(_de_pre, lambda u: _ck_list[u] if 0 <= u < len(_ck_list) else None,
+                                        int(debeta_dial(_debeta_cfg, 'block_min_uids')),
+                                        float(debeta_dial(_debeta_cfg, 'block_min_notional') or 0.0))
+            _block_window_ns = int(float(debeta_dial(_debeta_cfg, 'block_impact_window_s')) * 1e9)
+    _taker_window_ns = int(float(debeta_dial(_debeta_cfg, 'taker_impact_window_s') or 0.0) * 1e9) if _debeta_on else 0
     _t = time.perf_counter()
     _legs_due, _legs_weight = per_entry_legs_due(self, timestamp)
     prof["due"] = int(_legs_due)
@@ -1323,6 +1342,10 @@ def update_trade_volumes(self: Validator, state: MarketSimulationStateUpdate):
                     mark_window=_mark_window,
                     mark_mid=book_mid(book) if _mark_mode == 'mid' else None, fill_charge=_fill_charge,
                     charge_ref=_charge_ref,
+                    block_uids=_block_uids, impact_window_ns=_block_window_ns, taker_window_ns=_taker_window_ns,
+                    clock_ns=timestamp,
+                    pending=(self.debeta_pending_inv if (_block_uids or _taker_window_ns or self.debeta_pending_inv)
+                             else None),
                     heldn=self.debeta_heldn, heldinv=self.debeta_heldinv, helddrift=self.debeta_helddrift,
                     notional=self.debeta_notional, heldn_hist=self.debeta_heldn_hist,
                     heldinv_hist=self.debeta_heldinv_hist, helddrift_hist=self.debeta_helddrift_hist,
@@ -2053,6 +2076,7 @@ def shift_simulation_histories(
                     getattr(self, 'debeta_drift_alt_hist', None)], new_ts)
         # STATE re-base: fresh flat market, fresh price reference (new sim starts everyone flat).
         self.debeta_inv = defaultdict(lambda: defaultdict(float))
+        self.debeta_pending_inv = {}
         self.debeta_pfirst = {}
         self.debeta_plast = {}
         self.debeta_mark_state = {}
@@ -2349,6 +2373,15 @@ def reset_agent_histories(self, uid: int, book_ids: list) -> None:
     self.inventory_history[uid] = {}
     if getattr(self, 'inventory_quote', None) is not None:
         self.inventory_quote.pop(uid, None)
+    # a block's fills still waiting out the impact window: a new miner on the uid inherits none of them
+    _pend = getattr(self, 'debeta_pending_inv', None)
+    if isinstance(_pend, dict):
+        for _b in list(_pend.keys()):
+            _kept = [r for r in _pend[_b] if len(r) > 1 and int(r[1]) != int(uid)]
+            if _kept:
+                _pend[_b] = _kept
+            else:
+                _pend.pop(_b, None)
     for _name in ('debeta_msg_hist', 'debeta_fill_hist', 'debeta_msgs', 'debeta_fills',
                   'debeta_dusttake_hist', 'debeta_dustmake_hist', 'debeta_dusttakes', 'debeta_dustmakes'):
         if isinstance(getattr(self, _name, None), dict):

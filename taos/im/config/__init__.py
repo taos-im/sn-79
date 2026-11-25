@@ -412,6 +412,39 @@ def add_im_validator_args(cls, parser):
     )
 
     parser.add_argument(
+        "--scoring.debeta.block_min_uids",
+        type=int,
+        help="A synchronous block: this many or more uids of one coldkey taking on the same side within one state "
+             "across the books. The block's members earn nothing on the block's own impact: the inventory their block "
+             "fills open enters their marked position block_impact_window_s later, at the mark then, so the move the "
+             "block makes in between is not their alpha. A single uid is never a block. 0 disables it.",
+        default=8,
+    )
+    parser.add_argument(
+        "--scoring.debeta.block_min_notional",
+        type=float,
+        help="A synchronous block also needs this much aggressor notional (quote) across its fills in the state; 0 "
+             "takes any size.",
+        default=1_000_000.0,
+    )
+    parser.add_argument(
+        "--scoring.debeta.block_impact_window_s",
+        type=float,
+        help="How long after a synchronous block its members' block fills stay out of their marked inventory, in "
+             "simulated seconds.",
+        default=120.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.taker_impact_window_s",
+        type=float,
+        help="Every taker fill's inventory enters the taker's marked position this many simulated seconds later, at "
+             "the mark then, so no taker earns the move its own fill makes while it settles; the maker side is marked "
+             "at once as before. The broad form of the synchronous-block rule. 0 (the default) disables it.",
+        default=0.0,
+    )
+
+    parser.add_argument(
         "--scoring.debeta.skill_rank_scope",
         type=str,
         choices=["positives", "whole"],

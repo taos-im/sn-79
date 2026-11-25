@@ -26,6 +26,7 @@ BOOK_KEYED = {
         "recent_trades", "debeta_inv", "debeta_inv_alt", "debeta_invn", "debeta_invn_alt", "debeta_pfirst",
         "debeta_pfirst_alt", "debeta_plast", "debeta_plast_alt", "debeta_drift", "debeta_drift_alt",
         "debeta_mark_state", "debeta_mark_state_alt", "debeta_capture_mid", "debeta_invn_hist", "debeta_drift_hist",
+        "debeta_pending_inv",   # a block's fills waiting out the impact window, by book
         "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm", "debeta_conj_farm_hist",
         "debeta_conj_ref", "debeta_conj_samples",
     ),
@@ -52,6 +53,7 @@ NOT_BOOK_KEYED = (
     "debeta_msg_hist", "debeta_fill_hist", "debeta_msgs", "debeta_fills",   # per uid, the order-to-trade reading
     "debeta_dusttake_hist", "debeta_dustmake_hist", "debeta_dusttakes", "debeta_dustmakes",   # dust fills
     "capture_fee_check",   # validator-wide, the per-state fee check's counts
+    "uid_coldkeys",   # the metagraph's coldkey per uid, the block rule's read, rewritten whole at every sync
     "agent_pnl_total", "debeta_cp", "debeta_cp_hist", "debeta_conj_clock", "_debeta_class_vectors",
     "_debeta_handover", "_debeta_seen_tids", "_volume_seen_tids", "_debeta_young_books", "legs_clock",
     "debeta_seam_ts",   # the run change on the new clock (0.6.8, the seam split), validator-wide

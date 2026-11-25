@@ -19,8 +19,8 @@ import taos.im.validator.engines.simulation as sim  # noqa: E402
 
 S = 1_000_000_000
 H = 3600 * S
-RUN = "20261006_1603"
-LOGDIR = "/r/logs/20261006_160323"
+RUN = "20261006_1200"
+LOGDIR = "/r/logs/20261006_120000"
 
 
 def _engine(locked=RUN, held=20 * H):
@@ -81,5 +81,5 @@ def test_a_near_zero_clock_still_takes_the_missed_run_change_path():
 def test_an_older_run_is_still_refused_before_any_reopen():
     e, v, opened = _engine()
     with pytest.raises(sim.RunWentBackwardError):
-        e.on_tick(SimpleNamespace(timestamp=9 * H, logDir="/r/logs/20261002_183801"))
+        e.on_tick(SimpleNamespace(timestamp=9 * H, logDir="/r/logs/20261002_120000"))
     assert opened == [] and v.simulation_timestamp == 20 * H

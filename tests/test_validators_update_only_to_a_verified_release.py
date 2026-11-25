@@ -121,7 +121,7 @@ def test_a_release_that_is_not_a_fast_forward_is_not_applied(world):
     _commit(world["up"], "taos/v.txt", "side\n")
     _tag(world["up"], "v0.6.9", world["key_a"])
     _git(world["up"], "checkout", "-q", "main")
-    _git(world["up"], "merge", "-q", "--no-edit", "-s", "ours", "side")
+    _git(world["up"], "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-edit", "-s", "ours", "side")
     plan = signed_release.plan_update(world["val"], "origin", "main")
     assert plan["action"] != "update", plan
 

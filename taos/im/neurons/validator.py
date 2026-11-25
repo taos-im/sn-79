@@ -1010,6 +1010,9 @@ if __name__ != "__mp_main__":
             self._last_prune_timestamp = None
 
             self.main_loop = asyncio.new_event_loop()
+            # the uid to coldkey list the synchronous-block rule reads; refreshed at every metagraph sync, shipped to
+            # the scoring service in the INIT
+            self.uid_coldkeys = [str(ck) for ck in getattr(getattr(self, 'metagraph', None), 'coldkeys', [])]
             fdwatch.install_close_tracer()
             fdwatch.watch_loop(self.main_loop, "main")
             fdwatch.install_loop_handler(self.main_loop, "main")
@@ -1746,6 +1749,7 @@ if __name__ != "__mp_main__":
             for attempt in range(1, attempts + 1):
                 try:
                     self.metagraph.sync(subtensor=self.subtensor)
+                    self.uid_coldkeys = [str(ck) for ck in getattr(self.metagraph, 'coldkeys', [])]
                     if attempt > 1:
                         bt.logging.success(f"Metagraph sync succeeded on attempt {attempt}/{attempts}")
                     return
@@ -1787,6 +1791,7 @@ if __name__ != "__mp_main__":
                 except Exception:
                     pass
                 self.metagraph = _new_mg
+                self.uid_coldkeys = [str(ck) for ck in getattr(self.metagraph, 'coldkeys', [])]
             else:
                 previous_metagraph = copy.deepcopy(self.metagraph)
                 bt.logging.debug("Syncing metagraph...")
@@ -2436,6 +2441,10 @@ if __name__ != "__mp_main__":
                         'debeta_fill_charge': str(debeta_dial(_dcfg, 'fill_charge')),
                         'debeta_seam_split': int(debeta_dial(_dcfg, 'seam_split')),
                         'debeta_charge_ref': str(debeta_dial(_dcfg, 'charge_ref')),
+                        # the synchronous-block rule's bar and window, so the board shows the rule on
+                        'debeta_block_min_uids': int(debeta_dial(_dcfg, 'block_min_uids') or 0),
+                        'debeta_block_min_notional': float(debeta_dial(_dcfg, 'block_min_notional') or 0.0),
+                        'debeta_block_impact_window_s': float(debeta_dial(_dcfg, 'block_impact_window_s') or 0.0),
                         # 0.6.6: the conjunction's band per class and its size gate
                         'debeta_conjunction_bounds': str(debeta_dial(_dcfg, 'conjunction_bounds')),
                         'debeta_conjunction_min_size_frac': float(debeta_dial(_dcfg, 'conjunction_min_size_frac')),
@@ -3277,6 +3286,27 @@ if __name__ != "__mp_main__":
                 bt.logging.error(f"The forward's end at {state.timestamp} was never signalled ({limit:.0f}s): "
                                  "its boundary scoring goes on without it")
 
+        async def _pre_request_on_main_loop(self, state) -> None:
+            """The pre-request work for this state, run on the main loop and awaited from the listener's loop: the
+            work writes the accounting's structures the reward prunes and reads on the main loop, so it runs there
+            whatever loop asks for it (on_query_sent hands it over in the wait; handle_state here for a state whose
+            query was not sent, and before the exchange engine's forward). The done flag is written on the main loop
+            alone, so the work runs once per state and on one thread; a work that raises raises here."""
+            if getattr(state, '_pre_request_done', False):
+                return
+            import concurrent.futures
+            fut = concurrent.futures.Future()
+
+            def _run(state=state):
+                try:
+                    self._pre_request_work(state)
+                except BaseException as e:
+                    fut.set_exception(e)
+                else:
+                    fut.set_result(True)
+            self.main_loop.call_soon_threadsafe(_run)
+            await asyncio.wrap_future(fut)
+
         def _pre_request_work(self, state) -> None:
             """The pre-request work that feeds nothing the miners' request carries: the reset notices stashed for
             _reward, the placement counts and, in simulation, the GenTRX push. Once per state: from on_query_sent in
@@ -3435,7 +3465,7 @@ if __name__ != "__mp_main__":
             # simulation they run from on_query_sent, in the miners' wait (_pre_request_work). The exchange engine merges
             # its settled fills into the notices below, so there they keep their place before it.
             if self.engine.mode == 'exchange':
-                self._pre_request_work(state)
+                await self._pre_request_on_main_loop(state)
 
             # Surface settled fills to miners before the synapse goes out.
             #
@@ -3466,8 +3496,9 @@ if __name__ != "__mp_main__":
             miner_responses = await forward(self, state)
             _rp_fwd1 = time.time()
             bt.logging.debug(f"Gathered Response Batch ({time.time()-start}s)")
-            # a state whose query was not sent (observing, a failed hand-off) runs it here, before the reward reads it
-            self._pre_request_work(state)
+            # a state whose query was not sent (observing, a failed hand-over) runs it here, before the reward reads
+            # it: on the main loop, awaited, as every path runs it
+            await self._pre_request_on_main_loop(state)
 
             # Exchange: send instructions to LOB, execute on-chain, inject trade events
             if self.engine.mode == 'exchange':

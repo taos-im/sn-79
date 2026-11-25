@@ -13,7 +13,6 @@ import socket
 from collections import defaultdict, deque
 from types import SimpleNamespace
 
-from taos.im.validator.engines import NormalizedTradeEvent
 from taos.im.validator.scoring_shadow import (
     ShadowState,
     compute_parity_components,
@@ -663,7 +662,7 @@ def test_child_save_validator_state_roundtrip(tmp_path):
         "debeta_cpc_hist",  # the per-asset-class counterparty rows (0.6.3), after the pooled histories
         "debeta_invn_hist", "debeta_drift_hist", "debeta_invn_alt_hist", "debeta_drift_alt_hist", "debeta_conj_farm_hist",
         "debeta_msg_hist", "debeta_fill_hist", "debeta_dusttake_hist", "debeta_dustmake_hist",
-        "debeta_inv", "debeta_plast",
+        "debeta_inv", "debeta_pending_inv", "debeta_plast",
         "debeta_inv_alt", "debeta_plast_alt",
         "debeta_conj_ref", "debeta_conj_clock",  # the conjunction's references and clock (0.6.6)
         "debeta_class_vectors", "debeta_handover",  # the run-boundary handover (0.6.6)

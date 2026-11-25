@@ -33,20 +33,20 @@ def _engine(locked, tmp_path="/tmp"):
 
 
 def test_a_state_from_an_older_run_is_refused_and_changes_nothing():
-    e, v = _engine("20261006_1603")
+    e, v = _engine("20261006_1200")
     with pytest.raises(sim.RunWentBackwardError):
-        e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261002_183801"))
-    assert v.simulation.simulation_id == "20261006_1603"
-    assert v.simulation.logDir == "/r/logs/20261006_1603_00"
+        e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261002_120000"))
+    assert v.simulation.simulation_id == "20261006_1200"
+    assert v.simulation.logDir == "/r/logs/20261006_1200_00"
     assert v.simulation_timestamp == 10 * H
 
 
 def test_a_newer_run_and_the_same_run_are_not_refused():
-    e, v = _engine("20261006_1603")
-    e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261006_160323"))
+    e, v = _engine("20261006_1200")
+    e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261006_120000"))
     e.on_tick(SimpleNamespace(timestamp=10 * H + 2 * S, logDir="/r/logs/20261009_120000"))
 
 
 def test_nothing_is_refused_before_a_run_is_locked(tmp_path):
     e, _ = _engine(None, tmp_path)
-    e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261002_183801"))
+    e.on_tick(SimpleNamespace(timestamp=10 * H + S, logDir="/r/logs/20261002_120000"))

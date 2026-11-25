@@ -1515,11 +1515,57 @@ def combined_reward(making, skill, w_make=0.65):
     return [w_make * rm[i] + (1.0 - w_make) * rs[i] for i in range(len(rm))]
 
 
+def block_uids_in(batches, coldkey_of, min_uids, min_notional=0.0):
+    """The uids whose taker fills in one state form a synchronous block: per coldkey and side, the distinct taker
+    uids across the books and their aggressor notional; a group with min_uids uids or more and min_notional or more
+    is a block. {uid: side} for every member (the side its block took), {} when min_uids is 0, no coldkey map is
+    given, or no group reaches the bar. A uid can sit in a buy block and a sell block of the same state."""
+    if not min_uids or coldkey_of is None:
+        return {}
+    groups = {}
+    for book_trades in (batches or {}).values():
+        for t in book_trades or []:
+            ta = t.get("Ta")
+            if ta is None or int(ta) < 0:
+                continue
+            ck = coldkey_of(int(ta))
+            if not ck:
+                continue
+            g = groups.setdefault((ck, int(t["s"])), [set(), 0.0])
+            g[0].add(int(ta))
+            g[1] += float(t["p"]) * float(t["q"])
+    out = {}
+    for (_ck, side), (uids, notional) in groups.items():
+        if len(uids) >= int(min_uids) and notional >= float(min_notional or 0.0):
+            for u in uids:
+                out[u] = side
+    return out
+
+
+def release_pending_inventory(pending, book_id, binv, ts):
+    """Move a book's pending block fills whose release time has come into the marked inventory, at the mark the
+    next batch marks from; the moves before the release were not theirs."""
+    rows = (pending or {}).get(book_id)
+    if not rows or ts is None:
+        return
+    keep = []
+    for rel, uid, q in rows:
+        if rel <= ts:
+            binv[uid] = binv.get(uid, 0.0) + q
+        else:
+            keep.append((rel, uid, q))
+    if keep:
+        pending[book_id] = keep
+    else:
+        pending.pop(book_id, None)
+
+
 def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades, *,
                         mtm_hist=None, invsum_hist=None, invn_hist=None,
                         drift=None, drift_hist=None, ts=None,
                         mark_state=None, mark_mode="last", mark_window=0, mark_mid=None, fill_charge="none",
-                        charge_ref="mark",
+                        charge_ref="mark", block_uids=None, impact_window_ns=0, pending=None,
+                        taker_window_ns=0, clock_ns=None,
                         heldn=None, heldinv=None, helddrift=None, notional=None,
                         heldn_hist=None, heldinv_hist=None, helddrift_hist=None, notional_hist=None):
     """Accumulate the drift-strip inputs for kappa-of-alpha over ONE book's ordered trade batch,
@@ -1575,6 +1621,12 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
     mark_state is NOT persisted: after a restart the window re-warms and the first trade emits
     no dp - it can miss a marking move, never invent one."""
     binv = inv[book_id]  # {uid: current signed inventory in this book}, carried across batches
+    # a synchronous block's fills (block_uids: {uid: side}) wait in `pending` for impact_window_ns before they join
+    # the marked inventory; the ones whose time has come join now, at the mark this batch marks from
+    # the pending list keys on the state's own clock: `ts` is the volume-sampling stamp, floored to its interval
+    clock = ts if clock_ns is None else clock_ns
+    if pending is not None:
+        release_pending_inventory(pending, book_id, binv, clock)
     use_mid = mark_mode == "mid" and mark_state is not None
     use_mark = (not use_mid) and mark_mode != "last" and mark_window > 0 and mark_state is not None
     if use_mid:
@@ -1657,10 +1709,24 @@ def accumulate_book_mtm(mtm, invsum, invn, inv, p_first, p_last, book_id, trades
                 mtm[u][book_id] = mtm[u].get(book_id, 0.0) + c
                 if mtm_hist is not None:
                     _hadd2(mtm_hist, u, book_id, ts, c)
+        # the taker's fill waits for its impact to settle: a synchronous block's member for impact_window_ns, any
+        # taker for taker_window_ns (the longer of the two when both apply)
+        wait_ns = 0
+        if pending is not None and clock is not None and ta >= 0:
+            if block_uids and block_uids.get(ta) == int(t["s"]):
+                wait_ns = int(impact_window_ns)
+            if taker_window_ns:
+                wait_ns = max(wait_ns, int(taker_window_ns))
         if buyer >= 0:
-            binv[buyer] = binv.get(buyer, 0.0) + q
+            if wait_ns and buyer == ta:
+                pending.setdefault(book_id, []).append((int(clock) + wait_ns, buyer, q))
+            else:
+                binv[buyer] = binv.get(buyer, 0.0) + q
         if seller >= 0:
-            binv[seller] = binv.get(seller, 0.0) - q
+            if wait_ns and seller == ta:
+                pending.setdefault(book_id, []).append((int(clock) + wait_ns, seller, -q))
+            else:
+                binv[seller] = binv.get(seller, 0.0) - q
         if notional is not None:
             # Filled notional at the fill price (not the marked price): the hurdle is a cost of trading.
             for u in (buyer, seller):
